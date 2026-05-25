@@ -42,18 +42,6 @@ const limitQueryFastPathMaxLeaves = 8
 // a multi-residual LIMIT query is handed back to the general lead picker.
 const limitRangeNoOrderBroadResidualRowsPerNeed = 64
 
-const (
-	plannerLimitSampleMaxBuckets = 128
-	plannerLimitSampleMaxRows    = 1024
-	plannerLimitSampleMaxMatches = 16
-)
-
-type plannerLimitSample struct {
-	examined uint64
-	matched  uint64
-	buckets  uint64
-}
-
 type leafPostingScanCursor struct {
 	it   posting.Iterator
 	adv  leafPostingAdvanceIterator
@@ -63,6 +51,17 @@ type leafPostingScanCursor struct {
 
 type leafPostingAdvanceIterator interface {
 	AdvanceIfNeeded(uint64)
+}
+
+type limitScanGuard struct {
+	enabled     bool
+	noOrder     bool
+	minExamined uint64
+	needWindow  uint64
+	emitKeep    uint64
+	maxCost     float64
+	rowCost     float64
+	reason      string
 }
 
 func releaseLeafPostingScanCursors(cursors []leafPostingScanCursor) {
@@ -345,82 +344,6 @@ func leafPredsMatchActive(preds []leafPred, checks []int, idx uint64) bool {
 	return true
 }
 
-func plannerLimitSampleTarget(need uint64) uint64 {
-	target := need >> 3
-	if target < 4 {
-		target = 4
-	}
-	if target > plannerLimitSampleMaxMatches {
-		target = plannerLimitSampleMaxMatches
-	}
-	return target
-}
-
-func sampleLimitByFieldIndexBounds(
-	ov indexdata.FieldIndexView,
-	br indexdata.FieldIndexRange,
-	desc bool,
-	preds []leafPred,
-	target uint64,
-) plannerLimitSample {
-	if len(preds) == 0 || target == 0 || br.Empty() {
-		return plannerLimitSample{}
-	}
-
-	var activeBuf [limitQueryFastPathMaxLeaves]int
-	active := activeBuf[:0]
-	var activeHeap []int
-	if len(preds) > limitQueryFastPathMaxLeaves {
-		activeHeap = pooled.GetIntSlice(len(preds))
-		active = activeHeap[:0]
-	}
-	for i := 0; i < len(preds); i++ {
-		active = append(active, i)
-	}
-
-	var sample plannerLimitSample
-	cur := ov.NewCursor(br, desc)
-	for sample.buckets < plannerLimitSampleMaxBuckets && sample.examined < plannerLimitSampleMaxRows {
-		ids, idx, single, ok := cur.NextPostingOrSingle()
-		if !ok {
-			break
-		}
-		sample.buckets++
-		if single {
-			sample.examined++
-			if leafPredsMatchActive(preds, active, idx) {
-				sample.matched++
-				if sample.matched >= target {
-					break
-				}
-			}
-			continue
-		}
-		if ids.IsEmpty() {
-			continue
-		}
-		it := ids.Iter()
-		for it.HasNext() && sample.examined < plannerLimitSampleMaxRows {
-			sample.examined++
-			if leafPredsMatchActive(preds, active, it.Next()) {
-				sample.matched++
-				if sample.matched >= target {
-					break
-				}
-			}
-		}
-		it.Release()
-		if sample.matched >= target {
-			break
-		}
-	}
-
-	if activeHeap != nil {
-		pooled.ReleaseIntSlice(activeHeap)
-	}
-	return sample
-}
-
 func leafPredsEmitCandidate(
 	cursor *queryCursor,
 	preds []leafPred,
@@ -559,23 +482,57 @@ func leafPredsEmitPosting(
 	active, exactActive, residualActive []int,
 	exactOnly, residualApplyOnly bool,
 	ids, exactWork, applyWork posting.List,
+	guard limitScanGuard,
 	trace *Trace,
 	examined *uint64,
-) (bool, posting.List, posting.List) {
+) (bool, bool, posting.List, posting.List) {
 
 	if ids.IsEmpty() {
-		return false, exactWork, applyWork
+		return false, false, exactWork, applyWork
 	}
 
 	if len(active) == 0 {
-		return leafPredsEmitMatchedPosting(cursor, ids, ids.Cardinality(), trace, examined), exactWork, applyWork
+		return leafPredsEmitMatchedPosting(cursor, ids, ids.Cardinality(), trace, examined), false, exactWork, applyWork
 	}
 
 	if idx, ok := ids.TrySingle(); ok {
-		return leafPredsEmitCandidate(cursor, preds, active, trace, idx, examined), exactWork, applyWork
+		stop := leafPredsEmitCandidate(cursor, preds, active, trace, idx, examined)
+		if stop {
+			return true, false, exactWork, applyWork
+		}
+		if guard.enabled && uint64(len(cursor.out)) < guard.emitKeep &&
+			*examined >= guard.minExamined &&
+			float64(*examined)*guard.rowCost > guard.maxCost {
+			return false, true, exactWork, applyWork
+		}
+		return false, false, exactWork, applyWork
 	}
 
 	iterSrc := ids.Iter()
+	card := ids.Cardinality()
+	if guard.enabled &&
+		uint64(len(cursor.out)) < guard.emitKeep &&
+		*examined+card >= guard.minExamined &&
+		float64(*examined+card)*guard.rowCost > guard.maxCost {
+		guardActive := true
+		for iterSrc.HasNext() {
+			if leafPredsEmitCandidate(cursor, preds, active, trace, iterSrc.Next(), examined) {
+				iterSrc.Release()
+				return true, false, exactWork, applyWork
+			}
+			if guardActive {
+				if uint64(len(cursor.out)) >= guard.emitKeep {
+					guardActive = false
+				} else if *examined >= guard.minExamined &&
+					float64(*examined)*guard.rowCost > guard.maxCost {
+					iterSrc.Release()
+					return false, true, exactWork, applyWork
+				}
+			}
+		}
+		iterSrc.Release()
+		return false, false, exactWork, applyWork
+	}
 
 	exactApplied := false
 	if current, applied, handled, stop, nextExactWork, nextApplyWork := leafPredsTryBucketPosting(
@@ -593,7 +550,7 @@ func leafPredsEmitPosting(
 		examined,
 	); handled {
 		iterSrc.Release()
-		return stop, nextExactWork, nextApplyWork
+		return stop, false, nextExactWork, nextApplyWork
 
 	} else if applied && !current.IsEmpty() {
 		iterSrc.Release()
@@ -615,13 +572,13 @@ func leafPredsEmitPosting(
 	for iterSrc.HasNext() {
 		if leafPredsEmitCandidate(cursor, preds, checks, trace, iterSrc.Next(), examined) {
 			iterSrc.Release()
-			return true, exactWork, applyWork
+			return true, false, exactWork, applyWork
 		}
 	}
 
 	iterSrc.Release()
 
-	return false, exactWork, applyWork
+	return false, false, exactWork, applyWork
 }
 
 func (qv *View) extractNoOrderBounds(leaves []qir.Expr) (string, indexdata.Bounds, bool, error) {
@@ -935,30 +892,22 @@ func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.B
 		}
 	}
 
-	if guard.enabled && len(predsBuf) > 0 {
-		target := plannerLimitSampleTarget(guard.needWindow)
-		sample := sampleLimitByFieldIndexBounds(ov, br, false, predsBuf, target)
-		fallback := guard.shouldFallback(sample.examined, int(sample.matched))
-		reason := "sample_keep"
-		if fallback {
-			reason = "sample_" + guard.reason
-		} else if sample.examined < guard.minExamined {
-			reason = "sample_short"
-		} else if sample.matched >= target {
-			reason = "sample_hits"
-		}
-		if trace != nil {
-			trace.SetNoOrderLimitSample(sample.examined, sample.matched, sample.buckets, fallback, reason)
-		}
-		if fallback {
-			if trace != nil {
-				trace.SetNoOrderLimitRuntimeFallback(guard.reason)
-			}
-			return nil, false, true, nil
+	scanGuard := limitScanGuard{}
+	if guard.enabled {
+		scanGuard = limitScanGuard{
+			enabled:     true,
+			noOrder:     true,
+			minExamined: guard.minExamined,
+			needWindow:  guard.needWindow,
+			maxCost:     guard.fallbackCost * 1.15,
+			rowCost:     guard.rowCost,
+			reason:      guard.reason,
 		}
 	}
-
-	out, _ := qv.scanLimitByFieldIndexBounds(q, ov, br, false, predsBuf, "", plannerOrderedLimitRuntimeGuard{}, trace)
+	out, ok := qv.scanLimitByFieldIndexBounds(q, ov, br, false, predsBuf, "", scanGuard, trace)
+	if !ok {
+		return nil, false, true, nil
+	}
 	return out, true, false, nil
 }
 
@@ -1121,9 +1070,15 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 	return predsBuf, true, nil
 }
 
-func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds []leafPred, nilTailField string, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
+func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds []leafPred, nilTailField string, guard limitScanGuard, trace *Trace) ([]uint64, bool) {
 	if len(preds) == 0 {
 		return qv.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
+	}
+	if guard.enabled {
+		guard.emitKeep = guard.needWindow >> 2
+		if guard.needWindow&3 != 0 {
+			guard.emitKeep++
+		}
 	}
 
 	var extraRows uint64
@@ -1275,7 +1230,8 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 			}
 			var nextExactWork posting.List
 			var nextApplyWork posting.List
-			stop, nextExactWork, nextApplyWork = leafPredsEmitPosting(
+			var fallback bool
+			stop, fallback, nextExactWork, nextApplyWork = leafPredsEmitPosting(
 				&cursor,
 				preds,
 				active,
@@ -1286,12 +1242,37 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 				ids,
 				exactWork,
 				applyWork,
+				guard,
 				trace,
 				&examined,
 			)
 
 			exactWork = nextExactWork
 			applyWork = nextApplyWork
+			if fallback {
+				if trace != nil {
+					trace.AddExamined(examined)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
+					if guard.noOrder {
+						trace.SetNoOrderLimitRuntimeFallback(guard.reason)
+					} else {
+						trace.SetOrderedLimitRuntimeFallback(guard.reason)
+					}
+					trace.SetEarlyStopReason(guard.reason)
+				}
+
+				exactWork.Release()
+				applyWork.Release()
+				if activeHeap != nil {
+					pooled.ReleaseIntSlice(residualActiveHeap)
+					pooled.ReleaseIntSlice(exactActiveHeap)
+					pooled.ReleaseIntSlice(activeHeap)
+				}
+
+				return nil, false
+			}
 		}
 
 		if stop {
@@ -1316,28 +1297,36 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 			return cursor.out, true
 		}
-		if guard.enabled && guard.shouldFallback(examined, len(cursor.out)) {
-			if trace != nil {
-				trace.AddExamined(examined)
-				if trackScanWidth {
-					trace.AddOrderScanWidth(scanWidth)
+		if guard.enabled {
+			if uint64(len(cursor.out)) >= guard.emitKeep {
+				guard.enabled = false
+			} else if examined >= guard.minExamined && float64(examined)*guard.rowCost > guard.maxCost {
+				if trace != nil {
+					trace.AddExamined(examined)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
+					if guard.noOrder {
+						trace.SetNoOrderLimitRuntimeFallback(guard.reason)
+					} else {
+						trace.SetOrderedLimitRuntimeFallback(guard.reason)
+					}
+					trace.SetEarlyStopReason(guard.reason)
 				}
-				trace.SetOrderedLimitRuntimeFallback(guard.reason)
-				trace.SetEarlyStopReason(guard.reason)
-			}
 
-			exactWork.Release()
-			applyWork.Release()
-			if postingCursorActive {
-				releaseLeafPostingScanCursors(postingCursors)
-			}
-			if activeHeap != nil {
-				pooled.ReleaseIntSlice(residualActiveHeap)
-				pooled.ReleaseIntSlice(exactActiveHeap)
-				pooled.ReleaseIntSlice(activeHeap)
-			}
+				exactWork.Release()
+				applyWork.Release()
+				if postingCursorActive {
+					releaseLeafPostingScanCursors(postingCursors)
+				}
+				if activeHeap != nil {
+					pooled.ReleaseIntSlice(residualActiveHeap)
+					pooled.ReleaseIntSlice(exactActiveHeap)
+					pooled.ReleaseIntSlice(activeHeap)
+				}
 
-			return nil, false
+				return nil, false
+			}
 		}
 	}
 
@@ -1351,7 +1340,7 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 			if trackScanWidth {
 				scanWidth++
 			}
-			stop, nextExactWork, nextApplyWork := leafPredsEmitPosting(
+			stop, fallback, nextExactWork, nextApplyWork := leafPredsEmitPosting(
 				&cursor,
 				preds,
 				active,
@@ -1362,12 +1351,37 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 				ids,
 				exactWork,
 				applyWork,
+				guard,
 				trace,
 				&examined,
 			)
 
 			exactWork = nextExactWork
 			applyWork = nextApplyWork
+			if fallback {
+				if trace != nil {
+					trace.AddExamined(examined)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
+					if guard.noOrder {
+						trace.SetNoOrderLimitRuntimeFallback(guard.reason)
+					} else {
+						trace.SetOrderedLimitRuntimeFallback(guard.reason)
+					}
+					trace.SetEarlyStopReason(guard.reason)
+				}
+
+				exactWork.Release()
+				applyWork.Release()
+				if activeHeap != nil {
+					pooled.ReleaseIntSlice(residualActiveHeap)
+					pooled.ReleaseIntSlice(exactActiveHeap)
+					pooled.ReleaseIntSlice(activeHeap)
+				}
+
+				return nil, false
+			}
 
 			if stop {
 				if trace != nil {
@@ -1421,6 +1435,13 @@ func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.
 	if exhausted {
 		return nil, true
 	}
+	emitKeep := uint64(0)
+	if guard.enabled {
+		emitKeep = guard.needWindow >> 2
+		if guard.needWindow&3 != 0 {
+			emitKeep++
+		}
+	}
 	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 	keyCur := ov.NewCursor(br, desc)
@@ -1453,8 +1474,12 @@ func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.
 			}
 			it.Release()
 		}
-		if guard.enabled && guard.shouldFallback(examined, len(cursor.out)) {
-			return nil, false
+		if guard.enabled {
+			if uint64(len(cursor.out)) >= emitKeep {
+				guard.enabled = false
+			} else if examined >= guard.minExamined && float64(examined)*guard.rowCost > guard.fallbackCost*1.25 {
+				return nil, false
+			}
 		}
 	}
 	return cursor.out, true

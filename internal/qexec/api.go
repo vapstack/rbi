@@ -200,11 +200,6 @@ type TraceOrderedLimitRoute struct {
 
 	RuntimeGuardEnabled      bool
 	RuntimeGuardReason       string
-	SampleExamined           uint64
-	SampleMatched            uint64
-	SampleBuckets            uint64
-	SampleFallback           bool
-	SampleReason             string
 	RuntimeFallbackTriggered bool
 	RuntimeFallbackReason    string
 }
@@ -225,11 +220,6 @@ type TraceNoOrderLimitRoute struct {
 
 	RuntimeGuardEnabled      bool
 	RuntimeGuardReason       string
-	SampleExamined           uint64
-	SampleMatched            uint64
-	SampleBuckets            uint64
-	SampleFallback           bool
-	SampleReason             string
 	RuntimeFallbackTriggered bool
 	RuntimeFallbackReason    string
 }

@@ -1912,48 +1912,6 @@ dispatch:
 					}
 				}
 
-				sampleAllowed := guard.enabled && guard.fallbackCost < decision.selected.cost && len(predsBuf) > 0 && len(baseOps) > 0
-				if sampleAllowed && len(baseOps) <= 2 {
-					simpleResiduals := true
-					for i := 0; i < len(baseOps); i++ {
-						e := baseOps[i]
-						if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
-							simpleResiduals = false
-							break
-						}
-					}
-					if simpleResiduals {
-						sampleAllowed = false
-					}
-				}
-				if sampleAllowed {
-					target := plannerLimitSampleTarget(guard.needWindow)
-					sample := sampleLimitByFieldIndexBounds(ov, br, order.Desc, predsBuf, target)
-					fallback := guard.shouldFallback(sample.examined, int(sample.matched))
-					reason := "sample_keep"
-					if fallback {
-						reason = "sample_" + guard.reason
-					} else if sample.examined < guard.minExamined {
-						reason = "sample_short"
-					} else if sample.matched >= target {
-						reason = "sample_hits"
-					}
-					if trace != nil {
-						trace.SetOrderedLimitSample(sample.examined, sample.matched, sample.buckets, fallback, reason)
-					}
-					if fallback {
-						if predsBuf != nil {
-							leafPredSlicePool.Put(predsBuf)
-						}
-						if decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
-							selected = decision.runtimeFallback.kind
-							guard = plannerOrderedLimitRuntimeGuard{}
-							goto dispatch
-						}
-						return qv.dispatchOrderedLimitFallback(q, decision)
-					}
-				}
-
 				execTrace := trace
 				observePreds := qv.hasLimitLeafPredObservationCandidate(f, predsBuf)
 				var observedTrace Trace
@@ -1964,7 +1922,18 @@ dispatch:
 					observedStart = execTrace.RowsExamined()
 				}
 
-				out, ok := qv.scanLimitByFieldIndexBounds(q, ov, br, order.Desc, predsBuf, nilTailField, guard, execTrace)
+				scanGuard := limitScanGuard{}
+				if guard.enabled {
+					scanGuard = limitScanGuard{
+						enabled:     true,
+						minExamined: guard.minExamined,
+						needWindow:  guard.needWindow,
+						maxCost:     guard.fallbackCost * 1.25,
+						rowCost:     guard.rowCost,
+						reason:      guard.reason,
+					}
+				}
+				out, ok := qv.scanLimitByFieldIndexBounds(q, ov, br, order.Desc, predsBuf, nilTailField, scanGuard, execTrace)
 				if !ok {
 					if predsBuf != nil {
 						leafPredSlicePool.Put(predsBuf)

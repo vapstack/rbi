@@ -227,6 +227,9 @@ func (db *DB[K, V]) emitScannedStringKey(seek string, s string, fn func(K) (bool
 // SeqScan stops reading when the fn returns false or a non-nil error.
 // The scan runs inside a read-only transaction which remains open for the
 // duration of the scan.
+//
+// Records passed to fn can optionally be returned back using ReleaseRecords
+// to minimize GC pressure.
 func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	if err := db.beginOp(); err != nil {
 		return err

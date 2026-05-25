@@ -932,14 +932,14 @@ func TestPlannerArgmin_NoOrderLimitRuntimeGuard(t *testing.T) {
 	}
 }
 
-func TestPlannerLimitSampling_NoOrderDirectRangeFallback(t *testing.T) {
+func TestPlannerNoOrderLimitRuntimeGuard_DirectRangeFallback(t *testing.T) {
 	db := newTestDB(t, testOptions{
 		TraceSink:        func(TraceEvent) {},
 		TraceSampleEvery: 1,
 	})
 	db.seedGeneratedData(t, 3_000, func(id uint64) testRec {
 		return testRec{
-			Age:    int(id),
+			Age:    1,
 			Active: id > 2_000,
 		}
 	})
@@ -984,14 +984,17 @@ func TestPlannerLimitSampling_NoOrderDirectRangeFallback(t *testing.T) {
 		t.Fatalf("execNoOrderBounds: %v", err)
 	}
 	if used || !runtimeFallback {
-		t.Fatalf("expected sampling to request runtime fallback, used=%v runtimeFallback=%v", used, runtimeFallback)
+		t.Fatalf("expected runtime guard to request fallback, used=%v runtimeFallback=%v", used, runtimeFallback)
 	}
 	ev := trace.Event()
-	if !ev.NoOrderLimitRoute.SampleFallback {
-		t.Fatalf("expected sample fallback, sample=%+v", ev.NoOrderLimitRoute)
+	if !ev.NoOrderLimitRoute.RuntimeFallbackTriggered {
+		t.Fatalf("expected runtime fallback, route=%+v", ev.NoOrderLimitRoute)
 	}
-	if ev.NoOrderLimitRoute.SampleExamined < 128 || ev.NoOrderLimitRoute.SampleMatched != 0 {
-		t.Fatalf("unexpected sample metrics: %+v", ev.NoOrderLimitRoute)
+	if trace.RowsExamined() < guard.minExamined {
+		t.Fatalf("runtime guard fired before minExamined: rowsExamined=%d min=%d", trace.RowsExamined(), guard.minExamined)
+	}
+	if trace.RowsExamined() > guard.minExamined {
+		t.Fatalf("runtime guard scanned beyond bounded window: rowsExamined=%d min=%d", trace.RowsExamined(), guard.minExamined)
 	}
 }
 

@@ -243,17 +243,6 @@ func (t *Trace) SetOrderedLimitRuntimeGuard(enabled bool, reason string) {
 	t.ev.OrderedLimitRoute.RuntimeGuardReason = reason
 }
 
-func (t *Trace) SetOrderedLimitSample(examined, matched, buckets uint64, fallback bool, reason string) {
-	if !t.Full() {
-		return
-	}
-	t.ev.OrderedLimitRoute.SampleExamined = examined
-	t.ev.OrderedLimitRoute.SampleMatched = matched
-	t.ev.OrderedLimitRoute.SampleBuckets = buckets
-	t.ev.OrderedLimitRoute.SampleFallback = fallback
-	t.ev.OrderedLimitRoute.SampleReason = reason
-}
-
 func (t *Trace) SetOrderedLimitRuntimeFallback(reason string) {
 	if !t.Full() {
 		return
@@ -275,17 +264,6 @@ func (t *Trace) SetNoOrderLimitRuntimeGuard(enabled bool, reason string) {
 	}
 	t.ev.NoOrderLimitRoute.RuntimeGuardEnabled = enabled
 	t.ev.NoOrderLimitRoute.RuntimeGuardReason = reason
-}
-
-func (t *Trace) SetNoOrderLimitSample(examined, matched, buckets uint64, fallback bool, reason string) {
-	if !t.Full() {
-		return
-	}
-	t.ev.NoOrderLimitRoute.SampleExamined = examined
-	t.ev.NoOrderLimitRoute.SampleMatched = matched
-	t.ev.NoOrderLimitRoute.SampleBuckets = buckets
-	t.ev.NoOrderLimitRoute.SampleFallback = fallback
-	t.ev.NoOrderLimitRoute.SampleReason = reason
 }
 
 func (t *Trace) SetNoOrderLimitRuntimeFallback(reason string) {
