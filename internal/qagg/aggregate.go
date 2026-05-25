@@ -29,8 +29,63 @@ const (
 	aggregateMetricCountDistinct
 )
 
-const aggregateGroupIDOrdinalMaxLen = 8 << 20
+const aggregateGroupIDOrdinalMaxLen = 16 << 20
 const aggregateFullScanMaxAvgBucketRows = 64
+
+type aggregateGroupOrdinalMap struct {
+	keys   []uint64
+	values []uint32
+	mask   uint64
+}
+
+func (m *aggregateGroupOrdinalMap) init(n int) {
+	size := 1
+	for size < n*2 {
+		size <<= 1
+	}
+	if cap(m.keys) < size {
+		m.keys = make([]uint64, size)
+		m.values = make([]uint32, size)
+	} else {
+		m.keys = m.keys[:size]
+		m.values = m.values[:size]
+	}
+	m.mask = uint64(size - 1)
+}
+
+func (m *aggregateGroupOrdinalMap) reset() {
+	clear(m.values)
+}
+
+func (m *aggregateGroupOrdinalMap) put(id uint64, group uint32) {
+	slot := aggregateGroupOrdinalSlot(id, m.mask)
+	for m.values[slot] != 0 {
+		slot = (slot + 1) & m.mask
+	}
+	m.keys[slot] = id
+	m.values[slot] = group
+}
+
+func (m *aggregateGroupOrdinalMap) get(id uint64) uint32 {
+	slot := aggregateGroupOrdinalSlot(id, m.mask)
+	for {
+		group := m.values[slot]
+		if group == 0 {
+			return 0
+		}
+		if m.keys[slot] == id {
+			return group
+		}
+		slot = (slot + 1) & m.mask
+	}
+}
+
+func aggregateGroupOrdinalSlot(id uint64, mask uint64) uint64 {
+	id ^= id >> 33
+	id *= 0xff51afd7ed558ccd
+	id ^= id >> 33
+	return id & mask
+}
 
 type aggregateValueKind uint8
 
@@ -116,42 +171,42 @@ type aggregateExecutor struct {
 	snap *snapshot.View
 }
 
-func Execute(view *qexec.View, snap *snapshot.View, prepared *Query) (Result, error) {
-	if len(prepared.groups) == 0 && len(prepared.metrics) == 1 && prepared.metrics[0].rowCount {
-		count, err := Count(view, prepared.filter, true)
-		if err != nil {
-			return Result{}, err
-		}
-		result := Result{
-			Layout: []string{prepared.metrics[0].out},
-			Rows: []Row{{
-				Value{num: count, any: ValueKindUint},
-			}},
-		}
-		if prepared.hasHaving {
-			result = applyAggregateHaving(result, prepared.having)
-		}
-		return applyAggregateWindow(result, prepared.offset, prepared.limit), nil
-	}
-
-	ids, err := view.Filter(prepared.filter)
-	if err != nil {
-		return Result{}, err
-	}
-	defer ids.Release()
-
+func Execute(view *qexec.View, snap *snapshot.View, prepared *Query) (result Result, err error) {
+	family := selectAggregateFamily(prepared)
 	exec := aggregateExecutor{snap: snap}
-	result, err := exec.executeAggregate(prepared, ids)
+	var trace *qexec.Trace
+	if view.TraceSamplingEnabled() {
+		trace = view.BeginTrace(qir.NewShape(prepared.filter).WithWindow(prepared.offset, prepared.limit))
+		if trace != nil {
+			trace.SetPlan(PlanAggregate)
+			defer func() {
+				trace.Finish(uint64(len(result.Rows)), err)
+			}()
+		}
+	}
+
+	if family == aggregateSelectorCount {
+		result, err = exec.executeCountAggregateFamily(view, prepared, trace)
+	} else {
+		ids, filterErr := view.Filter(prepared.filter)
+		if filterErr != nil {
+			return Result{}, filterErr
+		}
+		defer ids.Release()
+		result, err = exec.executeAggregateFamily(prepared, ids, family, trace)
+	}
 	if err != nil {
 		return Result{}, err
 	}
+
 	if prepared.hasHaving {
 		result = applyAggregateHaving(result, prepared.having)
 	}
 	if len(prepared.order) > 0 {
 		sort.Sort(aggregateRowSorter{rows: result.Rows, order: prepared.order})
 	}
-	return applyAggregateWindow(result, prepared.offset, prepared.limit), nil
+	result = applyAggregateWindow(result, prepared.offset, prepared.limit)
+	return result, nil
 }
 
 func (q *Query) Release() {
@@ -665,21 +720,78 @@ func isAggregateFloatKind(kind reflect.Kind) bool {
 }
 
 func (ae *aggregateExecutor) executeAggregate(q *Query, ids posting.List) (Result, error) {
-	if ids.IsEmpty() {
-		if len(q.metrics) == 1 && q.metrics[0].op == aggregateMetricDistinct && len(q.groups) == 0 {
-			return Result{Layout: []string{q.metrics[0].out}, Rows: make([]Row, 0)}, nil
-		}
-		if len(q.groups) > 0 {
-			return Result{Layout: groupedAggregateLayout(q), Rows: make([]Row, 0)}, nil
-		}
+	return ae.executeAggregateFamily(q, ids, selectAggregateFamily(q), nil)
+}
+
+func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, family aggregateSelectorFamily, trace *qexec.Trace) (Result, error) {
+	var decision aggregateRouteDecision
+	switch family {
+	case aggregateSelectorCount:
+		decision = selectCountAggregate(aggregateCountFacts{})
+	case aggregateSelectorDistinct:
+		decision = selectDistinctAggregate(ae.collectDistinctFacts(q, ids))
+	case aggregateSelectorUngrouped:
+		decision = selectUngroupedAggregate(ae.collectUngroupedFacts(q, ids))
+	case aggregateSelectorGrouped:
+		decision = selectGroupedAggregate(ae.collectGroupedFacts(q, ids))
+	default:
+		return Result{}, dispatchInvalidAggregateRoute(0)
 	}
-	if len(q.metrics) == 1 && q.metrics[0].op == aggregateMetricDistinct && len(q.groups) == 0 {
+	if trace != nil {
+		trace.SetAggregateRoute(decision.traceRoute())
+	}
+	if family == aggregateSelectorCount {
+		if decision.route != aggregateRouteRowCount {
+			return Result{}, dispatchInvalidAggregateRoute(decision.route)
+		}
+		return aggregateCountResult(q.metrics[0].out, ids.Cardinality()), nil
+	}
+	return ae.dispatchAggregateRoute(q, ids, decision)
+}
+
+func (ae *aggregateExecutor) executeCountAggregateFamily(view *qexec.View, q *Query, trace *qexec.Trace) (Result, error) {
+	decision := selectCountAggregate(aggregateCountFacts{})
+	if trace != nil {
+		trace.SetAggregateRoute(decision.traceRoute())
+	}
+	count, err := Count(view, q.filter, false)
+	if err != nil {
+		return Result{}, err
+	}
+	decision.expectedFilterRows = count
+	decision.selectedCost = float64(count)
+	if trace != nil {
+		trace.SetAggregateRoute(decision.traceRoute())
+	}
+	return aggregateCountResult(q.metrics[0].out, count), nil
+}
+
+func aggregateCountResult(out string, count uint64) Result {
+	return Result{
+		Layout: []string{out},
+		Rows: []Row{{
+			Value{num: count, any: ValueKindUint},
+		}},
+	}
+}
+
+func (ae *aggregateExecutor) dispatchAggregateRoute(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
+	switch decision.route {
+	case aggregateRouteDistinctUngrouped:
 		return ae.executeDistinctAggregate(q.metrics[0], ids)
+	case aggregateRouteCountDistinctUngrouped:
+		return ae.executeCountDistinctAggregate(q.metrics[0], ids)
+	case aggregateRouteUngroupedOrdinary, aggregateRouteUngroupedMeasure, aggregateRouteUngroupedHybrid:
+		return ae.executeUngroupedAggregate(q, ids)
+	case aggregateRouteGroupedRecursive:
+		return ae.executeGroupedRecursiveAggregate(q, ids)
+	case aggregateRouteGroupedMeasure, aggregateRouteGroupedHybrid:
+		return ae.executeGroupedLookupAggregate(q, ids, decision)
+	case aggregateRouteGroupedOrdinaryByID:
+		return ae.executeGroupedOrdinaryByID(q, ids, decision)
+	default:
+		return Result{}, dispatchInvalidAggregateRoute(decision.route)
 	}
-	if len(q.groups) > 0 {
-		return ae.executeGroupedAggregate(q, ids)
-	}
-	return ae.executeUngroupedAggregate(q, ids)
 }
 
 func (ae *aggregateExecutor) executeUngroupedAggregate(q *Query, ids posting.List) (Result, error) {
@@ -717,76 +829,95 @@ func groupedAggregateLayout(q *Query) []string {
 }
 
 func (ae *aggregateExecutor) executeDistinctAggregate(metric aggregateMetric, ids posting.List) (Result, error) {
-	rows := make([]Row, 0)
-	if err := ae.appendDistinctRows(&rows, metric.field.ordinary, ids); err != nil {
-		return Result{}, err
+	if ids.IsEmpty() {
+		return Result{Layout: []string{metric.out}, Rows: make([]Row, 0)}, nil
 	}
-	return Result{Layout: []string{metric.out}, Rows: rows}, nil
+	acc := metric.field.ordinary
+	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
+	nilIDs := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
+	filterCardinality := ids.Cardinality()
+	universe := ae.snap.Universe.Cardinality()
+	keyCount := ov.KeyCount()
+	if filterCardinality == universe {
+		rowCount := keyCount
+		if !nilIDs.IsEmpty() {
+			rowCount++
+		}
+		rows := make([]Row, rowCount)
+		values := make([]Value, rowCount)
+		row := 0
+		cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+		for {
+			key, _, ok := cur.Next()
+			if !ok {
+				break
+			}
+			values[row] = aggregateValueFromIndexKey(acc.Field, key)
+			rows[row] = values[row : row+1 : row+1]
+			row++
+		}
+		if !nilIDs.IsEmpty() {
+			rows[row] = values[row : row+1 : row+1]
+		}
+		return Result{Layout: []string{metric.out}, Rows: rows}, nil
+	}
+
+	rowCap := min(uint64(keyCount)+1, filterCardinality+1)
+	singleBuckets := uint64(keyCount) > rowCap && ov.Rows() == uint64(keyCount)
+	if rowCap < 64 {
+		rows := make([]Row, 0)
+		ae.appendDistinctRows(&rows, nil, metric.field.ordinary, ids, ov, nilIDs, filterCardinality, universe, singleBuckets)
+		return Result{Layout: []string{metric.out}, Rows: rows}, nil
+	} else {
+		rows := make([]Row, 0, int(rowCap))
+		values := make([]Value, 0, int(rowCap))
+		ae.appendDistinctRows(&rows, &values, metric.field.ordinary, ids, ov, nilIDs, filterCardinality, universe, singleBuckets)
+		return Result{Layout: []string{metric.out}, Rows: rows}, nil
+	}
 }
 
-func (ae *aggregateExecutor) executeGroupedAggregate(q *Query, ids posting.List) (Result, error) {
-	if ae.canExecuteGroupedOrdinaryByID(q, ids) {
-		return ae.executeGroupedOrdinaryByID(q, ids)
+func (ae *aggregateExecutor) executeCountDistinctAggregate(metric aggregateMetric, ids posting.List) (Result, error) {
+	count := uint64(0)
+	if !ids.IsEmpty() {
+		acc := metric.field.ordinary
+		ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
+		universe := ae.snap.Universe.Cardinality()
+		filterCardinality := ids.Cardinality()
+		if filterCardinality == universe {
+			count = uint64(ov.KeyCount())
+		} else if ov.Rows() == uint64(ov.KeyCount()) {
+			count = filterCardinality
+			nilIDs := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			if !nilIDs.IsEmpty() {
+				count -= aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe)
+			}
+		} else {
+			cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+			for {
+				_, bucketIDs, ok := cur.Next()
+				if !ok {
+					break
+				}
+				if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) > 0 {
+					count++
+				}
+			}
+		}
 	}
+	return aggregateCountResult(metric.out, count), nil
+}
+
+func (ae *aggregateExecutor) executeGroupedRecursiveAggregate(q *Query, ids posting.List) (Result, error) {
 	layout := groupedAggregateLayout(q)
+	if ids.IsEmpty() {
+		return Result{Layout: layout, Rows: make([]Row, 0)}, nil
+	}
 	rows := make([]Row, 0)
 	groupValues := make([]Value, len(q.groups))
-	if err := ae.aggregateGroupRecursive(q, ids, 0, groupValues, &rows); err != nil {
+	if err := ae.executeGroupedRecursive(q, ids, 0, groupValues, &rows); err != nil {
 		return Result{}, err
 	}
 	return Result{Layout: layout, Rows: rows}, nil
-}
-
-func (ae *aggregateExecutor) canExecuteGroupedOrdinaryByID(q *Query, ids posting.List) bool {
-	hasOrdinary := false
-	for i := range q.metrics {
-		metric := q.metrics[i]
-		if metric.rowCount {
-			continue
-		}
-		if metric.field.isMeasure {
-			return false
-		}
-		hasOrdinary = true
-	}
-	if !hasOrdinary {
-		return false
-	}
-	maxID, ok := ids.Maximum()
-	if !ok || maxID >= aggregateGroupIDOrdinalMaxLen {
-		return false
-	}
-	filterCardinality := ids.Cardinality()
-	if maxID+1 > filterCardinality*16 {
-		return false
-	}
-
-	metricKeys, metricRows, minMetricRows := ae.aggregateOrdinaryMetricWork(q)
-	if metricRows == 0 || filterCardinality*8 < minMetricRows {
-		return false
-	}
-	groupEstimate := ae.aggregateGroupCountUpperBound(q, filterCardinality)
-	return aggregateMulGreater(groupEstimate, metricKeys, metricRows)
-}
-
-func (ae *aggregateExecutor) aggregateOrdinaryMetricWork(q *Query) (uint64, uint64, uint64) {
-	var keys uint64
-	var rows uint64
-	var minRows uint64
-	for i := range q.metrics {
-		metric := q.metrics[i]
-		if metric.rowCount || hasPriorOrdinaryAggregateMetric(q.metrics, i) {
-			continue
-		}
-		ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[metric.field.ordinary.Ordinal])
-		fieldRows := ov.Rows()
-		keys += uint64(ov.KeyCount())
-		rows += fieldRows
-		if minRows == 0 || fieldRows < minRows {
-			minRows = fieldRows
-		}
-	}
-	return keys, rows, minRows
 }
 
 func (ae *aggregateExecutor) aggregateGroupCountUpperBound(q *Query, filterCardinality uint64) uint64 {
@@ -811,51 +942,98 @@ func (ae *aggregateExecutor) aggregateGroupCountUpperBound(q *Query, filterCardi
 	return groups
 }
 
-func aggregateMulGreater(a uint64, b uint64, limit uint64) bool {
-	return b != 0 && a > limit/b
-}
-
-func (ae *aggregateExecutor) executeGroupedOrdinaryByID(q *Query, ids posting.List) (Result, error) {
+func (ae *aggregateExecutor) executeGroupedOrdinaryByID(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
 	layout := groupedAggregateLayout(q)
 	rows := make([]Row, 0)
-	states := aggregateMetricStateSlicePool.Get(len(q.metrics))
-	maxID, _ := ids.Maximum()
-	groupByIDLen := int(maxID) + 1
-
-	groupByID := pooled.GetUint32Slice(groupByIDLen)[:groupByIDLen]
-	clear(groupByID)
-
 	groupValues := make([]Value, len(q.groups))
-	err := ae.buildGroupedOrdinaryIDMap(q, ids, 0, groupValues, &rows, &states, groupByID)
-	if err == nil {
-		err = ae.foldGroupedOrdinaryByID(q, rows, states, groupByID)
-	}
+	var states []aggregateMetricState
 
-	pooled.ReleaseUint32Slice(groupByID)
+	var err error
+	switch decision.groupLookup {
+	case aggregateGroupLookupOrdinalSlice:
+		groupByIDLen := int(decision.groupMapLen)
+		groupByID := pooled.GetUint32Slice(groupByIDLen)[:groupByIDLen]
+		clear(groupByID)
+		err = ae.buildGroupedIDMap(q, ids, 0, groupValues, &rows, groupByID, nil)
+		if err == nil {
+			states = initGroupedMetricStates(q, rows)
+			err = ae.foldGroupedOrdinaryByID(q, rows, states, groupByID)
+		}
+		pooled.ReleaseUint32Slice(groupByID)
+
+	case aggregateGroupLookupMap:
+		groupByID := aggregateGroupOrdinalMapPool.Get()
+		groupByID.init(int(decision.groupMapLen))
+		err = ae.buildGroupedIDMap(q, ids, 0, groupValues, &rows, nil, groupByID)
+		if err == nil {
+			states = initGroupedMetricStates(q, rows)
+			err = ae.foldGroupedOrdinaryByIDMap(q, rows, states, groupByID)
+		}
+		aggregateGroupOrdinalMapPool.Put(groupByID)
+
+	default:
+		return Result{}, dispatchInvalidAggregateRoute(decision.route)
+	}
 
 	if err != nil {
-		aggregateMetricStateSlicePool.Put(states)
+		if states != nil {
+			aggregateMetricStateSlicePool.Put(states)
+		}
 		return Result{}, err
 	}
-	for rowIdx := range rows {
-		base := rowIdx * len(q.metrics)
-		for metricIdx := range q.metrics {
-			rows[rowIdx][len(q.groups)+metricIdx] = states[base+metricIdx].finish()
-		}
-	}
+	finishGroupedMetricStates(q, rows, states)
 	aggregateMetricStateSlicePool.Put(states)
 
 	return Result{Layout: layout, Rows: rows}, nil
 }
 
-func (ae *aggregateExecutor) buildGroupedOrdinaryIDMap(
+func (ae *aggregateExecutor) executeGroupedLookupAggregate(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
+	layout := groupedAggregateLayout(q)
+	if ids.IsEmpty() {
+		return Result{Layout: layout, Rows: make([]Row, 0)}, nil
+	}
+
+	rows := make([]Row, 0)
+	groupValues := make([]Value, len(q.groups))
+	var states []aggregateMetricState
+
+	var err error
+	switch decision.groupLookup {
+	case aggregateGroupLookupOrdinalSlice:
+		groupByIDLen := int(decision.groupMapLen)
+		groupByID := pooled.GetUint32Slice(groupByIDLen)[:groupByIDLen]
+		clear(groupByID)
+		err = ae.buildGroupedIDMap(q, ids, 0, groupValues, &rows, groupByID, nil)
+		if err == nil {
+			states = initGroupedMetricStates(q, rows)
+			err = ae.foldGroupedAggregateByID(q, ids, rows, states, groupByID)
+		}
+		pooled.ReleaseUint32Slice(groupByID)
+
+	default:
+		return Result{}, dispatchInvalidAggregateRoute(decision.route)
+	}
+
+	if err != nil {
+		if states != nil {
+			aggregateMetricStateSlicePool.Put(states)
+		}
+		return Result{}, err
+	}
+	finishGroupedMetricStates(q, rows, states)
+	aggregateMetricStateSlicePool.Put(states)
+
+	return Result{Layout: layout, Rows: rows}, nil
+}
+
+func (ae *aggregateExecutor) buildGroupedIDMap(
 	q *Query,
 	current posting.List,
 	level int,
 	groupValues []Value,
 	rows *[]Row,
-	states *[]aggregateMetricState,
 	groupByID []uint32,
+	groupByIDMap *aggregateGroupOrdinalMap,
 ) error {
 	if level == len(q.groups) {
 		rowIndex := len(*rows)
@@ -868,19 +1046,22 @@ func (ae *aggregateExecutor) buildGroupedOrdinaryIDMap(
 
 		rowCount := current.Cardinality()
 		for i := range q.metrics {
-			state := aggregateMetricState{metric: q.metrics[i]}
 			if q.metrics[i].rowCount {
-				state.count = rowCount
-				state.seen = true
+				row[len(q.groups)+i] = Value{num: rowCount, any: ValueKindUint}
 			}
-			*states = append(*states, state)
 		}
 
 		groupOrdinal := uint32(rowIndex + 1)
 		it := current.Iter()
-		for it.HasNext() {
-			id := it.Next()
-			groupByID[int(id)] = groupOrdinal
+		if groupByID != nil {
+			for it.HasNext() {
+				id := it.Next()
+				groupByID[int(id)] = groupOrdinal
+			}
+		} else {
+			for it.HasNext() {
+				groupByIDMap.put(it.Next(), groupOrdinal)
+			}
 		}
 		it.Release()
 		return nil
@@ -900,7 +1081,7 @@ func (ae *aggregateExecutor) buildGroupedOrdinaryIDMap(
 			continue
 		}
 		groupValues[level] = aggregateValueFromIndexKey(acc.Field, key)
-		if err := ae.buildGroupedOrdinaryIDMap(q, next, level+1, groupValues, rows, states, groupByID); err != nil {
+		if err := ae.buildGroupedIDMap(q, next, level+1, groupValues, rows, groupByID, groupByIDMap); err != nil {
 			next.Release()
 			return err
 		}
@@ -912,7 +1093,7 @@ func (ae *aggregateExecutor) buildGroupedOrdinaryIDMap(
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
 			groupValues[level] = Value{}
-			if err := ae.buildGroupedOrdinaryIDMap(q, next, level+1, groupValues, rows, states, groupByID); err != nil {
+			if err := ae.buildGroupedIDMap(q, next, level+1, groupValues, rows, groupByID, groupByIDMap); err != nil {
 				next.Release()
 				return err
 			}
@@ -921,6 +1102,42 @@ func (ae *aggregateExecutor) buildGroupedOrdinaryIDMap(
 	}
 
 	return nil
+}
+
+func initGroupedMetricStates(q *Query, rows []Row) []aggregateMetricState {
+	states := aggregateMetricStateSlicePool.Get(len(rows) * len(q.metrics))[:len(rows)*len(q.metrics)]
+	for rowIdx := range rows {
+		base := rowIdx * len(q.metrics)
+		for metricIdx := range q.metrics {
+			states[base+metricIdx].metric = q.metrics[metricIdx]
+		}
+	}
+	return states
+}
+
+func finishGroupedMetricStates(q *Query, rows []Row, states []aggregateMetricState) {
+	for rowIdx := range rows {
+		base := rowIdx * len(q.metrics)
+		for metricIdx := range q.metrics {
+			if q.metrics[metricIdx].rowCount {
+				continue
+			}
+			rows[rowIdx][len(q.groups)+metricIdx] = states[base+metricIdx].finish()
+		}
+	}
+}
+
+func (ae *aggregateExecutor) foldGroupedAggregateByID(
+	q *Query,
+	ids posting.List,
+	rows []Row,
+	states []aggregateMetricState,
+	groupByID []uint32,
+) error {
+	if err := ae.foldGroupedOrdinaryByID(q, rows, states, groupByID); err != nil {
+		return err
+	}
+	return ae.foldGroupedMeasureByID(q, ids, states, groupByID)
 }
 
 func (ae *aggregateExecutor) foldGroupedOrdinaryByID(
@@ -932,7 +1149,7 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryByID(
 
 	for i := range q.metrics {
 		metric := q.metrics[i]
-		if metric.rowCount {
+		if metric.rowCount || metric.field.isMeasure {
 			continue
 		}
 		if hasPriorOrdinaryAggregateMetric(q.metrics, i) {
@@ -945,10 +1162,42 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryByID(
 	return nil
 }
 
+func (ae *aggregateExecutor) foldGroupedOrdinaryByIDMap(
+	q *Query,
+	rows []Row,
+	states []aggregateMetricState,
+	groupByID *aggregateGroupOrdinalMap,
+) error {
+
+	for i := range q.metrics {
+		metric := q.metrics[i]
+		if metric.rowCount || metric.field.isMeasure {
+			continue
+		}
+		if hasPriorOrdinaryAggregateMetric(q.metrics, i) {
+			continue
+		}
+		if err := ae.foldGroupedOrdinaryFieldByIDMap(q, rows, states, groupByID, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func hasPriorOrdinaryAggregateMetric(metrics []aggregateMetric, pos int) bool {
 	metric := metrics[pos]
 	for i := 0; i < pos; i++ {
 		if aggregateMetricsShareOrdinaryField(metrics[i], metric) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPriorMeasureAggregateMetric(metrics []aggregateMetric, pos int) bool {
+	metric := metrics[pos]
+	for i := 0; i < pos; i++ {
+		if aggregateMetricsShareMeasureField(metrics[i], metric) {
 			return true
 		}
 	}
@@ -978,6 +1227,45 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByID(
 		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
+		}
+		if id, single := bucketIDs.TrySingle(); single {
+			if id >= uint64(len(groupByID)) {
+				continue
+			}
+			groupOrdinal := groupByID[int(id)]
+			if groupOrdinal == 0 {
+				continue
+			}
+			groupIndex := int(groupOrdinal - 1)
+			stateBase := groupIndex * len(q.metrics)
+			var value Value
+			valueReady := false
+			for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
+				if !aggregateMetricsShareOrdinaryField(q.metrics[first], q.metrics[metricIdx]) {
+					continue
+				}
+				state := &states[stateBase+metricIdx]
+				switch state.metric.op {
+				case aggregateMetricCount:
+					state.count++
+					state.seen = true
+				case aggregateMetricCountDistinct:
+					state.count++
+					state.seen = true
+				default:
+					if !valueReady {
+						value = aggregateValueFromIndexKey(acc.Field, key)
+						valueReady = true
+					}
+					if err = state.addValue(value, 1); err != nil {
+						break
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+			continue
 		}
 		it := bucketIDs.Iter()
 		for it.HasNext() {
@@ -1009,6 +1297,202 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByID(
 	pooled.ReleaseIntSlice(touched)
 	pooled.ReleaseUint64Slice(counts)
 	return err
+}
+
+func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByIDMap(
+	q *Query,
+	rows []Row,
+	states []aggregateMetricState,
+	groupByID *aggregateGroupOrdinalMap,
+	first int,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	counts := pooled.GetUint64Slice(len(rows))[:len(rows)]
+	clear(counts)
+	touched := pooled.GetIntSlice(len(rows))
+
+	acc := q.metrics[first].field.ordinary
+	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	var err error
+	for {
+		key, bucketIDs, ok := cur.Next()
+		if !ok {
+			break
+		}
+		if id, single := bucketIDs.TrySingle(); single {
+			groupOrdinal := groupByID.get(id)
+			if groupOrdinal == 0 {
+				continue
+			}
+			groupIndex := int(groupOrdinal - 1)
+			stateBase := groupIndex * len(q.metrics)
+			var value Value
+			valueReady := false
+			for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
+				if !aggregateMetricsShareOrdinaryField(q.metrics[first], q.metrics[metricIdx]) {
+					continue
+				}
+				state := &states[stateBase+metricIdx]
+				switch state.metric.op {
+				case aggregateMetricCount:
+					state.count++
+					state.seen = true
+				case aggregateMetricCountDistinct:
+					state.count++
+					state.seen = true
+				default:
+					if !valueReady {
+						value = aggregateValueFromIndexKey(acc.Field, key)
+						valueReady = true
+					}
+					if err = state.addValue(value, 1); err != nil {
+						break
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+			continue
+		}
+		it := bucketIDs.Iter()
+		for it.HasNext() {
+			groupOrdinal := groupByID.get(it.Next())
+			if groupOrdinal == 0 {
+				continue
+			}
+			groupIndex := int(groupOrdinal - 1)
+			if counts[groupIndex] == 0 {
+				touched = append(touched, groupIndex)
+			}
+			counts[groupIndex]++
+		}
+		it.Release()
+		if len(touched) > 0 {
+			err = addGroupedOrdinaryBucketValue(q, states, first, acc.Field, key, counts, touched)
+			touched = resetAggregateGroupBucketCounts(counts, touched)
+			if err != nil {
+				break
+			}
+		}
+	}
+
+	touched = resetAggregateGroupBucketCounts(counts, touched)
+	pooled.ReleaseIntSlice(touched)
+	pooled.ReleaseUint64Slice(counts)
+	return err
+}
+
+func (ae *aggregateExecutor) foldGroupedMeasureByID(
+	q *Query,
+	ids posting.List,
+	states []aggregateMetricState,
+	groupByID []uint32,
+) error {
+	for i := range q.metrics {
+		metric := q.metrics[i]
+		if metric.rowCount || !metric.field.isMeasure {
+			continue
+		}
+		if hasPriorMeasureAggregateMetric(q.metrics, i) {
+			continue
+		}
+		if err := ae.foldGroupedMeasureFieldByID(q, ids, states, groupByID, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ae *aggregateExecutor) foldGroupedMeasureFieldByID(
+	q *Query,
+	ids posting.List,
+	states []aggregateMetricState,
+	groupByID []uint32,
+	first int,
+) error {
+	acc := q.metrics[first].field.measure
+	storage := ae.snap.Measure[acc.Ordinal]
+	switch selectAggregateMeasureAccess(ids.Cardinality(), ae.snap.Universe.Cardinality(), storage) {
+	case aggregateMeasureAccessNone:
+		return nil
+	case aggregateMeasureAccessLookup:
+		it := ids.Iter()
+		for it.HasNext() {
+			id := it.Next()
+			raw, ok := storage.Lookup(id)
+			if !ok {
+				continue
+			}
+			if err := addGroupedMeasureRaw(q, states, first, int(groupByID[int(id)]-1), raw, acc.Kind); err != nil {
+				it.Release()
+				return err
+			}
+		}
+		it.Release()
+		return nil
+	}
+
+	measureIDs, values, ok := storage.FlatSlices()
+	if ok {
+		return addGroupedMeasureSlicesByID(q, states, first, groupByID, measureIDs, values, acc.Kind)
+	}
+	for chunkPos := 0; chunkPos < storage.ChunkCount(); chunkPos++ {
+		measureIDs, values = storage.ChunkSlices(chunkPos)
+		if err := addGroupedMeasureSlicesByID(q, states, first, groupByID, measureIDs, values, acc.Kind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addGroupedMeasureSlicesByID(
+	q *Query,
+	states []aggregateMetricState,
+	first int,
+	groupByID []uint32,
+	measureIDs []uint64,
+	values []uint64,
+	kind schema.MeasureValueKind,
+) error {
+	for i := range measureIDs {
+		id := measureIDs[i]
+		if id >= uint64(len(groupByID)) {
+			continue
+		}
+		groupOrdinal := groupByID[int(id)]
+		if groupOrdinal == 0 {
+			continue
+		}
+		if err := addGroupedMeasureRaw(q, states, first, int(groupOrdinal-1), values[i], kind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addGroupedMeasureRaw(
+	q *Query,
+	states []aggregateMetricState,
+	first int,
+	groupIndex int,
+	raw uint64,
+	kind schema.MeasureValueKind,
+) error {
+	stateBase := groupIndex * len(q.metrics)
+	for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
+		if !aggregateMetricsShareMeasureField(q.metrics[first], q.metrics[metricIdx]) {
+			continue
+		}
+		if err := states[stateBase+metricIdx].addRawMeasure(raw, kind, 1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func addGroupedOrdinaryBucketValue(
@@ -1061,7 +1545,7 @@ func resetAggregateGroupBucketCounts(counts []uint64, touched []int) []int {
 	return touched[:0]
 }
 
-func (ae *aggregateExecutor) aggregateGroupRecursive(
+func (ae *aggregateExecutor) executeGroupedRecursive(
 	q *Query,
 	current posting.List,
 	level int,
@@ -1102,7 +1586,7 @@ func (ae *aggregateExecutor) aggregateGroupRecursive(
 			continue
 		}
 		groupValues[level] = aggregateValueFromIndexKey(acc.Field, key)
-		if err := ae.aggregateGroupRecursive(q, next, level+1, groupValues, rows); err != nil {
+		if err := ae.executeGroupedRecursive(q, next, level+1, groupValues, rows); err != nil {
 			next.Release()
 			return err
 		}
@@ -1114,7 +1598,7 @@ func (ae *aggregateExecutor) aggregateGroupRecursive(
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
 			groupValues[level] = Value{}
-			if err := ae.aggregateGroupRecursive(q, next, level+1, groupValues, rows); err != nil {
+			if err := ae.executeGroupedRecursive(q, next, level+1, groupValues, rows); err != nil {
 				next.Release()
 				return err
 			}
@@ -1125,29 +1609,49 @@ func (ae *aggregateExecutor) aggregateGroupRecursive(
 	return nil
 }
 
-func (ae *aggregateExecutor) appendDistinctRows(rows *[]Row, acc schema.IndexedFieldAccessor, ids posting.List) error {
-	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
-	universe := ae.snap.Universe.Cardinality()
-	filterCardinality := ids.Cardinality()
+func (ae *aggregateExecutor) appendDistinctRows(rows *[]Row, values *[]Value, acc schema.IndexedFieldAccessor, ids posting.List, ov indexdata.FieldIndexView, nilIDs posting.List, filterCardinality uint64, universe uint64, singleBuckets bool) {
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	var contains posting.ContainsCursor
+	if singleBuckets {
+		contains.Reset(ids)
+	}
 
 	for {
 		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
-		if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) == 0 {
-			continue
+		if singleBuckets {
+			id, _ := bucketIDs.TrySingle()
+			if !contains.Contains(id) {
+				continue
+			}
+		} else {
+			if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) == 0 {
+				continue
+			}
 		}
-		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.Field, key)})
+		value := aggregateValueFromIndexKey(acc.Field, key)
+		if values == nil {
+			*rows = append(*rows, Row{value})
+		} else {
+			row := len(*values)
+			*values = append(*values, value)
+			v := *values
+			*rows = append(*rows, v[row:row+1:row+1])
+		}
 	}
-
-	nilIDs := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
 
 	if aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe) > 0 {
-		*rows = append(*rows, Row{Value{}})
+		if values == nil {
+			*rows = append(*rows, Row{Value{}})
+		} else {
+			row := len(*values)
+			*values = append(*values, Value{})
+			v := *values
+			*rows = append(*rows, v[row:row+1:row+1])
+		}
 	}
-	return nil
 }
 
 func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List) error {
@@ -1177,20 +1681,18 @@ func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricS
 func (ae *aggregateExecutor) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
 	acc := state.metric.field.measure
 	storage := ae.snap.Measure[acc.Ordinal]
-	if ids.IsEmpty() || storage.Rows() == 0 {
+	cardinality := ids.Cardinality()
+	switch selectAggregateMeasureAccess(cardinality, ae.snap.Universe.Cardinality(), storage) {
+	case aggregateMeasureAccessNone:
 		return nil
-	}
-
-	if ids.Cardinality() == ae.snap.Universe.Cardinality() {
+	case aggregateMeasureAccessFullScan:
 		if state.metric.op == aggregateMetricCount {
 			state.count += uint64(storage.Rows())
 			state.seen = true
 			return nil
 		}
 		return state.addMeasureStorageAll(storage, acc.Kind)
-	}
-
-	if useMeasureMergeScan(ids.Cardinality(), storage) {
+	case aggregateMeasureAccessMergeScan:
 		return state.addMeasureStorageIntersect(storage, acc.Kind, ids)
 	}
 
@@ -1305,6 +1807,14 @@ func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bo
 		!a.field.isMeasure &&
 		!b.field.isMeasure &&
 		a.field.ordinary.Ordinal == b.field.ordinary.Ordinal
+}
+
+func aggregateMetricsShareMeasureField(a aggregateMetric, b aggregateMetric) bool {
+	return !a.rowCount &&
+		!b.rowCount &&
+		a.field.isMeasure &&
+		b.field.isMeasure &&
+		a.field.measure.Ordinal == b.field.measure.Ordinal
 }
 
 func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {

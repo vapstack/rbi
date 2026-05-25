@@ -303,6 +303,13 @@ func (t *Trace) SetArrayPosOrderRoute(route TraceArrayPosOrderRoute) {
 	t.ev.ArrayPosOrderRoute = route
 }
 
+func (t *Trace) SetAggregateRoute(route TraceAggregateRoute) {
+	if !t.Full() {
+		return
+	}
+	t.ev.AggregateRoute = route
+}
+
 func (t *Trace) AddOROrderPlannerAnalysis(
 	d time.Duration,
 	predicates uint64,

@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	PlanAggregate          qexec.PlanName = "plan_aggregate"
 	PlanCountMaterialized  qexec.PlanName = "plan_count_materialized"
 	PlanCountUniqueEq      qexec.PlanName = "plan_count_unique_eq"
 	PlanCountScalarLookup  qexec.PlanName = "plan_count_scalar_lookup"

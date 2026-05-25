@@ -1768,8 +1768,11 @@ func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanCountScalarLookup) {
-		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	if last.Plan != string(PlanAggregate) {
+		t.Fatalf("expected plan %q, got %q", PlanAggregate, last.Plan)
+	}
+	if last.AggregateRoute.Selected != "row_count" || last.AggregateRoute.FilterInput != "cardinality" {
+		t.Fatalf("expected aggregate row-count route, got %+v", last.AggregateRoute)
 	}
 }
 
@@ -1817,8 +1820,11 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanCountMaterialized) {
-		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	if last.Plan != string(PlanAggregate) {
+		t.Fatalf("expected plan %q, got %q", PlanAggregate, last.Plan)
+	}
+	if last.AggregateRoute.Selected != "row_count" || last.AggregateRoute.FilterInput != "cardinality" {
+		t.Fatalf("expected aggregate row-count route, got %+v", last.AggregateRoute)
 	}
 }
 

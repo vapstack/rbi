@@ -103,6 +103,8 @@ type TraceEvent struct {
 	NoOrderLimitRoute TraceNoOrderLimitRoute
 	// ArrayPosOrderRoute contains route diagnostics for ArrayPos order selectors.
 	ArrayPosOrderRoute TraceArrayPosOrderRoute
+	// AggregateRoute contains route diagnostics for aggregate selectors.
+	AggregateRoute TraceAggregateRoute
 
 	// OrderIndexScanWidth is the number of non-empty order-index buckets
 	// traversed while producing query output.
@@ -240,6 +242,26 @@ type TraceArrayPosOrderRoute struct {
 	RejectedCost float64
 
 	ExpectedRows uint64
+}
+
+type TraceAggregateRoute struct {
+	Selected    string
+	Rejected    string
+	FilterInput string
+	MeasureMode string
+
+	SelectedCost float64
+	RejectedCost float64
+
+	ExpectedFilterRows  uint64
+	ExpectedGroups      uint64
+	MetricFieldCount    uint64
+	OrdinaryMetricCount uint64
+	MeasureMetricCount  uint64
+	MeasureRows         uint64
+	MeasureLookupSteps  uint64
+	OrdinaryKeyCount    uint64
+	GroupMapLen         uint64
 }
 
 type TraceORBranch struct {

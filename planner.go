@@ -13,6 +13,7 @@ type PlanName = qexec.PlanName
 
 const (
 	PlanMaterialized       = qexec.PlanMaterialized
+	PlanAggregate          = qagg.PlanAggregate
 	PlanCountMaterialized  = qagg.PlanCountMaterialized
 	PlanCountUniqueEq      = qagg.PlanCountUniqueEq
 	PlanCountScalarLookup  = qagg.PlanCountScalarLookup

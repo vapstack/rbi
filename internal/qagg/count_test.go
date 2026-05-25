@@ -370,6 +370,26 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 	if len(result.Rows) != 0 {
 		t.Fatalf("distinct empty rows len=%d, want 0; rows=%#v", len(result.Rows), result.Rows)
 	}
+
+	prepared, err = Prepare(
+		qx.Query(qx.EQ("country", "missing")).Metrics(qx.COUNT(qx.DISTINCT("country")).AS("countries")),
+		db.rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare count distinct: %v", err)
+	}
+	view = db.view()
+	result, err = Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute count distinct: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"countries"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("count distinct empty rows len=%d, want 1", len(result.Rows))
+	}
+	requireQaggUint(t, result.Rows[0][0], 0)
 }
 
 func TestExecuteNullGroupProducesNoneKey(t *testing.T) {
