@@ -1667,6 +1667,10 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 
 	sortActivePredicatesReader(active, preds)
 
+	if out, ok := qv.execLeadScanNoOrderBuckets(q, preds, leadIdx, trace); ok {
+		return out
+	}
+
 	capHint := q.Limit
 	cardHint := best
 	if leadIdx < 0 {
@@ -1682,10 +1686,6 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 	singleActive := -1
 	if len(active) == 1 {
 		singleActive = active[0]
-	}
-
-	if out, ok := qv.execLeadScanNoOrderBuckets(q, preds, leadIdx, trace); ok {
-		return out
 	}
 
 	var it posting.Iterator
