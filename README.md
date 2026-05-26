@@ -369,19 +369,24 @@ passed to `New` to become defaults for the whole DB instance.
   it mutates the caller-owned value directly. RBI does not protect against
   aliasing and does not restore the value if the later write fails.
 
-* All writes go through the internal batcher. `Batch*` methods keep their
+* `BeforeStore` and `BeforeCommit` receive RBI-owned record pointers for 
+  decoded old values and mutable working copies.
+  Do not retain `oldValue` or `newValue` after the hook returns;
+  copy the data you need instead.
+
+- All writes go through the internal batcher. `Batch*` methods keep their
   explicit per-call isolation and are never merged with neighboring writes.
 
-- Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
+* Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
   `BeforeStore`, and `BeforeCommit` may run more than once for the same
   logical write, so external side effects should be idempotent.
 
-* `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
+- `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
   methods on the same `DB` instance. Depending on execution mode, RBI may hold
   internal locks while running `BeforeCommit`, so re-entering the same `DB`
   can deadlock or become mode-dependent.
 
-- `BeforeCommit` must not modify the bucket managed by RBI itself.
+* `BeforeCommit` must not modify the bucket managed by RBI itself.
 
 ## Struct tags and indexing
 

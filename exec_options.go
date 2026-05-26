@@ -190,6 +190,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 //   - May return an error to abort the operation; in this case the
 //     transaction will be rolled back and index state will not be updated.
 //   - Must not modify oldValue or newValue.
+//   - Must not retain oldValue or newValue.
 //   - Must not commit or roll back the transaction.
 //   - Must not modify records or bucket sequence in the bucket managed by this DB instance
 //     (or by any other DB instance with enabled indexing),

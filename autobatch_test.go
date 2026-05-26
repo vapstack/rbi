@@ -315,6 +315,92 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 	assertOmits(qx.Query(qx.HASALL("tags", []string{"go"})), `tag="go"`)
 }
 
+func TestAutoBatchAttemptReleasesDecodedRecords(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+		t.Fatalf("seed Set(1): %v", err)
+	}
+
+	rt := db.autoBatcher.runtime
+	origDecode := rt.ops.decode
+	origRelease := rt.ops.release
+	decoded := 0
+	released := 0
+	rt.ops.decode = func(data []byte) (unsafe.Pointer, error) {
+		ptr, err := origDecode(data)
+		if err == nil {
+			decoded++
+		}
+		return ptr, err
+	}
+	rt.ops.release = func(ptr unsafe.Pointer) {
+		released++
+		origRelease(ptr)
+	}
+	defer func() {
+		rt.ops.decode = origDecode
+		rt.ops.release = origRelease
+	}()
+
+	check := func(stage string, want int) {
+		t.Helper()
+		if decoded != want || released != want {
+			t.Fatalf("%s: decoded=%d released=%d want=%d", stage, decoded, released, want)
+		}
+	}
+
+	if err := db.Set(1, &Rec{Name: "updated", Age: 11}, BeforeStore(func(_ uint64, _ *Rec, _ *Rec) error {
+		return nil
+	})); err != nil {
+		t.Fatalf("Set with BeforeStore: %v", err)
+	}
+	check("set before_store", 2)
+
+	if err := db.Patch(1, []Field{{Name: "age", Value: 12}}); err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	check("patch", 4)
+
+	if err := db.Delete(1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	check("delete", 5)
+
+	if err := db.Set(2, &Rec{Name: "repeat", Age: 20}); err != nil {
+		t.Fatalf("seed Set(2): %v", err)
+	}
+	check("insert", 5)
+
+	hookErr := errors.New("hook")
+	if err := db.Set(2, &Rec{Name: "blocked", Age: 30}, BeforeStore(func(_ uint64, _ *Rec, _ *Rec) error {
+		return hookErr
+	})); !errors.Is(err, hookErr) {
+		t.Fatalf("Set BeforeStore error = %v, want %v", err, hookErr)
+	}
+	check("set before_store error", 7)
+
+	reqAge := db.buildPatchAutoBatchRequest(2, []Field{{Name: "age", Value: 21}}, false, nil, nil, nil)
+	reqName := db.buildPatchAutoBatchRequest(2, []Field{{Name: "name", Value: "repeat-2"}}, false, nil, nil, nil)
+	defer db.autoBatcher.requestPool.Put(reqAge)
+	defer db.autoBatcher.requestPool.Put(reqName)
+
+	_, done, fatalErr := db.autoBatcher.executeAutoBatchAttempt(testAutoBatchRequestBuf(reqAge, reqName), false)
+	if fatalErr != nil {
+		t.Fatalf("executeAutoBatchAttempt: %v", fatalErr)
+	}
+	if !done {
+		t.Fatal("executeAutoBatchAttempt returned done=false")
+	}
+	if reqAge.err != nil {
+		t.Fatalf("age patch err: %v", reqAge.err)
+	}
+	if reqName.err != nil {
+		t.Fatalf("name patch err: %v", reqName.err)
+	}
+	check("repeated patch", 10)
+}
+
 func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 

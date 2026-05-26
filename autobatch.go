@@ -179,6 +179,7 @@ type autoBatchAttemptCore struct {
 	preparedSnapshots []snapshot.BatchEntry
 	acceptedSnapshots []snapshot.BatchEntry
 	ownedPayloads     []*bytes.Buffer
+	decodedValues     []unsafe.Pointer
 
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
@@ -204,6 +205,10 @@ func (core *autoBatchAttemptCore) prepare(bucket *bbolt.Bucket, statsEnabled boo
 	if cap(core.ownedPayloads) < capHint {
 		core.ownedPayloads = slices.Grow(core.ownedPayloads, capHint)
 	}
+	decodedCapHint := capHint * 2
+	if cap(core.decodedValues) < decodedCapHint {
+		core.decodedValues = slices.Grow(core.decodedValues, decodedCapHint)
+	}
 	if cap(core.uniqueIdxs) < capHint {
 		core.uniqueIdxs = slices.Grow(core.uniqueIdxs, capHint)
 	}
@@ -223,7 +228,13 @@ func (core *autoBatchAttemptCore) prepare(bucket *bbolt.Bucket, statsEnabled boo
 	}
 }
 
-func (core *autoBatchAttemptCore) cleanup() {
+func (core *autoBatchAttemptCore) cleanup(rt *autoBatchRuntime) {
+	for _, ptr := range core.decodedValues {
+		rt.ops.release(ptr)
+	}
+	clear(core.decodedValues)
+	core.decodedValues = core.decodedValues[:0]
+
 	for _, buf := range core.ownedPayloads {
 		encodePool.Put(buf)
 	}
@@ -398,6 +409,7 @@ func (st *autoBatchAttemptState) loadState(rt *autoBatchRuntime, req *autoBatchR
 			return nil, err
 		}
 		state.value = oldVal
+		st.decodedValues = append(st.decodedValues, oldVal)
 		state.setBorrowedPayload(prev)
 	}
 
@@ -1011,12 +1023,6 @@ func (ab *autoBatcher) prepareAutoBatchSet(att *autoBatchAttemptState, req *auto
 	newVal := req.setValue
 	payload := req.payloadBytes()
 	var ownedPayload *bytes.Buffer
-	releaseDecodedNewVal := false
-	defer func() {
-		if releaseDecodedNewVal {
-			rt.ops.release(newVal)
-		}
-	}()
 
 	if len(req.beforeStore) > 0 {
 		if att.statsEnabled {
@@ -1034,7 +1040,7 @@ func (ab *autoBatcher) prepareAutoBatchSet(att *autoBatchAttemptState, req *auto
 				req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrDecodePreparedValue, err)
 				return
 			}
-			releaseDecodedNewVal = true
+			att.decodedValues = append(att.decodedValues, newVal)
 		}
 		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
 			req.err = err
@@ -1088,7 +1094,6 @@ func (ab *autoBatcher) prepareAutoBatchSet(att *autoBatchAttemptState, req *auto
 		})
 	}
 	state.value = newVal
-	releaseDecodedNewVal = false
 	if ownedPayload != nil {
 		state.setOwnedPayload(ownedPayload)
 	} else {
@@ -1117,12 +1122,7 @@ func (ab *autoBatcher) prepareAutoBatchPatch(att *autoBatchAttemptState, req *au
 		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrRedecodeValue, err)
 		return
 	}
-	releaseDecodedNewVal := true
-	defer func() {
-		if releaseDecodedNewVal {
-			rt.ops.release(newVal)
-		}
-	}()
+	att.decodedValues = append(att.decodedValues, newVal)
 	if err = rt.schema.Patch.Apply(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrApplyPatch, err)
 		return
@@ -1182,7 +1182,6 @@ func (ab *autoBatcher) prepareAutoBatchPatch(att *autoBatchAttemptState, req *au
 		})
 	}
 	state.value = newVal
-	releaseDecodedNewVal = false
 	state.setOwnedPayload(buf)
 }
 

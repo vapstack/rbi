@@ -565,7 +565,7 @@ func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
 		requestScratchPool: pooled.NewSlicePool[*autoBatchRequest](uint(max(defaultAutoBatchMax, options.AutoBatchMax)), pooled.ClearCap),
 		attemptStatePool: pooled.Pointers[autoBatchAttemptState]{
 			Cleanup: func(st *autoBatchAttemptState) {
-				st.autoBatchAttemptCore.cleanup()
+				st.autoBatchAttemptCore.cleanup(runtime)
 
 				clear(st.prepared)
 				st.prepared = st.prepared[:0]
