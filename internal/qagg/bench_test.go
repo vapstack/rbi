@@ -739,3 +739,114 @@ func BenchmarkAggregatePostprocessOnly(b *testing.B) {
 		}
 	}
 }
+
+type qaggNullHeavyBenchRec struct {
+	Group   int   `db:"group"   rbi:"index"`
+	Leaf    *int  `db:"leaf"    rbi:"index"`
+	Value   int64 `db:"value"   rbi:"index"`
+	Measure int64 `db:"measure" rbi:"measure"`
+}
+
+func BenchmarkAggregateNullHeavyLeafGroup(b *testing.B) {
+	rt, err := schema.Compile(reflect.TypeFor[qaggNullHeavyBenchRec](), schema.Config{})
+	if err != nil {
+		b.Fatalf("schema.Compile: %v", err)
+	}
+	execRuntime := qexec.NewRuntime(qexec.Config{Schema: rt})
+
+	const rowsN = 100_000
+	const nonNullLeafRows = 1024
+	rows := make([]qaggNullHeavyBenchRec, rowsN)
+	leafValues := make([]int, nonNullLeafRows)
+	entries := make([]snapshot.BatchEntry, rowsN)
+	for i := range rows {
+		row := uint64(i + 1)
+		rows[i] = qaggNullHeavyBenchRec{
+			Group:   int(row & 7),
+			Value:   int64(row & 127),
+			Measure: int64((row*17)%1_000_003) - 500_000,
+		}
+		if i < nonNullLeafRows {
+			leafValues[i] = i
+			rows[i].Leaf = &leafValues[i]
+		}
+		entries[i] = snapshot.BatchEntry{ID: row, New: unsafe.Pointer(&rows[i])}
+	}
+	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "OrdinaryMetric",
+			q: qx.Group("group", "leaf").Metrics(
+				qx.ROWCOUNT().AS("rows"),
+				qx.SUM("value").AS("sum"),
+			),
+		},
+		{
+			name: "MeasureMetric",
+			q:    qx.Group("group", "leaf").Metrics(qx.SUM("measure").AS("sum")),
+		},
+	}
+
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			prepared, err := Prepare(tc.q, rt)
+			if err != nil {
+				b.Fatalf("Prepare: %v", err)
+			}
+			defer prepared.Release()
+
+			view := execRuntime.AcquireView(snap)
+			defer execRuntime.ReleaseView(view)
+			ids, err := view.Filter(prepared.filter)
+			if err != nil {
+				b.Fatalf("Filter: %v", err)
+			}
+			defer ids.Release()
+
+			agg := aggregateExecutor{snap: snap}
+			b.Run("AggregateOnly", func(b *testing.B) {
+				result, err := agg.executeAggregate(prepared, ids)
+				if err != nil {
+					b.Fatalf("Aggregate warmup: %v", err)
+				}
+				qaggBenchReportResult(b, prepared, ids.Cardinality(), result)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					result, err = agg.executeAggregate(prepared, ids)
+					if err != nil {
+						b.Fatalf("Aggregate: %v", err)
+					}
+					qaggBenchResult = result
+				}
+				qaggBenchReportResult(b, prepared, ids.Cardinality(), qaggBenchResult)
+			})
+
+			idsCardinality := ids.Cardinality()
+			b.Run("PreparedEndToEnd", func(b *testing.B) {
+				result, err := Execute(view, snap, prepared)
+				if err != nil {
+					b.Fatalf("Execute warmup: %v", err)
+				}
+				qaggBenchReportResult(b, prepared, idsCardinality, result)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					result, err = Execute(view, snap, prepared)
+					if err != nil {
+						b.Fatalf("Execute: %v", err)
+					}
+					qaggBenchResult = result
+				}
+				qaggBenchReportResult(b, prepared, idsCardinality, qaggBenchResult)
+			})
+		})
+	}
+}

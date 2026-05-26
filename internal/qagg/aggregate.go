@@ -1104,8 +1104,13 @@ func (ae *aggregateExecutor) buildGroupedIDMap(
 
 	acc := q.groups[level].ordinary
 	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
-	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
-	if groupByID != nil && level+1 == len(q.groups) {
+	keyCount := ov.KeyCount()
+	cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
+	useSliceLeaf := groupByID != nil && level+1 == len(q.groups)
+	if useSliceLeaf && level > 0 && keyCount > 0 && ov.Rows()/uint64(keyCount) < uint64(indexdata.FieldChunkTargetEntries) {
+		useSliceLeaf = false
+	}
+	if useSliceLeaf {
 		for {
 			key, bucketIDs, ok := cur.Next()
 			if !ok {
@@ -1147,9 +1152,15 @@ func (ae *aggregateExecutor) buildGroupedIDMap(
 
 	nilIDs := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
+		groupValues[level] = Value{}
+		if groupByID != nil && level+1 == len(q.groups) && nilIDs.Cardinality() >= uint64(indexdata.FieldChunkTargetEntries) {
+			if err := appendGroupedIDSliceLeaf(q, current, nilIDs, groupValues, rows, groupByID); err != nil {
+				return err
+			}
+			return nil
+		}
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
-			groupValues[level] = Value{}
 			if err := ae.buildGroupedIDMap(q, next, level+1, groupValues, rows, groupByID, groupByIDMap); err != nil {
 				next.Release()
 				return err
