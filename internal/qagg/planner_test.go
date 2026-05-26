@@ -171,12 +171,61 @@ func TestSelectGroupedAggregatePreservesByIDFeasibilityGate(t *testing.T) {
 	}
 }
 
+func TestSelectGroupedMeasurePrefersOrdinalLookupForBroadLowCardinality(t *testing.T) {
+	measure := selectGroupedAggregate(aggregateGroupedFacts{
+		hasMeasure:         true,
+		filterCardinality:  1_000_000,
+		maxID:              999_999,
+		hasMaxID:           true,
+		groupCountUpperMax: 4,
+		metricFieldCount:   1,
+		measureMetricCount: 1,
+		measureRows:        1_000_000,
+		measureLookupSteps: 16,
+		measureMode:        aggregateMeasureAccessMergeScan,
+		measureCost:        2_000_000,
+	})
+	if measure.route != aggregateRouteGroupedMeasure || measure.groupLookup != aggregateGroupLookupOrdinalSlice {
+		t.Fatalf("broad grouped measure decision=%+v", measure)
+	}
+	if measure.rejected != aggregateRouteGroupedRecursive || measure.selectedCost <= 0 || measure.rejectedCost <= 0 || measure.selectedCost >= measure.rejectedCost {
+		t.Fatalf("broad grouped measure costs=%+v", measure)
+	}
+
+	hybrid := selectGroupedAggregate(aggregateGroupedFacts{
+		hasOrdinary:         true,
+		hasMeasure:          true,
+		filterCardinality:   1_000_000,
+		maxID:               999_999,
+		hasMaxID:            true,
+		metricRows:          1_000_000,
+		groupCountUpperMax:  4,
+		metricFieldCount:    2,
+		ordinaryMetricCount: 1,
+		measureMetricCount:  1,
+		measureRows:         1_000_000,
+		measureLookupSteps:  16,
+		measureMode:         aggregateMeasureAccessMergeScan,
+		measureCost:         2_000_000,
+		ordinaryKeyCount:    1_000,
+	})
+	if hybrid.route != aggregateRouteGroupedHybrid || hybrid.groupLookup != aggregateGroupLookupOrdinalSlice {
+		t.Fatalf("broad grouped hybrid decision=%+v", hybrid)
+	}
+	if hybrid.rejected != aggregateRouteGroupedRecursive || hybrid.selectedCost <= 0 || hybrid.rejectedCost <= 0 || hybrid.selectedCost >= hybrid.rejectedCost {
+		t.Fatalf("broad grouped hybrid costs=%+v", hybrid)
+	}
+}
+
 func TestSelectGroupedMeasureFallsBackWithoutDenseOrdinalLookup(t *testing.T) {
 	selected := selectGroupedAggregate(aggregateGroupedFacts{
 		hasMeasure:         true,
 		filterCardinality:  10,
 		maxID:              10_000_000,
 		hasMaxID:           true,
+		groupCountUpperMax: 2,
+		metricFieldCount:   1,
+		measureMetricCount: 1,
 		measureRows:        100_000,
 		measureLookupSteps: 16,
 		measureMode:        aggregateMeasureAccessLookup,
@@ -187,6 +236,31 @@ func TestSelectGroupedMeasureFallsBackWithoutDenseOrdinalLookup(t *testing.T) {
 	}
 	if selected.groupLookup != aggregateGroupLookupNone || selected.groupMapLen != 0 {
 		t.Fatalf("sparse grouped measure lookup metrics=%+v", selected)
+	}
+	if selected.selectedCost <= 0 || selected.rejectedCost <= 0 {
+		t.Fatalf("sparse grouped measure costs=%+v", selected)
+	}
+}
+
+func TestSelectGroupedMeasureRejectedCostsAreRecorded(t *testing.T) {
+	selected := selectGroupedAggregate(aggregateGroupedFacts{
+		hasMeasure:         true,
+		filterCardinality:  10,
+		maxID:              9,
+		hasMaxID:           true,
+		groupCountUpperMax: 10,
+		metricFieldCount:   1,
+		measureMetricCount: 1,
+		measureRows:        100_000,
+		measureLookupSteps: 16,
+		measureMode:        aggregateMeasureAccessLookup,
+		measureCost:        160,
+	})
+	if selected.route != aggregateRouteGroupedRecursive || selected.rejected != aggregateRouteGroupedMeasure {
+		t.Fatalf("lookup grouped measure decision=%+v", selected)
+	}
+	if selected.selectedCost <= 0 || selected.rejectedCost <= 0 || selected.selectedCost >= selected.rejectedCost {
+		t.Fatalf("lookup grouped measure costs=%+v", selected)
 	}
 }
 
@@ -281,14 +355,35 @@ func TestExecuteAggregateEmitsSelectedRouteTrace(t *testing.T) {
 		if ev.AggregateRoute.FilterInput == "" {
 			t.Fatalf("%s empty aggregate filter input: %+v", tc.name, ev.AggregateRoute)
 		}
+		if ev.AggregateRoute.ExpectedFilterRows == 0 {
+			t.Fatalf("%s missing expected filter rows: %+v", tc.name, ev.AggregateRoute)
+		}
 		if ev.RowsReturned != uint64(len(result.Rows)) {
 			t.Fatalf("%s rows returned trace=%d result=%d", tc.name, ev.RowsReturned, len(result.Rows))
 		}
-		if tc.wantRoute == "grouped_ordinary_by_id" && ev.AggregateRoute.GroupMapLen == 0 {
-			t.Fatalf("%s missing group map length: %+v", tc.name, ev.AggregateRoute)
+		switch tc.wantRoute {
+		case "grouped_recursive", "grouped_ordinary_by_id", "grouped_measure", "grouped_hybrid":
+			if ev.AggregateRoute.ExpectedGroups == 0 {
+				t.Fatalf("%s missing expected groups: %+v", tc.name, ev.AggregateRoute)
+			}
 		}
-		if tc.wantRoute == "ungrouped_measure" && ev.AggregateRoute.MeasureRows == 0 {
-			t.Fatalf("%s missing measure row count: %+v", tc.name, ev.AggregateRoute)
+		switch tc.wantRoute {
+		case "grouped_ordinary_by_id", "grouped_measure", "grouped_hybrid":
+			if ev.AggregateRoute.Rejected == "" || ev.AggregateRoute.SelectedCost <= 0 || ev.AggregateRoute.RejectedCost <= 0 {
+				t.Fatalf("%s missing competing route cost: %+v", tc.name, ev.AggregateRoute)
+			}
+		}
+		switch tc.wantRoute {
+		case "grouped_ordinary_by_id", "grouped_measure", "grouped_hybrid":
+			if ev.AggregateRoute.GroupMapLen == 0 {
+				t.Fatalf("%s missing group map length: %+v", tc.name, ev.AggregateRoute)
+			}
+		}
+		switch tc.wantRoute {
+		case "ungrouped_measure", "ungrouped_hybrid", "grouped_measure", "grouped_hybrid":
+			if ev.AggregateRoute.MeasureRows == 0 || ev.AggregateRoute.MeasureLookupSteps == 0 || ev.AggregateRoute.MeasureMetricCount == 0 || ev.AggregateRoute.MeasureMode == "" {
+				t.Fatalf("%s missing measure diagnostics: %+v", tc.name, ev.AggregateRoute)
+			}
 		}
 	}
 	for _, route := range []string{

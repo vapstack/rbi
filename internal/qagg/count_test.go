@@ -46,14 +46,7 @@ func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
 		TraceSampleEvery: 1,
 	})
 
-	rows := []qaggTestRec{
-		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go", "db"}, Amount: qaggI64(10)},
-		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 31, Big: 1, Tags: []string{"ops"}, Amount: qaggI64(20)},
-		{Country: "NL", Active: false, Age: 42, Tags: []string{"db"}},
-		{Country: "US", Segment: qaggString("core"), Active: true, Age: 50, Tags: []string{"go"}, Amount: qaggI64(40)},
-		{Country: "PL", Active: false, Age: 60, Amount: qaggI64(50)},
-		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 37, Tags: []string{"go", "ops"}, Amount: qaggI64(15)},
-	}
+	rows := qaggDefaultRows()
 	entries := make([]snapshot.BatchEntry, len(rows))
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
@@ -64,6 +57,17 @@ func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
 	}, nil, nil, entries)
 
 	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
+}
+
+func qaggDefaultRows() []qaggTestRec {
+	return []qaggTestRec{
+		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go", "db"}, Amount: qaggI64(10)},
+		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 31, Big: 1, Tags: []string{"ops"}, Amount: qaggI64(20)},
+		{Country: "NL", Active: false, Age: 42, Tags: []string{"db"}},
+		{Country: "US", Segment: qaggString("core"), Active: true, Age: 50, Tags: []string{"go"}, Amount: qaggI64(40)},
+		{Country: "PL", Active: false, Age: 60, Amount: qaggI64(50)},
+		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 37, Tags: []string{"go", "ops"}, Amount: qaggI64(15)},
+	}
 }
 
 func qaggI64(v int64) *int64 {

@@ -809,7 +809,7 @@ func (ae *aggregateExecutor) dispatchAggregateRoute(q *Query, ids posting.List, 
 	case aggregateRouteCountDistinctUngrouped:
 		return ae.executeCountDistinctAggregate(q.metrics[0], ids)
 	case aggregateRouteUngroupedOrdinary, aggregateRouteUngroupedMeasure, aggregateRouteUngroupedHybrid:
-		return ae.executeUngroupedAggregate(q, ids)
+		return ae.executeUngroupedAggregate(q, ids, decision)
 	case aggregateRouteGroupedRecursive:
 		return ae.executeGroupedRecursiveAggregate(q, ids)
 	case aggregateRouteGroupedMeasure, aggregateRouteGroupedHybrid:
@@ -821,7 +821,7 @@ func (ae *aggregateExecutor) dispatchAggregateRoute(q *Query, ids posting.List, 
 	}
 }
 
-func (ae *aggregateExecutor) executeUngroupedAggregate(q *Query, ids posting.List) (Result, error) {
+func (ae *aggregateExecutor) executeUngroupedAggregate(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
 	layout := make([]string, len(q.metrics))
 	states := aggregateMetricStateSlicePool.Get(len(q.metrics))[:len(q.metrics)]
 	empty := ids.IsEmpty()
@@ -830,7 +830,7 @@ func (ae *aggregateExecutor) executeUngroupedAggregate(q *Query, ids posting.Lis
 		states[i].metric = q.metrics[i]
 	}
 	if !empty {
-		err := ae.foldAggregateMetricStates(states, ids)
+		err := ae.foldAggregateMetricStates(states, ids, decision.measureMode)
 		if err != nil {
 			aggregateMetricStateSlicePool.Put(states)
 			return Result{}, err
@@ -1033,7 +1033,7 @@ func (ae *aggregateExecutor) executeGroupedLookupAggregate(q *Query, ids posting
 		err = ae.buildGroupedIDMap(q, ids, 0, groupValues, &rows, groupByID, nil)
 		if err == nil {
 			states = initGroupedMetricStates(q, rows)
-			err = ae.foldGroupedAggregateByID(q, ids, rows, states, groupByID)
+			err = ae.foldGroupedAggregateByID(q, ids, rows, states, groupByID, decision.measureMode)
 		}
 		pooled.ReleaseUint32Slice(groupByID)
 
@@ -1160,11 +1160,12 @@ func (ae *aggregateExecutor) foldGroupedAggregateByID(
 	rows []Row,
 	states []aggregateMetricState,
 	groupByID []uint32,
+	measureMode aggregateMeasureAccess,
 ) error {
 	if err := ae.foldGroupedOrdinaryByID(q, rows, states, groupByID); err != nil {
 		return err
 	}
-	return ae.foldGroupedMeasureByID(q, ids, states, groupByID)
+	return ae.foldGroupedMeasureByID(q, ids, states, groupByID, measureMode)
 }
 
 func (ae *aggregateExecutor) foldGroupedOrdinaryByID(
@@ -1419,6 +1420,7 @@ func (ae *aggregateExecutor) foldGroupedMeasureByID(
 	ids posting.List,
 	states []aggregateMetricState,
 	groupByID []uint32,
+	measureMode aggregateMeasureAccess,
 ) error {
 	for i := range q.metrics {
 		metric := q.metrics[i]
@@ -1428,7 +1430,7 @@ func (ae *aggregateExecutor) foldGroupedMeasureByID(
 		if hasPriorMeasureAggregateMetric(q.metrics, i) {
 			continue
 		}
-		if err := ae.foldGroupedMeasureFieldByID(q, ids, states, groupByID, i); err != nil {
+		if err := ae.foldGroupedMeasureFieldByID(q, ids, states, groupByID, i, measureMode); err != nil {
 			return err
 		}
 	}
@@ -1441,10 +1443,17 @@ func (ae *aggregateExecutor) foldGroupedMeasureFieldByID(
 	states []aggregateMetricState,
 	groupByID []uint32,
 	first int,
+	measureMode aggregateMeasureAccess,
 ) error {
 	acc := q.metrics[first].field.measure
 	storage := ae.snap.Measure[acc.Ordinal]
-	switch selectAggregateMeasureAccess(ids.Cardinality(), ae.snap.Universe.Cardinality(), storage) {
+	if storage.Rows() == 0 {
+		return nil
+	}
+	if measureMode == aggregateMeasureAccessMixed {
+		measureMode = selectAggregateMeasureAccess(ids.Cardinality(), ae.snap.Universe.Cardinality(), storage)
+	}
+	switch measureMode {
 	case aggregateMeasureAccessNone:
 		return nil
 	case aggregateMeasureAccessLookup:
@@ -1585,7 +1594,7 @@ func (ae *aggregateExecutor) executeGroupedRecursive(
 		for i := range q.metrics {
 			states[i].metric = q.metrics[i]
 		}
-		if err := ae.foldAggregateMetricStates(states, current); err != nil {
+		if err := ae.foldAggregateMetricStates(states, current, aggregateMeasureAccessMixed); err != nil {
 			aggregateMetricStateSlicePool.Put(states)
 			return err
 		}
@@ -1681,7 +1690,7 @@ func (ae *aggregateExecutor) appendDistinctRows(rows *[]Row, values *[]Value, ac
 	}
 }
 
-func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List) error {
+func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List, measureMode aggregateMeasureAccess) error {
 	for i := range states {
 		metric := states[i].metric
 		if metric.rowCount {
@@ -1690,7 +1699,7 @@ func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricS
 			continue
 		}
 		if metric.field.isMeasure {
-			if err := ae.foldMeasureMetric(&states[i], ids); err != nil {
+			if err := ae.foldMeasureMetric(&states[i], ids, measureMode); err != nil {
 				return err
 			}
 			continue
@@ -1705,16 +1714,22 @@ func (ae *aggregateExecutor) foldAggregateMetricStates(states []aggregateMetricS
 	return nil
 }
 
-func (ae *aggregateExecutor) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
+func (ae *aggregateExecutor) foldMeasureMetric(state *aggregateMetricState, ids posting.List, measureMode aggregateMeasureAccess) error {
 	acc := state.metric.field.measure
 	storage := ae.snap.Measure[acc.Ordinal]
-	cardinality := ids.Cardinality()
-	switch selectAggregateMeasureAccess(cardinality, ae.snap.Universe.Cardinality(), storage) {
+	rows := storage.Rows()
+	if rows == 0 {
+		return nil
+	}
+	if measureMode == aggregateMeasureAccessMixed {
+		measureMode = selectAggregateMeasureAccess(ids.Cardinality(), ae.snap.Universe.Cardinality(), storage)
+	}
+	switch measureMode {
 	case aggregateMeasureAccessNone:
 		return nil
 	case aggregateMeasureAccessFullScan:
 		if state.metric.op == aggregateMetricCount {
-			state.count += uint64(storage.Rows())
+			state.count += uint64(rows)
 			state.seen = true
 			return nil
 		}

@@ -67,7 +67,7 @@ func TestGroupedRecursiveEqualsGroupedByIDForDenseOrdinaryInput(t *testing.T) {
 	requireQaggResultsEqualUnordered(t, recursive, byID)
 }
 
-func TestGroupedSparseHighIDSelectsRecursiveAndMatchesRecursiveRoute(t *testing.T) {
+func TestGroupedSparseHighIDSelectsRecursiveAndMatchesReference(t *testing.T) {
 	db := newQaggSparseIDTestDB(t)
 	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt)
 	if err != nil {
@@ -96,11 +96,8 @@ func TestGroupedSparseHighIDSelectsRecursiveAndMatchesRecursiveRoute(t *testing.
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	recursive, err := exec.executeGroupedRecursiveAggregate(prepared, ids)
-	if err != nil {
-		t.Fatalf("recursive: %v", err)
-	}
-	requireQaggResultsEqualUnordered(t, selected, recursive)
+	rows, _ := qaggSparseRows()
+	requireQaggResultsEqualUnordered(t, selected, qaggReferenceGroupedAgeSum(rows, []string{"country", "sum"}))
 }
 
 func TestGroupedOrdinaryMapRouteMatchesRecursive(t *testing.T) {
@@ -330,6 +327,90 @@ func TestCountDistinctUniqueFieldUsesNonNullFilterCardinality(t *testing.T) {
 	requireQaggUint(t, result.Rows[0][0], 2)
 }
 
+func TestUngroupedOrdinarySharedFieldMetricsMatchReference(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+	prepared, err := Prepare(
+		qx.Query(qx.GTE("age", 30)).Metrics(
+			qx.COUNT("age").AS("age_count"),
+			qx.SUM("age").AS("age_sum"),
+			qx.AVG("age").AS("age_avg"),
+			qx.MIN("age").AS("age_min"),
+			qx.MAX("age").AS("age_max"),
+		),
+		db.rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	requireQaggResultsEqualUnordered(t, result, qaggReferenceUngroupedAge(qaggDefaultRows(), []string{"age_count", "age_sum", "age_avg", "age_min", "age_max"}))
+}
+
+func TestUngroupedMeasureMetricsMatchReference(t *testing.T) {
+	tests := []struct {
+		name string
+		q    *qx.QX
+		keep int
+	}{
+		{
+			name: "dense",
+			q: qx.Aggregate(
+				qx.COUNT("amount").AS("amount_count"),
+				qx.SUM("amount").AS("amount_sum"),
+				qx.AVG("amount").AS("amount_avg"),
+				qx.MIN("amount").AS("amount_min"),
+				qx.MAX("amount").AS("amount_max"),
+			),
+		},
+		{
+			name: "sparse",
+			q: qx.Query(qx.EQ("country", "NL")).Metrics(
+				qx.COUNT("amount").AS("amount_count"),
+				qx.SUM("amount").AS("amount_sum"),
+				qx.AVG("amount").AS("amount_avg"),
+				qx.MIN("amount").AS("amount_min"),
+				qx.MAX("amount").AS("amount_max"),
+			),
+			keep: 1,
+		},
+		{
+			name: "null_heavy",
+			q: qx.Query(qx.EQ("active", false)).Metrics(
+				qx.COUNT("amount").AS("amount_count"),
+				qx.SUM("amount").AS("amount_sum"),
+				qx.AVG("amount").AS("amount_avg"),
+				qx.MIN("amount").AS("amount_min"),
+				qx.MAX("amount").AS("amount_max"),
+			),
+			keep: 2,
+		},
+	}
+
+	for i := range tests {
+		tc := tests[i]
+		db := newQaggTestDB(t, nil)
+		prepared, err := Prepare(tc.q, db.rt)
+		if err != nil {
+			t.Fatalf("%s Prepare: %v", tc.name, err)
+		}
+		view := db.view()
+		result, err := Execute(view, db.snap, prepared)
+		db.exec.ReleaseView(view)
+		prepared.Release()
+		if err != nil {
+			t.Fatalf("%s Execute: %v", tc.name, err)
+		}
+		requireQaggResultsEqualUnordered(t, result, qaggReferenceUngroupedAmount(qaggDefaultRows(), tc.keep, []string{"amount_count", "amount_sum", "amount_avg", "amount_min", "amount_max"}))
+	}
+}
+
 func TestGroupedHybridMetricsMatchReference(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 	prepared, err := Prepare(
@@ -350,25 +431,36 @@ func TestGroupedHybridMetricsMatchReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
+	requireQaggResultsEqualUnordered(t, result, qaggReferenceGroupedAgeAmountSums(qaggDefaultRows(), []string{"country", "age_sum", "amount_sum"}))
+}
 
-	want := map[string][2]int64{
-		"DE": {68, 35},
-		"NL": {67, 10},
-		"PL": {60, 50},
-		"US": {50, 40},
+func TestGroupedHavingOrderWindowMatchesReference(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+	prepared, err := Prepare(
+		qx.Query(qx.GTE("age", 30)).
+			Group("country").
+			Metrics(
+				qx.ROWCOUNT().AS("rows"),
+				qx.SUM("amount").AS("sum"),
+			).
+			Having(qx.GTE(qx.OUT("sum"), int64(20))).
+			SortOut("sum", qx.DESC).
+			Offset(1).
+			Limit(2),
+		db.rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
 	}
-	if len(result.Rows) != len(want) {
-		t.Fatalf("rows=%d, want %d; rows=%#v", len(result.Rows), len(want), result.Rows)
+	defer prepared.Release()
+
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
-	for i := range result.Rows {
-		country := mustQaggString(t, result.Rows[i][0])
-		expected, ok := want[country]
-		if !ok {
-			t.Fatalf("unexpected country row=%#v", result.Rows[i])
-		}
-		requireQaggInt(t, result.Rows[i][1], expected[0])
-		requireQaggInt(t, result.Rows[i][2], expected[1])
-	}
+	requireQaggResultsEqualOrdered(t, result, qaggReferenceGroupedHavingOrderWindow(qaggDefaultRows()))
 }
 
 func TestAggregateMetamorphicCounts(t *testing.T) {
@@ -535,6 +627,182 @@ func TestPrepareAggregateOrderUniqueRequiresGroupCoverage(t *testing.T) {
 	groupOrder.Release()
 }
 
+func qaggReferenceUngroupedAge(rows []qaggTestRec, layout []string) Result {
+	count := uint64(0)
+	sum := int64(0)
+	minAge := int64(0)
+	maxAge := int64(0)
+	for i := range rows {
+		if rows[i].Age < 30 {
+			continue
+		}
+		age := int64(rows[i].Age)
+		if count == 0 {
+			minAge = age
+			maxAge = age
+		} else {
+			if age < minAge {
+				minAge = age
+			}
+			if age > maxAge {
+				maxAge = age
+			}
+		}
+		count++
+		sum += age
+	}
+	return Result{Layout: layout, Rows: []Row{{
+		Value{num: count, any: ValueKindUint},
+		Value{num: uint64(sum), any: ValueKindInt},
+		Value{num: math.Float64bits(float64(sum) / float64(count)), any: ValueKindFloat},
+		Value{num: uint64(minAge), any: ValueKindInt},
+		Value{num: uint64(maxAge), any: ValueKindInt},
+	}}}
+}
+
+func qaggReferenceUngroupedAmount(rows []qaggTestRec, keep int, layout []string) Result {
+	count := uint64(0)
+	sum := int64(0)
+	minAmount := int64(0)
+	maxAmount := int64(0)
+	for i := range rows {
+		if keep == 1 && rows[i].Country != "NL" {
+			continue
+		}
+		if keep == 2 && rows[i].Active {
+			continue
+		}
+		if rows[i].Amount == nil {
+			continue
+		}
+		amount := *rows[i].Amount
+		if count == 0 {
+			minAmount = amount
+			maxAmount = amount
+		} else {
+			if amount < minAmount {
+				minAmount = amount
+			}
+			if amount > maxAmount {
+				maxAmount = amount
+			}
+		}
+		count++
+		sum += amount
+	}
+	return Result{Layout: layout, Rows: []Row{{
+		Value{num: count, any: ValueKindUint},
+		Value{num: uint64(sum), any: ValueKindInt},
+		Value{num: math.Float64bits(float64(sum) / float64(count)), any: ValueKindFloat},
+		Value{num: uint64(minAmount), any: ValueKindInt},
+		Value{num: uint64(maxAmount), any: ValueKindInt},
+	}}}
+}
+
+func qaggReferenceGroupedAgeSum(rows []qaggTestRec, layout []string) Result {
+	type group struct {
+		sum int64
+	}
+	groups := make(map[string]group, len(rows))
+	for i := range rows {
+		g := groups[rows[i].Country]
+		g.sum += int64(rows[i].Age)
+		groups[rows[i].Country] = g
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := Result{Layout: layout, Rows: make([]Row, len(keys))}
+	for i := range keys {
+		g := groups[keys[i]]
+		out.Rows[i] = Row{valueFromSafeString(keys[i]), Value{num: uint64(g.sum), any: ValueKindInt}}
+	}
+	return out
+}
+
+func qaggReferenceGroupedAgeAmountSums(rows []qaggTestRec, layout []string) Result {
+	type group struct {
+		ageSum    int64
+		amountSum int64
+	}
+	groups := make(map[string]group, len(rows))
+	for i := range rows {
+		g := groups[rows[i].Country]
+		g.ageSum += int64(rows[i].Age)
+		if rows[i].Amount != nil {
+			g.amountSum += *rows[i].Amount
+		}
+		groups[rows[i].Country] = g
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := Result{Layout: layout, Rows: make([]Row, len(keys))}
+	for i := range keys {
+		g := groups[keys[i]]
+		out.Rows[i] = Row{
+			valueFromSafeString(keys[i]),
+			Value{num: uint64(g.ageSum), any: ValueKindInt},
+			Value{num: uint64(g.amountSum), any: ValueKindInt},
+		}
+	}
+	return out
+}
+
+func qaggReferenceGroupedHavingOrderWindow(rows []qaggTestRec) Result {
+	type group struct {
+		rows uint64
+		sum  int64
+	}
+	groups := make(map[string]group, len(rows))
+	for i := range rows {
+		if rows[i].Age < 30 {
+			continue
+		}
+		g := groups[rows[i].Country]
+		g.rows++
+		if rows[i].Amount != nil {
+			g.sum += *rows[i].Amount
+		}
+		groups[rows[i].Country] = g
+	}
+	out := Result{Layout: []string{"country", "rows", "sum"}}
+	for key, g := range groups {
+		if g.sum < 20 {
+			continue
+		}
+		out.Rows = append(out.Rows, Row{
+			valueFromSafeString(key),
+			Value{num: g.rows, any: ValueKindUint},
+			Value{num: uint64(g.sum), any: ValueKindInt},
+		})
+	}
+	sort.Slice(out.Rows, func(i, j int) bool {
+		left, _ := out.Rows[i][2].Int()
+		right, _ := out.Rows[j][2].Int()
+		if left == right {
+			leftCountry, _ := out.Rows[i][0].String()
+			rightCountry, _ := out.Rows[j][0].String()
+			return leftCountry < rightCountry
+		}
+		return left > right
+	})
+	return Result{Layout: out.Layout, Rows: out.Rows[1:3]}
+}
+
+func qaggSparseRows() ([]qaggTestRec, []uint64) {
+	return []qaggTestRec{
+		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go"}, Amount: qaggI64(10)},
+		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 31, Big: 1, Tags: []string{"ops"}, Amount: qaggI64(20)},
+		{Country: "NL", Active: false, Age: 42, Tags: []string{"db"}},
+		{Country: "US", Segment: qaggString("core"), Active: true, Age: 50, Tags: []string{"go"}, Amount: qaggI64(40)},
+	}, []uint64{1, 20_000_000, 40_000_000, 60_000_000}
+}
+
 func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *qaggTestDB {
 	t.Helper()
 
@@ -551,13 +819,7 @@ func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *q
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
 	})
-	rows := []qaggTestRec{
-		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go"}, Amount: qaggI64(10)},
-		{Country: "DE", Segment: qaggString("edge"), Active: true, Age: 31, Big: 1, Tags: []string{"ops"}, Amount: qaggI64(20)},
-		{Country: "NL", Active: false, Age: 42, Tags: []string{"db"}},
-		{Country: "US", Segment: qaggString("core"), Active: true, Age: 50, Tags: []string{"go"}, Amount: qaggI64(40)},
-	}
-	ids := [...]uint64{1, 20_000_000, 40_000_000, 60_000_000}
+	rows, ids := qaggSparseRows()
 	entries := make([]snapshot.BatchEntry, len(rows))
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: ids[i], New: unsafe.Pointer(&rows[i])}
@@ -581,25 +843,44 @@ func requireQaggResultsEqualUnordered(t *testing.T, left Result, right Result) {
 	}
 }
 
+func requireQaggResultsEqualOrdered(t *testing.T, left Result, right Result) {
+	t.Helper()
+	requireQaggLayout(t, left.Layout, right.Layout)
+	if len(left.Rows) != len(right.Rows) {
+		t.Fatalf("row count=%d, want %d; left=%v right=%v", len(left.Rows), len(right.Rows), left.Rows, right.Rows)
+	}
+	for i := range left.Rows {
+		leftRow := qaggCanonicalRow(left.Rows[i])
+		rightRow := qaggCanonicalRow(right.Rows[i])
+		if leftRow != rightRow {
+			t.Fatalf("row[%d]=%q, want %q; left=%v right=%v", i, leftRow, rightRow, left.Rows, right.Rows)
+		}
+	}
+}
+
 func qaggCanonicalRows(rows []Row) []string {
 	out := make([]string, len(rows))
 	for i := range rows {
-		var b strings.Builder
-		for j := range rows[i] {
-			if j > 0 {
-				b.WriteByte('|')
-			}
-			v := rows[i][j]
-			b.WriteString(strconvValueKind(v.Kind()))
-			b.WriteByte(':')
-			if s, ok := v.ToString(); ok {
-				b.WriteString(s)
-			}
-		}
-		out[i] = b.String()
+		out[i] = qaggCanonicalRow(rows[i])
 	}
 	sort.Strings(out)
 	return out
+}
+
+func qaggCanonicalRow(row Row) string {
+	var b strings.Builder
+	for j := range row {
+		if j > 0 {
+			b.WriteByte('|')
+		}
+		v := row[j]
+		b.WriteString(strconvValueKind(v.Kind()))
+		b.WriteByte(':')
+		if s, ok := v.ToString(); ok {
+			b.WriteString(s)
+		}
+	}
+	return b.String()
 }
 
 func strconvValueKind(kind ValueKind) string {

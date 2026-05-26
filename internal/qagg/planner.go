@@ -301,37 +301,41 @@ func selectGroupedAggregate(facts aggregateGroupedFacts) aggregateRouteDecision 
 	rejected := aggregateRouteCandidate(0)
 	groupLookup := aggregateGroupLookupNone
 	groupMapLen := uint64(0)
-	if facts.hasMeasure {
-		measureRoute := aggregateRouteGroupedMeasure
-		if facts.hasOrdinary {
-			measureRoute = aggregateRouteGroupedHybrid
-		}
-		groupLookup, groupMapLen = selectAggregateMeasureGroupLookup(facts)
-		if groupLookup != aggregateGroupLookupNone || facts.filterCardinality == 0 {
-			route = measureRoute
-			rejected = aggregateRouteGroupedRecursive
-		} else {
-			rejected = measureRoute
-		}
-	} else if facts.byIDCandidate {
+	if !facts.hasMeasure && facts.byIDCandidate {
 		rejected = aggregateRouteGroupedOrdinaryByID
 	}
 	recursiveCost := 0.0
 	byIDCost := 0.0
 	mapCost := 0.0
+	groupedMeasureCost := 0.0
 	mapLookup := aggregateGroupLookupNone
 	mapLen := uint64(0)
 	if facts.filterCardinality != 0 {
 		recursiveCost = float64(facts.filterCardinality) +
+			float64(facts.groupCountUpperMax) +
 			float64(facts.metricRows) +
 			float64(facts.ordinaryKeyCount)*float64(facts.groupCountUpperMax)
+		if facts.hasMeasure && facts.measureMetricCount != 0 {
+			lookupCost := float64(facts.filterCardinality) * float64(facts.measureLookupSteps)
+			mergeCost := float64(facts.filterCardinality)*float64(facts.measureMetricCount) +
+				float64(facts.measureRows)*float64(facts.groupCountUpperMax)
+			if lookupCost < mergeCost {
+				recursiveCost += lookupCost
+			} else {
+				recursiveCost += mergeCost
+			}
+		}
 		byIDCost = float64(facts.filterCardinality) +
 			float64(facts.metricRows) +
 			float64(facts.byIDMapLen) +
 			float64(facts.groupCountUpperMax)
-		if facts.byIDCandidate && !facts.byIDFeasible {
+		if facts.hasMeasure {
+			groupLookup, groupMapLen, groupedMeasureCost = selectAggregateMeasureGroupLookup(facts, recursiveCost)
+		} else if facts.byIDCandidate && !facts.byIDFeasible {
 			mapLookup, mapLen, mapCost = selectAggregateOrdinaryGroupMapLookup(facts)
 		}
+	} else if facts.hasMeasure {
+		groupedMeasureCost = facts.measureCost
 	}
 	selectedCost := recursiveCost
 	rejectedCost := 0.0
@@ -349,10 +353,20 @@ func selectGroupedAggregate(facts aggregateGroupedFacts) aggregateRouteDecision 
 		selectedCost = mapCost
 		rejectedCost = recursiveCost
 		groupMapLen = mapLen
-	} else if route == aggregateRouteGroupedMeasure || route == aggregateRouteGroupedHybrid {
-		selectedCost = float64(facts.filterCardinality+facts.ordinaryKeyCount+facts.groupCountUpperMax) +
-			facts.measureCost
-		rejectedCost = recursiveCost
+	} else if facts.hasMeasure {
+		measureRoute := aggregateRouteGroupedMeasure
+		if facts.hasOrdinary {
+			measureRoute = aggregateRouteGroupedHybrid
+		}
+		if groupLookup != aggregateGroupLookupNone || facts.filterCardinality == 0 {
+			route = measureRoute
+			rejected = aggregateRouteGroupedRecursive
+			selectedCost = groupedMeasureCost
+			rejectedCost = recursiveCost
+		} else {
+			rejected = measureRoute
+			rejectedCost = groupedMeasureCost
+		}
 	} else if rejected == aggregateRouteGroupedOrdinaryByID {
 		rejectedCost = byIDCost
 	}
@@ -376,29 +390,36 @@ func selectGroupedAggregate(facts aggregateGroupedFacts) aggregateRouteDecision 
 	}
 }
 
-func selectAggregateMeasureGroupLookup(facts aggregateGroupedFacts) (aggregateGroupLookup, uint64) {
+func selectAggregateMeasureGroupLookup(facts aggregateGroupedFacts, recursiveCost float64) (aggregateGroupLookup, uint64, float64) {
 	if facts.filterCardinality == 0 {
-		return aggregateGroupLookupNone, 0
+		return aggregateGroupLookupNone, 0, facts.measureCost
 	}
-	if facts.measureMode == aggregateMeasureAccessNone || facts.measureMode == aggregateMeasureAccessLookup {
-		return aggregateGroupLookupNone, 0
-	}
-	if !facts.hasMaxID || facts.maxID >= aggregateGroupIDOrdinalMaxLen || facts.maxID+1 > facts.filterCardinality*16 {
-		return aggregateGroupLookupNone, 0
+	if facts.measureMode == aggregateMeasureAccessNone {
+		return aggregateGroupLookupNone, 0, 0
 	}
 	if facts.groupCountUpperMax == 0 || facts.measureMetricCount == 0 {
-		return aggregateGroupLookupNone, 0
+		return aggregateGroupLookupNone, 0, 0
 	}
-	measureRows := facts.measureRows / facts.measureMetricCount
-	lookupSteps := facts.measureLookupSteps / facts.measureMetricCount
-	if lookupSteps <= 1 {
-		return aggregateGroupLookupNone, 0
+	mapLen := uint64(0)
+	if facts.hasMaxID {
+		mapLen = facts.maxID
+		if facts.maxID != ^uint64(0) {
+			mapLen++
+		}
 	}
-	avgGroupRows := (facts.filterCardinality + facts.groupCountUpperMax - 1) / facts.groupCountUpperMax
-	if avgGroupRows > measureRows/(lookupSteps-1) {
-		return aggregateGroupLookupNone, 0
+	cost := float64(facts.filterCardinality) +
+		float64(facts.groupCountUpperMax) +
+		float64(mapLen) +
+		float64(facts.metricRows) +
+		float64(facts.ordinaryKeyCount) +
+		facts.measureCost
+	if !facts.hasMaxID || facts.maxID >= aggregateGroupIDOrdinalMaxLen || facts.maxID+1 > facts.filterCardinality*16 {
+		return aggregateGroupLookupNone, 0, cost
 	}
-	return aggregateGroupLookupOrdinalSlice, facts.maxID + 1
+	if cost >= recursiveCost {
+		return aggregateGroupLookupNone, 0, cost
+	}
+	return aggregateGroupLookupOrdinalSlice, mapLen, cost
 }
 
 func selectAggregateOrdinaryGroupMapLookup(facts aggregateGroupedFacts) (aggregateGroupLookup, uint64, float64) {
