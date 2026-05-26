@@ -848,6 +848,136 @@ func (c *FieldIndexCursor) NextPostingOrSingle() (posting.List, uint64, bool, bo
 	return ent.IDs.Borrow(), 0, false, true
 }
 
+func (c *FieldIndexCursor) NextKeyPostingOrSingle() (keycodec.IndexKey, posting.List, uint64, bool, bool) {
+	if c.desc {
+		if c.chunked != nil {
+			if c.remaining <= 0 || c.chunk == nil {
+				return keycodec.IndexKey{}, posting.List{}, 0, false, false
+			}
+			key := c.chunk.keyAt(c.entryIdx)
+			single := c.chunk.posts == nil
+			var (
+				ids posting.List
+				idx uint64
+			)
+			if single {
+				if c.chunk.stringRefs != nil {
+					idx = c.chunk.numeric[c.entryIdx]
+				} else {
+					idx = c.chunk.numeric[(c.entryIdx<<1)+1]
+				}
+			} else {
+				ids = c.chunk.posts[c.entryIdx].Borrow()
+			}
+			c.remaining--
+			if c.remaining > 0 {
+				if c.entryIdx > 0 {
+					c.entryIdx--
+				} else {
+					c.chunkIdx--
+					if c.refIdx > 0 {
+						c.refIdx--
+					} else {
+						c.pageIdx--
+						if c.pageIdx < 0 {
+							c.chunk = nil
+							if single {
+								return key, posting.List{}, idx, true, true
+							}
+							if singleIdx, ok := ids.TrySingle(); ok {
+								return key, posting.List{}, singleIdx, true, true
+							}
+							return key, ids, 0, false, true
+						}
+						c.refIdx = len(c.chunked.pages[c.pageIdx].refs) - 1
+					}
+					c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+					c.entryIdx = c.chunk.keyCount() - 1
+				}
+			}
+			if single {
+				return key, posting.List{}, idx, true, true
+			}
+			if singleIdx, ok := ids.TrySingle(); ok {
+				return key, posting.List{}, singleIdx, true, true
+			}
+			return key, ids, 0, false, true
+		}
+		if c.pos < c.end {
+			return keycodec.IndexKey{}, posting.List{}, 0, false, false
+		}
+		ent := c.base[c.pos]
+		c.pos--
+
+		if idx, ok := ent.IDs.TrySingle(); ok {
+			return ent.Key, posting.List{}, idx, true, true
+		}
+		return ent.Key, ent.IDs.Borrow(), 0, false, true
+	}
+
+	if c.chunked != nil {
+		if c.remaining <= 0 || c.chunk == nil {
+			return keycodec.IndexKey{}, posting.List{}, 0, false, false
+		}
+		key := c.chunk.keyAt(c.entryIdx)
+		single := c.chunk.posts == nil
+		var (
+			ids posting.List
+			idx uint64
+		)
+		if single {
+			if c.chunk.stringRefs != nil {
+				idx = c.chunk.numeric[c.entryIdx]
+			} else {
+				idx = c.chunk.numeric[(c.entryIdx<<1)+1]
+			}
+		} else {
+			ids = c.chunk.posts[c.entryIdx].Borrow()
+		}
+		c.remaining--
+		if c.remaining > 0 {
+			c.entryIdx++
+			if c.entryIdx >= c.chunk.keyCount() {
+				c.chunkIdx++
+				c.refIdx++
+				if c.refIdx >= len(c.chunked.pages[c.pageIdx].refs) {
+					c.pageIdx++
+					if c.pageIdx >= len(c.chunked.pages) {
+						c.chunk = nil
+						if single {
+							return key, posting.List{}, idx, true, true
+						}
+						if singleIdx, ok := ids.TrySingle(); ok {
+							return key, posting.List{}, singleIdx, true, true
+						}
+						return key, ids, 0, false, true
+					}
+					c.refIdx = 0
+				}
+				c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+				c.entryIdx = 0
+			}
+		}
+		if single {
+			return key, posting.List{}, idx, true, true
+		}
+		if singleIdx, ok := ids.TrySingle(); ok {
+			return key, posting.List{}, singleIdx, true, true
+		}
+		return key, ids, 0, false, true
+	}
+	if c.pos >= c.end {
+		return keycodec.IndexKey{}, posting.List{}, 0, false, false
+	}
+	ent := c.base[c.pos]
+	c.pos++
+
+	if idx, ok := ent.IDs.TrySingle(); ok {
+		return ent.Key, posting.List{}, idx, true, true
+	}
+	return ent.Key, ent.IDs.Borrow(), 0, false, true
+}
+
 func (o FieldIndexView) AppendPostingFilter(out []uint64, br FieldIndexRange, desc bool, filter posting.List, offset, limit uint64) ([]uint64, uint64, bool) {
 	if filter.IsEmpty() || br.Empty() || limit == 0 {
 		return out, 0, true

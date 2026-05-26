@@ -4,6 +4,8 @@ import "github.com/vapstack/rbi/internal/pooled"
 
 const (
 	aggregateMetricStateSlicePoolMaxCap = 1 << 20
+	aggregateMetricSlicePoolMaxCap      = 4 << 10
+	aggregateFieldRefSlicePoolMaxCap    = 4 << 10
 	aggregateOrderSlicePoolMaxCap       = 4 << 10
 	aggregateOutputPositionMapMaxLen    = 4 << 10
 	aggregateGroupOrdinalMapMaxLen      = 8 << 20
@@ -12,6 +14,16 @@ const (
 
 var aggregateMetricStateSlicePool = pooled.NewSlicePool[aggregateMetricState](
 	aggregateMetricStateSlicePoolMaxCap,
+	pooled.ClearCap,
+)
+
+var aggregateMetricSlicePool = pooled.NewSlicePool[aggregateMetric](
+	aggregateMetricSlicePoolMaxCap,
+	pooled.ClearCap,
+)
+
+var aggregateFieldRefSlicePool = pooled.NewSlicePool[aggregateFieldRef](
+	aggregateFieldRefSlicePoolMaxCap,
 	pooled.ClearCap,
 )
 

@@ -41,7 +41,7 @@ type aggregateGroupOrdinalMap struct {
 
 func (m *aggregateGroupOrdinalMap) init(n int) {
 	size := 1
-	for size < n*2 {
+	for size < n+n/3 {
 		size <<= 1
 	}
 	if cap(m.keys) < size {
@@ -222,7 +222,9 @@ func (q *Query) Release() {
 		q.filter.Release()
 		q.filter = nil
 	}
+	aggregateFieldRefSlicePool.Put(q.groups)
 	q.groups = nil
+	aggregateMetricSlicePool.Put(q.metrics)
 	q.metrics = nil
 	q.having = aggregateHavingExpr{}
 	q.hasHaving = false
@@ -250,6 +252,12 @@ func Prepare(src *qx.QX, rt *schema.Runtime) (*Query, error) {
 		filter: filter,
 		offset: src.Window.Offset,
 		limit:  src.Window.Limit,
+	}
+	if len(src.Reduction.Group) != 0 {
+		out.groups = aggregateFieldRefSlicePool.Get(len(src.Reduction.Group))
+	}
+	if len(src.Reduction.Metrics) != 0 {
+		out.metrics = aggregateMetricSlicePool.Get(len(src.Reduction.Metrics))
 	}
 	outputPositions := aggregateOutputPositionMapPool.Get(len(src.Reduction.Group) + len(src.Reduction.Metrics))
 	defer aggregateOutputPositionMapPool.Put(outputPositions)
@@ -1097,6 +1105,28 @@ func (ae *aggregateExecutor) buildGroupedIDMap(
 	acc := q.groups[level].ordinary
 	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	if groupByID != nil && level+1 == len(q.groups) {
+		for {
+			key, bucketIDs, ok := cur.Next()
+			if !ok {
+				break
+			}
+			groupValues[level] = aggregateValueFromIndexKey(acc.Field, key)
+			if err := appendGroupedIDSliceLeaf(q, current, bucketIDs, groupValues, rows, groupByID); err != nil {
+				return err
+			}
+		}
+
+		nilIDs := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		if !nilIDs.IsEmpty() {
+			groupValues[level] = Value{}
+			if err := appendGroupedIDSliceLeaf(q, current, nilIDs, groupValues, rows, groupByID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	for {
 		key, bucketIDs, ok := cur.Next()
 		if !ok {
@@ -1128,6 +1158,49 @@ func (ae *aggregateExecutor) buildGroupedIDMap(
 		next.Release()
 	}
 
+	return nil
+}
+
+func appendGroupedIDSliceLeaf(
+	q *Query,
+	current posting.List,
+	bucket posting.List,
+	groupValues []Value,
+	rows *[]Row,
+	groupByID []uint32,
+) error {
+	rowIndex := -1
+	groupOrdinal := uint32(0)
+	rowCount := uint64(0)
+	overflow := false
+
+	current.ForEachIntersecting(bucket, func(id uint64) bool {
+		if rowIndex < 0 {
+			rowIndex = len(*rows)
+			if uint64(rowIndex) >= uint64(^uint32(0)) {
+				overflow = true
+				return true
+			}
+			row := make(Row, len(groupValues)+len(q.metrics))
+			copy(row, groupValues)
+			*rows = append(*rows, row)
+			groupOrdinal = uint32(rowIndex + 1)
+		}
+		rowCount++
+		groupByID[int(id)] = groupOrdinal
+		return false
+	})
+	if overflow {
+		return fmt.Errorf("%w: aggregate group count exceeds runtime limit", qexec.ErrInvalidQuery)
+	}
+	if rowIndex >= 0 {
+		row := (*rows)[rowIndex]
+		for i := range q.metrics {
+			if q.metrics[i].rowCount {
+				row[len(q.groups)+i] = Value{num: rowCount, any: ValueKindUint}
+			}
+		}
+	}
 	return nil
 }
 
@@ -1252,11 +1325,11 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByID(
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	var err error
 	for {
-		key, bucketIDs, ok := cur.Next()
+		key, bucketIDs, id, single, ok := cur.NextKeyPostingOrSingle()
 		if !ok {
 			break
 		}
-		if id, single := bucketIDs.TrySingle(); single {
+		if single {
 			if id >= uint64(len(groupByID)) {
 				continue
 			}
@@ -1280,6 +1353,10 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByID(
 				case aggregateMetricCountDistinct:
 					state.count++
 					state.seen = true
+				case aggregateMetricSum, aggregateMetricAvg:
+					if err = state.addIndexKey(key, 1); err != nil {
+						break
+					}
 				default:
 					if !valueReady {
 						value = aggregateValueFromIndexKey(acc.Field, key)
@@ -1347,11 +1424,11 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByIDMap(
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	var err error
 	for {
-		key, bucketIDs, ok := cur.Next()
+		key, bucketIDs, id, single, ok := cur.NextKeyPostingOrSingle()
 		if !ok {
 			break
 		}
-		if id, single := bucketIDs.TrySingle(); single {
+		if single {
 			groupOrdinal := groupByID.get(id)
 			if groupOrdinal == 0 {
 				continue
@@ -1372,6 +1449,10 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByIDMap(
 				case aggregateMetricCountDistinct:
 					state.count++
 					state.seen = true
+				case aggregateMetricSum, aggregateMetricAvg:
+					if err = state.addIndexKey(key, 1); err != nil {
+						break
+					}
 				default:
 					if !valueReady {
 						value = aggregateValueFromIndexKey(acc.Field, key)
@@ -1520,11 +1601,27 @@ func addGroupedMeasureRaw(
 	kind schema.MeasureValueKind,
 ) error {
 	stateBase := groupIndex * len(q.metrics)
+
+	if first+1 == len(q.metrics) {
+		state := &states[stateBase+first]
+		if state.metric.op == aggregateMetricSum {
+			return state.addMeasureSumRaw(raw, kind)
+		}
+		return state.addRawMeasure(raw, kind, 1)
+	}
+
 	for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
 		if !aggregateMetricsShareMeasureField(q.metrics[first], q.metrics[metricIdx]) {
 			continue
 		}
-		if err := states[stateBase+metricIdx].addRawMeasure(raw, kind, 1); err != nil {
+		state := &states[stateBase+metricIdx]
+		var err error
+		if state.metric.op == aggregateMetricSum {
+			err = state.addMeasureSumRaw(raw, kind)
+		} else {
+			err = state.addRawMeasure(raw, kind, 1)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -1560,6 +1657,10 @@ func addGroupedOrdinaryBucketValue(
 			case aggregateMetricCountDistinct:
 				state.count++
 				state.seen = true
+			case aggregateMetricSum, aggregateMetricAvg:
+				if err := state.addIndexKey(key, n); err != nil {
+					return err
+				}
 			default:
 				if !valueReady {
 					value = aggregateValueFromIndexKey(field, key)
@@ -1652,29 +1753,43 @@ func (ae *aggregateExecutor) appendDistinctRows(rows *[]Row, values *[]Value, ac
 		contains.Reset(ids)
 	}
 
-	for {
-		key, bucketIDs, ok := cur.Next()
-		if !ok {
-			break
-		}
-		if singleBuckets {
-			id, _ := bucketIDs.TrySingle()
+	if singleBuckets {
+		for {
+			key, _, id, _, ok := cur.NextKeyPostingOrSingle()
+			if !ok {
+				break
+			}
 			if !contains.Contains(id) {
 				continue
 			}
-		} else {
+			value := aggregateValueFromIndexKey(acc.Field, key)
+			if values == nil {
+				*rows = append(*rows, Row{value})
+			} else {
+				row := len(*values)
+				*values = append(*values, value)
+				v := *values
+				*rows = append(*rows, v[row:row+1:row+1])
+			}
+		}
+	} else {
+		for {
+			key, bucketIDs, ok := cur.Next()
+			if !ok {
+				break
+			}
 			if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) == 0 {
 				continue
 			}
-		}
-		value := aggregateValueFromIndexKey(acc.Field, key)
-		if values == nil {
-			*rows = append(*rows, Row{value})
-		} else {
-			row := len(*values)
-			*values = append(*values, value)
-			v := *values
-			*rows = append(*rows, v[row:row+1:row+1])
+			value := aggregateValueFromIndexKey(acc.Field, key)
+			if values == nil {
+				*rows = append(*rows, Row{value})
+			} else {
+				row := len(*values)
+				*values = append(*values, value)
+				v := *values
+				*rows = append(*rows, v[row:row+1:row+1])
+			}
 		}
 	}
 
@@ -1745,7 +1860,13 @@ func (ae *aggregateExecutor) foldMeasureMetric(state *aggregateMetricState, ids 
 		if !ok {
 			continue
 		}
-		if err := state.addRawMeasure(raw, acc.Kind, 1); err != nil {
+		var err error
+		if state.metric.op == aggregateMetricSum {
+			err = state.addMeasureSumRaw(raw, acc.Kind)
+		} else {
+			err = state.addRawMeasure(raw, acc.Kind, 1)
+		}
+		if err != nil {
 			it.Release()
 			return err
 		}
@@ -1766,6 +1887,9 @@ func useMeasureMergeScan(idCardinality uint64, storage indexdata.MeasureStorage)
 func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.MeasureStorage, kind schema.MeasureValueKind) error {
 	_, values, ok := storage.FlatSlices()
 	if ok {
+		if state.metric.op == aggregateMetricSum {
+			return state.addMeasureSumValues(values, kind)
+		}
 		for i := range values {
 			if err := state.addRawMeasure(values[i], kind, 1); err != nil {
 				return err
@@ -1775,6 +1899,12 @@ func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.Measur
 	}
 	for chunkPos := 0; chunkPos < storage.ChunkCount(); chunkPos++ {
 		_, chunkValues := storage.ChunkSlices(chunkPos)
+		if state.metric.op == aggregateMetricSum {
+			if err := state.addMeasureSumValues(chunkValues, kind); err != nil {
+				return err
+			}
+			continue
+		}
 		for i := range chunkValues {
 			if err := state.addRawMeasure(chunkValues[i], kind, 1); err != nil {
 				return err
@@ -1802,7 +1932,13 @@ func (state *aggregateMetricState) addMeasureStorageIntersect(storage indexdata.
 				filterID = it.Next()
 			}
 			if filterID == measureID {
-				if err := state.addRawMeasure(values[i], kind, 1); err != nil {
+				var err error
+				if state.metric.op == aggregateMetricSum {
+					err = state.addMeasureSumRaw(values[i], kind)
+				} else {
+					err = state.addRawMeasure(values[i], kind, 1)
+				}
+				if err != nil {
 					it.Release()
 					return err
 				}
@@ -1822,7 +1958,13 @@ func (state *aggregateMetricState) addMeasureStorageIntersect(storage indexdata.
 				filterID = it.Next()
 			}
 			if filterID == measureID {
-				if err := state.addRawMeasure(values[i], kind, 1); err != nil {
+				var err error
+				if state.metric.op == aggregateMetricSum {
+					err = state.addMeasureSumRaw(values[i], kind)
+				} else {
+					err = state.addRawMeasure(values[i], kind, 1)
+				}
+				if err != nil {
 					it.Release()
 					return err
 				}
@@ -1879,11 +2021,10 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 		contains.Reset(ids)
 		cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
 		for {
-			key, bucketIDs, ok := cur.Next()
+			key, _, id, _, ok := cur.NextKeyPostingOrSingle()
 			if !ok {
 				break
 			}
-			id, _ := bucketIDs.TrySingle()
 			if !contains.Contains(id) {
 				continue
 			}
@@ -1902,6 +2043,11 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 				case aggregateMetricCountDistinct:
 					states[i].count++
 					states[i].seen = true
+
+				case aggregateMetricSum, aggregateMetricAvg:
+					if err := states[i].addIndexKey(key, 1); err != nil {
+						return err
+					}
 
 				default:
 					if !valueReady {
@@ -1941,6 +2087,11 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 			case aggregateMetricCountDistinct:
 				states[i].count++
 				states[i].seen = true
+
+			case aggregateMetricSum, aggregateMetricAvg:
+				if err := states[i].addIndexKey(key, n); err != nil {
+					return err
+				}
 
 			default:
 				if !valueReady {
@@ -2004,6 +2155,24 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStatesAll(states []aggregateMetri
 	}
 
 	cur := ov.NewCursor(br, false)
+	if !scanAll && (metric.field.kind == aggregateValueSigned || metric.field.kind == aggregateValueUnsigned) {
+		for {
+			key, bucketIDs, ok := cur.Next()
+			if !ok {
+				break
+			}
+			n := bucketIDs.Cardinality()
+			if n == 0 {
+				continue
+			}
+			for j := 0; j < scanN; j++ {
+				if err := states[scanIdx[j]].addIndexKey(key, n); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	if metric.field.kind == aggregateValueFloat && !scanAll {
 		for {
 			key, bucketIDs, ok := cur.Next()
@@ -2081,6 +2250,90 @@ func (state *aggregateMetricState) addRawMeasure(raw uint64, kind schema.Measure
 	}
 }
 
+func (state *aggregateMetricState) addMeasureSumValues(values []uint64, kind schema.MeasureValueKind) error {
+	if len(values) == 0 {
+		return nil
+	}
+	switch kind {
+
+	case schema.MeasureValueSigned:
+		sum := state.intSum
+		for i := range values {
+			v := int64(values[i])
+			if (v > 0 && sum > math.MaxInt64-v) || (v < 0 && sum < math.MinInt64-v) {
+				return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+			}
+			sum += v
+		}
+		state.intSum = sum
+
+	case schema.MeasureValueUnsigned:
+		sum := state.uintSum
+		for i := range values {
+			v := values[i]
+			if sum > math.MaxUint64-v {
+				return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+			}
+			sum += v
+		}
+		state.uintSum = sum
+
+	case schema.MeasureValueFloat:
+		sum := state.floatSum
+		for i := range values {
+			sum += math.Float64frombits(values[i])
+		}
+		state.floatSum = sum
+
+	default:
+		return fmt.Errorf("%w: unsupported measure value kind", qexec.ErrInvalidQuery)
+	}
+
+	state.seen = true
+	return nil
+}
+
+func (state *aggregateMetricState) addMeasureSumRaw(raw uint64, kind schema.MeasureValueKind) error {
+	switch kind {
+
+	case schema.MeasureValueSigned:
+		v := int64(raw)
+		if (v > 0 && state.intSum > math.MaxInt64-v) || (v < 0 && state.intSum < math.MinInt64-v) {
+			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+		}
+		state.intSum += v
+
+	case schema.MeasureValueUnsigned:
+		if state.uintSum > math.MaxUint64-raw {
+			return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+		}
+		state.uintSum += raw
+
+	case schema.MeasureValueFloat:
+		state.floatSum += math.Float64frombits(raw)
+
+	default:
+		return fmt.Errorf("%w: unsupported measure value kind", qexec.ErrInvalidQuery)
+	}
+
+	state.seen = true
+	return nil
+}
+
+func (state *aggregateMetricState) addIndexKey(key keycodec.IndexKey, n uint64) error {
+	raw := key.U64()
+	switch state.metric.field.kind {
+	case aggregateValueSigned:
+		return state.addSigned(keycodec.Int64FromOrderedKey(raw), n)
+	case aggregateValueUnsigned:
+		return state.addUnsigned(raw, n)
+	case aggregateValueFloat:
+		return state.addFloat(keycodec.Float64FromOrderedKey(raw), n)
+	default:
+		return fmt.Errorf("%w: aggregate requires numeric field %q", qexec.ErrInvalidQuery, state.metric.field.name)
+	}
+}
+
 func (state *aggregateMetricState) addValue(value Value, n uint64) error {
 	if state.metric.op == aggregateMetricCount {
 		state.count += n
@@ -2130,10 +2383,10 @@ func (state *aggregateMetricState) addSigned(v int64, n uint64) error {
 		return nil
 	}
 
-	state.count += n
-	state.floatSum += float64(v) * float64(n)
-
-	if state.metric.op == aggregateMetricSum {
+	if state.metric.op == aggregateMetricAvg {
+		state.count += n
+		state.floatSum += float64(v) * float64(n)
+	} else {
 		if n > uint64(math.MaxInt64) {
 			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
 		}
@@ -2161,10 +2414,11 @@ func (state *aggregateMetricState) addUnsigned(v uint64, n uint64) error {
 		state.addBest(Value{num: v, any: ValueKindUint})
 		return nil
 	}
-	state.count += n
-	state.floatSum += float64(v) * float64(n)
 
-	if state.metric.op == aggregateMetricSum {
+	if state.metric.op == aggregateMetricAvg {
+		state.count += n
+		state.floatSum += float64(v) * float64(n)
+	} else {
 		if n != 0 && v > math.MaxUint64/n {
 			return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
 		}
@@ -2189,7 +2443,9 @@ func (state *aggregateMetricState) addFloat(v float64, n uint64) error {
 		state.addBest(Value{num: math.Float64bits(v), any: ValueKindFloat})
 		return nil
 	}
-	state.count += n
+	if state.metric.op == aggregateMetricAvg {
+		state.count += n
+	}
 	state.floatSum += v * float64(n)
 	state.seen = true
 	return nil

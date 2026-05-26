@@ -165,6 +165,111 @@ func TestFieldIndexViewCursorNextPostingOrSingle(t *testing.T) {
 	}
 }
 
+func TestFieldIndexViewCursorNextKeyPostingOrSingle(t *testing.T) {
+	entries := fieldStorageEntriesForTest(fieldIndexChunkThreshold+17, true)
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	br := ov.RangeByRanks(fieldIndexChunkTargetEntries-3, fieldIndexChunkTargetEntries+5)
+
+	cur := ov.NewCursor(br, false)
+	for rank := br.BaseStart; rank < br.BaseEnd; rank++ {
+		key, ids, idx, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			t.Fatalf("ascending cursor ended at rank %d", rank)
+		}
+		if keycodec.Compare(key, entries[rank].Key) != 0 {
+			t.Fatalf("ascending key[%d]: got %q want %q", rank, key.UnsafeString(), entries[rank].Key.UnsafeString())
+		}
+		if !single || !ids.IsEmpty() || idx != uint64(rank+1) {
+			t.Fatalf("ascending item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, _, ok := cur.NextKeyPostingOrSingle(); ok {
+		t.Fatalf("ascending cursor returned extra row")
+	}
+
+	cur = ov.NewCursor(br, true)
+	for rank := br.BaseEnd - 1; rank >= br.BaseStart; rank-- {
+		key, ids, idx, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			t.Fatalf("descending cursor ended at rank %d", rank)
+		}
+		if keycodec.Compare(key, entries[rank].Key) != 0 {
+			t.Fatalf("descending key[%d]: got %q want %q", rank, key.UnsafeString(), entries[rank].Key.UnsafeString())
+		}
+		if !single || !ids.IsEmpty() || idx != uint64(rank+1) {
+			t.Fatalf("descending item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, _, ok := cur.NextKeyPostingOrSingle(); ok {
+		t.Fatalf("descending cursor returned extra row")
+	}
+
+	multi := []Entry{
+		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageOwnedTestPosting(10)},
+		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageOwnedTestPosting(20)},
+	}
+	defer multi[0].IDs.Release()
+	defer multi[1].IDs.Release()
+
+	ov = NewFieldIndexView(&multi)
+	cur = ov.NewCursor(ov.RangeByRanks(0, 2), false)
+	key, ids, _, single, ok := cur.NextKeyPostingOrSingle()
+	if !ok || single || !ids.IsBorrowed() || ids.Cardinality() != 2 || !ids.Contains(10) || keycodec.Compare(key, multi[0].Key) != 0 {
+		t.Fatalf("flat multi posting mismatch: ok=%v single=%v key=%q ids=%v", ok, single, key.UnsafeString(), ids)
+	}
+
+	entries = make([]Entry, fieldIndexChunkThreshold+17)
+	for i := range entries {
+		entries[i] = Entry{
+			Key: keycodec.FromU64(uint64(i * 2)),
+			IDs: fieldStorageOwnedTestPosting(uint64(i + 1)),
+		}
+	}
+	storage = newRegularFieldStorage(entries)
+	defer storage.Release()
+
+	ov = NewFieldIndexViewFromStorage(storage)
+	br = ov.RangeByRanks(fieldIndexChunkTargetEntries-2, fieldIndexChunkTargetEntries+3)
+	cur = ov.NewCursor(br, false)
+	for rank := br.BaseStart; rank < br.BaseEnd; rank++ {
+		key, ids, idx, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			t.Fatalf("ascending multi cursor ended at rank %d", rank)
+		}
+		if keycodec.Compare(key, entries[rank].Key) != 0 {
+			t.Fatalf("ascending multi key[%d]: got %q want %q", rank, key.UnsafeString(), entries[rank].Key.UnsafeString())
+		}
+		want := uint64(rank + 1)
+		if single || idx != 0 || !ids.IsBorrowed() || ids.Cardinality() != 2 || !ids.Contains(want) || !ids.Contains(want+1000000) {
+			t.Fatalf("ascending multi item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, _, ok := cur.NextKeyPostingOrSingle(); ok {
+		t.Fatalf("ascending multi cursor returned extra row")
+	}
+
+	cur = ov.NewCursor(br, true)
+	for rank := br.BaseEnd - 1; rank >= br.BaseStart; rank-- {
+		key, ids, idx, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			t.Fatalf("descending multi cursor ended at rank %d", rank)
+		}
+		if keycodec.Compare(key, entries[rank].Key) != 0 {
+			t.Fatalf("descending multi key[%d]: got %q want %q", rank, key.UnsafeString(), entries[rank].Key.UnsafeString())
+		}
+		want := uint64(rank + 1)
+		if single || idx != 0 || !ids.IsBorrowed() || ids.Cardinality() != 2 || !ids.Contains(want) || !ids.Contains(want+1000000) {
+			t.Fatalf("descending multi item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, _, ok := cur.NextKeyPostingOrSingle(); ok {
+		t.Fatalf("descending multi cursor returned extra row")
+	}
+}
+
 func TestFieldIndexViewRangeByRanksClampsFlatAndChunked(t *testing.T) {
 	tests := []struct {
 		name      string

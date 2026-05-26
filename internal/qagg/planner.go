@@ -258,8 +258,13 @@ func (ae *aggregateExecutor) collectGroupedFacts(q *Query, ids posting.List) agg
 			facts.hasOrdinary = true
 			facts.ordinaryMetricCount++
 			if !hasPriorOrdinaryAggregateMetric(q.metrics, i) {
-				ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[metric.field.ordinary.Ordinal])
-				fieldRows := ov.Rows()
+				ordinal := metric.field.ordinary.Ordinal
+				ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[ordinal])
+				fieldRows := universe
+				nilOV := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[ordinal])
+				if nilOV.KeyCount() != 0 {
+					fieldRows -= nilOV.LookupPostingRetained(indexdata.NilIndexEntryKey).Cardinality()
+				}
 				facts.ordinaryKeyCount += uint64(ov.KeyCount())
 				facts.metricRows += fieldRows
 				if facts.minMetricRows == 0 || fieldRows < facts.minMetricRows {
