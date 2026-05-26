@@ -5,29 +5,29 @@
 
 > This package should be considered experimental
 
-A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt).
+An embedded indexed database layer on top of [bbolt](https://github.com/etcd-io/bbolt).
 
-It turns a key-value store into a document-oriented database with rich
-query capabilities, while preserving bbolt’s ACID guarantees for data storage.
 Indexes are kept fully in memory and built on a heavily reworked fork of
-[roaring64](https://github.com/RoaringBitmap/roaring) for compact memory layout and fast set operations.
+[roaring64](https://github.com/RoaringBitmap/roaring)
+for compact memory layout and fast set operations.
 
-RBI is not a replacement for a relational database.
+RBI is not a replacement for a relational or analytical database.
 
 ### Features
 
 * ACID – data durability is delegated to bbolt.
-* Index-only filtering/sorting – disk is never touched.
+* Fast index-only filtering/sorting – disk is never touched.
 * Document-oriented – queries return whole records, not individual fields.
 * Strong typing – generic API with user-defined key and value types.
-* Opt-in indexing via struct tags (`dbi`, `rbi`)
-* Fine-grained control via struct tags (`db`, `dbi`, `rbi`)
+* Opt-in indexing via `rbi` struct tags or `Options`
 * Efficient query building via [qx package](https://github.com/vapstack/qx):
   - comparisons: `EQ`, `GT`, `GTE`, `LT`, `LTE`
-  - slices: `IN`, `HAS`, `HASANY`
+  - membership: `IN`, `NOTIN`
+  - slices: `HASALL`, `HASANY`, `HASNONE`
   - strings: `PREFIX`, `SUFFIX`, `CONTAINS`
   - logical: `AND`, `OR`, `NOT`
 * Index-based ordering with offset/limit, including sorting by array position/count
+* Simple index-backed aggregations: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `DISTINCT`
 * Partial updates (`Patch*`) with minimal index churn
 * Batch and auto-batched writes
 * Uniqueness constraints
@@ -53,12 +53,16 @@ import (
 )
 
 type User struct {
-    ID      uint64   `db:"id"     dbi:"default"`
-    Name    string   `db:"name"   dbi:"default"`
-    Age     int      `db:"age"    dbi:"default"`
-    Active  bool     `db:"active" dbi:"default"`
-    Tags    []string `db:"tags"   dbi:"default"`
-    Meta    string   `db:"meta"   dbi:"-"` // not indexed
+    ID      uint64   `db:"id"` // not indexed
+
+    Name    string   `db:"name"   rbi:"index"`
+    Email   string   `db:"email"  rbi:"unique"` // with unique constraint
+    Age     int      `db:"age"    rbi:"index"`
+    Active  bool     `db:"active" rbi:"index"`
+    Tags    []string `db:"tags"   rbi:"index"`
+    Spent   int64    `db:"spent"  rbi:"measure"` // aggregate-only
+
+    Meta    string   `db:"meta"   rbi:"-"` // not indexed
     Exclude string                         // not indexed
 }
 
@@ -78,10 +82,13 @@ func main() {
     defer db.Close()
 
     err = db.Set(1, &User{
+        ID:     1,
         Name:   "Alice",
+        Email:  "alice@example.com",
         Age:    30,
         Active: true,
         Tags:   []string{"admin", "dev"},
+        Spent:  120,
     })
     if err != nil {
         panic(err)
@@ -90,25 +97,23 @@ func main() {
     err = db.Set(2, &User{
         ID:     2,
         Name:   "Bob",
+        Email:  "bob@example.com",
         Age:    40,
         Active: false,
         Tags:   []string{"dev"},
+        Spent:  80,
     })
     if err != nil {
         panic(err)
     }
 
     q := qx.Query(
-        qx.OR(
-            qx.AND(
-                qx.EQ("active", true),
-                qx.HAS("tags", []string{"dev"}),
-            ),
-            qx.GT("age", 35),
-        ),
+        qx.EQ("active", true),
+        qx.HASALL("tags", []string{"dev"}),
+        qx.GT("age", 25),
     ).
-        By("age", qx.ASC).
-        Max(10)
+        Sort("age", qx.ASC).
+        Limit(10)
 
     users, err := db.Query(q)
     if err != nil {
@@ -118,6 +123,21 @@ func main() {
     for _, u := range users {
         fmt.Printf("%v (%v)\n", u.Name, u.Age)
     }
+
+    totals, err := db.Aggregate(
+        qx.Metrics(
+            qx.ROWCOUNT().AS("users"),
+            qx.SUM("spent").AS("spent"),
+        ).Group(
+            "age",
+        ).Where(
+            qx.EQ("active", true),
+        ),
+    )
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println(totals.Layout, totals.Rows)
 }
 ```
 
@@ -138,6 +158,18 @@ For the full API reference see
 Do not write directly to the bucket managed by `rbi` through raw Bolt APIs,
 (including `SetSequence`/`NextSequence`).
 
+### Automatic batching
+
+Single-record writes always go through internal auto-batcher.
+It cannot be disabled; `AutoBatchMax`, `AutoBatchWindow` and
+`AutoBatchMaxQueue` only tune its behavior.
+
+The batcher groups concurrent writes, can isolate requests that fail from the
+rest of the batch, and retries operations where the write contract allows it.
+This significantly improves throughput under active parallel write load.
+For synchronous bulk operations where the caller already has many rows ready,
+prefer explicit `BatchSet`, `BatchPatch` or `BatchDelete`.
+
 ### Querying
 
 Queries are constructed using the [`qx`](https://github.com/vapstack/qx) package.
@@ -145,7 +177,7 @@ Queries are constructed using the [`qx`](https://github.com/vapstack/qx) package
 Field names refer to the names specified in `db` tags.\
 If a field does not have a `db` tag, the Go struct field name is used.
 
-Predicates and ordering can only reference fields that are explicitly indexed.
+Predicates and ordering can only reference fields with regular indexes (`index`/`unique`).
 
 ```go
 q := qx.Query(
@@ -158,95 +190,127 @@ q := qx.Query(
         qx.LTE("score", 99.5),
     ),
 ).
-    By("field", qx.DESC).
-    Skip(10).
-    Max(50)
+    Sort("field", qx.DESC).
+    Offset(10).
+    Limit(50)
 ```
 
-Query methods:
+**Query methods:**
 
-* `Query` – return matching records
-* `QueryKeys` – return matching IDs
-* `Count` – return result cardinality (ignoring offset/limit)
+* `Query` - return matching records
+* `QueryKeys` - return matching IDs
+* `Count` - return result cardinality
 * `SeqScan` - performs a sequential scan over all records starting at the given key
-* `ScanKeys` – iterate the current in-memory key set without opening a Bolt read transaction
+* `ScanKeys` - iterate the current in-memory key set without opening a Bolt read transaction
+* `Aggregate` - evaluate grouped or ungrouped reductions over indexed and measure fields
 
-#### Supported `qx` subset:
+### Supported `qx` subset:
 
 - Supported predicate helpers:\
   `AND`, `OR`, `NOT`, `EQ`, `NE`/`NOTEQ`, `GT`, `GTE`, `LT`, `LTE`, `IN`,
-  `NOTIN`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
+  `NOTIN`, `HAS`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
   `PREFIX`, `SUFFIX`, and `CONTAINS`.
 - Predicate left-hand side must always be a source field reference.
 - Predicate right-hand side must always be a literal value.
 - No computed expressions on any side.
-- Grouping/reduction/having and projection/select are not supported.
-- Ordering supports exactly one expression, and only these forms:
+- Projections are not supported.
+- Outside aggregation, ordering supports exactly one expression, and only these forms:
   - By field:\
     `Sort("field", ASC|DESC)` or `SortBy(REF("field"), ASC)`
   - By slice-field length:\
     `SortBy(qx.LEN(qx.REF("field")), ASC|DESC)`
   - By field value position in the provided slice:\
-    `SortBy(qx.POS(qx.REF("field), []T{...}), ASC|DESC)`
+    `SortBy(qx.POS(qx.REF("field"), []T{...}), ASC|DESC)`
 - `qx.POS` ordering requires a literal priority list/array value.\
   Scalar-string `POS(field, "alice bob")` is not supported.
+- Projection is not supported, queries return whole records.
+
+### Aggregation
+
+`Aggregate` method evaluates simple reductions against the same in-memory
+snapshot model as queries. Filters use the same predicate subset 
+and must reference indexed fields.
+
+```go
+res, err := db.Aggregate(
+    qx.Where(qx.HAS("tags", "dev")).
+        Group("active").
+        Metrics(
+            qx.ROWCOUNT().AS("rows"),
+            qx.COUNT("spent").AS("spent_count"),
+            qx.SUM("spent").AS("spent_sum"),
+            qx.AVG("spent").AS("spent_avg"),
+            qx.MIN("age").AS("min_age"),
+            qx.MAX("age").AS("max_age"),
+        ),
+)
+```
+
+Currently supported:
+- `SUM`, `AVG`, `MIN`, `MAX` (`SUM`/`AVG` require numeric fields)
+- `ROWCOUNT()`, `COUNT(field)`, `COUNT(DISTINCT field)`
+- Standalone ungrouped `DISTINCT(field)` as the only metric, e.g. `qx.Aggregate(qx.DISTINCT("country"))`;
+  it returns one row per distinct value and includes `NULL` when present
+- Grouping by regular indexed scalar fields
+- `HAVING` with simple predicates over aggregate outputs
+- Ordering by one or more aggregate outputs
+
+Metric fields may be regular scalar indexes or numeric measure indexes.
+
+Aggregate `HAVING` supports `AND`, `OR`, `NOT`, `EQ`, `NE`, `GT`, `GTE`, `LT`,
+`LTE`, `IN`, `EXISTS`, and `ISNULL`; the left side must be `OUT`, and
+the right side must be a literal. Aggregate ordering supports only `OUT`,
+not computed expressions.
+
+Aggregation does not support projection, computed expressions, grouping by
+measure fields, slice fields, `DISTINCT` over measure/slice fields, or
+standalone `DISTINCT(field)` combined with grouping or other metrics.
 
 ## Ordering limitations
 
-The package currently supports ordering by **a single indexed field only**.
+Non-aggregate queries support ordering by **a single indexed field only**.
 
-Queries that specify more than one ordering expression are rejected with an
-error. This restriction is intentional and allows to execute ordered queries
-directly via index traversal without materializing or re-sorting intermediate
-result sets.
+Queries that specify more than one non-aggregate ordering expression are
+rejected with an error. This restriction is intentional and allows ordered
+queries to execute directly via index traversal without materializing or
+re-sorting intermediate result sets.
 
-If multi-column ordering is required, it must be implemented at the application
-level.
+If multi-column ordering is required, it must be implemented at the application level.
+
+Aggregate queries have separate output ordering and can use multiple `SortOut` keys.
+
+## Composite indexes
+
+Composite indexes are not supported. All RBI indexes live in memory, so storing
+field combinations can multiply memory use by the number of distinct values in
+the combined fields.
+
+The query engine is optimized to use the existing single-field indexes
+efficiently: it intersects bitmap-backed predicates, scans ordered indexes with
+early offset/limit stops, uses selective predicates as candidate sources, and
+reuses bounded materialized range/predicate state on warm snapshots.
 
 ## Transparent mode
 
-If a value type has no fields tagged for indexing, RBI automatically switches 
+If a value type has no indexed fields, RBI automatically switches 
 to a transparent mode. This is useful for a strongly-typed generic API 
 over a bbolt bucket without maintaining secondary indexes.
 
 In transparent mode:
 - read/write/scan methods continue to work (except `ScanKeys`)
-- query/count methods return `ErrNoIndex`
+- query/count/aggregation methods return `ErrNoIndex`
 - minimal overhead (no index maintenance) 
 
-## Query execution model
+## Query execution
 
-Queries run entirely in-memory; stored records are never scanned.
+Index operations run entirely in-memory; stored records are never scanned.
 
-The runtime uses a single planner/executor pipeline:
-1. Normalize query tree into a deterministic internal form.
-2. Compile leaf predicates into bitmap/iterator-backed checks.
-3. Select an execution strategy by shape and cost.
-4. Execute using shared iterator/bitmap contracts and tracing hooks.
+`Query` is aligned with a bbolt read transaction: the index snapshot and values
+come from the same committed bucket sequence, record values are read only after
+filtering, ordering and windowing have selected the final record IDs.
 
-Leaf predicates are resolved via field indexes, producing either bitmaps
-of matching record IDs or index-backed iterators.
-Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations;
-large result sets may be represented as negative sets to avoid materializing
-large bitmaps.
-
-For ordered queries, the ordered field index is traversed directly and
-intersected with compiled predicates. Offset and limit are applied during
-traversal when possible.
-
-For limit-driven candidate plans, a selective index yields candidate IDs,
-remaining predicates are checked via index lookups, and execution stops once
-enough results are collected.
-
-Only the final set of matching record IDs is materialized.
-For `Query`, record values are fetched from bbolt only for IDs that have
-passed all filters and limits.
-
-`Query` runs against an index snapshot aligned with a bbolt read transaction.
-Readers open a bbolt read transaction, read the managed bucket sequence, and
-pin the snapshot registered for that exact sequence. RBI pre-registers the next
-snapshot before commit, so readers do not wait for post-commit publication and
-are not affected by unrelated writes to other bbolt buckets.
+`QueryKeys`, `Count` and `Aggregate` operate on the current published index
+snapshot and do not read record values from bbolt.
 
 ## Configuration
 
@@ -273,7 +337,7 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
 Write methods accept `ExecOption` values, and the same options may also be
 passed to `New` to become defaults for the whole DB instance.
 
-Available hooks/options:
+**Available hooks/options:**
 
 - `BeforeProcess` - cheap mutable pre-processing hook.
   For `Set`/`BatchSet` it runs on the caller-owned value before RBI starts
@@ -298,32 +362,64 @@ Available hooks/options:
 
 * `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
 
-Important notes:
+**Important notes:**
 
 - `BeforeProcess` may run at different stages depending on the write method.
-  Do not retain the value pointer after the hook returns. With `Set`/`BatchSet`, 
-  it mutates the caller-owned value directly. RBI does not protect against 
+  Do not retain the value pointer after the hook returns. With `Set`/`BatchSet`,
+  it mutates the caller-owned value directly. RBI does not protect against
   aliasing and does not restore the value if the later write fails.
-- All writes go through the internal batcher. `Batch*` methods keep their
+
+* All writes go through the internal batcher. `Batch*` methods keep their
   explicit per-call isolation and are never merged with neighboring writes.
+
 - Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
   `BeforeStore`, and `BeforeCommit` may run more than once for the same
   logical write, so external side effects should be idempotent.
-- `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
+
+* `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
   methods on the same `DB` instance. Depending on execution mode, RBI may hold
   internal locks while running `BeforeCommit`, so re-entering the same `DB`
   can deadlock or become mode-dependent.
+
 - `BeforeCommit` must not modify the bucket managed by RBI itself.
 
 ## Struct tags and indexing
 
-Fields are indexed when marked with `rbi` or `dbi` struct tags.
-If both tags are present on the same field, `rbi` takes priority.
+Fields can be indexed in two ways:
+1. By `rbi` struct tags, used when `Options.Index == nil`.
+2. By `Options.Index`, which ignores all `rbi` tags when non-nil.
 
-Supported values are: `default`, `unique` and `-`.
+Supported tag values are `index`, `unique`, `measure`, and `-`.\
+Unknown values or multiple values in one tag are rejected.
 
-To keep a field non-indexed, just omit tags or use `rbi:"-"`
-when `dbi` tags are already present.
+```go
+type User struct {
+    Email string `db:"email" rbi:"unique"`  // regular index + uniqueness
+    Age   int    `db:"age"   rbi:"index"`   // regular inverted index
+    Spent int64  `db:"spent" rbi:"measure"` // aggregation-only measure
+    Cache string `db:"cache"`               // not indexed
+}
+```
+
+The same declaration can be made from `Options`:
+
+```go
+db, err := rbi.New[uint64, User](bolt, rbi.Options{
+    Index: map[string]rbi.IndexKind{
+        "email": rbi.IndexUnique,
+        "Age":   rbi.IndexDefault,
+        "spent": rbi.IndexMeasure,
+    },
+})
+```
+
+`Options.Index` keys may refer to Go field names or `db` tag values.
+A non-nil empty map disables all indexes.
+
+Regular indexes power filtering, ordering, `DISTINCT`, grouping,
+and ordinary-field aggregation. Unique indexes add a uniqueness constraint.
+Measure indexes store numeric field values by record ID for aggregation only;
+they are not usable in query predicates, ordering, or `GROUP BY`.
 
 ## Indexed string size limit
 
@@ -338,8 +434,8 @@ If existing data already contains such values, index rebuild/load will fail.
 
 ## Slice fields
 
-Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY`, 
-`HASNONE` operations.
+Slice-typed fields are indexed element-wise and support
+`HAS`, `HASALL`, `HASANY`, `HASNONE` operations.
 
 Equality for slice fields is implemented as **set equality**, not array equality.\
 This means `["a", "b", "a"] == ["a", "b"]`
@@ -347,16 +443,28 @@ This means `["a", "b", "a"] == ["a", "b"]`
 ## Unique constraints
 
 Tagging a field with:
-
 ```go
-`rbi:"unique"` / `dbi:"unique"`
+`rbi:"unique"` // or via Options.Index with rbi.IndexUnique
 ```
-
 enforces a uniqueness constraint for that field.
 
 * Only scalar (non-slice) fields can be unique.
 * Uniqueness is enforced across single and batch writes (`Set`, `Patch*`, `BatchSet`, `BatchPatch*`).
 * Violations return `ErrUniqueViolation` before committing the transaction.
+
+## Measure indexes
+
+Measure index is a specialized numeric index used only by aggregation.
+It is useful when aggregate results are calculated over filtered record sets 
+and the measured numeric field has high cardinality.
+
+Measure indexes are not general-purpose query indexes. They cannot be used for
+filtering or ordering and exist only to speed up a narrow set of aggregate
+plans. In many cases a regular `rbi:"index"` is faster: `MIN`/`MAX` over an
+ordinary index can be almost immediate, and `SUM`/`AVG` over low- and
+medium-cardinality fields is often much faster through ordinary index buckets.
+
+A field can be either `rbi:"index"` or `rbi:"measure"`, not both.
 
 ## Custom indexing with `ValueIndexer`
 
@@ -383,20 +491,21 @@ The returned value is used as the indexed representation.
 
 ## Patch resolution rules
 
-`Patch` accepts string field identifiers and resolves them in the following order:
-1. Struct field name
-2. `db` tag
-3. `json` tag
+`Patch` accepts string field identifiers matching any registered alias of a field:
+
+- Go struct field name
+- `db` tag value, unless it is `db:"-"`
+- `json` tag name, unless it is `json:"-"` or empty
 
 This allows JSON payloads to be applied directly without additional mapping.
 
 ```go
 type User struct {
     // Indexed as "UserName". Patchable via "UserName"
-    UserName string `dbi:"default"`
+    UserName string `rbi:"index"`
     
     // Indexed as "email". Patchable via "Email", "email", or "mail".
-    Email string `db:"email" json:"mail" dbi:"default"`
+    Email string `db:"email" json:"mail" rbi:"index"`
     
     // Not indexed. Patchable via "Password" or "pass".
     Password string `db:"-" json:"pass"`
@@ -439,25 +548,25 @@ Very long strings reduce chunk density and can increase chunk/page overhead.
 ### Unique string fields
 
 ```text
-ApproxMem(field) ~= N * (K + 20...22)
+ApproxMem(field) ~= N * (K + 24...26)
 ```
 
-For 5,000,000 rows with an average string length of 22 bytes, the estimate is:\
-`5,000,000 * (22 + 22) ~= 210 MiB`
+For 10,000,000 rows with an average string length of 22 bytes, the estimate is:\
+`10,000,000 * (22 + 25) ~= 448 MiB`
 
 ### Unique numeric fields
 
 ```text
-ApproxMem(field) ~= N * (24...26)
+ApproxMem(field) ~= N * (28...30)
 ```
 
-For 5,000,000 rows this is roughly:\
-`5,000,000 * (26) ~= 124 MiB`
+For 10,000,000 rows this is roughly:\
+`10,000,000 * (29) ~= 277 MiB`
 
 ### Non-unique scalar fields
 
 ```text
-ApproxMem(field) ~= D * (K + 16..22) + PostingBytes
+ApproxMem(field) ~= D * (K + 20...24) + PostingBytes
 ```
 
 **PostingBytes** depends on data distribution.
@@ -466,8 +575,54 @@ postings compress well.
 
 ### Slice fields
 
-Slice fields are indexed element-wise. Each distinct element of the slice 
-is treated like a regular indexed value of the same type.
+Slice fields are indexed element-wise. Each distinct element of the slice is
+treated like a regular indexed value of the same type. RBI also maintains a
+small slice-length helper index for `LEN` queries and length ordering.
+
+### Measure indexes
+
+Measure indexes store a record id and encoded numeric value for each non-nil measure value.
+
+```text
+ApproxMem(field) ~= N * (16...18)
+```
+
+For 10,000,000 measured rows this is roughly:\
+`10,000,000 * (17) ~= 162 MiB`
+
+### Runtime query caches
+
+Runtime query caches are snapshot-local and bounded by `Options`.
+With defaults, the materialized predicate cache keeps up to 24 regular postings
+and skips regular entries above 64K ids. Numeric range acceleration keeps one
+small descriptor per hot numeric field and up to 4 cached full-span postings per
+field, using the same cardinality guard.
+
+A bitmap-shaped 64K posting is about 8 KiB of posting payload, so 24 such cache
+entries are about 192 KiB before cache metadata. Less fragmented postings can be
+smaller; sparse or oversized hot postings can be larger, but cache memory is
+usually small compared with the main index.
+
+### String key mapping
+
+For `DB[string, V]`, RBI maps user string keys to internal `uint64` ids so
+posting lists remain numeric. The mapper keeps forward lookup and reverse
+lookup data in memory, separate from field indexes.
+
+```text
+ApproxMem(string keys) ~= N * (K + 64...80)
+```
+
+For 10,000,000 string keys with an average key length of 22 bytes, a rough
+planning range is about 820...973 MiB. Actual memory depends on Go map load
+factor, snapshot compaction, and key churn. `DB[uint64, V]` does not pay this
+mapping cost.
+
+### Snapshots and pinned reads
+
+Published index snapshots are immutable and updated with copy-on-write. A
+pinned read transaction can temporarily keep an older snapshot alive, but
+unchanged storage is shared by reference, so this overhead is usually modest.
 
 ### GC pressure
 
@@ -477,7 +632,7 @@ Index structures use arenas and ownership-aware copy-on-write behaviour.
 
 ## Multiple instances
 
-Multiple `DB` instances may safely operate on the same bbolt database.\
+Multiple different `DB` instances may safely operate on the same bbolt database.\
 Each instance maintains its own in-memory index.
 
 ## Bucket name
@@ -503,7 +658,7 @@ the exact structural layout of the type.
 Most schema changes are handled gracefully:
 
 - **Adding fields** – if the new field is indexed, a new index is
-  created for it; existing records simply have no value for it.
+  created for it; existing records have zero value for it.
 - **Removing fields** – if the field was indexed, the corresponding index is
   removed, but encoded data for the field remains on disk until the record is
   updated.
@@ -541,31 +696,32 @@ This package does not aim to be a relational database or a SQL engine.
 - Package is read-optimized.
 - Prefer batch writes over single inserts, if possible.
 - Always use limits when the whole result set is not needed.
-- Not all logical branches are currently optimized.
+- Complex logical and ordered shapes are data-dependent; benchmark important
+  production queries on representative data.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
 
 ### Query performance
 
-Query performance is shape-dependent. Current code has several specialized
+Query performance is shape-dependent. Current code has many specialized
 fast paths, but broader shapes depend on data distribution, chosen execution
 path, and whether snapshot-local runtime caches are already warm.
 
 #### 1. Usually fast
 
 These classes have dedicated execution paths or strong early-stop behavior.
-On the current synthetic benchmark profile, pure point/top-N/autocomplete
-shapes are typically sub- to low-single-microsecond.
 
-- Positive `EQ` on a unique scalar field, with or without explicit `LIMIT 1`
+- Positive `EQ` on a unique scalar field.
   - Candidate set is bounded to at most one row.
-- Small top-N on an indexed scalar field (`ORDER BY field LIMIT N`)
+- Small top-N on an indexed scalar field or slice length.
   - Ordered scan can stop as soon as enough rows are found.
-- Narrow `PREFIX ... LIMIT` without extra ordering, or `PREFIX` on the order field
+- Narrow `PREFIX ... LIMIT` without extra ordering, or `PREFIX` on the order field.
   - Binary-search into the matching key span, then scan until limit.
-- Selective conjunctions of `EQ` / `IN` / `HAS` / `HASANY` with small `LIMIT`
+- Selective conjunctions of `EQ` / `IN` / `HASALL` / `HASANY` with small `LIMIT`.
   - Usually lead-posting iteration plus candidate checks.
+- Narrow `POS` ordering over a small literal priority list.
+  - Best when the filter and requested window are both tight.
 
 #### 2. Data-dependent or cache-sensitive
 
@@ -573,18 +729,21 @@ These can differ by one or more orders of magnitude for the same query shape.
 The main reason is that planner/executor cost is dominated by span width,
 cardinality, overlap, ordering, and cache warmth.
 
-- Numeric range queries (`GT/GTE/LT/LTE`), especially with another `ORDER BY` field
-  - Current code uses numeric-range bucket reuse plus bounded materialized-predicate caching, so warm snapshots can be much faster than cold-cache runs.
-- Broad `PREFIX` on a non-order field, especially with a different `ORDER BY`
-- Prefix/text-like filters (`SUFFIX`, `CONTAINS`)
-- Moderate `OR` expressions with mixed predicates
+- Numeric range queries (`GT/GTE/LT/LTE`), especially with another `ORDER BY` field.
+  - Warm snapshots can be much faster when reusable range work is already cached.
+- Broad `PREFIX` on a non-order field, especially with a different `ORDER BY`.
+- Substring/suffix filters (`CONTAINS`, `SUFFIX`), especially without a selective indexed anchor.
+- `OR` expressions with mixed predicates
+  - Specialized routes exist, but branch count, overlap, ordering and limit/window
+    strongly affect the selected path.
+- Broad `POS` ordering or deep offsets over slice/order fields.
 
 What mostly determines runtime:
 - Predicate selectivity and field cardinality
 - Overlap between `OR` branches (high overlap increases redundant checks + dedupe work)
 - Order-field cardinality/skew
 - Prefix/range span size
-- Offset depth / requested window
+- Offset depth and requested window
 - Whether bounded snapshot caches already contain reusable materialized spans
 - Negative predicates (`NOT*`) that reduce early-stop opportunities
 
@@ -596,11 +755,24 @@ enumeration, global deduplication, expensive ordering, and/or large materializat
 - Wide `OR` trees with ordering and deep pagination:
   - Needs branch-level scanning, dedupe, global rank merge, then skip large prefixes
   - Practical complexity often approaches `O(total_examined_rows)`, with large constants
-- Broad text scans (`CONTAINS` / `SUFFIX`) without a selective anchor:
+- Broad suffix/substring scans (`SUFFIX`, `CONTAINS`) without a selective anchor:
   - Often requires scanning many index keys/buckets before filtering
   - Little opportunity for early pruning without additional anchors
-- Queries that need most or all matches rather than a small prefix of results:
+- Record-returning queries that need most or all matches rather than a small prefix:
   - Early-stop advantages disappear and materialization cost starts to dominate
+
+### Aggregation performance
+
+`Count` and `Aggregate` use index snapshots and do not read record values from
+bbolt. Cost depends on the filter, metric fields, grouping cardinality,
+and whether the result must be ordered or filtered with `HAVING`.
+
+- `ROWCOUNT`, simple `COUNT`, and `MIN`/`MAX` over ordinary indexes are usually very cheap.
+- `SUM/AVG` over low- or medium-cardinality ordinary indexes also very fast.
+- `COUNT(DISTINCT)` and `DISTINCT` depend mostly on distinct key count and filters.
+- `measure` indexes help mainly for filtered aggregation over high-cardinality numeric fields.
+- Grouped aggregation becomes heavier as group cardinality, metric count,
+  `HAVING`, `SortOut`, offset and limit work increase.
 
 ### Write performance
 

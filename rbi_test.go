@@ -74,15 +74,10 @@ type noIndexRec struct {
 }
 
 type optInTaggedRec struct {
-	DBDefault        string `db:"db_default"          dbi:"default"`
-	DBUnique         int    `db:"db_unique"           dbi:"unique"`
-	RBIIndex         string `db:"rbi_index"           rbi:"index"`
-	RBIUnique        int    `db:"rbi_unique"          rbi:"unique"`
-	RBIWinsNonUnique string `db:"rbi_wins_non_unique" rbi:"index"  dbi:"unique"`
-	RBIWinsUnique    int    `db:"rbi_wins_unique"     rbi:"unique"  dbi:"default"`
-	RBIWinsEnabled   string `db:"rbi_wins_enabled"    rbi:"index"  dbi:"-"`
-	RBIWinsDisabled  string `db:"rbi_wins_disabled"   rbi:"-"       dbi:"default"`
-	Untagged         string `db:"untagged"`
+	Index    string `db:"index"    rbi:"index"`
+	Unique   int    `db:"unique"   rbi:"unique"`
+	Disabled string `db:"disabled" rbi:"-"`
+	Untagged string `db:"untagged"`
 }
 
 type optInNoTagRec struct {
@@ -90,36 +85,16 @@ type optInNoTagRec struct {
 	Age  int    `db:"age"`
 }
 
-type ignoredInvalidDBITagRec struct {
-	Name string `db:"name" dbi:"defualt"`
-}
-
 type invalidRBITagRec struct {
-	Name string `db:"name" rbi:"autp" dbi:"default"`
-}
-
-type ignoredRemovedDBIAutoTagRec struct {
-	Name string `db:"name" dbi:"auto"`
+	Name string `db:"name" rbi:"autp"`
 }
 
 type removedRBIAutoTagRec struct {
-	Name string `db:"name" rbi:"auto" dbi:"default"`
-}
-
-type removedRBIDefaultTagRec struct {
-	Name string `db:"name" rbi:"default"`
+	Name string `db:"name" rbi:"auto"`
 }
 
 type multiValueRBITagRec struct {
 	Name string `db:"name" rbi:"index,unique"`
-}
-
-type ignoredForeignDBITagRec struct {
-	Name string `db:"name" rbi:"-" dbi:"btree"`
-}
-
-type rbiIndexIgnoresDBIDisableRec struct {
-	Name string `db:"name" rbi:"index" dbi:"-"`
 }
 
 type dbDashDoesNotDisableIndexRec struct {
@@ -408,7 +383,7 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	}
 }
 
-func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
+func TestIndexTags_OptInSupportRBI(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "opt_in_tags.db")
 	db, raw := openBoltAndNew[uint64, optInTaggedRec](t, path)
@@ -422,28 +397,18 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 	}
 
 	if err := db.Set(1, &optInTaggedRec{
-		DBDefault:        "db-default-1",
-		DBUnique:         10,
-		RBIIndex:         "rbi-index-1",
-		RBIUnique:        100,
-		RBIWinsNonUnique: "shared",
-		RBIWinsUnique:    1000,
-		RBIWinsEnabled:   "enabled-1",
-		RBIWinsDisabled:  "disabled-1",
-		Untagged:         "u1",
+		Index:    "index-1",
+		Unique:   100,
+		Disabled: "disabled-1",
+		Untagged: "u1",
 	}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 	if err := db.Set(2, &optInTaggedRec{
-		DBDefault:        "db-default-2",
-		DBUnique:         20,
-		RBIIndex:         "rbi-index-2",
-		RBIUnique:        200,
-		RBIWinsNonUnique: "shared",
-		RBIWinsUnique:    2000,
-		RBIWinsEnabled:   "enabled-2",
-		RBIWinsDisabled:  "disabled-2",
-		Untagged:         "u2",
+		Index:    "index-2",
+		Unique:   200,
+		Disabled: "disabled-2",
+		Untagged: "u2",
 	}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
@@ -453,11 +418,8 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		value any
 		want  []uint64
 	}{
-		{field: "rbi_index", value: "rbi-index-2", want: []uint64{2}},
-		{field: "rbi_unique", value: 200, want: []uint64{2}},
-		{field: "rbi_wins_non_unique", value: "shared", want: []uint64{1, 2}},
-		{field: "rbi_wins_unique", value: 2000, want: []uint64{2}},
-		{field: "rbi_wins_enabled", value: "enabled-1", want: []uint64{1}},
+		{field: "index", value: "index-2", want: []uint64{2}},
+		{field: "unique", value: 200, want: []uint64{2}},
 	}
 	for _, tc := range tests {
 		ids, err := db.QueryKeys(qx.Query(qx.EQ(tc.field, tc.value)))
@@ -468,23 +430,14 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 			t.Fatalf("QueryKeys(%s)=%v want %v", tc.field, ids, tc.want)
 		}
 	}
-	for _, field := range []string{"untagged", "db_default", "db_unique", "rbi_wins_disabled"} {
+	for _, field := range []string{"untagged", "disabled"} {
 		if _, err := db.QueryKeys(qx.Query(qx.EQ(field, "ignored"))); err == nil {
 			t.Fatalf("QueryKeys(%s) must fail for non-indexed field", field)
 		}
 	}
 
-	if err := db.Set(3, &optInTaggedRec{DBUnique: 20, RBIUnique: 300, RBIWinsUnique: 3000}); err != nil {
-		t.Fatalf("dbi unique must be ignored, err=%v", err)
-	}
-	if err := db.Set(4, &optInTaggedRec{RBIUnique: 200}); !errors.Is(err, ErrUniqueViolation) {
+	if err := db.Set(3, &optInTaggedRec{Unique: 200}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("duplicate unique rbi tag err=%v want %v", err, ErrUniqueViolation)
-	}
-	if err := db.Set(5, &optInTaggedRec{RBIWinsUnique: 2000}); !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("duplicate unique rbi-priority tag err=%v want %v", err, ErrUniqueViolation)
-	}
-	if err := db.Set(6, &optInTaggedRec{RBIUnique: 600, RBIWinsUnique: 6000, RBIWinsNonUnique: "shared"}); err != nil {
-		t.Fatalf("rbi index must ignore dbi unique, err=%v", err)
 	}
 }
 
@@ -505,21 +458,6 @@ func TestIndexTags_OptInLeavesUntaggedStructTransparent(t *testing.T) {
 func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	dir := t.TempDir()
 
-	rawDBI, err := bbolt.Open(filepath.Join(dir, "invalid_dbi.db"), 0o600, nil)
-	if err != nil {
-		t.Fatalf("open raw invalid_dbi: %v", err)
-	}
-	defer func() { _ = rawDBI.Close() }()
-
-	dbiDB, err := New[uint64, ignoredInvalidDBITagRec](rawDBI, testOptions(Options{}))
-	if err != nil {
-		t.Fatalf("invalid dbi tag must be ignored, err=%v", err)
-	}
-	if dbiDB.engine != nil {
-		t.Fatal("dbi-only struct must stay transparent")
-	}
-	_ = dbiDB.Close()
-
 	rawRBI, err := bbolt.Open(filepath.Join(dir, "invalid_rbi.db"), 0o600, nil)
 	if err != nil {
 		t.Fatalf("open raw invalid_rbi: %v", err)
@@ -531,21 +469,6 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 		t.Fatalf("invalid rbi tag err=%v", err)
 	}
 
-	rawDBIAuto, err := bbolt.Open(filepath.Join(dir, "removed_dbi_auto.db"), 0o600, nil)
-	if err != nil {
-		t.Fatalf("open raw removed_dbi_auto: %v", err)
-	}
-	defer func() { _ = rawDBIAuto.Close() }()
-
-	dbiAutoDB, err := New[uint64, ignoredRemovedDBIAutoTagRec](rawDBIAuto, testOptions(Options{}))
-	if err != nil {
-		t.Fatalf("removed dbi auto tag must be ignored, err=%v", err)
-	}
-	if dbiAutoDB.engine != nil {
-		t.Fatal("dbi auto-only struct must stay transparent")
-	}
-	_ = dbiAutoDB.Close()
-
 	rawRBIAuto, err := bbolt.Open(filepath.Join(dir, "removed_rbi_auto.db"), 0o600, nil)
 	if err != nil {
 		t.Fatalf("open raw removed_rbi_auto: %v", err)
@@ -556,61 +479,11 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "auto"`) {
 		t.Fatalf("removed rbi auto tag err=%v", err)
 	}
-
-	rawRBIDefault, err := bbolt.Open(filepath.Join(dir, "removed_rbi_default.db"), 0o600, nil)
-	if err != nil {
-		t.Fatalf("open raw removed_rbi_default: %v", err)
-	}
-	defer func() { _ = rawRBIDefault.Close() }()
-
-	_, err = New[uint64, removedRBIDefaultTagRec](rawRBIDefault, testOptions(Options{}))
-	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "default"`) {
-		t.Fatalf("removed rbi default tag err=%v", err)
-	}
-}
-
-func TestIndexTags_RBIDisableIgnoresForeignDBITag(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ignored_foreign_dbi.db")
-	db, raw := openBoltAndNew[uint64, ignoredForeignDBITagRec](t, path)
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	if db.engine != nil {
-		t.Fatal("expected transparent mode")
-	}
-}
-
-func TestIndexTags_RBIIndexIgnoresDBIDisable(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rbi_index_ignores_dbi_disable.db")
-	db, raw := openBoltAndNew[uint64, rbiIndexIgnoresDBIDisableRec](t, path)
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	if db.engine == nil {
-		t.Fatal("expected indexed mode")
-	}
-
-	if err := db.Set(1, &rbiIndexIgnoresDBIDisableRec{Name: "alice"}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("QueryKeys(name): %v", err)
-	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("QueryKeys(name)=%v want [1]", ids)
-	}
 }
 
 func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "embedded_parent_default.db")
+	path := filepath.Join(dir, "embedded_parent_index.db")
 	db, raw := openBoltAndNew[uint64, embeddedEnabledByParentRec](t, path)
 	t.Cleanup(func() {
 		_ = db.Close()
