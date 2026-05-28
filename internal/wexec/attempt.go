@@ -82,6 +82,7 @@ type attemptState struct {
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
 	uniqueNewVals []unsafe.Pointer
+	uniqueState   uniqueBatchCheckState
 }
 
 func (b *Batcher) prepareActive(att *attemptState, active []*request) {
@@ -511,8 +512,11 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		capHint = 1 << bits.Len(uint(capHint-1))
 	}
 	att := attemptStatePool.Get()
-	withUnique := b.unique.Schema != nil && len(b.unique.Schema.Unique) != 0
-	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, b.snapshotOps.Enabled, withUnique)
+	uniqueFields := 0
+	if b.unique.Schema != nil {
+		uniqueFields = len(b.unique.Schema.Unique)
+	}
+	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, b.snapshotOps.Enabled, uniqueFields)
 	if cap(att.prepared) < capHint {
 		att.prepared = slices.Grow(att.prepared, capHint)
 	}
@@ -621,7 +625,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	return nil, true, nil
 }
 
-func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, singleState bool, withSnapshots bool, withUnique bool) {
+func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, singleState bool, withSnapshots bool, uniqueFields int) {
 	st.bucket = bucket
 	st.statsEnabled = statsEnabled
 	st.release = release
@@ -633,7 +637,7 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 	if cap(st.decodedValues) < decodedCapHint {
 		st.decodedValues = slices.Grow(st.decodedValues, decodedCapHint)
 	}
-	if withUnique {
+	if uniqueFields != 0 {
 		if cap(st.uniqueIdxs) < capHint {
 			st.uniqueIdxs = slices.Grow(st.uniqueIdxs, capHint)
 		}
@@ -643,6 +647,7 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 		if cap(st.uniqueNewVals) < capHint {
 			st.uniqueNewVals = slices.Grow(st.uniqueNewVals, capHint)
 		}
+		st.uniqueState.prepare(uniqueFields)
 	}
 	if withSnapshots {
 		if cap(st.preparedSnapshots) < capHint {
@@ -680,6 +685,8 @@ func (st *attemptState) cleanup() {
 
 	clear(st.uniqueNewVals)
 	st.uniqueNewVals = st.uniqueNewVals[:0]
+
+	st.uniqueState.cleanup()
 
 	st.bucket = nil
 	st.statsEnabled = false

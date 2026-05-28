@@ -298,11 +298,11 @@ func (b *Batcher) runShared(batch []*request) {
 	}
 
 	activeScratch := batch
-	scratchOwned := false
+	var ownedScratch []*request
 	for i := 0; i < len(batch); i++ {
 		if batch[i].replacedBy != nil {
-			activeScratch = requestScratchPool.Get(len(batch))
-			scratchOwned = true
+			ownedScratch = requestScratchPool.Get(len(batch))
+			activeScratch = ownedScratch
 			for j := 0; j < len(batch); j++ {
 				req := batch[j]
 				if req.replacedBy == nil {
@@ -312,22 +312,19 @@ func (b *Batcher) runShared(batch []*request) {
 			break
 		}
 	}
-	if scratchOwned {
-		defer requestScratchPool.Put(activeScratch)
-	}
 
 	for {
 		retryWithoutReq, done, fatalErr := b.attempt(activeScratch, false)
 		if fatalErr != nil {
 			assignRequestErr(batch, fatalErr)
-			return
+			break
 		}
 		if done {
-			return
+			break
 		}
 
 		removed := false
-		if scratchOwned {
+		if ownedScratch != nil {
 			write := 0
 			for i := 0; i < len(activeScratch); i++ {
 				req := activeScratch[i]
@@ -341,8 +338,10 @@ func (b *Batcher) runShared(batch []*request) {
 				write++
 			}
 			activeScratch = activeScratch[:write]
+
 		} else {
-			scratch := requestScratchPool.Get(len(activeScratch) - 1)
+			ownedScratch = requestScratchPool.Get(len(activeScratch) - 1)
+			scratch := ownedScratch
 			for i := 0; i < len(activeScratch); i++ {
 				req := activeScratch[i]
 				if !removed && req == retryWithoutReq {
@@ -352,15 +351,13 @@ func (b *Batcher) runShared(batch []*request) {
 				scratch = append(scratch, req)
 			}
 			activeScratch = scratch
-			scratchOwned = true
-			defer requestScratchPool.Put(activeScratch)
 		}
 		if !removed {
 			assignRequestErr(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
-			return
+			break
 		}
 		if len(activeScratch) == 0 {
-			return
+			break
 		}
 		for i := 0; i < len(activeScratch); i++ {
 			req := activeScratch[i]
@@ -368,6 +365,9 @@ func (b *Batcher) runShared(batch []*request) {
 				req.Err = nil
 			}
 		}
+	}
+	if ownedScratch != nil {
+		requestScratchPool.Put(ownedScratch)
 	}
 }
 

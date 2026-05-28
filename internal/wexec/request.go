@@ -216,8 +216,10 @@ func (b *Batcher) buildPatchRequest(key keycodec.DataKey, patch []schema.PatchIt
 	req.beforeCommit = beforeCommit
 
 	rt := b.schema
+
 	if !b.indexed || !rt.HasUnique {
 		req.policy = reqRepeatIDSafeShared
+
 	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 {
 		touchesUnique := false
 		for i := range patch {
