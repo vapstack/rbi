@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -91,7 +90,6 @@ func main() {
 				fatalf("stop profiling: %v", err)
 			}
 		}
-		debug.FreeOSMemory()
 		closeErr := handle.Close()
 		if runErr != nil {
 			fatalf("run focused alloc profile: %v", runErr)
@@ -202,7 +200,7 @@ func main() {
 	if interrupted.Load() && renderer != nil && reader != nil {
 		renderShutdownStatus(app, renderer, reader, "Report saved; releasing OS memory...")
 	}
-	debug.FreeOSMemory()
+
 	if interrupted.Load() && renderer != nil && reader != nil {
 		renderShutdownStatus(app, renderer, reader, "Closing DB...")
 	}

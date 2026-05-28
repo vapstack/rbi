@@ -6,7 +6,6 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"runtime"
 	"runtime/pprof"
 )
 
@@ -48,7 +47,6 @@ func startStressProfiling(opts options) (profilerStopFn, error) {
 		}
 
 		if opts.HeapProfile != "" {
-			runtime.GC()
 			f, err := os.Create(opts.HeapProfile)
 			if err != nil {
 				if firstErr == nil {

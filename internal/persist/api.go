@@ -50,6 +50,8 @@ type StoreConfig struct {
 	PlannerStats *qexec.PlannerStatsSnapshot
 }
 
+const fileBufferSize = 64 << 10
+
 func Load(cfg LoadConfig) (result LoadResult, err error) {
 	diag := loadDiag{
 		file:   cfg.File,
@@ -82,7 +84,7 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 		diag.size = info.Size()
 	}
 
-	reader := bufio.NewReaderSize(f, 32<<20)
+	reader := bufio.NewReaderSize(f, fileBufferSize)
 
 	ver, err := reader.ReadByte()
 	if err != nil {
@@ -132,7 +134,7 @@ func Store(cfg StoreConfig) (err error) {
 		}
 	}()
 
-	buf := bufio.NewWriterSize(f, 32<<20)
+	buf := bufio.NewWriterSize(f, fileBufferSize)
 	if err = storeV26(buf, cfg); err != nil {
 		return err
 	}

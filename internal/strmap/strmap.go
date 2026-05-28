@@ -199,14 +199,14 @@ func (m *Mapper) createNoLock(s string) (uint64, bool) {
 func (m *Mapper) replaceAllDenseNoLock(keys map[string]uint64, strs []string, used []bool, next uint64) {
 	m.next = next
 	m.keys = keys
-	m.strs = strs
+	m.strs = strs[:len(strs):len(strs)]
 	m.sparseStrs = nil
-	m.strsUsed = used
+	m.strsUsed = used[:len(used):len(used)]
 	m.snap = &Snapshot{
 		next:      next,
 		strs:      nil,
-		denseStrs: slices.Clone(strs),
-		denseUsed: slices.Clone(used),
+		denseStrs: m.strs,
+		denseUsed: m.strsUsed,
 		depth:     1,
 	}
 	m.published = &Snapshot{

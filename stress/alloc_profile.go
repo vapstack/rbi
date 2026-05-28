@@ -192,8 +192,7 @@ func runFocusedAllocProfile(handle *DBHandle, opts options, collector *plannerTr
 		return err
 	}
 
-	runtime.GC()
-	if err := writeAllocProfile(opts.AllocProfile); err != nil {
+	if err = writeAllocProfile(opts.AllocProfile); err != nil {
 		return err
 	}
 

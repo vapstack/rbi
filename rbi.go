@@ -467,9 +467,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			if err = db.RefreshPlannerStats(); err != nil {
 				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
 			}
-			if buildMode != "" {
-				forceMemoryCleanup(true)
-			}
 		}
 
 		db.startPlannerAnalyzeLoop()

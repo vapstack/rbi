@@ -638,7 +638,7 @@ func (db *DB[K, V]) loadIndex() (
 		db.strMap = result.StrMap
 	}
 	db.stats.LoadTime = time.Since(start)
-	forceMemoryCleanup(true)
+
 	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
 }
 
@@ -655,8 +655,6 @@ func (db *DB[K, V]) storeIndex() error {
 }
 
 func (qe *queryEngine) storeIndex(rbiFile string, bolt *bbolt.DB, bucket []byte) error {
-	forceMemoryCleanup(true)
-
 	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return fmt.Errorf("store: reading bucket sequence: %w", err)

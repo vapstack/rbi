@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"sync"
@@ -257,7 +256,6 @@ func runFocusedReadRoutingCase(b *testing.B, benchCase focusedReadBenchCase) {
 	now := time.Now().Unix()
 	warmFocusedReadBenchmarkCase(b, handle, desc, benchCase, now, true)
 
-	runtime.GC()
 	b.ReportAllocs()
 	b.ResetTimer()
 	runFocusedReadWorkers(b, handle, collector, desc, benchCase, 1, now, true)
@@ -277,7 +275,6 @@ func runFocusedReadBenchmarkCase(b *testing.B, desc *classDescriptor, benchCase 
 	now := time.Now().Unix()
 	warmFocusedReadBenchmarkCase(b, handle, desc, benchCase, now, withTrace)
 
-	runtime.GC()
 	b.ReportAllocs()
 	b.ResetTimer()
 	runFocusedReadWorkers(b, handle, collector, desc, benchCase, workers, now, withTrace)
