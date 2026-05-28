@@ -727,46 +727,6 @@ func TestIndexOptions_InvalidReferencesFailFast(t *testing.T) {
 	}
 }
 
-func TestReadFieldRejectsOutOfRangePersistedIndexKind(t *testing.T) {
-	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
-	if err := writeSidecarString(writer, "field"); err != nil {
-		t.Fatalf("write name: %v", err)
-	}
-	if err := writeSidecarBool(writer, false); err != nil {
-		t.Fatalf("write unique: %v", err)
-	}
-	if err := writeSidecarUvarint(writer, 256); err != nil {
-		t.Fatalf("write index kind: %v", err)
-	}
-	if err := writeSidecarUvarint(writer, uint64(reflect.Int)); err != nil {
-		t.Fatalf("write kind: %v", err)
-	}
-	if err := writeSidecarBool(writer, false); err != nil {
-		t.Fatalf("write ptr: %v", err)
-	}
-	if err := writeSidecarBool(writer, false); err != nil {
-		t.Fatalf("write slice: %v", err)
-	}
-	if err := writeSidecarBool(writer, false); err != nil {
-		t.Fatalf("write use vi: %v", err)
-	}
-	if err := writeSidecarString(writer, "field"); err != nil {
-		t.Fatalf("write db name: %v", err)
-	}
-	if err := writeSidecarUvarint(writer, 0); err != nil {
-		t.Fatalf("write index len: %v", err)
-	}
-	if err := writer.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	_, _, err := readField(bufio.NewReader(&buf))
-	if err == nil || !strings.Contains(err.Error(), "invalid IndexKind 256") {
-		t.Fatalf("readField err=%v, want invalid IndexKind 256", err)
-	}
-}
-
 func TestIndexTags_MultiValueTagFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	raw, err := bbolt.Open(filepath.Join(dir, "multi_value_rbi.db"), 0o600, nil)

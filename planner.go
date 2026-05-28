@@ -201,10 +201,3 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 	s := db.engine.exec.BuildPlannerStatsSnapshot(snap, version)
 	db.engine.exec.Stats.Store(s)
 }
-
-func (qe *queryEngine) plannerStatsSnapshotForPersistLocked(version uint64) *qexec.PlannerStatsSnapshot {
-	snap, seq, ref := qe.snapshot.PinCurrent()
-	defer qe.snapshot.Unpin(seq, ref)
-
-	return qe.exec.PlannerStatsSnapshotForPersist(snap, version)
-}

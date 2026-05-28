@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
@@ -43,6 +44,18 @@ type Storage struct {
 	Measure           []indexdata.MeasureStorage
 	Universe          posting.List
 	StrMap            *strmap.Snapshot
+}
+
+func (st *Storage) Release() {
+	indexdata.ReleaseFieldStorageSlots(st.Index)
+	indexdata.ReleaseFieldStorageSlots(st.NilIndex)
+	indexdata.ReleaseFieldStorageSlots(st.LenIndex)
+	indexdata.ReleaseMeasureStorageSlots(st.Measure)
+	if st.LenZeroComplement != nil {
+		pooled.ReleaseBoolSlice(st.LenZeroComplement)
+	}
+	st.Universe.Release()
+	*st = Storage{}
 }
 
 func NewView(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, st Storage) *View {

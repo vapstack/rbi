@@ -1,8 +1,6 @@
 package rbi
 
 import (
-	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -135,26 +133,6 @@ func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
 	}
 	if heapSum != got.ApproxHeapBytes {
 		t.Fatalf("FieldApproxHeapBytes sum mismatch: got=%d want=%d", heapSum, got.ApproxHeapBytes)
-	}
-}
-
-func TestReadSidecarString_RoundTrip(t *testing.T) {
-	var payload bytes.Buffer
-	writer := bufio.NewWriter(&payload)
-	const want = "plain-string"
-	if err := writeSidecarString(writer, want); err != nil {
-		t.Fatalf("writeSidecarString: %v", err)
-	}
-	if err := writer.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-
-	got, err := readSidecarString(bufio.NewReader(bytes.NewReader(payload.Bytes())))
-	if err != nil {
-		t.Fatalf("readSidecarString: %v", err)
-	}
-	if got != want {
-		t.Fatalf("readSidecarString mismatch: got %q", got)
 	}
 }
 

@@ -1,24 +1,16 @@
 package rbi
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
-	"os"
-	"reflect"
 	"runtime"
-	"runtime/debug"
-	"slices"
-	"sort"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qexec"
@@ -46,44 +38,6 @@ func releaseBuildIndexLocalStates(localStates []schema.BuildFieldLocalState) {
 	}
 }
 
-type persistedIndexLoadDiag struct {
-	file         string
-	dbPath       string
-	bucket       string
-	size         int64
-	version      byte
-	versionKnown bool
-}
-
-func (d persistedIndexLoadDiag) context() string {
-	version := "unknown"
-	if d.versionKnown {
-		version = fmt.Sprintf("%d", d.version)
-	}
-	if d.size >= 0 {
-		return fmt.Sprintf("persisted index file=%q db=%q bucket=%q size=%d version=%s", d.file, d.dbPath, d.bucket, d.size, version)
-	}
-	return fmt.Sprintf("persisted index file=%q db=%q bucket=%q version=%s", d.file, d.dbPath, d.bucket, version)
-}
-
-func (d persistedIndexLoadDiag) wrap(stage string, err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s stage=%s: %w", d.context(), stage, err)
-}
-
-func recoverLoadIndex(err *error, diag *persistedIndexLoadDiag) {
-	if r := recover(); r != nil {
-		panicErr := fmt.Errorf("panic: %v\n%s", r, debug.Stack())
-		if diag != nil {
-			*err = diag.wrap("panic", panicErr)
-			return
-		}
-		*err = panicErr
-	}
-}
-
 func formatDiagnosticBytesPrefix(b []byte, limit int) string {
 	if len(b) == 0 {
 		return "empty"
@@ -92,14 +46,6 @@ func formatDiagnosticBytesPrefix(b []byte, limit int) string {
 		return fmt.Sprintf("%x", b)
 	}
 	return fmt.Sprintf("%x...(len=%d)", b[:limit], len(b))
-}
-
-type loadIndexResult struct {
-	skipFields        map[string]struct{}
-	skipMeasureFields map[string]struct{}
-	plannerStats      *qexec.PlannerStatsSnapshot
-	strMap            *strmap.Mapper
-	loadTime          time.Duration
 }
 
 type buildIndexDecodeFn func([]byte) (unsafe.Pointer, error)
@@ -641,170 +587,34 @@ func (db *DB[K, V]) loadIndex() (
 	plannerStats *qexec.PlannerStatsSnapshot,
 	err error,
 ) {
-	result, err := db.engine.loadIndex(db.rbiFile, db.bolt, db.bucket, db.strKey)
+	currentSeq, err := currentBucketSequence(db.bolt, db.bucket)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
+	}
+	start := time.Now()
+	result, err := persist.Load(persist.LoadConfig{
+		File:            db.rbiFile,
+		DBPath:          db.bolt.Path(),
+		Bucket:          db.bucket,
+		CurrentSeq:      currentSeq,
+		Schema:          db.schema,
+		StrMapCompactAt: defaultSnapshotStrMapCompactDepth,
+		Errors: persist.Errors{
+			Stale:   errPersistedIndexStale,
+			Invalid: errPersistedIndexInvalid,
+		},
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if db.strKey {
-		db.strMap = result.strMap
-	}
-	db.stats.LoadTime = result.loadTime
-	return result.skipFields, result.skipMeasureFields, result.plannerStats, nil
-}
-
-func (qe *queryEngine) loadIndex(
-	rbiFile string,
-	bolt *bbolt.DB,
-	bucket []byte,
-	strKey bool,
-) (result loadIndexResult, err error) {
-	diag := persistedIndexLoadDiag{
-		file:   rbiFile,
-		dbPath: bolt.Path(),
-		bucket: string(bucket),
-		size:   -1,
-	}
-	defer recoverLoadIndex(&err, &diag)
-
-	f, err := os.Open(rbiFile)
-	if err != nil {
-		return loadIndexResult{}, err
-	}
-	defer closeFile(f)
-	if info, statErr := f.Stat(); statErr == nil {
-		diag.size = info.Size()
-	}
-
-	start := time.Now()
-	reader := bufio.NewReaderSize(f, 32<<20)
-
-	ver, err := reader.ReadByte()
-	if err != nil {
-		return loadIndexResult{}, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err))
-	}
-	diag.version = ver
-	diag.versionKnown = true
-
-	var lenLoaded bool
-	switch ver {
-	case 26:
-		result.skipFields, result.skipMeasureFields, result.plannerStats, result.strMap, lenLoaded, err = qe.loadIndexV26(reader, bolt, bucket)
-	default:
-		return loadIndexResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver))
-	}
-	if err != nil {
-		if errors.Is(err, errPersistedIndexStale) || errors.Is(err, errPersistedIndexInvalid) {
-			return loadIndexResult{}, diag.wrap("load_v26", err)
+	installed := false
+	defer func() {
+		if !installed {
+			result.Storage.Release()
 		}
-		return loadIndexResult{}, diag.wrap("load_v26", fmt.Errorf("error loading index: %w", err))
-	}
+	}()
 
-	qe.lenIndexLoaded = lenLoaded
-	publishStrMap := result.strMap
-	if !strKey {
-		publishStrMap = nil
-	}
-	if err = qe.publishCurrentSequenceSnapshotNoLock(bolt, bucket, publishStrMap); err != nil {
-		return loadIndexResult{}, diag.wrap("publish_snapshot", fmt.Errorf("publish snapshot: %w", err))
-	}
-	result.loadTime = time.Since(start)
-	forceMemoryCleanup(true)
-
-	return result, nil
-}
-
-func (qe *queryEngine) loadIndexV26(
-	reader *bufio.Reader,
-	bolt *bbolt.DB,
-	bucket []byte,
-) (map[string]struct{}, map[string]struct{}, *qexec.PlannerStatsSnapshot, *strmap.Mapper, bool, error) {
-	storedSeq, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
-	}
-
-	currentSeq, err := currentBucketSequence(bolt, bucket)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading current bucket sequence: %w", err)
-	}
-	if storedSeq != currentSeq {
-		return nil, nil, nil, nil, false, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", errPersistedIndexStale, storedSeq, currentSeq)
-	}
-
-	skipFields, skipMeasureFields, plannerStats, strMap, lenLoaded, err := qe.loadIndexPayload(reader)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("%w: %w", errPersistedIndexInvalid, err)
-	}
-	return skipFields, skipMeasureFields, plannerStats, strMap, lenLoaded, nil
-}
-
-func (qe *queryEngine) loadIndexPayload(
-	reader *bufio.Reader,
-) (map[string]struct{}, map[string]struct{}, *qexec.PlannerStatsSnapshot, *strmap.Mapper, bool, error) {
-
-	var universe posting.List
-	universe, err := posting.ReadFrom(reader)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading universe: %w", err)
-	}
-
-	sm, err := strmap.Read(reader, defaultSnapshotStrMapCompactDepth)
-	if err != nil {
-		return nil, nil, nil, nil, false, err
-	}
-
-	compatible, err := readFieldCompatibility(reader, qe.schema.Fields)
-	if err != nil {
-		return nil, nil, nil, nil, false, err
-	}
-	measureCompatible, err := readFieldCompatibility(reader, qe.schema.MeasureFields)
-	if err != nil {
-		return nil, nil, nil, nil, false, err
-	}
-
-	indexes, err := readIndexSections(reader, compatible, "regular index")
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading index sections: %w", err)
-	}
-
-	nilIndexes, err := readIndexSections(reader, compatible, "nil index")
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading nil index sections: %w", err)
-	}
-
-	lenIndexes, err := readIndexSections(reader, compatible, "len index")
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading len index sections: %w", err)
-	}
-
-	measureIndexes, err := readMeasureIndexSections(reader, measureCompatible)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading measure index sections: %w", err)
-	}
-
-	plannerStats, err := readPlannerStatsSnapshot(reader, compatible)
-	if err != nil {
-		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
-	}
-
-	skipFields := make(map[string]struct{}, len(qe.schema.Fields))
-	for name := range qe.schema.Fields {
-		_, hasRegular := indexes[name]
-		_, hasNil := nilIndexes[name]
-		if compatible[name] && (hasRegular || hasNil) {
-			skipFields[name] = struct{}{}
-		}
-	}
-	skipMeasureFields := make(map[string]struct{}, len(qe.schema.MeasureFields))
-	for name := range qe.schema.MeasureFields {
-		if measureCompatible[name] {
-			if _, hasMeasure := measureIndexes[name]; hasMeasure {
-				skipMeasureFields[name] = struct{}{}
-			}
-		}
-	}
-
-	qe.universe = universe
+	qe := db.engine
 	indexdata.ReleaseFieldStorageSlots(qe.index)
 	indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
 	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
@@ -812,128 +622,24 @@ func (qe *queryEngine) loadIndexPayload(
 	if qe.lenZeroComplement != nil {
 		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
 	}
-	slotCount := len(qe.schema.Indexed)
-	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	measureSlotCount := len(qe.schema.Measures)
-	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for _, acc := range qe.schema.Indexed {
-		if storage, ok := indexes[acc.Name]; ok {
-			qe.index[acc.Ordinal] = storage
-			delete(indexes, acc.Name)
-		}
-		if storage, ok := nilIndexes[acc.Name]; ok {
-			qe.nilIndex[acc.Ordinal] = storage
-			delete(nilIndexes, acc.Name)
-		}
-		if storage, ok := lenIndexes[acc.Name]; ok {
-			qe.lenIndex[acc.Ordinal] = storage
-			delete(lenIndexes, acc.Name)
-		}
-	}
-	for _, acc := range qe.schema.Measures {
-		if storage, ok := measureIndexes[acc.Name]; ok {
-			qe.measure[acc.Ordinal] = storage
-			delete(measureIndexes, acc.Name)
-		}
-	}
-	indexdata.ReleaseFieldStorageMap(indexes)
-	indexdata.ReleaseFieldStorageMap(nilIndexes)
-	indexdata.ReleaseFieldStorageMap(lenIndexes)
-	indexdata.ReleaseMeasureStorageMap(measureIndexes)
-	qe.lenZeroComplement = detectLenZeroComplement(qe.lenIndex, qe.schema.Indexed)
+	qe.universe.Release()
+	qe.lenIndexLoaded = result.LenLoaded
 
-	lenLoaded := true
-	for name := range qe.schema.Fields {
-		if _, ok := skipFields[name]; !ok {
-			lenLoaded = false
-			break
-		}
+	publishStrMap := result.StrMap
+	if !db.strKey {
+		publishStrMap = nil
 	}
-	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range qe.schema.Fields {
-			if f == nil || !f.Slice {
-				continue
-			}
-			if _, ok := skipFields[name]; !ok {
-				continue
-			}
-			acc, ok := qe.schema.IndexedByName[name]
-			if !ok {
-				lenLoaded = false
-				break
-			}
-			if qe.lenIndex[acc.Ordinal].KeyCount() == 0 {
-				lenLoaded = false
-				break
-			}
-		}
-	}
+	st := result.Storage
+	result.Storage = snapshot.Storage{}
+	qe.publishStorageSnapshotNoLock(currentSeq, publishStrMap, st)
+	installed = true
 
-	return skipFields, skipMeasureFields, plannerStats, sm, lenLoaded, nil
-}
-
-func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []schema.IndexedFieldAccessor) []bool {
-	out := pooled.GetBoolSlice(len(access))[:len(access)]
-	clear(out)
-	if indexes == nil {
-		return out
+	if db.strKey {
+		db.strMap = result.StrMap
 	}
-	for _, acc := range access {
-		if acc.Ordinal >= len(indexes) {
-			continue
-		}
-		if indexdata.NewFieldIndexViewFromStorage(indexes[acc.Ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
-			out[acc.Ordinal] = true
-		}
-	}
-	return out
-}
-
-func readFieldCompatibility(reader *bufio.Reader, current map[string]*schema.Field) (map[string]bool, error) {
-	count, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading fields len: %w", err)
-	}
-	if count > uint64(^uint(0)>>1) {
-		return nil, fmt.Errorf("decode: stored field count overflows int: %v", count)
-	}
-	compatible := make(map[string]bool, max(0, min(int(count), len(current))))
-	seen := make(map[string]struct{}, max(0, min(int(count), len(current))))
-
-	for i := uint64(0); i < count; i++ {
-		name, stored, err := readField(reader)
-		if err != nil {
-			return nil, fmt.Errorf("decode: reading field %d/%d: %w", i+1, count, err)
-		}
-		if _, exists := seen[name]; exists {
-			return nil, fmt.Errorf("decode: duplicate field %q at entry %d/%d", name, i+1, count)
-		}
-		seen[name] = struct{}{}
-		cur := current[name]
-		if sameFieldDefinition(cur, stored) {
-			compatible[name] = true
-		}
-	}
-	return compatible, nil
-}
-
-func sameFieldDefinition(a, b *schema.Field) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	if a.Unique != b.Unique ||
-		a.IndexKind != b.IndexKind ||
-		a.Kind != b.Kind ||
-		a.Ptr != b.Ptr ||
-		a.Slice != b.Slice ||
-		a.UseVI != b.UseVI ||
-		a.DBName != b.DBName ||
-		!slices.Equal(a.Index, b.Index) {
-		return false
-	}
-	return true
+	db.stats.LoadTime = time.Since(start)
+	forceMemoryCleanup(true)
+	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
 }
 
 func (db *DB[K, V]) storeIndex() error {
@@ -951,601 +657,30 @@ func (db *DB[K, V]) storeIndex() error {
 func (qe *queryEngine) storeIndex(rbiFile string, bolt *bbolt.DB, bucket []byte) error {
 	forceMemoryCleanup(true)
 
-	tmpFile := rbiFile + ".temp"
-	defer os.Remove(tmpFile)
-
-	f, err := os.Create(tmpFile)
-	if err != nil {
-		return err
-	}
-	defer closeFile(f)
-
-	buf := bufio.NewWriterSize(f, 32<<20)
-
 	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return fmt.Errorf("store: reading bucket sequence: %w", err)
 	}
+	snap, snapSeq, ref := qe.snapshot.PinCurrent()
+	defer qe.snapshot.Unpin(snapSeq, ref)
 
-	if err = qe.storeIndexV26(buf, seq); err != nil {
-		return err
+	if snap.Seq != seq {
+		return fmt.Errorf("store: snapshot sequence mismatch: snapshot=%d bucket=%d", snap.Seq, seq)
 	}
-
-	if err = buf.Flush(); err != nil {
-		return fmt.Errorf("flushing write buffers: %w", err)
-	}
-	if err = f.Sync(); err != nil {
-		return fmt.Errorf("syncing persisted index temp file: %w", err)
-	}
-
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmpFile, rbiFile); err != nil {
-		return err
-	}
-	if err = syncDir(rbiFile); err != nil {
-		return fmt.Errorf("syncing persisted index directory: %w", err)
-	}
-	return nil
-}
-
-func (qe *queryEngine) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) error {
-	if err := writer.WriteByte(26); err != nil {
-		return fmt.Errorf("store: writing version: %w", err)
-	}
-	if err := writeSidecarUvarint(writer, bucketSeq); err != nil {
-		return fmt.Errorf("store: writing bucket sequence: %w", err)
-	}
-
-	return qe.storeIndexPayload(writer)
-}
-
-func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
-	snap := qe.snapshot.Current()
-	universe := snap.Universe.Borrow()
-
-	if err := universe.WriteTo(writer); err != nil {
-		return fmt.Errorf("encode: writing universe: %w", err)
-	}
-
-	if err := strmap.WriteSnapshot(writer, snap.StrMap); err != nil {
-		return err
-	}
-
-	if err := writeFields(writer, qe.schema.Fields); err != nil {
-		return err
-	}
-	if err := writeFields(writer, qe.schema.MeasureFields); err != nil {
-		return err
-	}
-
-	fieldNames := sortedFieldNames(snap.FieldNameSet())
-
-	if err := writeSidecarUvarint(writer, uint64(len(fieldNames))); err != nil {
-		return fmt.Errorf("encode: writing index family len: %w", err)
-	}
-	for _, field := range fieldNames {
-		if err := writeSidecarString(writer, field); err != nil {
-			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
-		}
-		storage, _ := snap.FieldIndexStorage(field)
-		if err := storage.WriteInto(writer); err != nil {
-			return fmt.Errorf("encode: writing index field %q: %w", field, err)
-		}
-	}
-
-	nilFieldNames := sortedFieldNames(snap.NilFieldNameSet())
-
-	if err := writeSidecarUvarint(writer, uint64(len(nilFieldNames))); err != nil {
-		return fmt.Errorf("encode: writing index family len: %w", err)
-	}
-	for _, field := range nilFieldNames {
-		if err := writeSidecarString(writer, field); err != nil {
-			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
-		}
-		acc := snap.IndexedFieldByName[field]
-		if err := snap.NilIndex[acc.Ordinal].WriteInto(writer); err != nil {
-			return fmt.Errorf("encode: writing index field %q: %w", field, err)
-		}
-	}
-
-	lenFieldNames := sortedFieldNames(snap.LenFieldNameSet())
-
-	if err := writeSidecarUvarint(writer, uint64(len(lenFieldNames))); err != nil {
-		return fmt.Errorf("encode: writing index family len: %w", err)
-	}
-	for _, field := range lenFieldNames {
-		if err := writeSidecarString(writer, field); err != nil {
-			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
-		}
-		acc := snap.IndexedFieldByName[field]
-		if err := snap.LenIndex[acc.Ordinal].WriteInto(writer); err != nil {
-			return fmt.Errorf("encode: writing index field %q: %w", field, err)
-		}
-	}
-
-	measureFieldNames := sortedMapFieldNames(qe.schema.MeasureFields)
-
-	if err := writeSidecarUvarint(writer, uint64(len(measureFieldNames))); err != nil {
-		return fmt.Errorf("encode: writing measure index family len: %w", err)
-	}
-	for _, field := range measureFieldNames {
-		if err := writeSidecarString(writer, field); err != nil {
-			return fmt.Errorf("encode: writing measure field %q name: %w", field, err)
-		}
-		acc := qe.schema.MeasuresByName[field]
-		var storage indexdata.MeasureStorage
-		if snap.Measure == nil || acc.Ordinal >= len(snap.Measure) {
-			storage = indexdata.MeasureStorage{}
-		} else {
-			storage = snap.Measure[acc.Ordinal]
-		}
-		if err := storage.WriteInto(writer); err != nil {
-			return fmt.Errorf("encode: writing measure field %q: %w", field, err)
-		}
-	}
-
 	statsVersion := qe.exec.StatsVersion.Load()
 	if statsVersion == 0 {
 		statsVersion = 1
 	} else {
 		statsVersion++
 	}
-	if err := writePlannerStatsSnapshot(writer, qe.plannerStatsSnapshotForPersistLocked(statsVersion)); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func writeFields(writer *bufio.Writer, fields map[string]*schema.Field) error {
-	names := make([]string, 0, len(fields))
-	for name := range fields {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	if err := writeSidecarUvarint(writer, uint64(len(names))); err != nil {
-		return fmt.Errorf("encode: writing fields len: %w", err)
-	}
-	for _, name := range names {
-		if err := writeField(writer, name, fields[name]); err != nil {
-			return fmt.Errorf("encode: writing field %q: %w", name, err)
-		}
-	}
-	return nil
-}
-
-func writeField(writer *bufio.Writer, name string, f *schema.Field) error {
-	if err := writeSidecarString(writer, name); err != nil {
-		return err
-	}
-	if err := writeSidecarBool(writer, f.Unique); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, uint64(f.IndexKind)); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, uint64(f.Kind)); err != nil {
-		return err
-	}
-	if err := writeSidecarBool(writer, f.Ptr); err != nil {
-		return err
-	}
-	if err := writeSidecarBool(writer, f.Slice); err != nil {
-		return err
-	}
-	if err := writeSidecarBool(writer, f.UseVI); err != nil {
-		return err
-	}
-	if err := writeSidecarString(writer, f.DBName); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, uint64(len(f.Index))); err != nil {
-		return err
-	}
-	for _, idx := range f.Index {
-		if idx < 0 {
-			return fmt.Errorf("negative field index")
-		}
-		if err := writeSidecarUvarint(writer, uint64(idx)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func readField(reader *bufio.Reader) (string, *schema.Field, error) {
-	name, err := readSidecarString(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	unique, err := readSidecarBool(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	indexKind, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	if indexKind > uint64(^schema.IndexKind(0)) {
-		return "", nil, fmt.Errorf("invalid IndexKind %d", indexKind)
-	}
-	fieldIndexKind := schema.IndexKind(indexKind)
-	if err := schema.ValidateIndexKind(fieldIndexKind); err != nil {
-		return "", nil, err
-	}
-	kind, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	ptr, err := readSidecarBool(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	slice, err := readSidecarBool(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	useVI, err := readSidecarBool(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	dbName, err := readSidecarString(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	valIndexLen, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return "", nil, err
-	}
-	valIndex := make([]int, 0, valIndexLen)
-	for i := uint64(0); i < valIndexLen; i++ {
-		v, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return "", nil, err
-		}
-		if v > uint64(^uint(0)>>1) {
-			return "", nil, fmt.Errorf("field index element overflows int")
-		}
-		valIndex = append(valIndex, int(v))
-	}
-	return name, &schema.Field{
-		Unique:    unique,
-		IndexKind: fieldIndexKind,
-		Kind:      reflect.Kind(kind),
-		Ptr:       ptr,
-		Slice:     slice,
-		UseVI:     useVI,
-		DBName:    dbName,
-		Index:     valIndex,
-	}, nil
-}
-
-func writePlannerStatsSnapshot(writer *bufio.Writer, s *qexec.PlannerStatsSnapshot) error {
-	if s == nil {
-		if err := writeSidecarUvarint(writer, 0); err != nil {
-			return fmt.Errorf("encode: writing planner stats version: %w", err)
-		}
-		if err := writeSidecarUvarint(writer, 0); err != nil {
-			return fmt.Errorf("encode: writing planner stats generated_at: %w", err)
-		}
-		if err := writeSidecarUvarint(writer, 0); err != nil {
-			return fmt.Errorf("encode: writing planner stats universe: %w", err)
-		}
-		return writeSidecarUvarint(writer, 0)
-	}
-
-	if err := writeSidecarUvarint(writer, s.Version); err != nil {
-		return fmt.Errorf("encode: writing planner stats version: %w", err)
-	}
-
-	generatedAt := uint64(0)
-	if !s.GeneratedAt.IsZero() {
-		generatedAt = uint64(s.GeneratedAt.UnixNano())
-	}
-	if err := writeSidecarUvarint(writer, generatedAt); err != nil {
-		return fmt.Errorf("encode: writing planner stats generated_at: %w", err)
-	}
-	if err := writeSidecarUvarint(writer, s.UniverseCardinality); err != nil {
-		return fmt.Errorf("encode: writing planner stats universe: %w", err)
-	}
-
-	fields := sortedMapFieldNames(s.Fields)
-	if err := writeSidecarUvarint(writer, uint64(len(fields))); err != nil {
-		return fmt.Errorf("encode: writing planner stats field count: %w", err)
-	}
-	for _, f := range fields {
-		if err := writeSidecarString(writer, f); err != nil {
-			return fmt.Errorf("encode: writing planner stats field name: %w", err)
-		}
-		if err := writePlannerFieldStats(writer, s.Fields[f]); err != nil {
-			return fmt.Errorf("encode: writing planner stats field %q: %w", f, err)
-		}
-	}
-	return nil
-}
-
-func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) (*qexec.PlannerStatsSnapshot, error) {
-	version, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading planner stats version: %w", err)
-	}
-	generatedAtNanos, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading planner stats generated_at: %w", err)
-	}
-	universe, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading planner stats universe: %w", err)
-	}
-	fieldCount, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading planner stats field count: %w", err)
-	}
-	if fieldCount > uint64(^uint(0)>>1) {
-		return nil, fmt.Errorf("decode: planner stats field count overflows int: %v", fieldCount)
-	}
-	if version == 0 && generatedAtNanos == 0 && universe == 0 && fieldCount == 0 {
-		return nil, nil
-	}
-
-	fields := make(map[string]PlannerFieldStats, min(int(fieldCount), len(compatible)))
-	for i := uint64(0); i < fieldCount; i++ {
-		f, err := readSidecarString(reader)
-		if err != nil {
-			return nil, fmt.Errorf("decode: reading planner stats field name %d/%d: %w", i+1, fieldCount, err)
-		}
-		stats, err := readPlannerFieldStats(reader)
-		if err != nil {
-			return nil, fmt.Errorf("decode: reading planner stats field %q (%d/%d): %w", f, i+1, fieldCount, err)
-		}
-		if compatible[f] {
-			if _, exists := fields[f]; exists {
-				return nil, fmt.Errorf("decode: duplicate planner stats field %q at entry %d/%d", f, i+1, fieldCount)
-			}
-			fields[f] = stats
-		}
-	}
-	if version == 0 && generatedAtNanos == 0 && universe == 0 && len(fields) == 0 {
-		return nil, nil
-	}
-	for f := range compatible {
-		if _, ok := fields[f]; !ok {
-			return nil, fmt.Errorf("decode: missing planner stats field %q (loaded=%d compatible=%d)", f, len(fields), len(compatible))
-		}
-	}
-
-	out := &qexec.PlannerStatsSnapshot{
-		Version:             version,
-		UniverseCardinality: universe,
-		Fields:              fields,
-	}
-	if generatedAtNanos > 0 {
-		out.GeneratedAt = time.Unix(0, int64(generatedAtNanos)).UTC()
-	}
-	return out, nil
-}
-
-func writePlannerFieldStats(writer *bufio.Writer, s PlannerFieldStats) error {
-	if err := writeSidecarUvarint(writer, s.DistinctKeys); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, s.NonEmptyKeys); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, s.TotalBucketCard); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, s.MaxBucketCard); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, s.P50BucketCard); err != nil {
-		return err
-	}
-	if err := writeSidecarUvarint(writer, s.P95BucketCard); err != nil {
-		return err
-	}
-	return nil
-}
-
-func readPlannerFieldStats(reader *bufio.Reader) (PlannerFieldStats, error) {
-	distinct, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-	nonEmpty, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-	total, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-	maxCard, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-	p50, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-	p95, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return PlannerFieldStats{}, err
-	}
-
-	out := PlannerFieldStats{
-		DistinctKeys:    distinct,
-		NonEmptyKeys:    nonEmpty,
-		TotalBucketCard: total,
-		MaxBucketCard:   maxCard,
-		P50BucketCard:   p50,
-		P95BucketCard:   p95,
-	}
-	if distinct > 0 {
-		out.AvgBucketCard = float64(total) / float64(distinct)
-	}
-	return out, nil
-}
-
-func sortedMapFieldNames[T any](m map[string]T) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for f := range m {
-		out = append(out, f)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func readIndexSections(
-	reader *bufio.Reader,
-	compatible map[string]bool,
-	section string,
-) (map[string]indexdata.FieldStorage, error) {
-	count, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s field count: %w", section, err)
-	}
-	if count == 0 {
-		return make(map[string]indexdata.FieldStorage), nil
-	}
-
-	out := make(map[string]indexdata.FieldStorage, min(int(count), len(compatible)))
-	seen := make(map[string]struct{}, min(int(count), len(compatible)))
-	for i := uint64(0); i < count; i++ {
-		f, err := readSidecarString(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading %s field name %d/%d: %w", section, i+1, count, err)
-		}
-		if _, exists := seen[f]; exists {
-			return nil, fmt.Errorf("duplicate %s field %q at entry %d/%d", section, f, i+1, count)
-		}
-		seen[f] = struct{}{}
-
-		keep := compatible[f]
-		storage, err := indexdata.ReadFieldStorage(reader, keep, section, f)
-		if err != nil {
-			return nil, fmt.Errorf("reading %s storage for field %q (%d/%d keep=%t): %w", section, f, i+1, count, keep, err)
-		}
-		if keep && storage.KeyCount() > 0 {
-			out[f] = storage
-		}
-	}
-
-	return out, nil
-}
-
-func readMeasureIndexSections(
-	reader *bufio.Reader,
-	compatible map[string]bool,
-) (map[string]indexdata.MeasureStorage, error) {
-	count, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("reading measure index field count: %w", err)
-	}
-	if count == 0 {
-		return make(map[string]indexdata.MeasureStorage), nil
-	}
-
-	out := make(map[string]indexdata.MeasureStorage, min(int(count), len(compatible)))
-	seen := make(map[string]struct{}, min(int(count), len(compatible)))
-	for i := uint64(0); i < count; i++ {
-		f, err := readSidecarString(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading measure index field name %d/%d: %w", i+1, count, err)
-		}
-		if _, exists := seen[f]; exists {
-			return nil, fmt.Errorf("duplicate measure index field %q at entry %d/%d", f, i+1, count)
-		}
-		seen[f] = struct{}{}
-
-		keep := compatible[f]
-		storage, err := indexdata.ReadMeasureStorage(reader, keep)
-		if err != nil {
-			return nil, fmt.Errorf("reading measure index storage for field %q (%d/%d keep=%t): %w", f, i+1, count, keep, err)
-		}
-		if keep {
-			out[f] = storage
-		}
-	}
-
-	return out, nil
-}
-
-func sortedFieldNames(set map[string]struct{}) []string {
-	if len(set) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(set))
-	for f := range set {
-		out = append(out, f)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func writeSidecarUvarint(writer *bufio.Writer, v uint64) error {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	if _, err := writer.Write(buf[:n]); err != nil {
-		return err
-	}
-	return nil
-}
-
-func writeSidecarBool(writer *bufio.Writer, v bool) error {
-	if v {
-		return writer.WriteByte(1)
-	}
-	return writer.WriteByte(0)
-}
-
-func readSidecarBool(reader *bufio.Reader) (bool, error) {
-	v, err := reader.ReadByte()
-	if v != 0 && v != 1 {
-		return false, fmt.Errorf("corrupted bool value: %v", v)
-	}
-	return v > 0, err
-}
-
-func writeSidecarString(writer *bufio.Writer, s string) error {
-	if err := writeSidecarUvarint(writer, uint64(len(s))); err != nil {
-		return err
-	}
-	if len(s) == 0 {
-		return nil
-	}
-	if _, err := io.WriteString(writer, s); err != nil {
-		return err
-	}
-	return nil
-}
-
-func readSidecarString(reader *bufio.Reader) (string, error) {
-	n, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return "", err
-	}
-	if n == 0 {
-		return "", nil
-	}
-	if n > indexdata.MaxStoredStringLen {
-		return "", fmt.Errorf("string len %v exceeds limit (%v)", n, indexdata.MaxStoredStringLen)
-	}
-	if n > uint64(^uint(0)>>1) {
-		return "", fmt.Errorf("string len %v overflows int", n)
-	}
-	b := make([]byte, int(n))
-	if _, err = io.ReadFull(reader, b); err != nil {
-		return "", err
-	}
-	s := unsafe.String(unsafe.SliceData(b), len(b))
-	return s, nil
+	plannerStats := qe.exec.PlannerStatsSnapshotForPersist(snap, statsVersion)
+	return persist.Store(persist.StoreConfig{
+		File:         rbiFile,
+		BucketSeq:    seq,
+		Schema:       qe.schema,
+		Snapshot:     snap,
+		PlannerStats: plannerStats,
+	})
 }
 
 func countDistinct(s []string) int {
