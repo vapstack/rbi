@@ -1,12 +1,16 @@
 package rbi
 
 import (
+	"errors"
 	"reflect"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/wexec"
 	"go.etcd.io/bbolt"
 )
+
+var errCloneNil = errors.New("clone returned nil")
 
 type (
 	beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
@@ -15,10 +19,10 @@ type (
 )
 
 type execOptions[K ~string | ~uint64, V any] struct {
-	beforeProcess []autoBatchBeforeProcessHook
-	beforeStore   []autoBatchBeforeStoreHook
-	beforeCommit  []autoBatchBeforeCommitHook
-	cloneValue    autoBatchCloneFunc
+	beforeProcess []wexec.BeforeProcessHook
+	beforeStore   []wexec.BeforeStoreHook
+	beforeCommit  []wexec.BeforeCommitHook
+	cloneValue    wexec.CloneFunc
 	noBatch       bool
 	patchStrict   bool
 }
@@ -165,7 +169,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 		f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 			cloned := fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
 			if cloned == nil {
-				return nil, errAutoBatchCloneNil
+				return nil, errCloneNil
 			}
 			return unsafe.Pointer(cloned), nil
 		}
@@ -175,7 +179,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 	f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 		cloned := fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
 		if cloned == nil {
-			return nil, errAutoBatchCloneNil
+			return nil, errCloneNil
 		}
 		return unsafe.Pointer(cloned), nil
 	}
@@ -257,22 +261,22 @@ func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOp
 			cfg.cloneValue = func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 				cloned := clone((*V)(value))
 				if cloned == nil {
-					return nil, errAutoBatchCloneNil
+					return nil, errCloneNil
 				}
 				return unsafe.Pointer(cloned), nil
 			}
 		}
 	}
 	if len(cfg.beforeProcess) > 0 {
-		cfg.beforeProcess = append([]autoBatchBeforeProcessHook(nil), cfg.beforeProcess...)
+		cfg.beforeProcess = append([]wexec.BeforeProcessHook(nil), cfg.beforeProcess...)
 		cfg.beforeProcess = cfg.beforeProcess[:len(cfg.beforeProcess):len(cfg.beforeProcess)]
 	}
 	if len(cfg.beforeStore) > 0 {
-		cfg.beforeStore = append([]autoBatchBeforeStoreHook(nil), cfg.beforeStore...)
+		cfg.beforeStore = append([]wexec.BeforeStoreHook(nil), cfg.beforeStore...)
 		cfg.beforeStore = cfg.beforeStore[:len(cfg.beforeStore):len(cfg.beforeStore)]
 	}
 	if len(cfg.beforeCommit) > 0 {
-		cfg.beforeCommit = append([]autoBatchBeforeCommitHook(nil), cfg.beforeCommit...)
+		cfg.beforeCommit = append([]wexec.BeforeCommitHook(nil), cfg.beforeCommit...)
 		cfg.beforeCommit = cfg.beforeCommit[:len(cfg.beforeCommit):len(cfg.beforeCommit)]
 	}
 	return cfg

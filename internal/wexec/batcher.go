@@ -1,0 +1,301 @@
+package wexec
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/strmap"
+	"go.etcd.io/bbolt"
+)
+
+type Batcher struct {
+	sched scheduler
+
+	bolt               *bbolt.DB
+	bucket             []byte
+	bucketFillPercent  float64
+	rejectEmptyPayload bool
+
+	strKey          bool
+	strMap          *strmap.Mapper
+	unavailable     func() error
+	dbMu            *sync.RWMutex
+	commit          func(*bbolt.Tx, string) error
+	indexed         bool
+	ops             *RecordOps
+	schema          *schema.Runtime
+	unique          UniqueContext
+	snapshotOps     SnapshotOps
+	indexPublishOps IndexPublishOps
+	errs            ErrorSet
+}
+
+type Config struct {
+	MaxOps       int
+	Window       time.Duration
+	MaxQueue     int
+	StatsEnabled bool
+	Unavailable  func() error
+	Errors       ErrorSet
+
+	Bolt               *bbolt.DB
+	Bucket             []byte
+	BucketFillPercent  float64
+	RejectEmptyPayload bool
+
+	RootMu          *sync.RWMutex
+	Commit          func(*bbolt.Tx, string) error
+	StrKey          bool
+	StrMap          *strmap.Mapper
+	Indexed         bool
+	Ops             *RecordOps
+	Schema          *schema.Runtime
+	Unique          UniqueContext
+	SnapshotOps     SnapshotOps
+	IndexPublishOps IndexPublishOps
+}
+
+func NewBatcher(cfg Config) *Batcher {
+	ex := &Batcher{
+		sched: newScheduler(cfg.MaxOps, cfg.Window, cfg.MaxQueue, cfg.StatsEnabled),
+
+		bolt:               cfg.Bolt,
+		bucket:             cfg.Bucket,
+		bucketFillPercent:  cfg.BucketFillPercent,
+		rejectEmptyPayload: cfg.RejectEmptyPayload,
+		strKey:             cfg.StrKey,
+		strMap:             cfg.StrMap,
+		unavailable:        cfg.Unavailable,
+		dbMu:               cfg.RootMu,
+		commit:             cfg.Commit,
+		indexed:            cfg.Indexed,
+		ops:                cfg.Ops,
+		schema:             cfg.Schema,
+		unique:             cfg.Unique,
+		snapshotOps:        cfg.SnapshotOps,
+		indexPublishOps:    cfg.IndexPublishOps,
+		errs:               cfg.Errors,
+	}
+	ex.sched.cond = sync.NewCond(&ex.sched.mu)
+	return ex
+}
+
+func (b *Batcher) BasicStats() (queueLen int, queueMax uint64, executed uint64, dequeued uint64) {
+	b.sched.mu.Lock()
+	queueLen = b.sched.queueLen
+	b.sched.mu.Unlock()
+	return queueLen, b.sched.stats.QueueHighWater.Load(), b.sched.stats.ExecutedBatches.Load(), b.sched.stats.Dequeued.Load()
+}
+
+func (b *Batcher) Stats() Stats {
+	return b.sched.getStats()
+}
+
+func (b *Batcher) WakeWaiters() {
+	b.sched.mu.Lock()
+	b.sched.forceWake = true
+	b.sched.cond.Broadcast()
+	b.sched.mu.Unlock()
+	select {
+	case b.sched.waitNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (b *Batcher) submit(reqs []*request, isolated bool) error {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	stats := b.sched.stats.Enabled
+	if stats {
+		b.sched.stats.Submitted.Add(1)
+	}
+	if err := b.unavailable(); err != nil {
+		for i := 0; i < len(reqs); i++ {
+			requestPool.Put(reqs[i])
+		}
+		if stats {
+			b.sched.stats.FallbackClosed.Add(1)
+		}
+		return err
+	}
+
+	job := jobPool.Get()
+	job.reqs = reqs
+	job.isolated = isolated || len(reqs) != 1
+
+	b.sched.mu.Lock()
+	for {
+		if err := b.unavailable(); err != nil {
+			b.sched.mu.Unlock()
+			for i := 0; i < len(reqs); i++ {
+				requestPool.Put(reqs[i])
+			}
+			jobPool.Put(job)
+			if stats {
+				b.sched.stats.FallbackClosed.Add(1)
+			}
+			return err
+		}
+		if !b.sched.running {
+			b.sched.running = true
+			go b.runLoop()
+		}
+		if b.sched.maxQ <= 0 || b.sched.queueLen < b.sched.maxQ {
+			break
+		}
+		b.sched.cond.Wait()
+	}
+
+	b.sched.enqueue(job)
+	select {
+	case b.sched.waitNotify <- struct{}{}:
+	default:
+	}
+	if b.sched.stats.Enabled {
+		job.enqueuedAt = time.Now().UnixNano()
+		b.sched.stats.Enqueued.Add(1)
+		atomicSetMax(&b.sched.stats.QueueHighWater, uint64(b.sched.queueLen))
+	}
+	b.sched.mu.Unlock()
+
+	err := <-job.done
+	for i := 0; i < len(reqs); i++ {
+		requestPool.Put(reqs[i])
+	}
+	jobPool.Put(job)
+	return err
+}
+
+func (b *Batcher) runLoop() {
+	for {
+		batch := b.sched.popBatch(b.strKey)
+		if len(batch) == 0 {
+			return
+		}
+		if err := b.unavailable(); err != nil {
+			failJobs(batch, err)
+			clear(batch)
+			b.sched.mu.Lock()
+			b.sched.recycleBatchScratchLocked(batch)
+			b.sched.mu.Unlock()
+			continue
+		}
+		b.executeJobs(batch)
+		clear(batch)
+		b.sched.mu.Lock()
+		b.sched.recycleBatchScratchLocked(batch)
+		b.sched.mu.Unlock()
+	}
+}
+
+func (b *Batcher) executeJobs(batch []*writeJob) {
+	b.sched.stats.recordExecuted(len(batch))
+	stats := b.sched.stats.Enabled
+	var started time.Time
+	if stats {
+		started = time.Now()
+	}
+
+	if len(batch) == 1 && batch[0].isolated {
+		b.runAtomic(batch[0].reqs)
+		finishJobs(batch)
+		if stats {
+			b.sched.stats.ExecuteNanos.Add(uint64(time.Since(started)))
+		}
+		return
+	}
+
+	reqScratch := requestScratchPool.Get(len(batch))
+
+	for _, job := range batch {
+		reqs := job.reqs
+		if len(reqs) != 1 {
+			assignRequestErr(reqs, fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch"))
+			continue
+		}
+		reqScratch = append(reqScratch, reqs[0])
+	}
+	if len(reqScratch) != 0 {
+		b.runShared(reqScratch)
+	}
+	finishJobs(batch)
+	requestScratchPool.Put(reqScratch)
+	if stats {
+		b.sched.stats.ExecuteNanos.Add(uint64(time.Since(started)))
+	}
+}
+
+func (b *Batcher) runShared(batch []*request) {
+	for i := 0; i < len(batch); i++ {
+		batch[i].Err = nil
+	}
+
+	activeScratch := requestScratchPool.Get(len(batch))
+	for i := 0; i < len(batch); i++ {
+		req := batch[i]
+		if req.replacedBy == nil {
+			activeScratch = append(activeScratch, req)
+		}
+	}
+	defer requestScratchPool.Put(activeScratch)
+
+	for {
+		retryWithoutReq, done, fatalErr := b.attempt(activeScratch, false)
+		if fatalErr != nil {
+			assignRequestErr(batch, fatalErr)
+			return
+		}
+		if done {
+			return
+		}
+
+		write := 0
+		removed := false
+		for i := 0; i < len(activeScratch); i++ {
+			req := activeScratch[i]
+			if !removed && req == retryWithoutReq {
+				removed = true
+				continue
+			}
+			if write != i {
+				activeScratch[write] = req
+			}
+			write++
+		}
+		activeScratch = activeScratch[:write]
+		if !removed {
+			assignRequestErr(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
+			return
+		}
+		if len(activeScratch) == 0 {
+			return
+		}
+		for i := 0; i < len(activeScratch); i++ {
+			req := activeScratch[i]
+			if errors.Is(req.Err, b.errs.UniqueViolation) {
+				req.Err = nil
+			}
+		}
+	}
+}
+
+func (b *Batcher) runAtomic(batch []*request) {
+	for i := 0; i < len(batch); i++ {
+		req := batch[i]
+		req.Err = nil
+		req.replacedBy = nil
+	}
+	_, done, fatalErr := b.attempt(batch, true)
+	if fatalErr != nil {
+		assignRequestErr(batch, fatalErr)
+		return
+	}
+	if !done {
+		assignRequestErr(batch, fmt.Errorf("internal auto-batch atomic retry error"))
+	}
+}

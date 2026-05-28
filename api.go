@@ -352,8 +352,10 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	cfg := db.resolveExecOptions(execOpts)
 	key := keycodec.DataKeyFromUserKey(id, db.strKey)
 	if len(cfg.beforeProcess) != 0 {
-		if err := runBeforeProcessHooks(key, unsafe.Pointer(newVal), cfg.beforeProcess); err != nil {
-			return err
+		for _, fn := range cfg.beforeProcess {
+			if err := fn(key, unsafe.Pointer(newVal)); err != nil {
+				return err
+			}
 		}
 	}
 	if err := db.beginOp(); err != nil {
@@ -361,15 +363,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	}
 	defer db.endOp()
 
-	req, err := db.buildSetAutoBatchRequest(key, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
-	if err != nil {
+	batch := db.batcher.NewBatch(1)
+	if err := batch.AddSet(key, unsafe.Pointer(newVal), cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); err != nil {
+		batch.Cancel()
 		return err
 	}
-	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
-	reqScratch = append(reqScratch, req)
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	return batch.Submit(cfg.noBatch)
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -415,9 +414,11 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 
 		for i := range newVals {
 			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
-			if err := runBeforeProcessHooks(key, unsafe.Pointer(newVals[i]), cfg.beforeProcess); err != nil {
-				keycodec.ReleaseDataKeySlice(keyScratch)
-				return err
+			for _, fn := range cfg.beforeProcess {
+				if err := fn(key, unsafe.Pointer(newVals[i])); err != nil {
+					keycodec.ReleaseDataKeySlice(keyScratch)
+					return err
+				}
 			}
 			keyScratch = append(keyScratch, key)
 		}
@@ -428,26 +429,19 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 	defer db.endOp()
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
+	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {
 		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 		if keyScratch != nil {
 			key = keyScratch[i]
 		}
-		req, err := db.buildSetAutoBatchRequest(key, newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
-		if err != nil {
-			for j := 0; j < len(reqScratch); j++ {
-				db.autoBatcher.requestPool.Put(reqScratch[j])
-			}
-			db.autoBatcher.requestScratchPool.Put(reqScratch)
+		if err := batch.AddSet(key, unsafe.Pointer(newVals[i]), cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); err != nil {
+			batch.Cancel()
 			return err
 		}
-		reqScratch = append(reqScratch, req)
 	}
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
+	return batch.Submit(true)
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -478,13 +472,10 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 	}
 	defer db.endOp()
 
-	req := db.buildPatchAutoBatchRequest(id, patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
-
-	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
-	reqScratch = append(reqScratch, req)
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	patchItems := patchItemsForWrite(patch)
+	batch := db.batcher.NewBatch(1)
+	batch.AddPatch(keycodec.DataKeyFromUserKey(id, db.strKey), patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+	return batch.Submit(cfg.noBatch)
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -501,22 +492,21 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
+	cfg := db.resolveExecOptions(execOpts)
+	ignoreUnknown := !cfg.patchStrict
+
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
-	cfg := db.resolveExecOptions(execOpts)
-	ignoreUnknown := !cfg.patchStrict
-
-	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
+	patchItems := patchItemsForWrite(patch)
+	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {
-		reqScratch = append(reqScratch, db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
+		batch.AddPatch(keycodec.DataKeyFromUserKey(ids[i], db.strKey), patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 	}
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
+	return batch.Submit(true)
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -526,19 +516,16 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 // operation is aborted. If the record does not exist, Delete is a no-op and no
 // callbacks are invoked.
 func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
+	cfg := db.resolveExecOptions(execOpts)
+
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
-	cfg := db.resolveExecOptions(execOpts)
-	req := db.buildDeleteAutoBatchRequest(id, cfg.beforeCommit)
-
-	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
-	reqScratch = append(reqScratch, req)
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	batch := db.batcher.NewBatch(1)
+	batch.AddDelete(keycodec.DataKeyFromUserKey(id, db.strKey), cfg.beforeCommit)
+	return batch.Submit(cfg.noBatch)
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -553,28 +540,17 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		return nil
 	}
 
+	cfg := db.resolveExecOptions(execOpts)
+
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
-	cfg := db.resolveExecOptions(execOpts)
-
-	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
+	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {
-		reqScratch = append(reqScratch, db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
+		batch.AddDelete(keycodec.DataKeyFromUserKey(ids[i], db.strKey), cfg.beforeCommit)
 	}
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
-}
-
-func runBeforeProcessHooks(id keycodec.DataKey, newVal unsafe.Pointer, hooks []autoBatchBeforeProcessHook) error {
-	for _, fn := range hooks {
-		if err := fn(id, newVal); err != nil {
-			return err
-		}
-	}
-	return nil
+	return batch.Submit(true)
 }

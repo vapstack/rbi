@@ -16,7 +16,6 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
@@ -24,6 +23,7 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/internal/wexec"
 	"go.etcd.io/bbolt"
 )
 
@@ -516,208 +516,91 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool)
 }
 
 func (db *DB[K, V]) initBatcher() {
-	runtime := &autoBatchRuntime{
-		bolt:               db.bolt,
-		bucket:             db.bucket,
-		bucketFillPercent:  db.options.BucketFillPercent,
-		strKey:             db.strKey,
-		strMap:             db.strMap,
-		engine:             db.engine,
-		schema:             db.schema,
-		testHookAccessor:   func() *testHooks { return db.testHooks },
-		broken:             &db.broken,
-		logger:             db.logger,
-		mu:                 &db.mu,
-		closed:             &db.closed,
-		rejectEmptyPayload: db.decodeFn == nil,
-		ops: autoBatchRecordOps{
-			encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-				return db.encode((*V)(ptr), buf)
-			},
-			decode: func(data []byte) (unsafe.Pointer, error) {
-				val, err := db.decode(data)
-				if err != nil {
-					return nil, err
-				}
-				return unsafe.Pointer(val), nil
-			},
-			release: func(ptr unsafe.Pointer) {
-				db.ReleaseRecords((*V)(ptr))
-			},
-			validateIndex: func(ptr unsafe.Pointer) error {
-				return db.validateIndexedStringValues((*V)(ptr))
-			},
+	ops := wexec.RecordOps{
+		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+			return db.encode((*V)(ptr), buf)
+		},
+		Decode: func(data []byte) (unsafe.Pointer, error) {
+			val, err := db.decode(data)
+			if err != nil {
+				return nil, err
+			}
+			return unsafe.Pointer(val), nil
+		},
+		Release: func(ptr unsafe.Pointer) {
+			db.ReleaseRecords((*V)(ptr))
+		},
+		ValidateIndex: func(ptr unsafe.Pointer) error {
+			return db.validateIndexedStringValues((*V)(ptr))
 		},
 	}
-	db.autoBatcher = newAutoBatcher(db.options, runtime)
-}
-
-func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
-	ab := &autoBatcher{
-		autoBatchScheduler: newAutoBatchScheduler(options),
-		runtime:            runtime,
-		repeatUintIDPool: pooled.Maps[uint64, int]{
-			NewCap: 8,
+	cfg := wexec.Config{
+		MaxOps:       db.options.AutoBatchMax,
+		Window:       db.options.AutoBatchWindow,
+		MaxQueue:     db.options.AutoBatchMaxQueue,
+		StatsEnabled: db.options.EnableAutoBatchStats,
+		Unavailable: func() error {
+			if db.closed.Load() {
+				return ErrClosed
+			}
+			if db.broken.Load() {
+				return ErrBroken
+			}
+			return nil
 		},
-		repeatStringIDPool: pooled.Maps[string, int]{
-			NewCap: 8,
+		Errors: wexec.ErrorSet{
+			UniqueViolation: ErrUniqueViolation,
 		},
-		requestScratchPool: pooled.NewSlicePool[*autoBatchRequest](uint(max(defaultAutoBatchMax, options.AutoBatchMax)), pooled.ClearCap),
-		attemptStatePool: pooled.Pointers[autoBatchAttemptState]{
-			Cleanup: func(st *autoBatchAttemptState) {
-				st.autoBatchAttemptCore.cleanup(runtime)
 
-				clear(st.prepared)
-				st.prepared = st.prepared[:0]
-
-				clear(st.accepted)
-				st.accepted = st.accepted[:0]
-
-				clear(st.states)
-				st.states = st.states[:0]
-
-				if st.stateByUintID != nil {
-					clear(st.stateByUintID)
-				}
-				if st.stateByStringID != nil {
-					clear(st.stateByStringID)
-				}
-			},
+		Bolt:               db.bolt,
+		Bucket:             db.bucket,
+		BucketFillPercent:  db.options.BucketFillPercent,
+		RejectEmptyPayload: db.decodeFn == nil,
+		RootMu:             &db.mu,
+		Commit: func(tx *bbolt.Tx, op string) error {
+			return commitTx(tx, op, db.testHooks)
 		},
-		requestPool: pooled.Pointers[autoBatchRequest]{
-			Init: func(req *autoBatchRequest) {
-				if req.done == nil {
-					req.done = make(chan error, 1)
-				}
+		StrKey:  db.strKey,
+		StrMap:  db.strMap,
+		Indexed: db.engine != nil,
+		Ops:     &ops,
+		Schema:  db.schema,
+	}
+
+	if db.engine != nil {
+		cfg.Unique = wexec.UniqueContext{
+			Schema:          db.schema,
+			Current:         db.engine.snapshot.Current,
+			UniqueViolation: ErrUniqueViolation,
+		}
+		cfg.SnapshotOps = wexec.SnapshotOps{
+			Enabled:     true,
+			Manager:     db.engine.snapshot,
+			Schema:      db.schema,
+			CacheConfig: db.engine.snapshotCacheConfig,
+			StrMap:      db.strMap,
+			PatchFields: db.schema.Patch.Fields,
+		}
+		cfg.IndexPublishOps = wexec.IndexPublishOps{
+			PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
+				return publishAfterCommitLocked(
+					db.testHooks,
+					&db.broken,
+					db.logger,
+					db.engine,
+					seq,
+					op,
+					func() {
+						db.engine.installViewNoLock(snap)
+						if db.strMap != nil {
+							db.strMap.MarkCommittedPublished(snap.StrMap)
+						}
+					},
+				)
 			},
-			Cleanup: func(req *autoBatchRequest) {
-				if req.setPayload != nil {
-					encodePool.Put(req.setPayload)
-					req.setPayload = nil
-				}
-				req.setValue = nil
-				req.setBaseline = nil
-				clear(req.patch)
-				req.patch = req.patch[:0]
-				req.patchIgnoreUnknown = false
-				req.beforeProcess = nil
-				req.beforeStore = nil
-				req.beforeCommit = nil
-				req.cloneValue = nil
-				req.policy = 0
-				req.replacedBy = nil
-				select {
-				case <-req.done:
-				default:
-				}
-				req.op = 0
-				req.id = keycodec.DataKey{}
-				req.err = nil
-			},
-		},
+		}
 	}
-	ab.cond = sync.NewCond(&ab.mu)
-	return ab
-}
-
-func newAutoBatchScheduler(options *Options) autoBatchScheduler {
-	maxOps := options.AutoBatchMax
-	window := options.AutoBatchWindow
-	if maxOps <= 1 || window <= 0 {
-		maxOps = 1
-		window = 0
-	}
-	maxQueue := options.AutoBatchMaxQueue
-	if maxQueue < 0 {
-		maxQueue = 0
-	}
-	capHint := max(64, maxOps*4)
-	if maxQueue > 0 && maxQueue < capHint {
-		capHint = maxQueue
-	}
-	return autoBatchScheduler{
-		statsEnabled: options.EnableAutoBatchStats,
-		window:       window,
-		maxOps:       maxOps,
-		maxQ:         maxQueue,
-		waitNotify:   make(chan struct{}, 1),
-		queue:        make([]*autoBatchJob, capHint),
-		jobPool: pooled.Pointers[autoBatchJob]{
-			Init: func(job *autoBatchJob) {
-				if job.done == nil {
-					job.done = make(chan error, 1)
-				}
-			},
-			Cleanup: func(job *autoBatchJob) {
-				select {
-				case <-job.done:
-				default:
-				}
-				job.reqs = nil
-				job.isolated = false
-				job.enqueuedAt = 0
-			},
-		},
-	}
-}
-
-type autoBatchScheduler struct {
-	statsEnabled bool
-	window       time.Duration
-	maxOps       int
-	maxQ         int
-
-	queue        []*autoBatchJob
-	batchScratch []*autoBatchJob
-	jobPool      pooled.Pointers[autoBatchJob]
-
-	mu           sync.Mutex
-	cond         *sync.Cond
-	waitNotify   chan struct{}
-	waitTimer    *time.Timer
-	running      bool
-	queueHead    int
-	queueSize    int
-	hotUntil     time.Time
-	hotBatchSize int
-
-	submitted          atomic.Uint64
-	enqueued           atomic.Uint64
-	dequeued           atomic.Uint64
-	executedBatches    atomic.Uint64
-	multiReqBatches    atomic.Uint64
-	multiReqOps        atomic.Uint64
-	batchSize1         atomic.Uint64
-	batchSize2To4      atomic.Uint64
-	batchSize5To8      atomic.Uint64
-	batchSize9Plus     atomic.Uint64
-	callbackOps        atomic.Uint64
-	coalescedSetDelete atomic.Uint64
-	maxBatchSeen       atomic.Uint64
-	queueHighWater     atomic.Uint64
-	coalesceWaits      atomic.Uint64
-	coalesceWaitNanos  atomic.Uint64
-	queueWaitNanos     atomic.Uint64
-	executeNanos       atomic.Uint64
-
-	fallbackClosed atomic.Uint64
-
-	uniqueRejected atomic.Uint64
-	txBeginErrors  atomic.Uint64
-	txOpErrors     atomic.Uint64
-	txCommitErrors atomic.Uint64
-	callbackErrors atomic.Uint64
-}
-
-type autoBatcher struct {
-	autoBatchScheduler
-
-	runtime            *autoBatchRuntime
-	repeatUintIDPool   pooled.Maps[uint64, int]
-	repeatStringIDPool pooled.Maps[string, int]
-	requestScratchPool *pooled.SlicePool[*autoBatchRequest]
-	attemptStatePool   pooled.Pointers[autoBatchAttemptState]
-	requestPool        pooled.Pointers[autoBatchRequest]
+	db.batcher = wexec.NewBatcher(cfg)
 }
 
 type rebuilder struct {
@@ -759,7 +642,7 @@ type (
 		closed atomic.Bool
 		broken atomic.Bool
 
-		autoBatcher *autoBatcher
+		batcher *wexec.Batcher
 
 		execOptions execOptions[K, V]
 
@@ -1272,14 +1155,13 @@ func (db *DB[K, V]) Stats() Stats[K] {
 		out.SnapshotSequence = snap.Seq
 	}
 
-	db.autoBatcher.mu.Lock()
-	out.AutoBatchQueueLen = db.autoBatcher.queueSize
-	db.autoBatcher.mu.Unlock()
-	out.AutoBatchQueueMax = db.autoBatcher.queueHighWater.Load()
+	queueLen, queueMax, executed, dequeued := db.batcher.BasicStats()
+	out.AutoBatchQueueLen = queueLen
+	out.AutoBatchQueueMax = queueMax
 
-	out.AutoBatchCount = db.autoBatcher.executedBatches.Load()
+	out.AutoBatchCount = executed
 	if out.AutoBatchCount > 0 {
-		out.AutoBatchAvgSize = float64(db.autoBatcher.dequeued.Load()) / float64(out.AutoBatchCount)
+		out.AutoBatchAvgSize = float64(dequeued) / float64(out.AutoBatchCount)
 	}
 
 	return out
@@ -1406,56 +1288,7 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 // batching remains active in both modes, so when stats collection is enabled
 // the returned counters and queue state reflect the current write workload.
 func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
-	return db.autoBatcher.autoBatchScheduler.snapshotStats()
-}
-
-func (ab *autoBatchScheduler) snapshotStats() AutoBatchStats {
-	if !ab.statsEnabled {
-		return AutoBatchStats{}
-	}
-	out := AutoBatchStats{
-		Window:              ab.window,
-		MaxBatch:            ab.maxOps,
-		MaxQueue:            ab.maxQ,
-		Submitted:           ab.submitted.Load(),
-		Enqueued:            ab.enqueued.Load(),
-		Dequeued:            ab.dequeued.Load(),
-		QueueHighWater:      ab.queueHighWater.Load(),
-		ExecutedBatches:     ab.executedBatches.Load(),
-		MultiRequestBatches: ab.multiReqBatches.Load(),
-		MultiRequestOps:     ab.multiReqOps.Load(),
-		BatchSize1:          ab.batchSize1.Load(),
-		BatchSize2To4:       ab.batchSize2To4.Load(),
-		BatchSize5To8:       ab.batchSize5To8.Load(),
-		BatchSize9Plus:      ab.batchSize9Plus.Load(),
-		MaxBatchSeen:        ab.maxBatchSeen.Load(),
-		CallbackOps:         ab.callbackOps.Load(),
-		CoalescedSetDelete:  ab.coalescedSetDelete.Load(),
-		CoalesceWaits:       ab.coalesceWaits.Load(),
-		CoalesceWaitTime:    time.Duration(ab.coalesceWaitNanos.Load()),
-		QueueWaitTime:       time.Duration(ab.queueWaitNanos.Load()),
-		ExecuteTime:         time.Duration(ab.executeNanos.Load()),
-		FallbackClosed:      ab.fallbackClosed.Load(),
-		UniqueRejected:      ab.uniqueRejected.Load(),
-		TxBeginErrors:       ab.txBeginErrors.Load(),
-		TxOpErrors:          ab.txOpErrors.Load(),
-		TxCommitErrors:      ab.txCommitErrors.Load(),
-		CallbackErrors:      ab.callbackErrors.Load(),
-	}
-
-	ab.mu.Lock()
-	out.QueueLen = ab.queueSize
-	out.QueueCap = cap(ab.queue)
-	out.WorkerRunning = ab.running
-	out.HotWindowActive = ab.window > 0 &&
-		time.Now().Before(ab.hotUntil) &&
-		(ab.hotBatchSize == 0 || ab.hotBatchSize >= 3)
-	ab.mu.Unlock()
-
-	if out.ExecutedBatches > 0 {
-		out.AvgBatchSize = float64(out.Dequeued) / float64(out.ExecutedBatches)
-	}
-	return out
+	return AutoBatchStats(db.batcher.Stats())
 }
 
 // PlannerStats returns the last published planner statistics snapshot together
@@ -1508,11 +1341,7 @@ func (db *DB[K, V]) Close() error {
 
 	db.stopAnalyzeLoop()
 
-	db.autoBatcher.mu.Lock()
-	if db.autoBatcher.cond != nil {
-		db.autoBatcher.cond.Broadcast()
-	}
-	db.autoBatcher.mu.Unlock()
+	db.batcher.WakeWaiters()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1541,7 +1370,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	// Keep writer lock order consistent with batched/single write paths:
 	// open bbolt write tx first, then take db.mu. This avoids tx<->mu inversion
-	// deadlocks against executeAutoBatch (which already uses that order).
+	// deadlocks against the write executor, which already uses that order.
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
 		return fmt.Errorf("tx error: %w", err)

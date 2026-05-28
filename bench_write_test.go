@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
@@ -22,6 +23,8 @@ const writeBenchSeedBatch = 50_000
 const writeBenchSeedCount = 200_000
 const writeBenchUserBatchSize = 1000
 const writeBenchHighChurnOps = 2048
+
+var writeBenchEncodePool pooled.Buffers
 
 func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
 	return buildWriteBenchDBWithOptions(b, Options{
@@ -187,8 +190,8 @@ func buildWriteBenchBatchUpdateInput(batchSize int) ([]uint64, []*UserBench, []*
 }
 
 func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
-	b := encodePool.Get()
-	defer encodePool.Put(b)
+	b := writeBenchEncodePool.Get()
+	defer writeBenchEncodePool.Put(b)
 
 	if err := db.encode(rec, b); err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -237,8 +240,8 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 			return fmt.Errorf("apply patch: %w", err)
 		}
 
-		b := encodePool.Get()
-		defer encodePool.Put(b)
+		b := writeBenchEncodePool.Get()
+		defer writeBenchEncodePool.Put(b)
 		if err = db.encode(newVal, b); err != nil {
 			return fmt.Errorf("encode: %w", err)
 		}

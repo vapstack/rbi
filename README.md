@@ -631,6 +631,11 @@ unchanged storage is shared by reference, so this overhead is usually modest.
 
 ### GC pressure
 
+RBI is designed to keep allocations as close to zero as practical, but some
+allocations are unavoidable: bbolt operations and value encoding/decoding.
+To reduce allocations further, call `ReleaseRecords` when you are done
+with records so they can be returned to the internal pool.
+
 RBI uses semi-manual memory management to minimize GC pressure.
 Most internal and intermediate structures are pooled and reused.
 Index structures use arenas and ownership-aware copy-on-write behaviour.

@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/snapshot"
@@ -179,28 +181,65 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	badReq, err := db.buildSetAutoBatchRequest(dataKeyFromID("ghost-hole"), &StringUniqueTestRec{
-		Email: "seed@x",
-		Code:  2,
-	}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("build bad request: %v", err)
+	var commitCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	db.testHooks = &testHooks{
+		beforeCommit: func(string) error {
+			if commitCalls.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		},
 	}
-	goodReq, err := db.buildSetAutoBatchRequest(dataKeyFromID("real-hole"), &StringUniqueTestRec{
-		Email: "real@x",
-		Code:  3,
-	}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("build good request: %v", err)
-	}
+	t.Cleanup(func() {
+		db.testHooks = nil
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
 
-	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- db.Set("blocker", &StringUniqueTestRec{Email: "blocker@x", Code: 2})
+	}()
 
-	if !errors.Is(badReq.err, ErrUniqueViolation) {
-		t.Fatalf("bad request error = %v, want %v", badReq.err, ErrUniqueViolation)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocked commit")
 	}
-	if goodReq.err != nil {
-		t.Fatalf("good request failed: %v", goodReq.err)
+	baseline := db.AutoBatchStats()
+
+	badDone := make(chan error, 1)
+	go func() {
+		badDone <- db.Set("ghost-hole", &StringUniqueTestRec{Email: "seed@x", Code: 3})
+	}()
+	waitAutoBatchExtraStats(t, db, "queued rejected string set", func(st AutoBatchStats) bool {
+		return st.Submitted == baseline.Submitted+1 && st.QueueLen == 1
+	})
+
+	goodDone := make(chan error, 1)
+	go func() {
+		goodDone <- db.Set("real-hole", &StringUniqueTestRec{Email: "real@x", Code: 4})
+	}()
+	waitAutoBatchExtraStats(t, db, "queued rejected+accepted string sets", func(st AutoBatchStats) bool {
+		return st.Submitted == baseline.Submitted+2 && st.QueueLen == 2
+	})
+
+	close(release)
+
+	if err := <-blockerDone; err != nil {
+		t.Fatalf("blocker Set: %v", err)
+	}
+	if err := <-badDone; !errors.Is(err, ErrUniqueViolation) {
+		t.Fatalf("bad Set error = %v, want %v", err, ErrUniqueViolation)
+	}
+	if err := <-goodDone; err != nil {
+		t.Fatalf("good Set: %v", err)
 	}
 
 	assertHole := func(label string) {
@@ -210,26 +249,30 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		if snap == nil || snap.StrMap == nil {
 			t.Fatalf("%s: expected published strmap snapshot", label)
 		}
-		if snap.StrMap.Next() != 3 {
-			t.Fatalf("%s: strmap.Next = %d, want 3", label, snap.StrMap.Next())
+		if snap.StrMap.Next() != 4 {
+			t.Fatalf("%s: strmap.Next = %d, want 4", label, snap.StrMap.Next())
 		}
 
 		seedIdx, ok := snap.StrMap.Index("seed")
 		if !ok || seedIdx != 1 {
 			t.Fatalf("%s: seed idx = %d ok=%v, want 1", label, seedIdx, ok)
 		}
+		blockerIdx, ok := snap.StrMap.Index("blocker")
+		if !ok || blockerIdx != 2 {
+			t.Fatalf("%s: blocker idx = %d ok=%v, want 2", label, blockerIdx, ok)
+		}
 		if _, ok := snap.StrMap.Index("ghost-hole"); ok {
 			t.Fatalf("%s: rejected key unexpectedly remained in strmap", label)
 		}
 		realIdx, ok := snap.StrMap.Index("real-hole")
-		if !ok || realIdx != 3 {
-			t.Fatalf("%s: real-hole idx = %d ok=%v, want 3", label, realIdx, ok)
+		if !ok || realIdx != 4 {
+			t.Fatalf("%s: real-hole idx = %d ok=%v, want 4", label, realIdx, ok)
 		}
-		if s, ok := snap.StrMap.String(2); ok {
-			t.Fatalf("%s: hole idx 2 unexpectedly mapped to %q", label, s)
+		if s, ok := snap.StrMap.String(3); ok {
+			t.Fatalf("%s: hole idx 3 unexpectedly mapped to %q", label, s)
 		}
-		if s, ok := snap.StrMap.String(3); !ok || s != "real-hole" {
-			t.Fatalf("%s: idx 3 reverse mapping = %q ok=%v, want real-hole", label, s, ok)
+		if s, ok := snap.StrMap.String(4); !ok || s != "real-hole" {
+			t.Fatalf("%s: idx 4 reverse mapping = %q ok=%v, want real-hole", label, s, ok)
 		}
 
 		v, getErr := db.Get("ghost-hole")
@@ -239,12 +282,19 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		if v != nil {
 			t.Fatalf("%s: rejected key persisted: %#v", label, v)
 		}
+		v, getErr = db.Get("blocker")
+		if getErr != nil {
+			t.Fatalf("%s: Get(blocker): %v", label, getErr)
+		}
+		if v == nil || v.Email != "blocker@x" || v.Code != 2 {
+			t.Fatalf("%s: blocker payload mismatch: %#v", label, v)
+		}
 
 		v, getErr = db.Get("real-hole")
 		if getErr != nil {
 			t.Fatalf("%s: Get(real-hole): %v", label, getErr)
 		}
-		if v == nil || v.Email != "real@x" || v.Code != 3 {
+		if v == nil || v.Email != "real@x" || v.Code != 4 {
 			t.Fatalf("%s: real-hole payload mismatch: %#v", label, v)
 		}
 
@@ -253,8 +303,8 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		if queryErr != nil {
 			t.Fatalf("%s: QueryKeys(NOOP): %v", label, queryErr)
 		}
-		if !queryStringIDsEqual(allQ, gotAll, []string{"seed", "real-hole"}) {
-			t.Fatalf("%s: NOOP query mismatch: got=%v want=[seed real-hole]", label, gotAll)
+		if !queryStringIDsEqual(allQ, gotAll, []string{"seed", "blocker", "real-hole"}) {
+			t.Fatalf("%s: NOOP query mismatch: got=%v want=[seed blocker real-hole]", label, gotAll)
 		}
 
 		gotReal, queryErr := db.QueryKeys(qx.Query(qx.EQ("email", "real@x")))

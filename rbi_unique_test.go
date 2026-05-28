@@ -4,14 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"unsafe"
+	"time"
 
 	"github.com/vapstack/qx"
+	"go.etcd.io/bbolt"
 )
 
 func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
@@ -510,386 +510,6 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 	})
 }
 
-func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
-		t.Fatalf("Set(2): %v", err)
-	}
-
-	newVal := &UniqueTestRec{Email: "a@x", Code: 2}
-	payload := mustEncodeAutoBatchPayload(t, db, newVal)
-
-	delReq := &autoBatchRequest{
-		op:   autoBatchDelete,
-		id:   dataKeyFromID(uint64(1)),
-		done: make(chan error, 1),
-	}
-	setReq := &autoBatchRequest{
-		op:         autoBatchSet,
-		id:         dataKeyFromID(uint64(2)),
-		setValue:   unsafe.Pointer(newVal),
-		setPayload: payload,
-		done:       make(chan error, 1),
-	}
-
-	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{delReq, setReq})
-
-	if err := <-delReq.done; err != nil {
-		t.Fatalf("batch delete request failed: %v", err)
-	}
-	if err := <-setReq.done; err != nil {
-		t.Fatalf("batch set request failed: %v", err)
-	}
-
-	v1, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if v1 != nil {
-		t.Fatalf("id=1 must be deleted, got: %#v", v1)
-	}
-
-	v2, err := db.Get(2)
-	if err != nil {
-		t.Fatalf("Get(2): %v", err)
-	}
-	if v2 == nil || v2.Email != "a@x" || v2.Code != 2 {
-		t.Fatalf("id=2 unexpected value after batch reuse: %#v", v2)
-	}
-
-	idsA, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x")))
-	if err != nil {
-		t.Fatalf("QueryKeys(email=a@x): %v", err)
-	}
-	if len(idsA) != 1 || idsA[0] != 2 {
-		t.Fatalf("unexpected owners for email=a@x: %v", idsA)
-	}
-}
-
-func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
-		t.Fatalf("Set(2): %v", err)
-	}
-	if err := db.Set(3, &UniqueTestRec{Email: "c@x", Code: 3}); err != nil {
-		t.Fatalf("Set(3): %v", err)
-	}
-
-	badVal := &UniqueTestRec{Email: "a@x", Code: 3}
-	badPayload := mustEncodeAutoBatchPayload(t, db, badVal)
-
-	goodVal := &UniqueTestRec{Email: "d@x", Code: 2}
-	goodPayload := mustEncodeAutoBatchPayload(t, db, goodVal)
-
-	badReq := &autoBatchRequest{
-		op:         autoBatchSet,
-		id:         dataKeyFromID(uint64(3)),
-		setValue:   unsafe.Pointer(badVal),
-		setPayload: badPayload,
-		done:       make(chan error, 1),
-	}
-	goodReq := &autoBatchRequest{
-		op:         autoBatchSet,
-		id:         dataKeyFromID(uint64(2)),
-		setValue:   unsafe.Pointer(goodVal),
-		setPayload: goodPayload,
-		done:       make(chan error, 1),
-	}
-
-	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
-
-	if err := <-badReq.done; err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("bad request must fail with ErrUniqueViolation, got: %v", err)
-	}
-	if err := <-goodReq.done; err != nil {
-		t.Fatalf("good request must succeed, got: %v", err)
-	}
-
-	v2, err := db.Get(2)
-	if err != nil {
-		t.Fatalf("Get(2): %v", err)
-	}
-	if v2 == nil || v2.Email != "d@x" {
-		t.Fatalf("id=2 must be updated to d@x, got: %#v", v2)
-	}
-
-	v3, err := db.Get(3)
-	if err != nil {
-		t.Fatalf("Get(3): %v", err)
-	}
-	if v3 == nil || v3.Email != "c@x" {
-		t.Fatalf("id=3 must stay unchanged after rejected op, got: %#v", v3)
-	}
-
-	checkOwner := func(email string, want uint64) {
-		t.Helper()
-		ids, qerr := db.QueryKeys(qx.Query(qx.EQ("email", email)))
-		if qerr != nil {
-			t.Fatalf("QueryKeys(email=%s): %v", email, qerr)
-		}
-		if len(ids) != 1 || ids[0] != want {
-			t.Fatalf("unexpected owner for %s: got=%v want=[%d]", email, ids, want)
-		}
-	}
-	checkOwner("a@x", 1)
-	checkOwner("c@x", 3)
-	checkOwner("d@x", 2)
-}
-
-func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
-	dbBatch, _ := openTempDBUint64Unique(t)
-	dbSeq, _ := openTempDBUint64Unique(t, Options{AutoBatchMax: 1})
-
-	const idSpace = 32
-
-	cloneUniqueRec := func(v *UniqueTestRec) *UniqueTestRec {
-		if v == nil {
-			return nil
-		}
-		cp := *v
-		cp.Tags = slices.Clone(v.Tags)
-		if v.Opt != nil {
-			s := *v.Opt
-			cp.Opt = &s
-		}
-		return &cp
-	}
-	cloneFieldValue := func(v any) any {
-		switch x := v.(type) {
-		case []string:
-			return slices.Clone(x)
-		default:
-			return x
-		}
-	}
-	cloneFields := func(in []Field) []Field {
-		out := make([]Field, len(in))
-		for i := range in {
-			out[i].Name = in[i].Name
-			out[i].Value = cloneFieldValue(in[i].Value)
-		}
-		return out
-	}
-	errClass := func(err error) string {
-		switch {
-		case err == nil:
-			return "ok"
-		case errors.Is(err, ErrUniqueViolation):
-			return "unique"
-		default:
-			return err.Error()
-		}
-	}
-	compareState := func(step int) {
-		t.Helper()
-
-		cntBatch, err := dbBatch.Count()
-		if err != nil {
-			t.Fatalf("step=%d batch Count: %v", step, err)
-		}
-		cntSeq, err := dbSeq.Count()
-		if err != nil {
-			t.Fatalf("step=%d seq Count: %v", step, err)
-		}
-		if cntBatch != cntSeq {
-			t.Fatalf("step=%d count mismatch: batch=%d seq=%d", step, cntBatch, cntSeq)
-		}
-
-		for id := uint64(1); id <= idSpace; id++ {
-			vb, err := dbBatch.Get(id)
-			if err != nil {
-				t.Fatalf("step=%d batch Get(%d): %v", step, id, err)
-			}
-			vs, err := dbSeq.Get(id)
-			if err != nil {
-				t.Fatalf("step=%d seq Get(%d): %v", step, id, err)
-			}
-			if vb == nil && vs == nil {
-				continue
-			}
-			if vb == nil || vs == nil {
-				t.Fatalf("step=%d id=%d nil mismatch: batch=%#v seq=%#v", step, id, vb, vs)
-			}
-			if !reflect.DeepEqual(*vb, *vs) {
-				t.Fatalf("step=%d id=%d value mismatch\nbatch=%#v\nseq=%#v", step, id, vb, vs)
-			}
-		}
-
-		emailPool := []string{"u0@x", "u1@x", "u2@x", "u3@x", "u4@x", "u5@x", "u6@x", "u7@x", "u8@x", "u9@x"}
-		for _, email := range emailPool {
-			ib, err := dbBatch.QueryKeys(qx.Query(qx.EQ("email", email)))
-			if err != nil {
-				t.Fatalf("step=%d batch QueryKeys(email=%q): %v", step, email, err)
-			}
-			is, err := dbSeq.QueryKeys(qx.Query(qx.EQ("email", email)))
-			if err != nil {
-				t.Fatalf("step=%d seq QueryKeys(email=%q): %v", step, email, err)
-			}
-			if !slices.Equal(ib, is) {
-				t.Fatalf("step=%d email index mismatch for %q: batch=%v seq=%v", step, email, ib, is)
-			}
-		}
-		for code := 1; code <= 14; code++ {
-			ib, err := dbBatch.QueryKeys(qx.Query(qx.EQ("code", code)))
-			if err != nil {
-				t.Fatalf("step=%d batch QueryKeys(code=%d): %v", step, code, err)
-			}
-			is, err := dbSeq.QueryKeys(qx.Query(qx.EQ("code", code)))
-			if err != nil {
-				t.Fatalf("step=%d seq QueryKeys(code=%d): %v", step, code, err)
-			}
-			if !slices.Equal(ib, is) {
-				t.Fatalf("step=%d code index mismatch for %d: batch=%v seq=%v", step, code, ib, is)
-			}
-		}
-	}
-
-	seed := []*UniqueTestRec{
-		{Email: "u0@x", Code: 1, Tags: []string{"t0"}},
-		{Email: "u1@x", Code: 2, Tags: []string{"t1"}},
-		{Email: "u2@x", Code: 3, Tags: []string{"t2"}},
-		{Email: "u3@x", Code: 4, Tags: []string{"t3"}},
-	}
-	for i, v := range seed {
-		id := uint64(i + 1)
-		if err := dbBatch.Set(id, cloneUniqueRec(v)); err != nil {
-			t.Fatalf("seed batch Set(%d): %v", id, err)
-		}
-		if err := dbSeq.Set(id, cloneUniqueRec(v)); err != nil {
-			t.Fatalf("seed seq Set(%d): %v", id, err)
-		}
-	}
-	compareState(0)
-
-	type batchOp struct {
-		kind  uint8 // 0=set, 1=patch, 2=delete
-		id    uint64
-		value *UniqueTestRec
-		patch []Field
-	}
-
-	r := rand.New(rand.NewSource(20260325))
-	emailPool := []string{"u0@x", "u1@x", "u2@x", "u3@x", "u4@x", "u5@x", "u6@x", "u7@x", "u8@x", "u9@x"}
-	tagPool := []string{"t0", "t1", "t2", "t3", "t4", "t5"}
-
-	for step := 1; step <= 140; step++ {
-		n := 2 + r.Intn(6)
-		used := make(map[uint64]struct{}, n)
-		ops := make([]batchOp, 0, n)
-
-		for len(ops) < n {
-			id := uint64(1 + r.Intn(idSpace))
-			if _, ok := used[id]; ok {
-				continue
-			}
-			used[id] = struct{}{}
-
-			switch r.Intn(3) {
-			case 0:
-				ops = append(ops, batchOp{
-					kind: 0,
-					id:   id,
-					value: &UniqueTestRec{
-						Email: emailPool[r.Intn(len(emailPool))],
-						Code:  1 + r.Intn(14),
-						Tags: []string{
-							tagPool[r.Intn(len(tagPool))],
-							tagPool[r.Intn(len(tagPool))],
-						},
-					},
-				})
-			case 1:
-				var patch []Field
-				switch r.Intn(3) {
-				case 0:
-					patch = []Field{{Name: "email", Value: emailPool[r.Intn(len(emailPool))]}}
-				case 1:
-					patch = []Field{{Name: "code", Value: 1 + r.Intn(14)}}
-				default:
-					patch = []Field{{Name: "tags", Value: []string{tagPool[r.Intn(len(tagPool))], tagPool[r.Intn(len(tagPool))]}}}
-				}
-				ops = append(ops, batchOp{
-					kind:  1,
-					id:    id,
-					patch: patch,
-				})
-			default:
-				ops = append(ops, batchOp{
-					kind: 2,
-					id:   id,
-				})
-			}
-		}
-
-		reqs := make([]*autoBatchRequest, 0, len(ops))
-		for _, op := range ops {
-			switch op.kind {
-			case 0:
-				val := cloneUniqueRec(op.value)
-				reqs = append(reqs, &autoBatchRequest{
-					op:         autoBatchSet,
-					id:         dataKeyFromID(op.id),
-					setValue:   unsafe.Pointer(val),
-					setPayload: mustEncodeAutoBatchPayload(t, dbBatch, op.value),
-					done:       make(chan error, 1),
-				})
-			case 1:
-				reqs = append(reqs, &autoBatchRequest{
-					op:                 autoBatchPatch,
-					id:                 dataKeyFromID(op.id),
-					patch:              schemaPatchItemsForTest(op.patch...),
-					patchIgnoreUnknown: true,
-					done:               make(chan error, 1),
-				})
-			default:
-				reqs = append(reqs, &autoBatchRequest{
-					op:   autoBatchDelete,
-					id:   dataKeyFromID(op.id),
-					done: make(chan error, 1),
-				})
-			}
-		}
-
-		dbBatch.autoBatcher.executeAutoBatch(reqs)
-
-		batchErrs := make([]error, len(reqs))
-		for i := range reqs {
-			batchErrs[i] = <-reqs[i].done
-		}
-
-		seqErrs := make([]error, len(ops))
-		for i, op := range ops {
-			switch op.kind {
-			case 0:
-				seqErrs[i] = dbSeq.Set(op.id, cloneUniqueRec(op.value))
-			case 1:
-				seqErrs[i] = dbSeq.Patch(op.id, cloneFields(op.patch))
-			default:
-				seqErrs[i] = dbSeq.Delete(op.id)
-			}
-		}
-
-		for i := range ops {
-			if errClass(batchErrs[i]) != errClass(seqErrs[i]) {
-				t.Fatalf(
-					"step=%d op=%d kind=%d id=%d error class mismatch: batch=%v seq=%v",
-					step, i, ops[i].kind, ops[i].id, batchErrs[i], seqErrs[i],
-				)
-			}
-		}
-
-		compareState(step)
-	}
-}
-
 func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{AutoBatchMax: 1})
 
@@ -1170,6 +790,232 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 		if step%17 == 0 || step == steps-1 {
 			checkState(step)
 		}
+	}
+}
+
+func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) {
+	db, _ := openTempDBUint64Unique(t, Options{
+		AnalyzeInterval:   -1,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 256,
+	})
+
+	type modelRec struct {
+		Email string
+		Code  int
+		Tags  []string
+	}
+
+	cloneRec := func(src *UniqueTestRec) modelRec {
+		return modelRec{
+			Email: src.Email,
+			Code:  src.Code,
+			Tags:  slices.Clone(src.Tags),
+		}
+	}
+	makeRec := func(i int) modelRec {
+		tags := []string{"shared", fmt.Sprintf("g-%d", i%5)}
+		if i%3 == 0 {
+			tags = append(tags, "hot")
+		}
+		return modelRec{
+			Email: fmt.Sprintf("shared-%03d@x", i),
+			Code:  1000 + i,
+			Tags:  tags,
+		}
+	}
+	patchFor := func(rec modelRec) []Field {
+		return []Field{
+			{Name: "email", Value: rec.Email},
+			{Name: "code", Value: rec.Code},
+			{Name: "tags", Value: slices.Clone(rec.Tags)},
+		}
+	}
+
+	model := make(map[uint64]modelRec, 48)
+	for i := 1; i <= 12; i++ {
+		id := uint64(i)
+		rec := makeRec(i)
+		if err := db.Set(id, &UniqueTestRec{
+			Email: rec.Email,
+			Code:  rec.Code,
+			Tags:  slices.Clone(rec.Tags),
+		}, NoBatch[uint64, UniqueTestRec]); err != nil {
+			t.Fatalf("seed Set(%d): %v", id, err)
+		}
+		model[id] = rec
+	}
+
+	type event struct {
+		id     uint64
+		delete bool
+		rec    modelRec
+	}
+	var (
+		mu     sync.Mutex
+		events []event
+	)
+	recordCommit := func(_ *bbolt.Tx, id uint64, _, newValue *UniqueTestRec) error {
+		mu.Lock()
+		if newValue == nil {
+			events = append(events, event{id: id, delete: true})
+		} else {
+			events = append(events, event{id: id, rec: cloneRec(newValue)})
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	type op struct {
+		kind  int
+		id    uint64
+		rec   modelRec
+		patch []Field
+	}
+	const opCount = 128
+	ops := make([]op, opCount)
+	for i := range ops {
+		switch i % 8 {
+		case 0:
+			rec := makeRec(2000 + i)
+			rec.Email = model[1].Email
+			ops[i] = op{kind: 0, id: uint64(13 + (i*5)%28), rec: rec}
+		case 1:
+			rec := makeRec(2000 + i)
+			rec.Code = model[1].Code
+			ops[i] = op{kind: 1, id: uint64(2 + (i % 11)), patch: patchFor(rec)}
+		case 2, 5:
+			ops[i] = op{kind: 0, id: uint64(2 + (i*7)%39), rec: makeRec(3000 + i)}
+		case 3, 6:
+			rec := makeRec(3000 + i)
+			ops[i] = op{kind: 1, id: uint64(2 + (i*7)%39), patch: patchFor(rec)}
+		default:
+			ops[i] = op{kind: 2, id: uint64(20 + (i*5)%21)}
+		}
+	}
+
+	before := db.AutoBatchStats()
+	start := make(chan struct{})
+	errCh := make(chan error, len(ops))
+	var wg sync.WaitGroup
+	for i := range ops {
+		op := ops[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			var err error
+			switch op.kind {
+			case 0:
+				rec := UniqueTestRec{
+					Email: op.rec.Email,
+					Code:  op.rec.Code,
+					Tags:  slices.Clone(op.rec.Tags),
+				}
+				err = db.Set(op.id, &rec, BeforeCommit(recordCommit))
+			case 1:
+				err = db.Patch(op.id, op.patch, BeforeCommit(recordCommit))
+			default:
+				err = db.Delete(op.id, BeforeCommit(recordCommit))
+			}
+			if err != nil && !errors.Is(err, ErrUniqueViolation) {
+				errCh <- fmt.Errorf("kind=%d id=%d: %w", op.kind, op.id, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	for i := range events {
+		ev := events[i]
+		if ev.delete {
+			delete(model, ev.id)
+		} else {
+			model[ev.id] = ev.rec
+		}
+	}
+
+	if got, err := db.Count(); err != nil {
+		t.Fatalf("Count: %v", err)
+	} else if got != uint64(len(model)) {
+		t.Fatalf("Count = %d, want %d", got, len(model))
+	}
+
+	byEmail := make(map[string]uint64, len(model))
+	byCode := make(map[int]uint64, len(model))
+	for id, exp := range model {
+		if prev, ok := byEmail[exp.Email]; ok && prev != id {
+			t.Fatalf("model duplicate email %q: ids %d and %d", exp.Email, prev, id)
+		}
+		byEmail[exp.Email] = id
+		if prev, ok := byCode[exp.Code]; ok && prev != id {
+			t.Fatalf("model duplicate code %d: ids %d and %d", exp.Code, prev, id)
+		}
+		byCode[exp.Code] = id
+
+		got, err := db.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", id, err)
+		}
+		if got == nil || got.Email != exp.Email || got.Code != exp.Code || !slices.Equal(got.Tags, exp.Tags) {
+			t.Fatalf("Get(%d) = %#v, want %#v", id, got, exp)
+		}
+
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", exp.Email)))
+		if err != nil {
+			t.Fatalf("QueryKeys(email=%q): %v", exp.Email, err)
+		}
+		if len(ids) != 1 || ids[0] != id {
+			t.Fatalf("email index mismatch for %q: got %v want [%d]", exp.Email, ids, id)
+		}
+		ids, err = db.QueryKeys(qx.Query(qx.EQ("code", exp.Code)))
+		if err != nil {
+			t.Fatalf("QueryKeys(code=%d): %v", exp.Code, err)
+		}
+		if len(ids) != 1 || ids[0] != id {
+			t.Fatalf("code index mismatch for %d: got %v want [%d]", exp.Code, ids, id)
+		}
+	}
+	for id := uint64(1); id <= 40; id++ {
+		if _, ok := model[id]; ok {
+			continue
+		}
+		got, err := db.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", id, err)
+		}
+		if got != nil {
+			t.Fatalf("Get(%d) = %#v, want nil", id, got)
+		}
+	}
+
+	gotHot, err := db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"hot"})))
+	if err != nil {
+		t.Fatalf("QueryKeys(tags has hot): %v", err)
+	}
+	wantHot := make([]uint64, 0, len(model))
+	for id, rec := range model {
+		if slices.Contains(rec.Tags, "hot") {
+			wantHot = append(wantHot, id)
+		}
+	}
+	slices.Sort(gotHot)
+	slices.Sort(wantHot)
+	if !slices.Equal(gotHot, wantHot) {
+		t.Fatalf("hot tag index mismatch: got %v want %v", gotHot, wantHot)
+	}
+
+	after := db.AutoBatchStats()
+	if after.MultiRequestBatches <= before.MultiRequestBatches {
+		t.Fatalf("expected shared auto-batch path, before=%+v after=%+v", before, after)
+	}
+	if after.UniqueRejected <= before.UniqueRejected {
+		t.Fatalf("expected queued unique rejects, before=%+v after=%+v", before, after)
 	}
 }
 

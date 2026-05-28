@@ -11,7 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -486,7 +485,7 @@ func TestBeforeStore_AutoCloneMethod_BatchSet_AllowsNormalizationBeforeEncode(t 
 	}
 }
 
-func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T) {
+func TestBatchSet_BuildErrorDoesNotAffectFollowingWrite(t *testing.T) {
 	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
 
 	err := db.BatchSet(
@@ -500,33 +499,22 @@ func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T
 		t.Fatalf("BatchSet build error = %v, want encode failure", err)
 	}
 
-	req, err := db.buildSetAutoBatchRequest(
-		dataKeyFromID(uint64(3)),
-		&beforeStoreCloneRec{Name: "hooked", Ready: true},
-		nil,
-		testBeforeCommitHooks([]beforeCommitFunc[uint64, beforeStoreCloneRec]{
-			func(_ *bbolt.Tx, _ uint64, _ *beforeStoreCloneRec, _ *beforeStoreCloneRec) error { return nil },
-		}),
-		nil,
-	)
+	calls := 0
+	if err := db.Set(3, &beforeStoreCloneRec{Name: "hooked", Ready: true}, NoBatch[uint64, beforeStoreCloneRec], BeforeCommit(func(_ *bbolt.Tx, _ uint64, _ *beforeStoreCloneRec, _ *beforeStoreCloneRec) error {
+		calls++
+		return nil
+	})); err != nil {
+		t.Fatalf("Set after failed BatchSet: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("beforeCommit calls after failed BatchSet = %d, want 1", calls)
+	}
+	got, err := db.Get(3)
 	if err != nil {
-		t.Fatalf("buildSetAutoBatchRequest after failed BatchSet: %v", err)
+		t.Fatalf("Get(3): %v", err)
 	}
-	defer func() {
-		db.autoBatcher.requestPool.Put(req)
-	}()
-
-	if req.policy != 0 {
-		t.Fatalf("request policy after failed BatchSet = %08b, want 0", req.policy)
-	}
-	if req.canCoalesceSetDelete() {
-		t.Fatal("hooked set request inherited coalescing flag after failed BatchSet")
-	}
-	if req.hasPolicy(autoBatchReqRepeatIDSafeShared) {
-		t.Fatal("hooked set request inherited repeated-id flag after failed BatchSet")
-	}
-	if req.beforeCommit == nil {
-		t.Fatal("beforeCommit hooks were not attached")
+	if got == nil || got.Name != "hooked" || !got.Ready {
+		t.Fatalf("following write stored %#v", got)
 	}
 }
 
@@ -1031,7 +1019,7 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
+func TestTruncate_NoDeadlock_WithConcurrentWriteExecutor(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "truncate_deadlock.db")
 	db, raw := openBoltAndNew[uint64, Rec](t, path)
@@ -1040,27 +1028,19 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	newVal := &Rec{Name: "after", Age: 2}
-	payload := mustEncodeAutoBatchPayload(t, db, newVal)
-
-	req := &autoBatchRequest{
-		op:         autoBatchSet,
-		id:         dataKeyFromID(uint64(1)),
-		setValue:   unsafe.Pointer(newVal),
-		setPayload: payload,
-		done:       make(chan error, 1),
-	}
-
 	// Force lock-order contention window:
 	// 1) truncate goroutine waits on db.mu
-	// 2) executeAutoBatch goroutine acquires writer tx and then waits on db.mu
+	// 2) write executor goroutine acquires writer tx and then waits on db.mu
 	// 3) release db.mu and assert both operations complete.
 	db.mu.Lock()
 	truncateDone := make(chan error, 1)
 	go func() {
 		truncateDone <- db.Truncate()
 	}()
-	go db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req})
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- db.Set(1, &Rec{Name: "after", Age: 2}, NoBatch[uint64, Rec])
+	}()
 	time.Sleep(20 * time.Millisecond)
 	db.mu.Unlock()
 
@@ -1074,12 +1054,12 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	}
 
 	select {
-	case err := <-req.done:
+	case err := <-writeDone:
 		if err != nil {
-			t.Fatalf("executeAutoBatch req error: %v", err)
+			t.Fatalf("write executor error: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("executeAutoBatch timed out (possible deadlock)")
+		t.Fatalf("write executor timed out (possible deadlock)")
 	}
 
 	if err := db.Close(); err != nil {

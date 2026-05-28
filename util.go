@@ -297,8 +297,6 @@ func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
 	return err
 }
 
-var encodePool pooled.Buffers
-
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func closeFile(f *os.File) { _ = f.Close() }
