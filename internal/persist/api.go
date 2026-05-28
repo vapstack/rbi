@@ -57,18 +57,26 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 		bucket: string(cfg.Bucket),
 		size:   -1,
 	}
+	var f *os.File
 	defer func() {
 		if err != nil {
 			result.Storage.Release()
+			result = LoadResult{}
+		}
+	}()
+	defer func() {
+		if f != nil {
+			if closeErr := f.Close(); err == nil && closeErr != nil {
+				err = diag.wrap("close", fmt.Errorf("closing persisted index file: %w", closeErr))
+			}
 		}
 	}()
 	defer recoverLoad(&err, &diag)
 
-	f, err := os.Open(cfg.File)
+	f, err = os.Open(cfg.File)
 	if err != nil {
 		return LoadResult{}, err
 	}
-	defer f.Close()
 
 	if info, statErr := f.Stat(); statErr == nil {
 		diag.size = info.Size()
@@ -98,15 +106,31 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 	return result, nil
 }
 
-func Store(cfg StoreConfig) error {
+func Store(cfg StoreConfig) (err error) {
 	tmpFile := cfg.File + ".temp"
-	defer os.Remove(tmpFile)
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			if removeErr := os.Remove(tmpFile); err == nil && removeErr != nil {
+				err = fmt.Errorf("removing persisted index temp file: %w", removeErr)
+			}
+		}
+	}()
 
 	f, err := os.Create(tmpFile)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			closeErr := f.Close()
+			closed = true
+			if err == nil && closeErr != nil {
+				err = fmt.Errorf("closing persisted index temp file: %w", closeErr)
+			}
+		}
+	}()
 
 	buf := bufio.NewWriterSize(f, 32<<20)
 	if err = storeV26(buf, cfg); err != nil {
@@ -120,14 +144,17 @@ func Store(cfg StoreConfig) error {
 		return fmt.Errorf("syncing persisted index temp file: %w", err)
 	}
 
-	if err = f.Close(); err != nil {
-		return err
+	err = f.Close()
+	closed = true
+	if err != nil {
+		return fmt.Errorf("closing persisted index temp file: %w", err)
 	}
 	if err = os.Rename(tmpFile, cfg.File); err != nil {
 		return err
 	}
+	removeTemp = false
 	if err = syncDir(cfg.File); err != nil {
-		return fmt.Errorf("syncing persisted index directory: %w", err)
+		return err
 	}
 	return nil
 }
@@ -392,7 +419,7 @@ func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []schema.I
 	return out
 }
 
-func syncDir(path string) error {
+func syncDir(path string) (err error) {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -402,8 +429,15 @@ func syncDir(path string) error {
 	}
 	f, err := os.Open(dir)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening persisted index directory: %w", err)
 	}
-	defer f.Close()
-	return f.Sync()
+	defer func() {
+		if closeErr := f.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("closing persisted index directory: %w", closeErr)
+		}
+	}()
+	if err = f.Sync(); err != nil {
+		return fmt.Errorf("syncing persisted index directory: %w", err)
+	}
+	return nil
 }

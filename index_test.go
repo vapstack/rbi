@@ -16,7 +16,6 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qagg"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -152,10 +151,6 @@ func TestPinnedStrMapSnapshotKeepsOriginalMapping(t *testing.T) {
 	if got, ok := indexSnap.StrMap.String(1); !ok || got != "snap-key" {
 		t.Fatalf("strmap snapshot mismatch: got=%q ok=%v want=%q", got, ok, "snap-key")
 	}
-}
-
-func indexTestSingleton(id uint64) posting.List {
-	return (posting.List{}).BuildAdded(id)
 }
 
 func TestIndexPersistence(t *testing.T) {
@@ -2608,12 +2603,6 @@ func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) 
 	q := qx.Query(qx.EQ("score", keycodec.Float64ByteString(42.0)))
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
-}
-
-/**/
-
-func postingConsumerExpected(ids posting.List) []uint64 {
-	return ids.ToArray()
 }
 
 func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {

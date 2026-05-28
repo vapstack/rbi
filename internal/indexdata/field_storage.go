@@ -348,9 +348,9 @@ func storedFieldPosting(ids posting.List) posting.List {
 	return ids
 }
 
-func (ent Entry) borrow() Entry {
-	ent.IDs = ent.IDs.Borrow()
-	return ent
+func (entry Entry) borrow() Entry {
+	entry.IDs = entry.IDs.Borrow()
+	return entry
 }
 
 func copyBorrowedIndexEntries(dst, src []Entry) {
@@ -364,12 +364,6 @@ func appendBorrowedIndexEntries(dst []Entry, src []Entry) []Entry {
 		dst = append(dst, src[i].borrow())
 	}
 	return dst
-}
-
-func copyBorrowedPostingSlice(dst, src []posting.List) {
-	for i := range src {
-		dst[i] = src[i].Borrow()
-	}
 }
 
 func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64) *fieldIndexChunk {
@@ -1977,7 +1971,7 @@ func (b *fieldIndexChunkBuilder) appendPage(page *fieldIndexChunkDirPage) {
 	if b == nil || page == nil || len(page.refs) == 0 {
 		return
 	}
-	if len(page.refs) != fieldIndexDirPageTargetRefs || (b.pendingRefs != nil && len(b.pendingRefs) != 0) {
+	if len(page.refs) != fieldIndexDirPageTargetRefs || len(b.pendingRefs) != 0 {
 		b.appendRefSlice(page, 0, len(page.refs))
 		return
 	}
@@ -1991,7 +1985,7 @@ func (b *fieldIndexChunkBuilder) appendOwnedPage(page *fieldIndexChunkDirPage) {
 	if b == nil || page == nil || len(page.refs) == 0 {
 		return
 	}
-	if b.pendingRefs != nil && len(b.pendingRefs) != 0 {
+	if len(b.pendingRefs) != 0 {
 		b.flushPendingPage()
 	}
 	b.pages = append(b.pages, page)

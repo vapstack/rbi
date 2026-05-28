@@ -5,7 +5,6 @@ import (
 	"math"
 	"reflect"
 	"slices"
-	"sync"
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -15,27 +14,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
-
-func (qv *View) checkUsedQuery(q *qir.Shape) error {
-	if q.HasOrder && qv.fieldMetaByOrder(q.Order) == nil {
-		return fmt.Errorf("no index for field: %v", qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal))
-	}
-	return qv.checkUsedExpr(q.Expr)
-}
-
-func (qv *View) checkUsedExpr(exp qir.Expr) error {
-	if exp.FieldOrdinal >= 0 {
-		if qv.fieldMetaByExpr(exp) == nil {
-			return fmt.Errorf("no index for field: %v", qv.exec.FieldNameByOrdinal(exp.FieldOrdinal))
-		}
-	}
-	for _, op := range exp.Operands {
-		if err := qv.checkUsedExpr(op); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 // evalExpr evaluates a boolean expression tree into a postingResult representation.
 //
@@ -334,19 +312,19 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			}
 			return postingResult{}, nil
 
-		} else {
-			valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
-			if err != nil {
-				return postingResult{}, err
-			}
-			if valsBuf != nil {
-				defer pooled.ReleaseStringSlice(valsBuf)
-			}
-			if !isSlice {
-				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
-			}
-			return qv.evalSliceEQ(fieldName, e.FieldOrdinal, valsBuf)
 		}
+
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		if err != nil {
+			return postingResult{}, err
+		}
+		if valsBuf != nil {
+			defer pooled.ReleaseStringSlice(valsBuf)
+		}
+		if !isSlice {
+			return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
+		}
+		return qv.evalSliceEQ(fieldName, e.FieldOrdinal, valsBuf)
 
 	case qir.OpIN:
 		if f.Slice {
@@ -513,67 +491,6 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 	}
 }
 
-func linearPostingUnionOwned(posts []posting.List) posting.List {
-	bestIdx := 0
-	maxCard := posts[0].Cardinality()
-	for i := 1; i < len(posts); i++ {
-		c := posts[i].Cardinality()
-		if c > maxCard {
-			maxCard = c
-			bestIdx = i
-		}
-	}
-
-	res := posts[bestIdx].Clone()
-	for i, ids := range posts {
-		if i == bestIdx {
-			continue
-		}
-		res = res.BuildOr(ids)
-	}
-	return res.BuildOptimized()
-}
-
-func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
-	n := len(posts)
-
-	workers := 8
-	if n < workers*2 {
-		workers = n / 2
-	}
-	if workers < 2 {
-		return linearPostingUnionOwned(posts)
-	}
-
-	chunkSize := (n + workers - 1) / workers
-	workerCount := (n + chunkSize - 1) / chunkSize
-	resultsBuf := posting.GetSlice(workerCount)[:workerCount]
-	defer posting.ReleaseSlice(resultsBuf)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > n {
-			end = n
-		}
-
-		wg.Add(1)
-		go func(wg *sync.WaitGroup, results []posting.List, idx int, part []posting.List) {
-			results[idx] = linearPostingUnionOwned(part)
-			wg.Done()
-		}(&wg, resultsBuf, i, posts[start:end])
-	}
-
-	wg.Wait()
-
-	final := resultsBuf[0]
-	for i := 1; i < len(resultsBuf); i++ {
-		final = final.BuildMergedOwned(resultsBuf[i])
-	}
-	return final.BuildOptimized()
-}
-
 // evalSliceEQ evaluates equality for slice fields by intersecting member
 // bitmaps, because slice-EQ semantics require full set match.
 //
@@ -698,17 +615,6 @@ func scalarValueToLookupKeyRaw(raw any, v reflect.Value) (keycodec.IndexLookupKe
 		}
 		return keycodec.IndexLookupKey{}, fmt.Errorf("unsupported value type: %v", v.Type())
 	}
-}
-
-func scalarValueToIdxRaw(raw any, v reflect.Value) (string, error) {
-	key, err := scalarValueToLookupKeyRaw(raw, v)
-	if err != nil {
-		return "", err
-	}
-	if key.IsNumeric() {
-		return keycodec.U64ByteString(key.U64()), nil
-	}
-	return key.StringKey(), nil
 }
 
 func signedIntFieldKind(kind reflect.Kind) bool {

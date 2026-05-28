@@ -2,12 +2,13 @@ package rbi
 
 import (
 	"fmt"
-	"github.com/vapstack/qx"
 	"reflect"
 	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vapstack/qx"
 )
 
 func TestRegression_NotInOrderOffset_RouteEquivalence(t *testing.T) {

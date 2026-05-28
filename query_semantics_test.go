@@ -2,9 +2,10 @@ package rbi
 
 import (
 	"fmt"
-	"github.com/vapstack/qx"
 	"strings"
 	"testing"
+
+	"github.com/vapstack/qx"
 )
 
 func TestQueryUnknownFieldReturnsError(t *testing.T) {

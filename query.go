@@ -200,18 +200,6 @@ func (db *DB[K, V]) queryKeysFromIDs(snap *snapshot.View, ids []uint64) []K {
 	return out
 }
 
-// execPreparedQuery skips normalize/field-validation and tracing for internal
-// callers that already operate on validated/normalized QX.
-func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	view := db.engine.exec.AcquireView(snap)
-	defer db.engine.exec.ReleaseView(view)
-
-	return view.PreparedQuery(q)
-}
-
 type queryEngine struct {
 	snapshot               *snapshot.Manager
 	schema                 *schema.Runtime

@@ -1156,7 +1156,7 @@ func (rb *bitmap32) and(x2 *bitmap32) {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1178,20 +1178,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -1211,7 +1213,7 @@ func (rb *bitmap32) andFresh(x2 *bitmap32) *bitmap32 {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1227,20 +1229,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -1260,7 +1264,7 @@ func (rb *bitmap32) andCardinality(x2 *bitmap32) uint64 {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1273,24 +1277,27 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
 			}
+
 		} else {
 			break
 		}
@@ -1305,7 +1312,7 @@ func (rb *bitmap32) intersects(x2 *bitmap32) bool {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1320,24 +1327,27 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
 			}
+
 		} else {
 			break
 		}
@@ -1351,7 +1361,7 @@ func (rb *bitmap32) forEachIntersecting64(base uint64, other *bitmap32, fn func(
 	length1 := rb.highlowcontainer.size()
 	length2 := other.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1366,24 +1376,27 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
 				}
 			}
+
 		} else {
 			break
 		}
@@ -1862,7 +1875,7 @@ func (rb *bitmap32) andNot(x2 *bitmap32) {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1884,10 +1897,11 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					c1 := rb.highlowcontainer.getContainerAtIndex(pos1)
 					rb.highlowcontainer.replaceKeyAndContainerAtIndex(intersectionsize, s1, c1)
@@ -1897,13 +1911,14 @@ main:
 					intersectionsize++
 					pos1++
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -1933,7 +1948,7 @@ func (rb *bitmap32) andNotFresh(x2 *bitmap32) *bitmap32 {
 	length1 := rb.highlowcontainer.size()
 	length2 := x2.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
@@ -1949,25 +1964,28 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					out.highlowcontainer.appendContainer(s1, rb.highlowcontainer.getContainerAtIndex(pos1).retain())
 					pos1++
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
 				}
 			}
+
 		} else {
 			break
 		}

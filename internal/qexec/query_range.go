@@ -1,25 +1,12 @@
 package qexec
 
 import (
-	"reflect"
-
 	"github.com/vapstack/rbi/internal/indexdata"
 
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
 )
-
-func isNumericScalarKind(kind reflect.Kind) bool {
-	switch kind {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
-		return true
-	default:
-		return false
-	}
-}
 
 func (qv *View) numericRangeFieldOrdinal(field string) (int, bool) {
 	acc, ok := qv.exec.Schema.IndexedByName[field]

@@ -2157,7 +2157,6 @@ func (qv *View) orderedORKWayCandidateTraceWork(q *qir.Shape, facts *plannerORFa
 		if plannerMaterializedCacheStateUnretained(cacheState) {
 			nextCost = costMerge * cachePressurePenalty
 			mergeWork.UnretainedRebuildPenalty += nextCost - costMerge
-			costMerge = nextCost
 		}
 	}
 
@@ -2237,7 +2236,7 @@ func (qv *View) orderedORSelectorCacheRoute(q *qir.Shape, facts *plannerORFacts)
 						if merged.first != li {
 							continue
 						}
-						key := qcache.MaterializedPredKey{}
+						var key qcache.MaterializedPredKey
 						if boundsExactStringPrefix(merged.bounds) {
 							prefixExpr := merged.expr
 							prefixExpr.Op = qir.OpPREFIX
@@ -3764,70 +3763,6 @@ func (qv *View) initOrderedORBranchEstimates(branches plannerORBranches, branchU
 		est.probeRows = estimateRowsForNeed(branchNeed, est.card, est.universe)
 		out[i] = est
 	}
-}
-
-func (qv *View) initNoOrderORBranchEstimates(branches plannerORBranches, needWindow int, out *[plannerORBranchLimit]plannerOROrderedBranchEstimate) bool {
-	if out == nil || needWindow <= 0 {
-		return false
-	}
-	*out = [plannerORBranchLimit]plannerOROrderedBranchEstimate{}
-
-	universe := qv.snap.Universe.Cardinality()
-	if universe == 0 {
-		return false
-	}
-
-	var branchCards [plannerORBranchLimit]uint64
-	branchCount := branches.Len()
-	if branchCount > plannerORBranchLimit {
-		branchCount = plannerORBranchLimit
-	}
-	totalCard := uint64(0)
-	for i := 0; i < branchCount; i++ {
-		card := branches.owner[i].estimatedCard(universe)
-		branchCards[i] = card
-		totalCard = satAddUint64(totalCard, card)
-	}
-	if totalCard == 0 {
-		return false
-	}
-
-	need := uint64(needWindow)
-	for i := 0; i < branchCount; i++ {
-		card := branchCards[i]
-		if card == 0 {
-			continue
-		}
-		branchNeed := uint64(math.Ceil(float64(need) * float64(card) / float64(totalCard)))
-		if branchNeed == 0 {
-			branchNeed = 1
-		}
-		if branchNeed > need {
-			branchNeed = need
-		}
-		leadEst := card
-		if branch := branches.owner[i]; branch.hasLead() && branch.preds.owner[branch.leadIdx].estCard > 0 {
-			leadEst = branch.preds.owner[branch.leadIdx].estCard
-		}
-		if leadEst == 0 {
-			leadEst = 1
-		}
-		probeRows := estimateRowsForNeed(branchNeed, card, leadEst)
-		budget := branches.owner[i].noOrderBudget(needWindow)
-		if probeRows < budget {
-			probeRows = budget
-		}
-		if probeRows > leadEst {
-			probeRows = leadEst
-		}
-		out[i] = plannerOROrderedBranchEstimate{
-			need:      branchNeed,
-			card:      card,
-			universe:  universe,
-			probeRows: probeRows,
-		}
-	}
-	return true
 }
 
 func orderedORNextPredicateRows(rows, predCard, branchCard, branchUniverse uint64) uint64 {
@@ -6127,8 +6062,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 	for i := 0; i < branches.Len(); i++ {
 		branch := &branches.owner[i]
 		var covered []bool
-		branchStart := 0
-		branchEnd := ov.KeyCount()
+		var branchStart, branchEnd int
 		branchUniverse := snapshotUniverse
 		reuseAnalysis := analysis != nil && i < analysis.branchCount
 

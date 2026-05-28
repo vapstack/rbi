@@ -83,8 +83,6 @@ type preparedScalarPrefixSpan struct {
 	ov      indexdata.FieldIndexView
 	br      indexdata.FieldIndexRange
 	hasData bool
-	span    int
-	rows    uint64
 }
 
 type preparedScalarIndexSpan struct {
@@ -130,18 +128,6 @@ func isScalarRangeEqOp(op qir.Op) bool {
 
 func isPositiveScalarEqLeaf(e qir.Expr) bool {
 	return !e.Not && e.FieldOrdinal >= 0 && len(e.Operands) == 0 && isScalarEqOp(e.Op)
-}
-
-func allPositiveScalarEqLeaves(leaves []qir.Expr) bool {
-	if len(leaves) == 0 {
-		return false
-	}
-	for _, e := range leaves {
-		if !isPositiveScalarEqLeaf(e) {
-			return false
-		}
-	}
-	return true
 }
 
 func isPositiveScalarPrefixLeaf(e qir.Expr) bool {
@@ -392,32 +378,6 @@ func (qv *View) prepareScalarIndexSpan(e qir.Expr) (preparedScalarIndexSpan, boo
 	}
 	out.hasData = true
 	out.br = out.ov.RangeForBounds(rb)
-	return out, true, nil
-}
-
-func (qv *View) prepareScalarPrefixSpan(e qir.Expr) (preparedScalarPrefixSpan, bool, error) {
-	out, ok, err := qv.prepareScalarPrefixRoute(e)
-	if err != nil || !ok {
-		return preparedScalarPrefixSpan{}, ok, err
-	}
-	if !out.hasData || out.br.Empty() {
-		return out, true, nil
-	}
-
-	cur := out.ov.NewCursor(out.br, false)
-	for {
-		_, ids, ok := cur.Next()
-		if !ok {
-			break
-		}
-		out.span++
-		card := ids.Cardinality()
-		if ^uint64(0)-out.rows < card {
-			out.rows = ^uint64(0)
-		} else {
-			out.rows += card
-		}
-	}
 	return out, true, nil
 }
 

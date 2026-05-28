@@ -105,7 +105,7 @@ func parseProcRollup(path string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)
@@ -128,7 +128,7 @@ func parseProcMapRollup(path, matchPath string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)

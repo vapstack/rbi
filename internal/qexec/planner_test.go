@@ -2439,7 +2439,7 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 			orderOV.KeyCount(),
 		)
 	}
-	if covered := analysis.branches[0].covered; covered != nil && len(covered) != 0 {
+	if covered := analysis.branches[0].covered; len(covered) != 0 {
 		t.Fatalf("expected non-range order predicate branch to keep zero covered leaves, got=%d", len(covered))
 	}
 

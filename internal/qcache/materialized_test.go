@@ -641,7 +641,7 @@ func TestMaterializedPredCache_RetainDrainRetiredAndMaxCardinality(t *testing.T)
 
 	cache.Store(keyA, idsA.Borrow())
 	cache.Store(keyB, idsB.Borrow())
-	if cache.retired == nil || len(cache.retired) == 0 {
+	if len(cache.retired) == 0 {
 		cache.ReleaseRef()
 		t.Fatal("expected evicted entry to be retired before drain")
 	}

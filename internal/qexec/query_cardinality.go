@@ -11,23 +11,21 @@ import (
 )
 
 const (
-	cardinalityPredicateScanMaxLeaves                  = 16
-	cardinalityORPredicateMaxBranchesBase              = 5
-	cardinalityORScalarDisjointMaxBranches             = 8 // Matches the max OR predicate branch limit; keeps disjoint-branch probes on stack.
-	cardinalityORHybridMaterializedBranchMax           = 3
-	cardinalityORSeenUnionThresholdBase                = 64_000
-	cardinalityORSeenUniverseDiv                       = 16
-	cardinalityScalarInSplitMaxValues                  = 32
-	cardinalitySetMaterializeMinTermsBase              = 6
-	cardinalityCustomMaterializeMinProbeBase           = 4_096
-	cardinalityBroadRangeLazyMinCard                   = 65_536
-	cardinalityBroadRangeComplementMaxCard             = 32_768
-	cardinalityBroadRangeComplementMaxCardCap          = 131_072
-	cardinalityBroadRangeComplementFastProbeMin        = 4_096
-	cardinalityBroadRangeComplementFastAvgPerBucketMax = 8
-	cardinalityLeadResidualHasAnyExactMaxTerms         = 4
-	cardinalityLeadResidualHasAnyExactMinCard          = 65_536
-	cardinalityNumericBucketExactMinRows               = 65_536 // Below this, direct lead iteration is cheaper than building bucket postings for exact residual counts.
+	cardinalityPredicateScanMaxLeaves          = 16
+	cardinalityORPredicateMaxBranchesBase      = 5
+	cardinalityORScalarDisjointMaxBranches     = 8 // Matches the max OR predicate branch limit; keeps disjoint-branch probes on stack.
+	cardinalityORHybridMaterializedBranchMax   = 3
+	cardinalityORSeenUnionThresholdBase        = 64_000
+	cardinalityORSeenUniverseDiv               = 16
+	cardinalityScalarInSplitMaxValues          = 32
+	cardinalitySetMaterializeMinTermsBase      = 6
+	cardinalityCustomMaterializeMinProbeBase   = 4_096
+	cardinalityBroadRangeLazyMinCard           = 65_536
+	cardinalityBroadRangeComplementMaxCard     = 32_768
+	cardinalityBroadRangeComplementMaxCardCap  = 131_072
+	cardinalityLeadResidualHasAnyExactMaxTerms = 4
+	cardinalityLeadResidualHasAnyExactMinCard  = 65_536
+	cardinalityNumericBucketExactMinRows       = 65_536 // Below this, direct lead iteration is cheaper than building bucket postings for exact residual counts.
 )
 
 var cardinalityORMaterializedRouteKeys = [4]qcache.MaterializedPredKey{
@@ -2343,17 +2341,6 @@ func cardinalityBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64
 		limit = uint64(cardinalityBroadRangeComplementMaxCardCap)
 	}
 	return limit
-}
-
-func shouldUseFastCardinalityBroadRangeComplementMaterializationForShape(probeLen int, est uint64) bool {
-	if probeLen < cardinalityBroadRangeComplementFastProbeMin || est == 0 {
-		return false
-	}
-	avgPerBucket := est / uint64(probeLen)
-	if avgPerBucket == 0 {
-		avgPerBucket = 1
-	}
-	return avgPerBucket <= cardinalityBroadRangeComplementFastAvgPerBucketMax
 }
 
 func (qv *View) tryMaterializeBroadRangeComplementPredicateForCardinality(p *predicate, leadProbeEst uint64, universe uint64, trace *Trace) bool {

@@ -2,9 +2,6 @@ package rbi
 
 import (
 	"fmt"
-	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/qir"
-	"go.etcd.io/bbolt"
 	"math"
 	"math/rand/v2"
 	"path/filepath"
@@ -14,6 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/qir"
+	"go.etcd.io/bbolt"
 )
 
 type Meta struct {
@@ -181,68 +182,6 @@ func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(
 	flush()
 }
 
-func mustExtractAndLeaves(t testing.TB, e qx.Expr) []qx.Expr {
-	t.Helper()
-	leaves, ok := collectAndLeavesForTest(e)
-	if !ok || len(leaves) == 0 {
-		t.Fatalf("extractAndLeaves failed: ok=%v len=%d", ok, len(leaves))
-	}
-	return leaves
-}
-
-func collectAndLeavesForTest(e qx.Expr) ([]qx.Expr, bool) {
-	switch {
-	case e.Is(qx.KindOP, qx.OpNOT):
-		if len(e.Args) != 1 {
-			return nil, false
-		}
-		child := e.Args[0]
-		if child.Is(qx.KindOP, qx.OpAND) || child.Is(qx.KindOP, qx.OpOR) || child.Is(qx.KindOP, qx.OpNOT) || child.Kind == qx.KindNONE {
-			return nil, false
-		}
-		if child.Kind != qx.KindOP {
-			return nil, false
-		}
-		return []qx.Expr{e}, true
-	case e.Is(qx.KindOP, qx.OpAND):
-		if len(e.Args) == 0 {
-			return nil, false
-		}
-		out := make([]qx.Expr, 0, len(e.Args))
-		for i := range e.Args {
-			leaves, ok := collectAndLeavesForTest(e.Args[i])
-			if !ok {
-				return nil, false
-			}
-			out = append(out, leaves...)
-		}
-		return out, true
-	case e.Kind == qx.KindNONE:
-		return []qx.Expr{e}, true
-	case e.Kind == qx.KindOP:
-		if e.Is(qx.KindOP, qx.OpOR) {
-			return nil, false
-		}
-		return []qx.Expr{e}, true
-	default:
-		return nil, false
-	}
-}
-
-func orderWindowForTest(q *qx.QX) (int, bool) {
-	if q == nil || q.Window.Limit == 0 {
-		return 0, false
-	}
-	need := q.Window.Offset + q.Window.Limit
-	if need < q.Window.Offset {
-		return 0, false
-	}
-	if need > uint64(math.MaxInt) {
-		return 0, false
-	}
-	return int(need), true
-}
-
 func testOrderBasic(field string, desc bool) qx.Order {
 	return qx.Order{By: qx.REF(field), Desc: desc}
 }
@@ -253,20 +192,6 @@ func testOrderByArrayPos(field string, priority []string, desc bool) qx.Order {
 
 func testOrderByArrayCount(field string, desc bool) qx.Order {
 	return qx.Order{By: qx.LEN(field), Desc: desc}
-}
-
-func queryTestOrderField(q *qx.QX) string {
-	if q == nil || len(q.Order) == 0 {
-		return ""
-	}
-	by := q.Order[0].By
-	if by.Kind == qx.KindREF {
-		return by.Name
-	}
-	if by.Kind == qx.KindOP && len(by.Args) > 0 && by.Args[0].Kind == qx.KindREF {
-		return by.Args[0].Name
-	}
-	return ""
 }
 
 func queryTestOrderIsArrayPosOnField(q *qx.QX, field string) bool {
@@ -1668,16 +1593,6 @@ func newUint64QueryContract(t testing.TB, db *DB[uint64, Rec]) queryContract[uin
 		db:        db,
 		reference: expectedKeysUint64,
 		equal:     queryIDsEqual,
-	}
-}
-
-func newStringQueryContract(t testing.TB, db *DB[string, Rec]) queryContract[string] {
-	t.Helper()
-	return queryContract[string]{
-		t:         t,
-		db:        db,
-		reference: expectedKeysString,
-		equal:     queryStringIDsEqual,
 	}
 }
 

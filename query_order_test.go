@@ -3,10 +3,11 @@ package rbi
 import (
 	"errors"
 	"fmt"
-	"github.com/vapstack/qx"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/vapstack/qx"
 )
 
 func TestSort_OrderStability_WithDupValues(t *testing.T) {

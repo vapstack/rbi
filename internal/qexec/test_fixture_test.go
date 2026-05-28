@@ -928,15 +928,6 @@ func tryLimitRoutesForTest(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64
 	return nil, false, nil
 }
 
-func (qe *queryEngine) tryPlan(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return nil, false, err
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().executeOR(&viewQ, trace)
-}
-
 func (qe *queryEngine) tryCandidateLimitRoute(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
@@ -1169,15 +1160,6 @@ func copyBoolBufAndRelease(buf []bool) []bool {
 	return out
 }
 
-func (qe *queryEngine) selectPlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return plannerORNoOrderDecision{}
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().selectPlanORNoOrder(&viewQ, branches)
-}
-
 func (qe *queryEngine) shouldUseOROrderKWayRuntimeFallback(q *qx.QX, branches plannerORBranches, needWindow int) bool {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
@@ -1243,26 +1225,6 @@ func (qe *queryEngine) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) boo
 	return qe.currentQueryViewForTests().shouldUseCandidateOrder(orderView.Order, compiledLeaves)
 }
 
-func (qe *queryEngine) buildPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
-	prepared, compiledLeaves, err := prepareTestExprs(qe, leaves)
-	if err != nil {
-		return nil, false
-	}
-	defer releasePreparedQueriesForTest(prepared)
-	preds, ok := qe.currentQueryViewForTests().buildPredicatesWithMode(compiledLeaves, allowMaterialize)
-	return detachPredicateSetForTests(preds), ok
-}
-
-func (qe *queryEngine) buildCardinalityPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
-	prepared, compiledLeaves, err := prepareTestExprs(qe, leaves)
-	if err != nil {
-		return nil, false
-	}
-	defer releasePreparedQueriesForTest(prepared)
-	preds, ok := qe.currentQueryViewForTests().buildCardinalityPredicatesWithMode(compiledLeaves, allowMaterialize)
-	return detachPredicateSetForTests(preds), ok
-}
-
 func detachPredicateSetForTests(preds predicateSet) []predicate {
 	out := make([]predicate, len(preds.owner))
 	for i := 0; i < len(out); i++ {
@@ -1295,15 +1257,6 @@ func (qe *queryEngine) exprValueToIdxScalar(expr qx.Expr) (string, bool, bool, e
 	return qe.currentQueryViewForTests().exprValueToIdxScalar(compiled)
 }
 
-func (qe *queryEngine) tryFilterCardinalityByPredicates(expr qx.Expr, trace *Trace) (uint64, bool, error) {
-	prepared, compiled, err := prepareTestExpr(qe, expr)
-	if err != nil {
-		return 0, false, err
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().TryFilterCardinalityByPredicates(compiled, trace)
-}
-
 func (qe *queryEngine) extractNoOrderBounds(leaves []qx.Expr) (string, indexdata.Bounds, bool, error) {
 	prepared, compiledLeaves, err := prepareTestExprs(qe, leaves)
 	if err != nil {
@@ -1311,15 +1264,6 @@ func (qe *queryEngine) extractNoOrderBounds(leaves []qx.Expr) (string, indexdata
 	}
 	defer releasePreparedQueriesForTest(prepared)
 	return qe.currentQueryViewForTests().extractNoOrderBounds(compiledLeaves)
-}
-
-func (qe *queryEngine) checkUsedQuery(q *qx.QX) error {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return err
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().checkUsedQuery(&viewQ)
 }
 
 func (qe *queryEngine) evalSimple(e qx.Expr) (postingResult, error) {

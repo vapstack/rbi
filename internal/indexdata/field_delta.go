@@ -1158,7 +1158,7 @@ func applyFieldPostingDiffSorted(base []Entry, deltaKeys []PostingDelta) ([]Entr
 }
 
 func applyFieldPostingDiffSortedBuf(base []Entry, deltaKeys []PostingDelta) ([]Entry, bool) {
-	if deltaKeys == nil || len(deltaKeys) == 0 {
+	if len(deltaKeys) == 0 {
 		return base, true
 	}
 	if len(deltaKeys) == 1 {
@@ -1340,14 +1340,14 @@ func (b *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entry, del
 		return
 	}
 
-	if len(src) == 0 && (deltaKeys == nil || len(deltaKeys) == 0) {
+	if len(src) == 0 && len(deltaKeys) == 0 {
 		return
 	}
 
 	numeric := false
 	if len(src) > 0 {
 		numeric = src[0].Key.IsNumeric()
-	} else if deltaKeys != nil && len(deltaKeys) > 0 {
+	} else if len(deltaKeys) > 0 {
 		numeric = deltaKeys[0].Key.IsNumeric()
 	}
 	out := newFieldIndexChunkStreamBuilder(numeric)
@@ -1752,7 +1752,7 @@ func (r *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta) Fi
 	if r == nil || r.keyCount == 0 {
 		return applyFieldPostingDiffFlatMaybeChunkedBuf(nil, deltaKeys)
 	}
-	if deltaKeys == nil || len(deltaKeys) == 0 {
+	if len(deltaKeys) == 0 {
 		return newChunkedFieldStorage(r)
 	}
 	if len(deltaKeys) == 1 {
@@ -1819,11 +1819,10 @@ func (r *fieldIndexChunkedRoot) rebuildWithOwnedPageRefsReplaced(page int, replR
 	}
 
 	est := r.keyCount - r.pages[page].keyCount()
-	if replRefs != nil {
-		for i := range replRefs {
-			if chunk := replRefs[i].chunk; chunk != nil {
-				est += chunk.keyCount()
-			}
+
+	for i := range replRefs {
+		if chunk := replRefs[i].chunk; chunk != nil {
+			est += chunk.keyCount()
 		}
 	}
 

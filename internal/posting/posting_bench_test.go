@@ -869,9 +869,8 @@ func BenchmarkPostingReleaseMap(b *testing.B) {
 }
 
 var (
-	postingBenchIntSink       int
-	postingBenchUint16Sink    uint16
-	postingBenchContainerSink container16
+	postingBenchIntSink    int
+	postingBenchUint16Sink uint16
 )
 
 func postingBenchBitmapWords(shape string, seed uint64) []uint64 {

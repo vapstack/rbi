@@ -1687,15 +1687,6 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 	return uint64(len(ids))
 }
 
-func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx.Expr) uint64 {
-	t.Helper()
-	ids, err := db.QueryKeys(qx.Query(expr))
-	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	return uint64(len(ids))
-}
-
 func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
 	t.Helper()
 	ids, err := db.QueryKeys(qx.Query(expr))

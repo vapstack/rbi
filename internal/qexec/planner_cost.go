@@ -991,7 +991,7 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 			costFallback *= 1.35
 		}
 	}
-	cacheState := plannerMaterializedCacheDisabled
+	var cacheState plannerMaterializedCacheState
 	eagerBuildWork := uint64(0)
 	cachePressurePenalty := 1.0
 	if cache != nil && q.Offset == 0 && potentialCacheKeys > 0 &&

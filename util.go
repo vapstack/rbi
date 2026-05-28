@@ -6,7 +6,6 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
-	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -298,24 +297,6 @@ func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
 }
 
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
-
-func closeFile(f *os.File) { _ = f.Close() }
-
-func syncDir(path string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	dir := filepath.Dir(path)
-	if dir == "" || dir == "." {
-		dir = "."
-	}
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer closeFile(f)
-	return f.Sync()
-}
 
 func validateBucketName(name string) error {
 	if name == "" {

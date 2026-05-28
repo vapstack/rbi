@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"fmt"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sync"
@@ -771,15 +770,6 @@ var plannerExtSeeded struct {
 	err  error
 }
 
-var (
-	plannerExtCountries = []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland"}
-	plannerExtNames     = []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve"}
-	plannerExtTags      = []string{"go", "db", "java", "rust", "ops"}
-	plannerExtPrefixes  = []string{"FN-", "FN-0", "FN-1", "FN-2", "FN-3", "FN-7", "FN-9", "FN-10", "FN-99"}
-)
-
-const plannerExtPropertyCases = 128
-
 func plannerExtSeedPath(t *testing.T) string {
 	t.Helper()
 
@@ -1113,166 +1103,8 @@ func plannerExtQueryAdversarialNoOrderNegativeResidualOverlap() *qx.QX {
 	)
 }
 
-func plannerExtRandomStrings(r *rand.Rand, pool []string, maxN int, allowDup bool) []string {
-	n := 1 + r.IntN(maxN)
-	out := make([]string, 0, n)
-	if allowDup {
-		for len(out) < n {
-			out = append(out, pool[r.IntN(len(pool))])
-		}
-		return out
-	}
-
-	used := make(map[string]struct{}, n)
-	for len(out) < n {
-		v := pool[r.IntN(len(pool))]
-		if _, ok := used[v]; ok {
-			continue
-		}
-		used[v] = struct{}{}
-		out = append(out, v)
-	}
-	return out
-}
-
-func plannerExtRandomPositiveLeaf(r *rand.Rand, orderField string) qx.Expr {
-	switch r.IntN(10) {
-	case 0:
-		return qx.EQ("country", plannerExtCountries[r.IntN(len(plannerExtCountries))])
-	case 1:
-		return qx.IN("country", plannerExtRandomStrings(r, plannerExtCountries, 3, r.IntN(4) == 0))
-	case 2:
-		return qx.EQ("name", plannerExtNames[r.IntN(len(plannerExtNames))])
-	case 3:
-		return qx.EQ("active", r.IntN(2) == 0)
-	case 4:
-		if r.IntN(2) == 0 {
-			return qx.GTE("age", 18+r.IntN(45))
-		}
-		return qx.LT("age", 20+r.IntN(48))
-	case 5:
-		if r.IntN(2) == 0 {
-			return qx.GTE("score", float64(5*r.IntN(18)))
-		}
-		return qx.LT("score", float64(5+5*r.IntN(19)))
-	case 6:
-		return qx.HASANY("tags", plannerExtRandomStrings(r, plannerExtTags, 3, r.IntN(3) == 0))
-	case 7:
-		return qx.PREFIX("full_name", plannerExtPrefixes[r.IntN(len(plannerExtPrefixes))])
-	case 8:
-		switch orderField {
-		case "age":
-			if r.IntN(2) == 0 {
-				return qx.GTE("age", 18+r.IntN(45))
-			}
-			return qx.LT("age", 20+r.IntN(48))
-		case "score":
-			if r.IntN(2) == 0 {
-				return qx.GTE("score", float64(5*r.IntN(18)))
-			}
-			return qx.LT("score", float64(5+5*r.IntN(19)))
-		case "full_name":
-			if r.IntN(2) == 0 {
-				return qx.PREFIX("full_name", plannerExtPrefixes[r.IntN(len(plannerExtPrefixes))])
-			}
-			return qx.EQ("full_name", fmt.Sprintf("FN-%02d", 1+r.IntN(200)))
-		}
-	}
-	return qx.EQ("country", plannerExtCountries[r.IntN(len(plannerExtCountries))])
-}
-
-func plannerExtRandomLeaf(r *rand.Rand, orderField string, allowNegative bool) qx.Expr {
-	if allowNegative && r.IntN(4) == 0 {
-		switch r.IntN(2) {
-		case 0:
-			return qx.NOTIN("country", plannerExtRandomStrings(r, plannerExtCountries, 3, false))
-		default:
-			return qx.NOTIN("name", plannerExtRandomStrings(r, plannerExtNames, 3, false))
-		}
-	}
-	return plannerExtRandomPositiveLeaf(r, orderField)
-}
-
-func plannerExtRandomBranch(r *rand.Rand, orderField string, allowNegativeOnly bool) qx.Expr {
-	leafCount := 1 + r.IntN(3)
-	ops := make([]qx.Expr, 0, leafCount)
-	positive := 0
-
-	for len(ops) < leafCount {
-		leaf := plannerExtRandomLeaf(r, orderField, true)
-		if !plannerExtExprIsNot(leaf) && plannerExtExprOp(leaf) != qx.OpNOOP {
-			positive++
-		}
-		ops = append(ops, leaf)
-	}
-	if !allowNegativeOnly && positive == 0 {
-		ops = append(ops, plannerExtRandomPositiveLeaf(r, orderField))
-	}
-
-	var out qx.Expr
-	if len(ops) == 1 {
-		out = ops[0]
-	} else {
-		out = qx.AND(ops...)
-	}
-	if r.IntN(3) == 0 {
-		out = wrapExprWithNoise(out, r.IntN(4))
-	}
-	return out
-}
-
-func plannerExtRandomORQuery(
-	t *testing.T,
-	r *rand.Rand,
-	ordered bool,
-	allowNegativeOnly bool,
-	offsetAllowed bool,
-) *qx.QX {
-	t.Helper()
-
-	orderFields := []string{"age", "score", "full_name"}
-
-	for attempt := 0; attempt < 256; attempt++ {
-		orderField := ""
-		if ordered {
-			orderField = orderFields[r.IntN(len(orderFields))]
-		}
-
-		branchCount := 2 + r.IntN(3)
-		ops := make([]qx.Expr, 0, branchCount)
-		for len(ops) < branchCount {
-			ops = append(ops, plannerExtRandomBranch(r, orderField, allowNegativeOnly))
-		}
-
-		q := qx.Query(qx.OR(ops...))
-		if ordered {
-			if r.IntN(2) == 0 {
-				q = q.Sort(orderField, qx.ASC)
-			} else {
-				q = q.Sort(orderField, qx.DESC)
-			}
-		}
-		if offsetAllowed && r.IntN(3) == 0 {
-			q = q.Offset(r.IntN(40))
-		}
-		q = q.Limit(1 + r.IntN(80))
-
-		nq := normalizeQueryForTest(q)
-		if nq.Filter.Is(qx.KindOP, qx.OpOR) && len(nq.Filter.Args) >= 2 {
-			return nq
-		}
-	}
-
-	t.Fatal("failed to generate normalized OR query")
-	return nil
-}
-
 func plannerExtValidateNoOrderWindow(q *qx.QX, got, full []uint64) error {
 	return queryContractValidateNoOrderWindow(q, got, full)
-}
-
-func plannerExtExprIsNot(expr qx.Expr) bool {
-	return expr.Is(qx.KindOP, qx.OpNOT)
 }
 
 func plannerExtExprOp(expr qx.Expr) qx.Op {

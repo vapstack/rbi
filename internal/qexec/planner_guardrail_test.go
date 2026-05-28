@@ -79,10 +79,10 @@ func plannerGuardrailOpenNoOrderORSkewedDB(
 		case id <= 20:
 			rec.Name = "alice"
 			rec.Active = false
-			rec.Meta.Country = "PL"
+			rec.Country = "PL"
 		case id <= 40:
 			rec.Active = false
-			rec.Meta.Country = "DE"
+			rec.Country = "DE"
 		}
 		return rec
 	})

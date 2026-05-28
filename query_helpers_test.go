@@ -16,13 +16,6 @@ func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
 	return qe.exec.FieldNameByOrdinal(ordinal)
 }
 
-func testExprFieldName(qe *queryEngine, expr qir.Expr) string {
-	if qe == nil {
-		return ""
-	}
-	return qe.fieldNameByOrdinal(expr.FieldOrdinal)
-}
-
 func testOrderFieldName(qe *queryEngine, order qir.Order) string {
 	if qe == nil {
 		return ""
@@ -62,27 +55,6 @@ func prepareTestExpr(qe *queryEngine, expr qx.Expr) (*qir.Query, qir.Expr, error
 	return prepared, prepared.Expr, nil
 }
 
-func prepareTestExprs(qe *queryEngine, exprs []qx.Expr) ([]*qir.Query, []qir.Expr, error) {
-	prepared := make([]*qir.Query, 0, len(exprs))
-	out := make([]qir.Expr, 0, len(exprs))
-	for i := range exprs {
-		p, expr, err := prepareTestExpr(qe, exprs[i])
-		if err != nil {
-			releasePreparedQueriesForTest(prepared)
-			return nil, nil, err
-		}
-		prepared = append(prepared, p)
-		out = append(out, detachTestQIRExpr(expr))
-	}
-	return prepared, out, nil
-}
-
-func releasePreparedQueriesForTest(prepared []*qir.Query) {
-	for i := range prepared {
-		prepared[i].Release()
-	}
-}
-
 func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
 	for v.IsValid() {
 		switch v.Kind() {
@@ -96,58 +68,6 @@ func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
 		}
 	}
 	return reflect.Value{}, true
-}
-
-func detachTestQIRExpr(expr qir.Expr) qir.Expr {
-	if len(expr.Operands) == 0 {
-		return expr
-	}
-	out := expr
-	out.Operands = make([]qir.Expr, len(expr.Operands))
-	for i := range expr.Operands {
-		out.Operands[i] = detachTestQIRExpr(expr.Operands[i])
-	}
-	return out
-}
-
-func mustTestQIRExpr(t testing.TB, expr qx.Expr) qir.Expr {
-	t.Helper()
-	prepared, compiled, err := prepareTestExpr(nil, expr)
-	if err != nil {
-		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
-	}
-	compiled = detachTestQIRExpr(compiled)
-	prepared.Release()
-	return compiled
-}
-
-func compileScalarOpForTest(op qx.Op) qir.Op {
-	switch op {
-	case qx.OpEQ:
-		return qir.OpEQ
-	case qx.OpGT:
-		return qir.OpGT
-	case qx.OpGTE:
-		return qir.OpGTE
-	case qx.OpLT:
-		return qir.OpLT
-	case qx.OpLTE:
-		return qir.OpLTE
-	case qx.OpIN:
-		return qir.OpIN
-	case qx.OpHASANY:
-		return qir.OpHASANY
-	case qx.OpHASALL:
-		return qir.OpHASALL
-	case qx.OpPREFIX:
-		return qir.OpPREFIX
-	case qx.OpSUFFIX:
-		return qir.OpSUFFIX
-	case qx.OpCONTAINS:
-		return qir.OpCONTAINS
-	default:
-		panic(fmt.Sprintf("unsupported qx op in test helper: %q", op))
-	}
 }
 
 func (qe *queryEngine) filterCardinalityForTests(expr qx.Expr) (uint64, error) {

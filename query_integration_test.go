@@ -2,11 +2,12 @@ package rbi
 
 import (
 	"fmt"
-	"github.com/vapstack/qx"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/vapstack/qx"
 )
 
 func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {

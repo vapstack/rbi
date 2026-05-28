@@ -198,14 +198,6 @@ func (qv *View) indexedFieldAccessorByOrdinal(ordinal int) (schema.IndexedFieldA
 	return qv.exec.Schema.Indexed[ordinal], true
 }
 
-func (qv *View) fieldMetaByOrdinal(ordinal int) *schema.Field {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
-	if !ok {
-		return nil
-	}
-	return acc.Field
-}
-
 func (qv *View) fieldMeta(field string, ordinal int) *schema.Field {
 	acc, ok := qv.indexedFieldAccessor(field, ordinal)
 	if !ok {
@@ -281,16 +273,6 @@ func (qv *View) fieldIndexViewFromSlotsForOrder(slots []indexdata.FieldStorage, 
 	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *View) hasIndexedFieldOrdinal(ordinal int) bool {
-	_, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
-	return ok
-}
-
-func (qv *View) hasIndexedFieldRef(field string, ordinal int) bool {
-	_, ok := qv.indexedFieldAccessor(field, ordinal)
-	return ok
-}
-
 func (qv *View) hasIndexedFieldForExpr(expr qir.Expr) bool {
 	_, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	return ok
@@ -316,14 +298,6 @@ func (qv *View) isLenZeroComplementOrdinal(ordinal int) bool {
 
 func (qv *View) isLenZeroComplementRef(field string, ordinal int) bool {
 	acc, ok := qv.indexedFieldAccessor(field, ordinal)
-	if !ok {
-		return false
-	}
-	return qv.isLenZeroComplementOrdinal(acc.Ordinal)
-}
-
-func (qv *View) isLenZeroComplementField(field string) bool {
-	acc, ok := qv.indexedFieldAccessorByName(field)
 	if !ok {
 		return false
 	}

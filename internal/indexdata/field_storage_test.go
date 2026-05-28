@@ -146,7 +146,7 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *tes
 	}
 
 	refs := newFieldIndexChunkRefsFromEntries(entries)
-	if refs == nil || len(refs) < 2 {
+	if len(refs) < 2 {
 		t.Fatalf("expected long string entries to split into multiple chunks")
 	}
 	for i := 0; i < len(refs); i++ {
@@ -274,7 +274,7 @@ func TestFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testing.T
 			}
 
 			replRefs := ref.chunk.refsWithInsertedEntry(pos, add)
-			if replRefs == nil || len(replRefs) == 0 {
+			if len(replRefs) == 0 {
 				t.Fatalf("expected replacement refs")
 			}
 			if tc.size+1 <= fieldIndexChunkMaxEntries {

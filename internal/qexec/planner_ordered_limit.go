@@ -10,7 +10,7 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 )
 
-type plannerMaterializedCacheState uint8
+type plannerMaterializedCacheState byte
 
 const (
 	plannerMaterializedCacheDisabled plannerMaterializedCacheState = iota
@@ -155,7 +155,7 @@ func (facts *orderedLimitFacts) Release() {
 	orderedLimitFactsPool.Put(facts)
 }
 
-func (d plannerOrderedLimitDecision) usesBaseCore() bool {
+func (d plannerOrderedLimitDecision) usesBaseCore() bool { // nolint:unused
 	return d.selected.kind.usesBaseCore()
 }
 

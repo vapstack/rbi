@@ -20,6 +20,11 @@ type qaggGroupedOrdinaryMapRec struct {
 	Value  int64 `db:"value"  rbi:"index"`
 }
 
+type qaggGroupedOrdinaryOverflowRec struct {
+	Group int   `db:"group" rbi:"index"`
+	Value int64 `db:"value" rbi:"index"`
+}
+
 type qaggCountDistinctUniqueRec struct {
 	Keep  bool   `db:"keep"  rbi:"index"`
 	Value *int64 `db:"value" rbi:"index"`
@@ -152,6 +157,103 @@ func TestGroupedOrdinaryMapRouteMatchesRecursive(t *testing.T) {
 		t.Fatalf("recursive: %v", err)
 	}
 	requireQaggResultsEqualUnordered(t, selected, recursive)
+}
+
+func TestGroupedOrdinaryByIDSharedFieldOverflowReturnsError(t *testing.T) {
+	rt, err := schema.Compile(reflect.TypeFor[qaggGroupedOrdinaryOverflowRec](), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	execRuntime := qexec.NewRuntime(qexec.Config{Schema: rt})
+	rows := []qaggGroupedOrdinaryOverflowRec{
+		{Group: 1, Value: math.MaxInt64},
+		{Group: 1, Value: 1},
+		{Group: 2, Value: 0},
+	}
+	entries := make([]snapshot.BatchEntry, len(rows))
+	for i := range rows {
+		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
+	}
+	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	view := execRuntime.AcquireView(snap)
+	defer execRuntime.ReleaseView(view)
+
+	prepared, err := Prepare(
+		qx.Group("group").Metrics(qx.SUM("value").AS("sum"), qx.AVG("value").AS("avg")),
+		rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := view.Filter(prepared.filter)
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	defer ids.Release()
+
+	aggExec := aggregateExecutor{snap: snap}
+	decision := selectGroupedAggregate(aggExec.collectGroupedFacts(prepared, ids))
+	if decision.route != aggregateRouteGroupedOrdinaryByID || decision.groupLookup != aggregateGroupLookupOrdinalSlice {
+		t.Fatalf("decision=%+v", decision)
+	}
+	_, err = aggExec.dispatchAggregateRoute(prepared, ids, decision)
+	if err == nil || !strings.Contains(err.Error(), "integer SUM overflow") {
+		t.Fatalf("dispatch err=%v, want integer SUM overflow", err)
+	}
+}
+
+func TestGroupedOrdinaryByIDMapSharedFieldOverflowReturnsError(t *testing.T) {
+	rt, err := schema.Compile(reflect.TypeFor[qaggGroupedOrdinaryOverflowRec](), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	execRuntime := qexec.NewRuntime(qexec.Config{Schema: rt})
+	rows := make([]qaggGroupedOrdinaryOverflowRec, 640)
+	entries := make([]snapshot.BatchEntry, len(rows))
+	for i := range rows {
+		group := i & 63
+		value := int64(i + 2)
+		switch i {
+		case 0:
+			group = 0
+			value = math.MaxInt64
+		case 1:
+			group = 0
+			value = 1
+		}
+		rows[i] = qaggGroupedOrdinaryOverflowRec{Group: group, Value: value}
+		entries[i] = snapshot.BatchEntry{ID: uint64(i+1) * 1_000_000, New: unsafe.Pointer(&rows[i])}
+	}
+	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	view := execRuntime.AcquireView(snap)
+	defer execRuntime.ReleaseView(view)
+
+	prepared, err := Prepare(
+		qx.Group("group").Metrics(qx.SUM("value").AS("sum"), qx.AVG("value").AS("avg")),
+		rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := view.Filter(prepared.filter)
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	defer ids.Release()
+
+	aggExec := aggregateExecutor{snap: snap}
+	decision := selectGroupedAggregate(aggExec.collectGroupedFacts(prepared, ids))
+	if decision.route != aggregateRouteGroupedOrdinaryByID || decision.groupLookup != aggregateGroupLookupMap {
+		t.Fatalf("decision=%+v", decision)
+	}
+	_, err = aggExec.dispatchAggregateRoute(prepared, ids, decision)
+	if err == nil || !strings.Contains(err.Error(), "integer SUM overflow") {
+		t.Fatalf("dispatch err=%v, want integer SUM overflow", err)
+	}
 }
 
 func TestGroupedMeasureLookupRoutesMatchRecursive(t *testing.T) {

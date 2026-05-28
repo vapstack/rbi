@@ -123,10 +123,10 @@ func main() {
 		if err != nil {
 			fatalf("line reader: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		renderer = newRenderer(os.Stdout, reader.Interactive() && isTerminal(int(os.Stdout.Fd())))
-		defer renderer.Close()
+		defer func() { _ = renderer.Close() }()
 	}
 
 	sigCh := make(chan os.Signal, 2)

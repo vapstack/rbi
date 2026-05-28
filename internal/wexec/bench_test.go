@@ -39,7 +39,7 @@ type benchmarkExecutorConfig struct {
 
 var (
 	benchmarkWexecRecPool = pooled.Pointers[benchmarkWexecRec]{Clear: true}
-	benchmarkUniqueErr    = errors.New("unique violation")
+	benchmarkUniqueErr    = errors.New("unique violation") // nolint:staticcheck
 	benchmarkStatsSink    Stats
 	benchmarkUintSink     uint64
 	benchmarkRecordOps    = RecordOps{

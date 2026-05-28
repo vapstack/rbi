@@ -360,6 +360,7 @@ func (ac *containerArray) iorArray(value2 *containerArray) container16 {
 	len1 := value1.getCardinality()
 	len2 := value2.getCardinality()
 	maxPossibleCardinality := len1 + len2
+
 	if maxPossibleCardinality > cap(value1.content) {
 		// doubling the capacity reduces new slice allocations in the case of
 		// repeated calls to iorArray().
@@ -382,9 +383,9 @@ func (ac *containerArray) iorArray(value2 *containerArray) container16 {
 		donor.content = donor.content[:nl]
 		replaceContainerArrayStorage(ac, donor)
 		return ac
-	} else {
-		copy(ac.content[len2:maxPossibleCardinality], ac.content[0:len1])
 	}
+
+	copy(ac.content[len2:maxPossibleCardinality], ac.content[0:len1])
 	nl := union2by2(value1.content[len2:maxPossibleCardinality], value2.content, ac.content)
 	ac.content = ac.content[:nl] // reslice to match actual used capacity
 
@@ -595,10 +596,10 @@ func (ac *containerArray) iandNotRun(rc *containerRun) container16 {
 		ac.content = ac.content[:0]
 		return ac
 	}
-	current_run := 0
+	currentRun := 0
 	// All values in [start_run, end_end] are part of the run
-	start_run := rc.iv[current_run].start
-	end_end := start_run + rc.iv[current_run].length
+	startRun := rc.iv[currentRun].start
+	endEnd := startRun + rc.iv[currentRun].length
 	// We are going to read values in the array at index i, and we are
 	// going to write them at index pos. So we do in-place processing.
 	// We always have that pos <= i by construction. So we can either
@@ -606,20 +607,23 @@ func (ac *containerArray) iandNotRun(rc *containerRun) container16 {
 	pos := 0
 	i := 0
 	for ; i < len(ac.content); i++ {
-		if ac.content[i] < start_run {
+		if ac.content[i] < startRun {
 			// the value in the array appears before the run [start_run, end_end]
 			ac.content[pos] = ac.content[i]
 			pos++
-		} else if ac.content[i] <= end_end {
+
+		} else if ac.content[i] <= endEnd {
 			// nothing to do, the value is in the array but also in the run.
+
 		} else {
 			// We have the value in the array after the run. We cannot tell
 			// whether we need to keep it or not. So let us move to another run.
-			if current_run+1 < len(rc.iv) {
-				current_run++
-				start_run = rc.iv[current_run].start
-				end_end = start_run + rc.iv[current_run].length
+			if currentRun+1 < len(rc.iv) {
+				currentRun++
+				startRun = rc.iv[currentRun].start
+				endEnd = startRun + rc.iv[currentRun].length
 				i-- // retry with the same i
+
 			} else {
 				// We have exhausted the number of runs. We can keep the rest of the values
 				// from i to len(ac.content) - 1 inclusively.
@@ -865,10 +869,9 @@ func (ac *containerArray) numberOfRuns() (nr int) {
 				}
 				if cur == prev {
 					panic("the fundamental containerArray assumption of deduplicated content was broken")
-				} else {
-					nr++
-					runlen = 0
 				}
+				nr++
+				runlen = 0
 			}
 		}
 		nr++

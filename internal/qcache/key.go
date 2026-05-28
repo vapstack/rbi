@@ -579,9 +579,7 @@ func MaterializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []stri
 		op:    op,
 	}
 	key.setValueCnt = uint8(len(vals))
-	for i, v := range vals {
-		key.setTerms[i] = v
-	}
+	copy(key.setTerms[:], vals)
 	if includeNil {
 		key.flags |= materializedPredKeySetHasNil
 	}

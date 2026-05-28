@@ -2,11 +2,11 @@ package qexec
 
 import (
 	"fmt"
-	"github.com/vapstack/rbi/internal/indexdata"
 	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/snapshot"
 )

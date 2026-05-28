@@ -519,7 +519,7 @@ func (lp *largePosting) and(other *largePosting) {
 	length1 := lp.highlowcontainer.size()
 	length2 := other.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := lp.highlowcontainer.getKeyAtIndex(pos1)
@@ -546,20 +546,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = lp.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -579,7 +581,7 @@ func (lp *largePosting) andCardinality(other *largePosting) uint64 {
 	length1 := lp.highlowcontainer.size()
 	length2 := other.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := lp.highlowcontainer.getKeyAtIndex(pos1)
@@ -592,20 +594,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = lp.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -623,7 +627,7 @@ func (lp *largePosting) intersects(other *largePosting) bool {
 	length1 := lp.highlowcontainer.size()
 	length2 := other.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := lp.highlowcontainer.getKeyAtIndex(pos1)
@@ -638,20 +642,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = lp.highlowcontainer.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -695,7 +701,7 @@ func forEachLargeArrayIntersecting(left, right *largeArray, fn func(uint64) bool
 	length1 := left.size()
 	length2 := right.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := left.getKeyAtIndex(pos1)
@@ -710,20 +716,22 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = left.getKeyAtIndex(pos1)
 					s2 = right.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					pos1 = left.advanceUntil(s2, pos1)
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = left.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = right.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = right.getKeyAtIndex(pos2)
 				}
@@ -809,7 +817,7 @@ func (lp *largePosting) andNot(other *largePosting) {
 	length1 := lp.highlowcontainer.size()
 	length2 := other.highlowcontainer.size()
 
-main:
+OUTER:
 	for {
 		if pos1 < length1 && pos2 < length2 {
 			s1 := lp.highlowcontainer.getKeyAtIndex(pos1)
@@ -836,10 +844,11 @@ main:
 					pos1++
 					pos2++
 					if pos1 == length1 || pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+
 				} else if s1 < s2 {
 					c1 := lp.highlowcontainer.getContainerAtIndex(pos1)
 					lp.highlowcontainer.replaceKeyAndContainerAtIndex(outSize, s1, c1)
@@ -849,13 +858,14 @@ main:
 					outSize++
 					pos1++
 					if pos1 == length1 {
-						break main
+						break OUTER
 					}
 					s1 = lp.highlowcontainer.getKeyAtIndex(pos1)
+
 				} else {
 					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
 					if pos2 == length2 {
-						break main
+						break OUTER
 					}
 					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
 				}
@@ -937,7 +947,7 @@ func (it *largeIterator) AdvanceIfNeeded(minval uint64) {
 	it.advanceIfNeeded(minval)
 }
 
-func (it *largeIterator) initialize(lp *largePosting) {
+func (it *largeIterator) initialize(lp *largePosting) { // nolint:unused
 	it.initializeSnapshot(lp)
 	it.init()
 }

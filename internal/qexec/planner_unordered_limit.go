@@ -111,7 +111,7 @@ func (facts *noOrderLimitFacts) Release() {
 	noOrderLimitFactsPool.Put(facts)
 }
 
-func (d plannerNoOrderLimitDecision) selectedKind() plannerNoOrderLimitCandidateKind {
+func (d plannerNoOrderLimitDecision) selectedKind() plannerNoOrderLimitCandidateKind { // nolint:unused
 	return d.selected.kind
 }
 

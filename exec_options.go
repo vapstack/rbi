@@ -12,12 +12,6 @@ import (
 
 var errCloneNil = errors.New("clone returned nil")
 
-type (
-	beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
-	beforeStoreFunc[K ~string | ~uint64, V any]   = func(key K, oldValue, newValue *V) error
-	beforeCommitFunc[K ~string | ~uint64, V any]  = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
-)
-
 type execOptions[K ~string | ~uint64, V any] struct {
 	beforeProcess []wexec.BeforeProcessHook
 	beforeStore   []wexec.BeforeStoreHook

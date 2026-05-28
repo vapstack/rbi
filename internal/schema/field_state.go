@@ -761,9 +761,8 @@ func collectFieldBatchLenDiff(fieldDelta *indexdata.LenPostingDiff, idx uint64, 
 		return fieldDelta, false
 	}
 
-	var changed bool
-
 	if !useZeroComplement {
+		var changed bool
 		if diff.oldExists {
 			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.oldLen, false)
 			changed = true
@@ -778,22 +777,18 @@ func collectFieldBatchLenDiff(fieldDelta *indexdata.LenPostingDiff, idx uint64, 
 	if diff.oldExists {
 		if diff.oldLen > 0 {
 			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.oldLen, false)
-			changed = true
 		}
 		if diff.oldLen > 0 && (!diff.newExists || diff.newLen == 0) {
 			fieldDelta = indexdata.AddLenPostingNonEmpty(fieldDelta, idx, false)
-			changed = true
 		}
 	}
 
 	if diff.newExists {
 		if diff.newLen > 0 {
 			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.newLen, true)
-			changed = true
 		}
 		if diff.newLen > 0 && (!diff.oldExists || diff.oldLen == 0) {
 			fieldDelta = indexdata.AddLenPostingNonEmpty(fieldDelta, idx, true)
-			changed = true
 		}
 	}
 

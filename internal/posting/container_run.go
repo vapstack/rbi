@@ -598,27 +598,25 @@ func (rc *containerRun) union(b *containerRun) *containerRun {
 	// finish by merging anything remaining into merged we can:
 	if mergedUsed {
 		if !aDone {
-		aAdds:
 			for na < alim {
 				cura = rc.iv[na]
 				if canMerge16(cura, merged) {
 					merged = mergeInterval16s(cura, merged)
 					na = rc.indexOfIntervalAtOrAfter(int(merged.last())+1, na+1)
 				} else {
-					break aAdds
+					break
 				}
 			}
 		}
 
 		if !bDone {
-		bAdds:
 			for nb < blim {
 				curb = b.iv[nb]
 				if canMerge16(curb, merged) {
 					merged = mergeInterval16s(curb, merged)
 					nb = b.indexOfIntervalAtOrAfter(int(merged.last())+1, nb+1)
 				} else {
-					break bAdds
+					break
 				}
 			}
 		}
@@ -673,7 +671,7 @@ func (rc *containerRun) intersect(b *containerRun) *containerRun {
 	var leftoverstart int
 	var isOverlap, isLeftoverA, isLeftoverB bool
 	var done bool
-toploop:
+LOOP:
 	for acuri < numa && bcuri < numb {
 
 		isOverlap, isLeftoverA, isLeftoverB, leftoverstart, intersection = intersectWithLeftover16(astart, int(a.iv[acuri].last()), bstart, int(b.iv[bcuri].last()))
@@ -683,17 +681,18 @@ toploop:
 			case astart < bstart:
 				acuri, done = a.findNextIntervalThatIntersectsStartingFrom(acuri+1, bstart)
 				if done {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
 
 			case astart > bstart:
 				bcuri, done = b.findNextIntervalThatIntersectsStartingFrom(bcuri+1, astart)
 				if done {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
 			}
+
 		} else {
 			// isOverlap
 			if output == nil {
@@ -704,6 +703,7 @@ toploop:
 				output.iv = output.iv[:0]
 			}
 			output.iv = append(output.iv, intersection)
+
 			switch {
 			case isLeftoverA:
 				// note that we change astart without advancing acuri,
@@ -711,37 +711,39 @@ toploop:
 				astart = leftoverstart
 				bcuri++
 				if bcuri >= numb {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
+
 			case isLeftoverB:
 				// note that we change bstart without advancing bcuri,
 				// since we need to capture any 2ndary intersections with b.iv[bcuri]
 				bstart = leftoverstart
 				acuri++
 				if acuri >= numa {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
+
 			default:
 				// neither had leftover, both completely consumed
 
 				// advance to next a interval
 				acuri++
 				if acuri >= numa {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
 
 				// advance to next b interval
 				bcuri++
 				if bcuri >= numb {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
 			}
 		}
-	} // end for toploop
+	}
 
 	if output == nil {
 		return getRunContainer()
@@ -779,7 +781,7 @@ func (rc *containerRun) intersectCardinality(b *containerRun) int {
 	var isOverlap, isLeftoverA, isLeftoverB bool
 	var done bool
 	pass := 0
-toploop:
+LOOP:
 	for acuri < numa && bcuri < numb {
 		pass++
 
@@ -790,20 +792,22 @@ toploop:
 			case astart < bstart:
 				acuri, done = a.findNextIntervalThatIntersectsStartingFrom(acuri+1, bstart)
 				if done {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
 
 			case astart > bstart:
 				bcuri, done = b.findNextIntervalThatIntersectsStartingFrom(bcuri+1, astart)
 				if done {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
 			}
+
 		} else {
 			// isOverlap
 			answer += int(intersection.last()) - int(intersection.start) + 1
+
 			switch {
 			case isLeftoverA:
 				// note that we change astart without advancing acuri,
@@ -811,37 +815,39 @@ toploop:
 				astart = leftoverstart
 				bcuri++
 				if bcuri >= numb {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
+
 			case isLeftoverB:
 				// note that we change bstart without advancing bcuri,
 				// since we need to capture any 2ndary intersections with b.iv[bcuri]
 				bstart = leftoverstart
 				acuri++
 				if acuri >= numa {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
+
 			default:
 				// neither had leftover, both completely consumed
 
 				// advance to next a interval
 				acuri++
 				if acuri >= numa {
-					break toploop
+					break LOOP
 				}
 				astart = int(a.iv[acuri].start)
 
 				// advance to next b interval
 				bcuri++
 				if bcuri >= numb {
-					break toploop
+					break LOOP
 				}
 				bstart = int(b.iv[bcuri].start)
 			}
 		}
-	} // end for toploop
+	}
 
 	return answer
 }
@@ -1821,12 +1827,12 @@ func (rc *containerRun) andArrayCardinality(ac *containerArray) int {
 		return 0 // won't happen in actual code
 	}
 	v := ac.content[pos]
-mainloop:
+OUTER:
 	for _, p := range rc.iv {
 		for v < p.start {
 			pos++
 			if pos == maxpos {
-				break mainloop
+				break OUTER
 			}
 			v = ac.content[pos]
 		}
@@ -1834,7 +1840,7 @@ mainloop:
 			answer++
 			pos++
 			if pos == maxpos {
-				break mainloop
+				break OUTER
 			}
 			v = ac.content[pos]
 		}

@@ -389,14 +389,6 @@ func snapshotExtOptions() Options {
 	}
 }
 
-func snapshotExtPosting(ids ...uint64) posting.List {
-	var out posting.List
-	for _, id := range ids {
-		out = out.BuildAdded(id)
-	}
-	return out
-}
-
 func snapshotExtFieldContainsID(tb testing.TB, s *snapshot.View, field, key string, id uint64) bool {
 	tb.Helper()
 	return s.FieldLookupPostingRetained(field, key).Contains(id)
@@ -1040,14 +1032,6 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 	}
 }
 
-func assertPostingConsumerSet(t *testing.T, got posting.List, want []uint64) {
-	t.Helper()
-	gotIDs := got.ToArray()
-	if !slices.Equal(gotIDs, want) {
-		t.Fatalf("posting mismatch: got=%v want=%v", gotIDs, want)
-	}
-}
-
 /**/
 
 func TestSnapshotExt_PinCurrentViewTracksReaderPinsAcrossPublish(t *testing.T) {
@@ -1147,56 +1131,6 @@ func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testin
 	}
 }
 
-func snapshotTestIndexedFieldByName(
-	index map[string]indexdata.FieldStorage,
-	nilIndex map[string]indexdata.FieldStorage,
-	lenIndex map[string]indexdata.FieldStorage,
-	lenZeroComplement map[string]bool,
-) map[string]schema.IndexedFieldAccessor {
-	keys := make([]string, 0, len(index)+len(nilIndex)+len(lenIndex)+len(lenZeroComplement))
-	seen := make(map[string]struct{}, cap(keys))
-	add := func(name string) {
-		if _, ok := seen[name]; ok {
-			return
-		}
-		seen[name] = struct{}{}
-		keys = append(keys, name)
-	}
-	for name := range index {
-		add(name)
-	}
-	for name := range nilIndex {
-		add(name)
-	}
-	for name := range lenIndex {
-		add(name)
-	}
-	for name := range lenZeroComplement {
-		add(name)
-	}
-	slices.Sort(keys)
-	out := make(map[string]schema.IndexedFieldAccessor, len(keys))
-	for i, name := range keys {
-		out[name] = schema.IndexedFieldAccessor{
-			Ordinal: i,
-			Name:    name,
-			Field:   &schema.Field{Slice: lenIndex[name].KeyCount() > 0 || lenZeroComplement[name]},
-		}
-	}
-	return out
-}
-
-func snapshotTestFieldIndexSlots(
-	src map[string]indexdata.FieldStorage,
-	byName map[string]schema.IndexedFieldAccessor,
-) []indexdata.FieldStorage {
-	out := indexdata.GetFieldStorageSlice(len(byName))[:len(byName)]
-	for name, storage := range src {
-		out[byName[name].Ordinal] = storage
-	}
-	return out
-}
-
 func snapshotTestBoolSlots(src map[string]bool, byName map[string]schema.IndexedFieldAccessor) []bool {
 	out := pooled.GetBoolSlice(len(byName))[:len(byName)]
 	clear(out)
@@ -1206,22 +1140,6 @@ func snapshotTestBoolSlots(src map[string]bool, byName map[string]schema.Indexed
 		}
 	}
 	return out
-}
-
-func snapshotTestNewSnapshot(
-	index map[string]indexdata.FieldStorage,
-	nilIndex map[string]indexdata.FieldStorage,
-	lenIndex map[string]indexdata.FieldStorage,
-	lenZeroComplement map[string]bool,
-) *snapshot.View {
-	byName := snapshotTestIndexedFieldByName(index, nilIndex, lenIndex, lenZeroComplement)
-	return &snapshot.View{
-		Index:              snapshotTestFieldIndexSlots(index, byName),
-		NilIndex:           snapshotTestFieldIndexSlots(nilIndex, byName),
-		LenIndex:           snapshotTestFieldIndexSlots(lenIndex, byName),
-		LenZeroComplement:  snapshotTestBoolSlots(lenZeroComplement, byName),
-		IndexedFieldByName: byName,
-	}
 }
 
 func snapshotTestLenZeroComplementField(s *snapshot.View, name string) bool {

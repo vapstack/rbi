@@ -32,10 +32,6 @@ func testStrMapSnapshotCount(snap *strmap.Snapshot) int {
 	return count
 }
 
-func dataKeyFromID[K ~string | ~uint64](id K) keycodec.DataKey {
-	return keycodec.DataKeyFromUserKey(id, reflect.TypeFor[K]().Kind() == reflect.String)
-}
-
 func TestAutoBatchMissingBucketRollsBackWriteTx(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {

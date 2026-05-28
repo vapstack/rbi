@@ -918,30 +918,29 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 				posting:  ids,
 				estCard:  ids.Cardinality(),
 			}, true
+		}
 
-		} else {
-			ids := lookupScalarPostingRetained(ov, key)
-			if e.Not {
-				if ids.IsEmpty() {
-					return predicate{expr: e, alwaysTrue: true}, true
-				}
-				return predicate{
-					expr:    e,
-					kind:    predicateKindPostingNot,
-					posting: ids,
-				}, true
-			}
+		ids := lookupScalarPostingRetained(ov, key)
+		if e.Not {
 			if ids.IsEmpty() {
-				return predicate{expr: e, alwaysFalse: true}, true
+				return predicate{expr: e, alwaysTrue: true}, true
 			}
 			return predicate{
-				expr:     e,
-				kind:     predicateKindPosting,
-				iterKind: predicateIterPosting,
-				posting:  ids,
-				estCard:  ids.Cardinality(),
+				expr:    e,
+				kind:    predicateKindPostingNot,
+				posting: ids,
 			}, true
 		}
+		if ids.IsEmpty() {
+			return predicate{expr: e, alwaysFalse: true}, true
+		}
+		return predicate{
+			expr:     e,
+			kind:     predicateKindPosting,
+			iterKind: predicateIterPosting,
+			posting:  ids,
+			estCard:  ids.Cardinality(),
+		}, true
 	}
 
 	if !isSlice {
@@ -1564,10 +1563,6 @@ func (qv *View) materializedPredComplementKeyForScalar(field string, op qir.Op, 
 		return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
 	}
 	return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
-}
-
-func (qv *View) materializedPredComplementCacheKeyForScalar(field string, op qir.Op, key string) string {
-	return qv.materializedPredComplementKeyForScalar(field, op, key).String()
 }
 
 func (qv *View) materializedPredKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) qcache.MaterializedPredKey {

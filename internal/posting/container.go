@@ -864,32 +864,25 @@ func exclusiveUnion2by2(set1 []uint16, set2 []uint16, buffer []uint16) int {
 	return pos
 }
 
-func intersection2by2(
-	set1 []uint16,
-	set2 []uint16,
-	buffer []uint16,
-) int {
+func intersection2by2(set1, set2, buffer []uint16) int {
 	if len(set1)*64 < len(set2) {
 		return onesidedgallopingintersect2by2(set1, set2, buffer)
+
 	} else if len(set2)*64 < len(set1) {
 		return onesidedgallopingintersect2by2(set2, set1, buffer)
-	} else {
-		return localintersect2by2(set1, set2, buffer)
 	}
+	return localintersect2by2(set1, set2, buffer)
 }
 
 // intersection2by2Cardinality computes the cardinality of the intersection
-func intersection2by2Cardinality(
-	set1 []uint16,
-	set2 []uint16,
-) int {
+func intersection2by2Cardinality(set1, set2 []uint16) int {
 	if len(set1)*64 < len(set2) {
 		return onesidedgallopingintersect2by2Cardinality(set1, set2)
+
 	} else if len(set2)*64 < len(set1) {
 		return onesidedgallopingintersect2by2Cardinality(set2, set1)
-	} else {
-		return localintersect2by2Cardinality(set1, set2)
 	}
+	return localintersect2by2Cardinality(set1, set2)
 }
 
 // intersects2by2 computes whether the two sets intersect
@@ -905,14 +898,14 @@ func intersects2by2(
 	index2 := 0
 	value1 := set1[index1]
 	value2 := set2[index2]
-mainwhile:
+OUTER:
 	for {
 
 		if value2 < value1 {
 			for {
 				index2++
 				if index2 == len(set2) {
-					break mainwhile
+					break OUTER
 				}
 				value2 = set2[index2]
 				if value2 >= value1 {
@@ -924,7 +917,7 @@ mainwhile:
 			for {
 				index1++
 				if index1 == len(set1) {
-					break mainwhile
+					break OUTER
 				}
 				value1 = set1[index1]
 				if value1 >= value2 {
@@ -939,11 +932,7 @@ mainwhile:
 	return false
 }
 
-func localintersect2by2(
-	set1 []uint16,
-	set2 []uint16,
-	buffer []uint16,
-) int {
+func localintersect2by2(set1, set2, buffer []uint16) int {
 	if (len(set1) == 0) || (len(set2) == 0) {
 		return 0
 	}
@@ -953,13 +942,13 @@ func localintersect2by2(
 	buffer = buffer[:cap(buffer)]
 	s1 := set1[k1]
 	s2 := set2[k2]
-mainwhile:
+OUTER:
 	for {
 		if s2 < s1 {
 			for {
 				k2++
 				if k2 == len(set2) {
-					break mainwhile
+					break OUTER
 				}
 				s2 = set2[k2]
 				if s2 >= s1 {
@@ -971,7 +960,7 @@ mainwhile:
 			for {
 				k1++
 				if k1 == len(set1) {
-					break mainwhile
+					break OUTER
 				}
 				s1 = set1[k1]
 				if s1 >= s2 {
@@ -1010,13 +999,13 @@ func localintersect2by2Cardinality(
 	pos := 0
 	value1 := set1[index1]
 	value2 := set2[index2]
-mainwhile:
+OUTER:
 	for {
 		if value2 < value1 {
 			for {
 				index2++
 				if index2 == len(set2) {
-					break mainwhile
+					break OUTER
 				}
 				value2 = set2[index2]
 				if value2 >= value1 {
@@ -1024,17 +1013,19 @@ mainwhile:
 				}
 			}
 		}
+
 		if value1 < value2 {
 			for {
 				index1++
 				if index1 == len(set1) {
-					break mainwhile
+					break OUTER
 				}
 				value1 = set1[index1]
 				if value1 >= value2 {
 					break
 				}
 			}
+
 		} else {
 			// (set2[k2] == set1[k1])
 			pos++
@@ -1122,20 +1113,19 @@ func onesidedgallopingintersect2by2(
 	pos := 0
 	s1 := largeset[k1]
 	s2 := smallset[k2]
-mainwhile:
 
 	for {
 		if s1 < s2 {
 			k1 = advanceUntil(largeset, k1, len(largeset), s2)
 			if k1 == len(largeset) {
-				break mainwhile
+				break
 			}
 			s1 = largeset[k1]
 		}
 		if s2 < s1 {
 			k2++
 			if k2 == len(smallset) {
-				break mainwhile
+				break
 			}
 			s2 = smallset[k2]
 		} else {
@@ -1149,7 +1139,7 @@ mainwhile:
 			s2 = smallset[k2]
 			k1 = advanceUntil(largeset, k1, len(largeset), s2)
 			if k1 == len(largeset) {
-				break mainwhile
+				break
 			}
 			s1 = largeset[k1]
 		}
@@ -1170,20 +1160,18 @@ func onesidedgallopingintersect2by2Cardinality(
 	pos := 0
 	s1 := largeset[k1]
 	s2 := smallset[k2]
-mainwhile:
-
 	for {
 		if s1 < s2 {
 			k1 = advanceUntil(largeset, k1, len(largeset), s2)
 			if k1 == len(largeset) {
-				break mainwhile
+				break
 			}
 			s1 = largeset[k1]
 		}
 		if s2 < s1 {
 			k2++
 			if k2 == len(smallset) {
-				break mainwhile
+				break
 			}
 			s2 = smallset[k2]
 		} else {
@@ -1196,7 +1184,7 @@ mainwhile:
 			s2 = smallset[k2]
 			k1 = advanceUntil(largeset, k1, len(largeset), s2)
 			if k1 == len(largeset) {
-				break mainwhile
+				break
 			}
 			s1 = largeset[k1]
 		}

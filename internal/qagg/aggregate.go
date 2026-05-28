@@ -651,9 +651,9 @@ func prepareAggregateMetricField(rt *schema.Runtime, name string, op aggregateMe
 	kind := aggregateFieldValueKind(acc.Field)
 	if op == aggregateMetricSum || op == aggregateMetricAvg {
 		if acc.Field.UseVI ||
-			!(isAggregateSignedKind(acc.Field.Kind) ||
-				isAggregateUnsignedKind(acc.Field.Kind) ||
-				isAggregateFloatKind(acc.Field.Kind)) {
+			(!isAggregateSignedKind(acc.Field.Kind) &&
+				!isAggregateUnsignedKind(acc.Field.Kind) &&
+				!isAggregateFloatKind(acc.Field.Kind)) {
 			return aggregateFieldRef{}, fmt.Errorf("%w: %s requires numeric field %q", qexec.ErrInvalidQuery, aggregateMetricOpName(op), name)
 		}
 	}
@@ -899,16 +899,17 @@ func (ae *aggregateExecutor) executeDistinctAggregate(metric aggregateMetric, id
 
 	rowCap := min(uint64(keyCount)+1, filterCardinality+1)
 	singleBuckets := uint64(keyCount) > rowCap && ov.Rows() == uint64(keyCount)
+
 	if rowCap < 64 {
 		rows := make([]Row, 0)
 		ae.appendDistinctRows(&rows, nil, metric.field.ordinary, ids, ov, nilIDs, filterCardinality, universe, singleBuckets)
 		return Result{Layout: []string{metric.out}, Rows: rows}, nil
-	} else {
-		rows := make([]Row, 0, int(rowCap))
-		values := make([]Value, 0, int(rowCap))
-		ae.appendDistinctRows(&rows, &values, metric.field.ordinary, ids, ov, nilIDs, filterCardinality, universe, singleBuckets)
-		return Result{Layout: []string{metric.out}, Rows: rows}, nil
 	}
+
+	rows := make([]Row, 0, int(rowCap))
+	values := make([]Value, 0, int(rowCap))
+	ae.appendDistinctRows(&rows, &values, metric.field.ordinary, ids, ov, nilIDs, filterCardinality, universe, singleBuckets)
+	return Result{Layout: []string{metric.out}, Rows: rows}, nil
 }
 
 func (ae *aggregateExecutor) executeCountDistinctAggregate(metric aggregateMetric, ids posting.List) (Result, error) {
@@ -1352,29 +1353,35 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByID(
 			stateBase := groupIndex * len(q.metrics)
 			var value Value
 			valueReady := false
+		LOOP:
 			for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
 				if !aggregateMetricsShareOrdinaryField(q.metrics[first], q.metrics[metricIdx]) {
 					continue
 				}
 				state := &states[stateBase+metricIdx]
+
 				switch state.metric.op {
+
 				case aggregateMetricCount:
 					state.count++
 					state.seen = true
+
 				case aggregateMetricCountDistinct:
 					state.count++
 					state.seen = true
+
 				case aggregateMetricSum, aggregateMetricAvg:
 					if err = state.addIndexKey(key, 1); err != nil {
-						break
+						break LOOP
 					}
+
 				default:
 					if !valueReady {
 						value = aggregateValueFromIndexKey(acc.Field, key)
 						valueReady = true
 					}
 					if err = state.addValue(value, 1); err != nil {
-						break
+						break LOOP
 					}
 				}
 			}
@@ -1448,29 +1455,35 @@ func (ae *aggregateExecutor) foldGroupedOrdinaryFieldByIDMap(
 			stateBase := groupIndex * len(q.metrics)
 			var value Value
 			valueReady := false
+		LOOP:
 			for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
 				if !aggregateMetricsShareOrdinaryField(q.metrics[first], q.metrics[metricIdx]) {
 					continue
 				}
 				state := &states[stateBase+metricIdx]
+
 				switch state.metric.op {
+
 				case aggregateMetricCount:
 					state.count++
 					state.seen = true
+
 				case aggregateMetricCountDistinct:
 					state.count++
 					state.seen = true
+
 				case aggregateMetricSum, aggregateMetricAvg:
 					if err = state.addIndexKey(key, 1); err != nil {
-						break
+						break LOOP
 					}
+
 				default:
 					if !valueReady {
 						value = aggregateValueFromIndexKey(acc.Field, key)
 						valueReady = true
 					}
 					if err = state.addValue(value, 1); err != nil {
-						break
+						break LOOP
 					}
 				}
 			}

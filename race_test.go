@@ -14,7 +14,6 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/qcache"
-	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
 )
 
@@ -1001,22 +1000,6 @@ func raceExtraSetNumericBucketKnobs(t *testing.T, db *DB[uint64, raceExtraRec], 
 		db.engine.exec.NumericRangeBucketMinFieldKeys = prevEngineMinField
 		db.engine.exec.NumericRangeBucketMinSpanKeys = prevEngineMinSpan
 	})
-}
-
-func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *snapshot.View, field string) *qcache.NumericRangeBucketEntry {
-	t.Helper()
-
-	if snap == nil || snap.NumericRangeBucketCache() == nil {
-		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
-	}
-	entry, ok := snap.NumericRangeBucketCache().LoadField(field)
-	if !ok {
-		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
-	}
-	if entry == nil || entry.Index().BucketSize() <= 0 {
-		t.Fatalf("expected non-nil numeric range bucket entry for field %q", field)
-	}
-	return entry
 }
 
 func raceExtraRangeKeys(startInclusive, endExclusive, total int) []uint64 {

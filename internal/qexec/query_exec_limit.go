@@ -122,28 +122,6 @@ func (p *leafPred) setExpectedContainsCalls(expected int) {
 	}
 }
 
-func (p *leafPred) hasIter() bool {
-	switch p.kind {
-	case leafPredKindEmpty:
-		return true
-	case leafPredKindPredicate:
-		return p.pred.hasIter()
-	case leafPredKindPosting, leafPredKindPostsConcat, leafPredKindPostsUnion, leafPredKindPostsAll:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p *leafPred) leadIterNeedsContainsCheck() bool {
-	if p.kind == leafPredKindPredicate {
-		return p.pred.leadIterNeedsContainsCheck()
-	}
-	// HAS(list) uses one posting as iterator seed and must still validate
-	// remaining terms for each candidate.
-	return p.kind == leafPredKindPostsAll && p.postCount() > 1
-}
-
 func (p *leafPred) iterNew() posting.Iterator {
 	switch p.kind {
 	case leafPredKindEmpty:
@@ -1847,40 +1825,6 @@ func (qv *View) supportsLimitLeafPredExpr(e qir.Expr) bool {
 	default:
 		return false
 	}
-}
-
-func (qv *View) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
-	hasResidual := false
-	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
-			continue
-		}
-		hasResidual = true
-		if !qv.supportsLimitLeafPredExpr(e) {
-			return false
-		}
-	}
-	return hasResidual
-}
-
-func (qv *View) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
-	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
-			continue
-		}
-		if !isSimpleScalarRangeOrPrefixLeaf(e) {
-			continue
-		}
-		candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
-		if !ok {
-			continue
-		}
-		if hit, ok := candidate.core.loadWarmScalarPostingResult(); ok {
-			hit.ids.Release()
-			return true
-		}
-	}
-	return false
 }
 
 func (qv *View) attachLeafPredPostingFilter(p *leafPred) {
