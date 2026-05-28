@@ -1103,6 +1103,40 @@ func TestRunAtomicEmptyPayloadFailsWholeBatch(t *testing.T) {
 	}
 }
 
+func TestRunAtomicBeforeCommitFailureRollsBackWholeBatch(t *testing.T) {
+	callbackErr := errors.New("before commit failed")
+	var events []string
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+		return tx.Commit()
+	})
+	ex.snapshotOps = SnapshotOps{}
+
+	goodReq := setAttemptReq(1, 1)
+	defer encodePool.Put(goodReq.setPayload)
+	badReq := setAttemptReq(2, 2)
+	defer encodePool.Put(badReq.setPayload)
+	badReq.beforeCommit = []BeforeCommitHook{
+		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
+			return callbackErr
+		},
+	}
+
+	ex.runAtomic([]*request{goodReq, badReq})
+
+	if !errors.Is(goodReq.Err, callbackErr) {
+		t.Fatalf("good request error = %v, want callback error", goodReq.Err)
+	}
+	if !errors.Is(badReq.Err, callbackErr) {
+		t.Fatalf("bad request error = %v, want callback error", badReq.Err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
+		t.Fatalf("good request payload persisted after atomic failure: %v", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); got != nil {
+		t.Fatalf("bad request payload persisted after atomic failure: %v", got)
+	}
+}
+
 func TestExecuteBatchCleansCompletedRequest(t *testing.T) {
 	var events []string
 	ex, _, _ := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {

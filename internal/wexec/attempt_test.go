@@ -1,6 +1,7 @@
 package wexec
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
 	"strings"
@@ -379,6 +380,81 @@ func TestSharedSetValidateIndexFailureCommitsRest(t *testing.T) {
 	}
 }
 
+func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
+	decodeErr := errors.New("decode failed")
+	var events []string
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+		return tx.Commit()
+	})
+	ex.snapshotOps = SnapshotOps{}
+	origDecode := ex.ops.Decode
+	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
+		if len(data) == 1 && data[0] == 0xc1 {
+			return nil, decodeErr
+		}
+		return origDecode(data)
+	}
+	putAttemptPayload(t, raw, bucket, 1, []byte{0xc1})
+
+	badReq := setAttemptReq(1, 9)
+	goodReq := setAttemptReq(2, 2)
+
+	executeBatchForTest(ex, []*request{badReq, goodReq})
+
+	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+		t.Fatalf("bad request error = %v, want decode error", err)
+	}
+	if err := <-goodReq.Done; err != nil {
+		t.Fatalf("good request error = %v", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
+		t.Fatalf("bad request payload = %v, want [193]", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("good request payload = %v, want [2]", got)
+	}
+}
+
+func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
+	encodeErr := errors.New("encode failed")
+	var events []string
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+		return tx.Commit()
+	})
+	ex.snapshotOps = SnapshotOps{}
+	origEncode := ex.ops.Encode
+	ex.ops.Encode = func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+		if (*attemptRec)(ptr).V == 99 {
+			return encodeErr
+		}
+		return origEncode(ptr, buf)
+	}
+
+	badReq := setAttemptReq(1, 1)
+	badReq.beforeStore = []BeforeStoreHook{
+		func(_ keycodec.DataKey, _, newValue unsafe.Pointer) error {
+			(*attemptRec)(newValue).V = 99
+			return nil
+		},
+	}
+	goodReq := setAttemptReq(2, 2)
+
+	executeBatchForTest(ex, []*request{badReq, goodReq})
+
+	if err := <-badReq.Done; !errors.Is(err, encodeErr) {
+		t.Fatalf("bad request error = %v, want encode error", err)
+	}
+	if err := <-goodReq.Done; err != nil {
+		t.Fatalf("good request error = %v", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
+		t.Fatalf("bad request payload persisted: %v", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("good request payload = %v, want [2]", got)
+	}
+}
+
 func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
@@ -479,6 +555,40 @@ func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{66}) {
 		t.Fatalf("good request payload = %v, want [66]", got)
+	}
+}
+
+func TestSharedPatchExistingDecodeFailureCommitsRest(t *testing.T) {
+	decodeErr := errors.New("decode failed")
+	var events []string
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+		return tx.Commit()
+	})
+	origDecode := ex.ops.Decode
+	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
+		if len(data) == 1 && data[0] == 0xc1 {
+			return nil, decodeErr
+		}
+		return origDecode(data)
+	}
+	putAttemptPayload(t, raw, bucket, 1, []byte{0xc1})
+
+	badReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(55)}}, true)
+	goodReq := setAttemptReq(2, 2)
+
+	executeBatchForTest(ex, []*request{badReq, goodReq})
+
+	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+		t.Fatalf("bad request error = %v, want decode error", err)
+	}
+	if err := <-goodReq.Done; err != nil {
+		t.Fatalf("good request error = %v", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
+		t.Fatalf("bad request payload = %v, want [193]", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("good request payload = %v, want [2]", got)
 	}
 }
 

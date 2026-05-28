@@ -505,6 +505,175 @@ func TestStoreRemovesTempFileOnRenameFailure(t *testing.T) {
 	}
 }
 
+func TestStoreLoadRoundTrip(t *testing.T) {
+	nameField := persistTestField("name", 0)
+	tagsField := persistTestField("tags", 1)
+	tagsField.Slice = true
+	amountField := persistTestField("amount", 0)
+	rt := &schema.Runtime{
+		Fields: map[string]*schema.Field{
+			"name": nameField,
+			"tags": tagsField,
+		},
+		MeasureFields: map[string]*schema.Field{
+			"amount": amountField,
+		},
+		Indexed: []schema.IndexedFieldAccessor{
+			{Ordinal: 0, Name: "name", Field: nameField},
+			{Ordinal: 1, Name: "tags", Field: tagsField},
+		},
+		IndexedByName: schema.IndexedFieldMap{
+			"name": {Ordinal: 0, Name: "name", Field: nameField},
+			"tags": {Ordinal: 1, Name: "tags", Field: tagsField},
+		},
+		Measures: []schema.MeasureFieldAccessor{
+			{Ordinal: 0, Name: "amount", Field: amountField},
+		},
+		MeasuresByName: schema.MeasureFieldMap{
+			"amount": {Ordinal: 0, Name: "amount", Field: amountField},
+		},
+	}
+
+	nameStorage := persistTestRegularStorage("alice", 1)
+	defer nameStorage.Release()
+	tagsStorage := persistTestRegularStorage("go", 1)
+	defer tagsStorage.Release()
+	nilStorage := indexdata.NewNilFieldStorageOwned((posting.List{}).BuildAdded(2))
+	defer nilStorage.Release()
+	universe := (posting.List{}).BuildAdded(1)
+	universe = universe.BuildAdded(2)
+	defer universe.Release()
+	lengths := indexdata.GetLenPostingMap(2)
+	lengths[0] = (posting.List{}).BuildAdded(2)
+	lengths[1] = (posting.List{}).BuildAdded(1)
+	lenStorage, _ := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
+	indexdata.ReleaseLenPostingMap(lengths)
+	defer lenStorage.Release()
+	measureStorage := persistTestMeasureStorage()
+	defer measureStorage.Release()
+
+	snap := &snapshot.View{
+		Seq:                77,
+		Index:              []indexdata.FieldStorage{nameStorage, tagsStorage},
+		NilIndex:           []indexdata.FieldStorage{nilStorage, {}},
+		LenIndex:           []indexdata.FieldStorage{{}, lenStorage},
+		Measure:            []indexdata.MeasureStorage{measureStorage},
+		IndexedFieldByName: rt.IndexedByName,
+		Universe:           universe,
+	}
+	stats := &qexec.PlannerStatsSnapshot{
+		Version:             5,
+		GeneratedAt:         time.Date(2026, 5, 28, 1, 2, 3, 4, time.FixedZone("MSK", 3*60*60)),
+		UniverseCardinality: 2,
+		Fields: map[string]qexec.PlannerFieldStats{
+			"name": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
+			"tags": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
+		},
+	}
+
+	file := filepath.Join(t.TempDir(), "roundtrip.rbi")
+	if err := Store(StoreConfig{
+		File:         file,
+		BucketSeq:    77,
+		Schema:       rt,
+		Snapshot:     snap,
+		PlannerStats: stats,
+	}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if _, err := os.Stat(file + ".temp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file stat err=%v, want not exist", err)
+	}
+
+	result, err := Load(LoadConfig{
+		File:            file,
+		DBPath:          "test.db",
+		Bucket:          []byte("bucket"),
+		CurrentSeq:      77,
+		Schema:          rt,
+		StrMapCompactAt: 0,
+		Errors: Errors{
+			Stale:   errors.New("stale sentinel"),
+			Invalid: errors.New("invalid sentinel"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer result.Storage.Release()
+	if !result.LenLoaded {
+		t.Fatalf("LenLoaded=false, want true")
+	}
+	if _, ok := result.SkipFields["name"]; !ok {
+		t.Fatalf("name field was not marked loaded")
+	}
+	if _, ok := result.SkipFields["tags"]; !ok {
+		t.Fatalf("tags field was not marked loaded")
+	}
+	if _, ok := result.SkipMeasureFields["amount"]; !ok {
+		t.Fatalf("amount measure was not marked loaded")
+	}
+	if result.Storage.Index[0].KeyCount() == 0 || result.Storage.Index[1].KeyCount() == 0 {
+		t.Fatalf("regular field storage was not loaded")
+	}
+	if result.Storage.NilIndex[0].KeyCount() == 0 {
+		t.Fatalf("nil field storage was not loaded")
+	}
+	if result.Storage.LenIndex[1].KeyCount() == 0 {
+		t.Fatalf("len field storage was not loaded")
+	}
+	if result.Storage.Measure[0].Rows() != 1 {
+		t.Fatalf("measure rows=%d, want 1", result.Storage.Measure[0].Rows())
+	}
+	if result.PlannerStats == nil || result.PlannerStats.Version != 5 {
+		t.Fatalf("planner stats=%+v, want version 5", result.PlannerStats)
+	}
+	if result.PlannerStats.GeneratedAt.Location() != time.UTC {
+		t.Fatalf("planner stats GeneratedAt location=%v, want UTC", result.PlannerStats.GeneratedAt.Location())
+	}
+}
+
+func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := writer.WriteByte(persistedIndexVersion); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, 1); err != nil {
+		t.Fatalf("write seq: %v", err)
+	}
+	writePersistTestUniverse(t, writer)
+	if err := strmap.WriteSnapshot(writer, nil); err != nil {
+		t.Fatalf("write strmap: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	file := filepath.Join(t.TempDir(), "panic.rbi")
+	if err := os.WriteFile(file, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	_, err := Load(LoadConfig{
+		File:            file,
+		DBPath:          "test.db",
+		Bucket:          []byte("bucket"),
+		CurrentSeq:      1,
+		StrMapCompactAt: 0,
+		Errors: Errors{
+			Stale:   errors.New("stale sentinel"),
+			Invalid: errors.New("invalid sentinel"),
+		},
+	})
+	if err == nil {
+		t.Fatalf("Load succeeded, want recovered panic")
+	}
+	if !strings.Contains(err.Error(), "stage=panic") || !strings.Contains(err.Error(), "persisted index file=") {
+		t.Fatalf("Load err=%v, want panic diagnostic context", err)
+	}
+}
+
 func TestPlannerStatsSnapshotCodecRoundTrip(t *testing.T) {
 	generatedAt := time.Unix(10, 123).UTC()
 	in := &qexec.PlannerStatsSnapshot{
@@ -631,6 +800,12 @@ func persistTestMeasureStorage() indexdata.MeasureStorage {
 	entries := indexdata.GetMeasureEntrySlice(1)
 	entries = append(entries, indexdata.MeasureEntry{ID: 1, Value: 10})
 	return indexdata.NewMeasureStorageFromEntriesOwned(entries)
+}
+
+func persistTestRegularStorage(key string, id uint64) indexdata.FieldStorage {
+	m := indexdata.GetPostingMap()
+	m[key] = (posting.List{}).BuildAdded(id)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m, false)
 }
 
 func writePersistTestUniverse(t *testing.T, writer *bufio.Writer) {

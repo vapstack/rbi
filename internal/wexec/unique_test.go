@@ -130,6 +130,51 @@ func TestRunAtomicUniqueDeleteThenSetReusesFreedValue(t *testing.T) {
 	}
 }
 
+func TestRunAtomicUniqueDuplicateIDUsesFinalValue(t *testing.T) {
+	uniqueErr := errors.New("unique violation")
+	seed := []attemptRec{{V: 1}, {V: 2}}
+	var events []string
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&seed[0])},
+		{ID: 2, New: unsafe.Pointer(&seed[1])},
+	}, func(tx *bbolt.Tx, op string) error {
+		return tx.Commit()
+	})
+	putAttemptPayload(t, raw, bucket, 1, []byte{1})
+	putAttemptPayload(t, raw, bucket, 2, []byte{2})
+
+	transientReq := setAttemptReq(1, 2)
+	defer encodePool.Put(transientReq.setPayload)
+	finalReq := setAttemptReq(1, 3)
+	defer encodePool.Put(finalReq.setPayload)
+
+	ex.runAtomic([]*request{transientReq, finalReq})
+
+	if transientReq.Err != nil {
+		t.Fatalf("transient request error = %v", transientReq.Err)
+	}
+	if finalReq.Err != nil {
+		t.Fatalf("final request error = %v", finalReq.Err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{3}) {
+		t.Fatalf("id=1 payload = %v, want [3]", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("id=2 payload = %v, want [2]", got)
+	}
+
+	snap := ex.unique.Current()
+	if ids := snap.FieldLookupPostingRetainedKey("v", keycodec.IndexLookupU64(1)); ids.Contains(1) {
+		t.Fatalf("stale unique value 1 owner remained")
+	}
+	if ids := snap.FieldLookupPostingRetainedKey("v", keycodec.IndexLookupU64(2)); ids.Contains(1) || !ids.Contains(2) {
+		t.Fatalf("unique value 2 ids mismatch")
+	}
+	if ids := snap.FieldLookupPostingRetainedKey("v", keycodec.IndexLookupU64(3)); !ids.Contains(1) {
+		t.Fatalf("unique value 3 missing id=1")
+	}
+}
+
 func TestSharedPatchUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
 	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}, {V: 3}}

@@ -2,6 +2,7 @@ package wexec
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 	"unsafe"
@@ -93,6 +94,50 @@ func TestBuildSetRequestHookSuppressesCoalescingPolicy(t *testing.T) {
 		t.Fatalf("beforeCommit hooks were not attached")
 	}
 	requestPool.Put(req)
+}
+
+func TestBuildSetRequestEncodeFailureReturnsError(t *testing.T) {
+	encodeErr := errors.New("encode failed")
+	ex := NewBatcher(Config{
+		MaxOps:      8,
+		Unavailable: func() error { return nil },
+	})
+	ex.ops = &RecordOps{
+		Encode: func(unsafe.Pointer, *bytes.Buffer) error {
+			return encodeErr
+		},
+	}
+
+	v := attemptRec{V: 1}
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), nil, nil, nil)
+	if req != nil {
+		t.Fatalf("buildSetRequest returned request on encode failure: %#v", req)
+	}
+	if !errors.Is(err, encodeErr) {
+		t.Fatalf("buildSetRequest error = %v, want encode error", err)
+	}
+}
+
+func TestBuildSetRequestCloneFailureReturnsError(t *testing.T) {
+	cloneErr := errors.New("clone failed")
+	ex := NewBatcher(Config{
+		MaxOps:      8,
+		Unavailable: func() error { return nil },
+	})
+
+	v := attemptRec{V: 1}
+	beforeStore := []BeforeStoreHook{func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error { return nil }}
+	cloneValue := func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error) {
+		return nil, cloneErr
+	}
+
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), beforeStore, nil, cloneValue)
+	if req != nil {
+		t.Fatalf("buildSetRequest returned request on clone failure: %#v", req)
+	}
+	if !errors.Is(err, cloneErr) {
+		t.Fatalf("buildSetRequest error = %v, want clone error", err)
+	}
 }
 
 func TestOpNamesMatchExecutionMode(t *testing.T) {
