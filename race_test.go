@@ -1211,7 +1211,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		defer prepared.Release()
 
 		view := db.engine.exec.AcquireView(snap)
-		got, err := view.Query(&viewQ, false, false)
+		got, err := view.Query(&viewQ, false)
 		db.engine.exec.ReleaseView(view)
 		if err != nil {
 			return err

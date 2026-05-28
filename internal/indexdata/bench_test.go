@@ -1273,9 +1273,11 @@ func BenchmarkNewLenFieldStorageFromMapOwned(b *testing.B) {
 		}
 		base[ln] = base[ln].BuildAdded(uint64(i))
 	}
-	for i := range base {
-		defer base[i].Release()
-	}
+	defer func() {
+		for i := range base {
+			base[i].Release()
+		}
+	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()

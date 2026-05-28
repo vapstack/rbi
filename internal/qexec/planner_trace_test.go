@@ -242,7 +242,7 @@ func TestTracer_OrderedLimitRouteWorkSeparatesExactBucketFilter(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	ids, err := db.view().Query(&shape, true, false)
+	ids, err := db.view().Query(&shape, true)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}

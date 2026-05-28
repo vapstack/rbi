@@ -525,13 +525,13 @@ func TestPlannerExecutionOrderFactors_Adaptive(t *testing.T) {
 		coverage:     1.0,
 		activeChecks: 2,
 	}
-	baseBase, baseCheck, baseRange, basePrefix := plannerExecutionOrderFactors(baseProfile, 1.2, 500_000)
+	baseBase, baseCheck, baseRange, basePrefix := plannerExecutionOrderFactors(baseProfile, 1.2)
 
 	narrowProfile := plannerOrderedProfile{
 		coverage:     0.10,
 		activeChecks: 2,
 	}
-	narrowBase, narrowCheck, narrowRange, narrowPrefix := plannerExecutionOrderFactors(narrowProfile, 1.2, 500_000)
+	narrowBase, narrowCheck, narrowRange, narrowPrefix := plannerExecutionOrderFactors(narrowProfile, 1.2)
 	if narrowBase >= baseBase || narrowCheck >= baseCheck || narrowRange >= baseRange || narrowPrefix >= basePrefix {
 		t.Fatalf(
 			"expected narrower coverage to reduce factors: base=(%.3f %.3f %.3f %.3f) narrow=(%.3f %.3f %.3f %.3f)",
@@ -540,8 +540,8 @@ func TestPlannerExecutionOrderFactors_Adaptive(t *testing.T) {
 		)
 	}
 
-	_, lowSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 1.2, 500_000)
-	_, highSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 5.0, 500_000)
+	_, lowSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 1.2)
+	_, highSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 5.0)
 	if highSkewCheck <= lowSkewCheck {
 		t.Fatalf("expected higher skew to increase check factor: low=%.3f high=%.3f", lowSkewCheck, highSkewCheck)
 	}
@@ -1679,7 +1679,7 @@ func TestPlannerOROrderObserverHotCheckDoesNotTouchSeenKeys(t *testing.T) {
 		ok:              true,
 	}
 
-	if view.shouldObserveOrderedORPredicate(predicate{}, info) {
+	if view.shouldObserveOrderedORPredicate(info) {
 		t.Fatalf("cold key must not be observed")
 	}
 	if got := view.snap.RuntimeMaterializedPredSeenEntryCount(); got != 0 {
@@ -1687,7 +1687,7 @@ func TestPlannerOROrderObserverHotCheckDoesNotTouchSeenKeys(t *testing.T) {
 	}
 
 	view.snap.ShouldPromoteRuntimeMaterializedPredKey(key)
-	if !view.shouldObserveOrderedORPredicate(predicate{}, info) {
+	if !view.shouldObserveOrderedORPredicate(info) {
 		t.Fatalf("seen key must be observed")
 	}
 }

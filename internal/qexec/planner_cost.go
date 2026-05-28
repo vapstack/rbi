@@ -1590,7 +1590,7 @@ const (
 	plannerExecutionNoOrderPrefixProbeShareMax = 0.40
 )
 
-func plannerExecutionOrderFactors(profile plannerOrderedProfile, orderSkew float64, universe uint64) (base, check, rangeMul, prefixMul float64) {
+func plannerExecutionOrderFactors(profile plannerOrderedProfile, orderSkew float64) (base, check, rangeMul, prefixMul float64) {
 	base = plannerExecutionOrderBaseFactor
 	check = plannerExecutionOrderCheckFactor
 	rangeMul = plannerExecutionOrderRangeFactor
@@ -1896,7 +1896,7 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 	orderSkew := plannerFieldStatsSkew(orderStats)
 	expectedProbeRows := estimateOrderExpectedProbes(float64(need), float64(universe), profile.selectivity, profile.coverage, orderSkew)
 
-	baseFactor, checkFactor, rangeFactor, prefixFactor := plannerExecutionOrderFactors(profile, orderSkew, universe)
+	baseFactor, checkFactor, rangeFactor, prefixFactor := plannerExecutionOrderFactors(profile, orderSkew)
 	execRowFactor := baseFactor + float64(profile.activeChecks)*checkFactor
 
 	if profile.orderRangeLeaves > 0 {

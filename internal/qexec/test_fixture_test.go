@@ -290,7 +290,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 		return nil, err
 	}
 	defer prepared.Release()
-	ids, err := db.engine.currentQueryViewForTests().Query(&viewQ, true, false)
+	ids, err := db.engine.currentQueryViewForTests().Query(&viewQ, true)
 	if err != nil {
 		return nil, err
 	}
@@ -701,7 +701,7 @@ func (db *testDB) query(q *qx.QX) ([]uint64, error) {
 		return nil, err
 	}
 	defer prepared.Release()
-	return db.view().Query(&viewQ, false, false)
+	return db.view().Query(&viewQ, false)
 }
 
 func (db *testDB) beginTrace(q qir.Shape) *Trace {

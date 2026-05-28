@@ -2994,7 +2994,7 @@ func initOrderedORObservedStats(
 		for ci, pi := range checks {
 			p := branch.preds.owner[pi]
 			info := qv.orderedORPredicateBuildInfoForBranch(field, p, analysis, branch, bi, pi)
-			if qv.shouldObserveOrderedORPredicate(p, info) {
+			if qv.shouldObserveOrderedORPredicate(info) {
 				observed.candidatesBuf[start+ci] = true
 				active++
 				continue
@@ -4438,7 +4438,7 @@ func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
 	}
 }
 
-func (qv *View) shouldObserveOrderedORPredicate(p predicate, info orderedORMaterializedPredicateBuildInfo) bool {
+func (qv *View) shouldObserveOrderedORPredicate(info orderedORMaterializedPredicateBuildInfo) bool {
 	if !orderedORPredicateObservationEligible(info) {
 		return false
 	}

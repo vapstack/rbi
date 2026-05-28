@@ -402,7 +402,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 		}
 	}
 
-	inheritMatPred := prev != nil && next.matPredCache != nil && prev.matPredCache != nil
+	inheritMatPred := next.matPredCache != nil && prev.matPredCache != nil
 	var changed []bool
 	for i, acc := range rt.Indexed {
 		state := &fieldStates[i]
@@ -655,7 +655,7 @@ func buildPreparedSnapshotAggregated(
 		collectSnapshotBatchEntryDiffs(rt, op, &deltas, &measureDeltas, prev.LenZeroComplement, patchFields)
 	}
 
-	inheritMatPred := prev != nil && next.matPredCache != nil && prev.matPredCache != nil
+	inheritMatPred := next.matPredCache != nil && prev.matPredCache != nil
 	if inheritMatPred {
 		for i := range deltas.touched {
 			deltas.changed[deltas.touched[i]] = false

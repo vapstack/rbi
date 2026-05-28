@@ -1315,7 +1315,7 @@ func snapshotExtraQuerySnapshotKeys[K ~string | ~uint64](t *testing.T, db *DB[K,
 	defer prepared.Release()
 
 	view := db.engine.exec.AcquireView(snap)
-	ids, err := view.Query(&viewQ, false, false)
+	ids, err := view.Query(&viewQ, false)
 	db.engine.exec.ReleaseView(view)
 	if err != nil {
 		t.Fatalf("snapshot query: %v", err)
@@ -3445,7 +3445,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheStaysExactAcrossConcurrentT
 			return nil, err
 		}
 		view := db.engine.exec.AcquireView(pinned)
-		out, err := view.Query(&viewQ, false, false)
+		out, err := view.Query(&viewQ, false)
 		db.engine.exec.ReleaseView(view)
 		prepared.Release()
 		return out, err
@@ -3582,7 +3582,7 @@ func TestSnapshotExtra_PinnedOldNumericRangeCacheStaysExactAcrossConcurrentAgeCh
 			return nil, err
 		}
 		view := db.engine.exec.AcquireView(pinned)
-		out, err := view.Query(&viewQ, false, false)
+		out, err := view.Query(&viewQ, false)
 		db.engine.exec.ReleaseView(view)
 		prepared.Release()
 		return out, err

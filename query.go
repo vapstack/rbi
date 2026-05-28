@@ -87,7 +87,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *snapshot.View, q *qir.Shape
 		}
 	}
 
-	ids, err := view.Query(q, true, false)
+	ids, err := view.Query(q, true)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	view := db.engine.exec.AcquireView(snap)
 	defer db.engine.exec.ReleaseView(view)
 
-	ids, err := view.Query(&viewQ, true, false)
+	ids, err := view.Query(&viewQ, true)
 	if err != nil {
 		return nil, err
 	}

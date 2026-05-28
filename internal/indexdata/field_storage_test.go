@@ -514,17 +514,17 @@ func TestFieldStorageFromRunsOwned_MergesStringRuns(t *testing.T) {
 }
 
 func TestFieldStorageRunFromPostingMapOwned_DrainsMaps(t *testing.T) {
-	strings := GetPostingMap()
-	strings["b"] = fieldStoragePosting(2)
-	strings["a"] = fieldStoragePosting(1)
-	strings["empty"] = posting.List{}
-	stringRun := NewStringFieldStorageRunFromPostingMap(strings)
+	strs := GetPostingMap()
+	strs["b"] = fieldStoragePosting(2)
+	strs["a"] = fieldStoragePosting(1)
+	strs["empty"] = posting.List{}
+	stringRun := NewStringFieldStorageRunFromPostingMap(strs)
 	defer stringRun.ReleaseOwned()
 
-	if len(strings) != 0 {
+	if len(strs) != 0 {
 		t.Fatalf("string map retained entries after run construction")
 	}
-	ReleasePostingMap(strings)
+	ReleasePostingMap(strs)
 	if stringRun.KeyCount() != 2 {
 		t.Fatalf("string run key count: got %d want 2", stringRun.KeyCount())
 	}

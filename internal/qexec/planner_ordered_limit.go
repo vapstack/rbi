@@ -933,7 +933,7 @@ func (qv *View) orderedLimitBoundsScanCandidate(
 		}
 
 		rowsForContains := float64(expectedRows)
-		if exactFilters > 0 && residualChecks > 0 {
+		if exactFilters > 0 {
 			rowsForContains *= residualSel
 			if rowsForContains < float64(need) {
 				rowsForContains = float64(need)

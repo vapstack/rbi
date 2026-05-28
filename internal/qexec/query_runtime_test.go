@@ -349,9 +349,11 @@ func TestPostingUnionBuilder_CompactPostingsBatchSinglesAllocsPerRunStayZeroAfte
 		posting.BuildFromSorted([]uint64{49, 51, 53, 55, 57, 59, 61, 63}),
 		posting.BuildFromSorted([]uint64{65, 67, 69, 71, 73, 75, 77, 79}),
 	}
-	for i := range posts {
-		defer posts[i].Release()
-	}
+	defer func() {
+		for i := range posts {
+			posts[i].Release()
+		}
+	}()
 
 	run := func() {
 		builder := newPostingUnionBuilder(true)

@@ -404,7 +404,7 @@ func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
 		t.Fatalf("prepare name query: %v", err)
 	}
 	view := db.engine.exec.AcquireView(snap)
-	nameIDs, err := view.Query(&nameShape, false, false)
+	nameIDs, err := view.Query(&nameShape, false)
 	db.engine.exec.ReleaseView(view)
 	namePrepared.Release()
 	if err != nil {
@@ -419,7 +419,7 @@ func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
 		t.Fatalf("prepare empty-tags query: %v", err)
 	}
 	view = db.engine.exec.AcquireView(snap)
-	tagIDs, err := view.Query(&tagsShape, false, false)
+	tagIDs, err := view.Query(&tagsShape, false)
 	db.engine.exec.ReleaseView(view)
 	tagsPrepared.Release()
 	if err != nil {
@@ -2305,7 +2305,7 @@ func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 	defer prepared.Release()
 
 	view := db.engine.exec.AcquireView(snap)
-	wantKeys, err := view.Query(&viewQ, false, false)
+	wantKeys, err := view.Query(&viewQ, false)
 	db.engine.exec.ReleaseView(view)
 	if err != nil {
 		t.Fatalf("pinned snapshot query: %v", err)
@@ -2327,7 +2327,7 @@ func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
 				view := db.engine.exec.AcquireView(snap)
-				gotKeys, err := view.Query(&viewQ, false, false)
+				gotKeys, err := view.Query(&viewQ, false)
 				db.engine.exec.ReleaseView(view)
 				if err != nil {
 					setFailed(fmt.Sprintf("pinned snapshot query: %v", err))

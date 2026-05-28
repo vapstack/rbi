@@ -573,7 +573,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						switch selectAggregateFamily(prepared) {
 						case aggregateSelectorCount:
-							decision = selectCountAggregate(aggregateCountFacts{})
+							decision = selectCountAggregate()
 						case aggregateSelectorDistinct:
 							decision = selectDistinctAggregate(exec.collectDistinctFacts(prepared, ids))
 						case aggregateSelectorUngrouped:

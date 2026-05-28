@@ -1657,7 +1657,7 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 		warm.Release()
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
-	if !view.materializeOrderedORPredicate((&warm.owner[0])) {
+	if !view.materializeOrderedORPredicate(&warm.owner[0]) {
 		warm.Release()
 		t.Fatalf("expected merged exact-range warm predicate to materialize")
 	}

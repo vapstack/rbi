@@ -853,7 +853,7 @@ func (qv *View) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 		if !ov.HasData() {
 			return predicate{}, false
 		}
-		return qv.buildPredInCandidate(e, fm, ov)
+		return qv.buildPredInCandidate(e, fm)
 
 	case qir.OpHASALL:
 		if !ov.HasData() {
@@ -1036,7 +1036,7 @@ func (qv *View) buildPredEqCandidateWithEst(e qir.Expr, est uint64) (predicate, 
 	}, true
 }
 
-func (qv *View) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView) (predicate, bool) {
+func (qv *View) buildPredInCandidate(e qir.Expr, fm *schema.Field) (predicate, bool) {
 	if fm.Slice {
 		return predicate{}, false
 	}

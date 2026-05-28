@@ -2181,7 +2181,7 @@ func TestQuery_OrderBasicLimit_DeclinesNegatedCompositeShape(t *testing.T) {
 		t.Fatalf("executeOrderedLimit out=%v ok=%v plan=%v err=%v, want selector decline", out, ok, plan, err)
 	}
 
-	got, err := view.Query(&shape, false, false)
+	got, err := view.Query(&shape, false)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -2222,7 +2222,7 @@ func TestQuery_OrderBasicLimit_PreservesInterleavedResidual(t *testing.T) {
 		Operands:     []qir.Expr{ageGTE, tagsEQ, ageLTE},
 	}
 
-	got, err := db.engine.currentQueryViewForTests().Query(&shape, false, false)
+	got, err := db.engine.currentQueryViewForTests().Query(&shape, false)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}

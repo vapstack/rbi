@@ -448,7 +448,7 @@ func benchmarkPreparedQueryShape(b *testing.B, db *testDB, q *qx.QX) {
 
 	db.clearCurrentSnapshotCaches()
 	view := db.view()
-	out, err := view.Query(&shape, false, false)
+	out, err := view.Query(&shape, false)
 	if err != nil {
 		b.Fatalf("Query warmup: %v", err)
 	}
@@ -457,7 +457,7 @@ func benchmarkPreparedQueryShape(b *testing.B, db *testDB, q *qx.QX) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, err = view.Query(&shape, false, false)
+		out, err = view.Query(&shape, false)
 		if err != nil {
 			b.Fatalf("Query: %v", err)
 		}
@@ -1390,7 +1390,7 @@ func benchmarkCardinalityPredicateExecutor(b *testing.B, db *testDB, expr qx.Exp
 			break
 		}
 	}
-	if err = view.prepareCardinalityPredicate((&preds.owner[leadIdx]), leadEst, universe); err != nil {
+	if err = view.prepareCardinalityPredicate(&preds.owner[leadIdx], leadEst, universe); err != nil {
 		b.Fatalf("prepareCardinalityPredicate lead: %v", err)
 	}
 	if preds.owner[leadIdx].estCard > 0 {
@@ -1414,7 +1414,7 @@ func benchmarkCardinalityPredicateExecutor(b *testing.B, db *testDB, expr qx.Exp
 		active = append(active, i)
 	}
 	for _, pi := range active {
-		if err = view.prepareCardinalityPredicate((&preds.owner[pi]), leadEst, universe); err != nil {
+		if err = view.prepareCardinalityPredicate(&preds.owner[pi], leadEst, universe); err != nil {
 			b.Fatalf("prepareCardinalityPredicate residual: %v", err)
 		}
 	}
@@ -2151,7 +2151,7 @@ func benchmarkArrayPosOrderSelector(b *testing.B, db *testDB, q *qx.QX) {
 	if !view.collectArrayPosOrderFacts(&shape, &facts) {
 		b.Skip("ArrayPos order facts not collected for this shape")
 	}
-	decision, ok := view.selectArrayPosOrder(&shape, &facts)
+	decision, ok := view.selectArrayPosOrder(&shape)
 	if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
 		b.Skip("ArrayPos order selector did not choose a route")
 	}
@@ -2164,7 +2164,7 @@ func benchmarkArrayPosOrderSelector(b *testing.B, db *testDB, q *qx.QX) {
 		if !view.collectArrayPosOrderFacts(&shape, &facts) {
 			b.Fatal("ArrayPos order facts were not collected")
 		}
-		decision, ok := view.selectArrayPosOrder(&shape, &facts)
+		decision, ok := view.selectArrayPosOrder(&shape)
 		if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
 			b.Fatal("ArrayPos order selector did not choose a route")
 		}
@@ -2348,7 +2348,7 @@ func benchmarkArrayPosOrderDispatch(b *testing.B, db *testDB, q *qx.QX) {
 	if !view.collectArrayPosOrderFacts(&shape, &facts) {
 		b.Skip("ArrayPos order facts not collected for this shape")
 	}
-	decision, ok := view.selectArrayPosOrder(&shape, &facts)
+	decision, ok := view.selectArrayPosOrder(&shape)
 	if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
 		b.Skip("ArrayPos order selector did not choose a route")
 	}
@@ -2454,7 +2454,7 @@ func benchmarkPlannerRegressionBudget(b *testing.B, db *testDB, q *qx.QX, cold b
 		db.clearCurrentSnapshotCaches()
 	} else {
 		db.clearCurrentSnapshotCaches()
-		out, err := view.Query(&shape, false, false)
+		out, err := view.Query(&shape, false)
 		if err != nil {
 			b.Fatalf("Query warmup: %v", err)
 		}
@@ -2470,7 +2470,7 @@ func benchmarkPlannerRegressionBudget(b *testing.B, db *testDB, q *qx.QX, cold b
 			db.clearCurrentSnapshotCaches()
 			b.StartTimer()
 		}
-		out, err = view.Query(&shape, false, false)
+		out, err = view.Query(&shape, false)
 		if err != nil {
 			b.Fatalf("Query: %v", err)
 		}
@@ -2798,7 +2798,7 @@ func benchmarkPreparedQueryShapeColdCaches(b *testing.B, db *testDB, q *qx.QX) {
 		b.StopTimer()
 		db.clearCurrentSnapshotCaches()
 		b.StartTimer()
-		out, err = view.Query(&shape, false, false)
+		out, err = view.Query(&shape, false)
 		if err != nil {
 			b.Fatalf("Query: %v", err)
 		}
@@ -3007,7 +3007,7 @@ func benchmarkPreparedQueryShapeTrace(b *testing.B, db *testDB, q *qx.QX) {
 
 	db.clearCurrentSnapshotCaches()
 	view := db.view()
-	out, err := view.Query(&shape, true, false)
+	out, err := view.Query(&shape, true)
 	if err != nil {
 		b.Fatalf("Query warmup: %v", err)
 	}
@@ -3016,7 +3016,7 @@ func benchmarkPreparedQueryShapeTrace(b *testing.B, db *testDB, q *qx.QX) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, err = view.Query(&shape, true, false)
+		out, err = view.Query(&shape, true)
 		if err != nil {
 			b.Fatalf("Query: %v", err)
 		}
@@ -3679,7 +3679,7 @@ func BenchmarkEndToEndWrappers(b *testing.B) {
 		if err != nil {
 			b.Fatalf("prepareQuery warmup: %v", err)
 		}
-		out, err := view.Query(&shape, false, false)
+		out, err := view.Query(&shape, false)
 		prepared.Release()
 		if err != nil {
 			b.Fatalf("Query warmup: %v", err)
@@ -3693,7 +3693,7 @@ func BenchmarkEndToEndWrappers(b *testing.B) {
 			if err != nil {
 				b.Fatalf("prepareQuery: %v", err)
 			}
-			out, err = view.Query(&shape, false, false)
+			out, err = view.Query(&shape, false)
 			prepared.Release()
 			if err != nil {
 				b.Fatalf("Query: %v", err)
@@ -4284,9 +4284,11 @@ func qexecBenchPostingLists() [4]posting.List {
 
 func BenchmarkPostingIters(b *testing.B) {
 	lists := qexecBenchPostingLists()
-	for i := range lists {
-		defer lists[i].Release()
-	}
+	defer func() {
+		for i := range lists {
+			lists[i].Release()
+		}
+	}()
 	posts := lists[:]
 
 	b.Run("Concat", func(b *testing.B) {

@@ -840,7 +840,7 @@ func TestPlannerGuardrails_OrderedLimitBroadResidualNoOffsetUsesOrderScan(t *tes
 	}
 	defer prepared.Release()
 
-	ids, err := db.view().Query(&viewQ, true, false)
+	ids, err := db.view().Query(&viewQ, true)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -889,7 +889,7 @@ func TestPlannerGuardrails_OrderedLimitBoundedExactResidualsUsesOrderScan(t *tes
 	}
 	defer prepared.Release()
 
-	ids, err := db.view().Query(&viewQ, true, false)
+	ids, err := db.view().Query(&viewQ, true)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}

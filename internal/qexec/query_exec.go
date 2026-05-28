@@ -2273,17 +2273,13 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 				scanWidth++
 			}
 			examined++
-			if trace != nil {
-				trace.AddMatched(1)
-			}
+			trace.AddMatched(1)
 			if cursor.emit(idx) {
-				if trace != nil {
-					trace.AddExamined(examined)
-					if trackScanWidth {
-						trace.AddOrderScanWidth(scanWidth)
-					}
-					trace.SetEarlyStopReason("limit_reached")
+				trace.AddExamined(examined)
+				if trackScanWidth {
+					trace.AddOrderScanWidth(scanWidth)
 				}
+				trace.SetEarlyStopReason("limit_reached")
 				return cursor.out, true
 			}
 			continue
@@ -2295,13 +2291,11 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 			scanWidth++
 		}
 		if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
-			if trace != nil {
-				trace.AddExamined(examined)
-				if trackScanWidth {
-					trace.AddOrderScanWidth(scanWidth)
-				}
-				trace.SetEarlyStopReason("limit_reached")
+			trace.AddExamined(examined)
+			if trackScanWidth {
+				trace.AddOrderScanWidth(scanWidth)
 			}
+			trace.SetEarlyStopReason("limit_reached")
 			return cursor.out, true
 		}
 	}
@@ -2313,25 +2307,22 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 				scanWidth++
 			}
 			if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
-				if trace != nil {
-					trace.AddExamined(examined)
-					if trackScanWidth {
-						trace.AddOrderScanWidth(scanWidth)
-					}
-					trace.SetEarlyStopReason("limit_reached")
+				trace.AddExamined(examined)
+				if trackScanWidth {
+					trace.AddOrderScanWidth(scanWidth)
 				}
+				trace.SetEarlyStopReason("limit_reached")
 				return cursor.out, true
 			}
 		}
 	}
 
-	if trace != nil {
-		trace.AddExamined(examined)
-		if trackScanWidth {
-			trace.AddOrderScanWidth(scanWidth)
-		}
-		trace.SetEarlyStopReason("input_exhausted")
+	trace.AddExamined(examined)
+	if trackScanWidth {
+		trace.AddOrderScanWidth(scanWidth)
 	}
+	trace.SetEarlyStopReason("input_exhausted")
+
 	return cursor.out, true
 }
 

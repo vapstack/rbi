@@ -2627,7 +2627,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	}
 	defer predSet.Release()
 
-	if err := qv.prepareCardinalityPredicateWithTrace((&predSet.owner[leadIdx]), leadEst, universe, trace); err != nil {
+	if err := qv.prepareCardinalityPredicateWithTrace(&predSet.owner[leadIdx], leadEst, universe, trace); err != nil {
 		return 0, true, err
 	}
 	if predSet.owner[leadIdx].alwaysFalse {
@@ -2667,7 +2667,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 		return out, true, err
 	}
 	for _, pi := range active {
-		if err := qv.prepareCardinalityPredicateWithTrace((&predSet.owner[pi]), leadEst, universe, trace); err != nil {
+		if err := qv.prepareCardinalityPredicateWithTrace(&predSet.owner[pi], leadEst, universe, trace); err != nil {
 			return 0, true, err
 		}
 	}
@@ -4165,7 +4165,7 @@ LOOP:
 		}
 
 		for _, pi := range checks {
-			if err := qv.prepareCardinalityORPredicateWithTrace((&predSet.owner[pi]), leadEst, uc, trace); err != nil {
+			if err := qv.prepareCardinalityORPredicateWithTrace(&predSet.owner[pi], leadEst, uc, trace); err != nil {
 				predSet.Release()
 				cardinalityORBranchSlicePool.Put(branchesBuf)
 				return 0, true, err

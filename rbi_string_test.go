@@ -533,7 +533,7 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 						db.engine.exec.ReleaseView(view)
 						scanErr = prepErr
 					} else {
-						queryIDs, err := view.Query(&viewQ, false, false)
+						queryIDs, err := view.Query(&viewQ, false)
 						db.engine.exec.ReleaseView(view)
 						if err != nil {
 							scanErr = err

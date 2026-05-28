@@ -240,9 +240,11 @@ func TestPostingUnionBufIter_SmallUnionAllocsPerRunStayZeroAfterWarmup(t *testin
 		postingOf(2, 3),
 		postingOf(1, 4),
 	}
-	for i := range posts {
-		defer posts[i].Release()
-	}
+	defer func() {
+		for i := range posts {
+			posts[i].Release()
+		}
+	}()
 
 	postsBuf := posting.GetSlice(3)
 	postsBuf = append(postsBuf, posts[0], posts[1], posts[2])

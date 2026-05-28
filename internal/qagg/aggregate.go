@@ -762,7 +762,7 @@ func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, 
 	var decision aggregateRouteDecision
 	switch family {
 	case aggregateSelectorCount:
-		decision = selectCountAggregate(aggregateCountFacts{})
+		decision = selectCountAggregate()
 	case aggregateSelectorDistinct:
 		decision = selectDistinctAggregate(ae.collectDistinctFacts(q, ids))
 	case aggregateSelectorUngrouped:
@@ -785,7 +785,7 @@ func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, 
 }
 
 func (ae *aggregateExecutor) executeCountAggregateFamily(view *qexec.View, q *Query, trace *qexec.Trace) (Result, error) {
-	decision := selectCountAggregate(aggregateCountFacts{})
+	decision := selectCountAggregate()
 	if trace != nil {
 		trace.SetAggregateRoute(decision.traceRoute())
 	}

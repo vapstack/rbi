@@ -580,49 +580,67 @@ func orderedDistinctStrings(vals []string, desc bool) []string {
 }
 
 func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, vals []string) bool {
-	if !ov.HasData() {
+	keyCount := ov.KeyCount()
+	if keyCount == 0 {
 		return true
 	}
-	if len(vals) == 0 {
+	if len(vals) < keyCount {
 		return false
 	}
-
-	set := stringSetPool.Get(len(vals))
-	defer stringSetPool.Put(set)
 
 	var fixed u64set
-	hasFixed := false
+	fixedBuilt := false
 
-	for _, v := range vals {
-		set[v] = struct{}{}
-		if len(v) == 8 {
-			if !hasFixed {
-				fixed = getU64Set(len(vals))
-				defer releaseU64Set(&fixed)
-				hasFixed = true
-			}
-			fixed.Add(keycodec.Fixed8StringToU64(v))
-		}
-	}
+	var set map[string]struct{}
+	setBuilt := false
 
-	if len(set) < ov.KeyCount() {
-		return false
-	}
-
-	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	ok := true
+	cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
 	for {
-		key, _, ok := cur.Next()
-		if !ok {
-			return true
+		key, _, more := cur.Next()
+		if !more {
+			break
 		}
+
 		if key.IsNumeric() {
-			if !hasFixed || !fixed.Has(key.U64()) {
-				return false
+			if !fixedBuilt {
+				for _, v := range vals {
+					if len(v) == 8 {
+						if len(fixed.keys) == 0 {
+							fixed = getU64Set(len(vals))
+						}
+						fixed.Add(keycodec.Fixed8StringToU64(v))
+					}
+				}
+				fixedBuilt = true
 			}
-		} else if _, ok = set[key.UnsafeString()]; !ok {
-			return false
+			if !fixed.Has(key.U64()) {
+				ok = false
+				break
+			}
+			continue
+		}
+
+		if !setBuilt {
+			set = stringSetPool.Get(len(vals))
+			for _, v := range vals {
+				set[v] = struct{}{}
+			}
+			setBuilt = true
+		}
+		if _, found := set[key.UnsafeString()]; !found {
+			ok = false
+			break
 		}
 	}
+
+	if setBuilt {
+		stringSetPool.Put(set)
+	}
+	if len(fixed.keys) != 0 {
+		releaseU64Set(&fixed)
+	}
+	return ok
 }
 
 func scalarArrayPosPriorityCoversAllResultsIndexView(resultBM posting.List, ov, nilOV indexdata.FieldIndexView, vals []string) bool {
@@ -753,7 +771,7 @@ func (qv *View) collectArrayPosOrderFacts(q *qir.Shape, facts *plannerArrayPosOr
 	return true
 }
 
-func (qv *View) selectArrayPosOrder(q *qir.Shape, facts *plannerArrayPosOrderFacts) (plannerArrayPosOrderDecision, bool) {
+func (qv *View) selectArrayPosOrder(q *qir.Shape) (plannerArrayPosOrderDecision, bool) {
 	expected := q.Limit
 	if expected == 0 {
 		expected = qv.snap.Universe.Cardinality()
@@ -799,7 +817,7 @@ func (qv *View) executeArrayPosOrder(q *qir.Shape, trace *Trace) ([]uint64, bool
 		return nil, false, "", nil
 	}
 
-	decision, ok := qv.selectArrayPosOrder(q, &facts)
+	decision, ok := qv.selectArrayPosOrder(q)
 	if !ok {
 		return nil, false, "", nil
 	}
