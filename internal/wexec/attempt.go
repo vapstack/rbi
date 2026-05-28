@@ -61,6 +61,7 @@ type attemptState struct {
 	bucket       *bbolt.Bucket
 	statsEnabled bool
 	release      func(unsafe.Pointer)
+	singleState  bool
 
 	prepared []prepared
 	accepted []prepared
@@ -73,6 +74,7 @@ type attemptState struct {
 	stateByStringID    map[string]int
 	stateByStringIDCap int
 	states             []recordState
+	state              recordState
 
 	ownedPayloads []*bytes.Buffer
 	decodedValues []unsafe.Pointer
@@ -117,7 +119,7 @@ func (b *Batcher) ensureIdx(state *recordState, id keycodec.DataKey, create bool
 }
 
 func (b *Batcher) prepareSet(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req)
+	state, err := att.loadState(b.strKey, b.ops, req, b.indexed || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -206,7 +208,7 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 }
 
 func (b *Batcher) preparePatch(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req)
+	state, err := att.loadState(b.strKey, b.ops, req, true)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecodeExistingValue, err)
 		return
@@ -289,7 +291,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 }
 
 func (b *Batcher) prepareDelete(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req)
+	state, err := att.loadState(b.strKey, b.ops, req, true)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -363,7 +365,24 @@ func (st *attemptState) setStatePos(strKey bool, key keycodec.DataKey, pos int) 
 	st.stateByUintID[key.Uint()] = pos
 }
 
-func (st *attemptState) loadState(strKey bool, ops *RecordOps, req *request) (*recordState, error) {
+func (st *attemptState) loadState(strKey bool, ops *RecordOps, req *request, read bool) (*recordState, error) {
+	if st.singleState {
+		state := &st.state
+		state.key = req.id.Bytes(strKey, &state.keyBuf)
+		if read {
+			if prev := st.bucket.Get(state.key); prev != nil {
+				oldVal, err := ops.Decode(prev)
+				if err != nil {
+					return nil, err
+				}
+				state.value = oldVal
+				st.decodedValues = append(st.decodedValues, oldVal)
+				state.setBorrowedPayload(prev)
+			}
+		}
+		return state, nil
+	}
+
 	if pos, ok := st.statePos(strKey, req.id); ok {
 		return &st.states[pos], nil
 	}
@@ -372,15 +391,17 @@ func (st *attemptState) loadState(strKey bool, ops *RecordOps, req *request) (*r
 	st.states = append(st.states, recordState{})
 	state := &st.states[pos]
 	state.key = req.id.Bytes(strKey, &state.keyBuf)
-	if prev := st.bucket.Get(state.key); prev != nil {
-		oldVal, err := ops.Decode(prev)
-		if err != nil {
-			st.states = st.states[:pos]
-			return nil, err
+	if read {
+		if prev := st.bucket.Get(state.key); prev != nil {
+			oldVal, err := ops.Decode(prev)
+			if err != nil {
+				st.states = st.states[:pos]
+				return nil, err
+			}
+			state.value = oldVal
+			st.decodedValues = append(st.decodedValues, oldVal)
+			state.setBorrowedPayload(prev)
 		}
-		state.value = oldVal
-		st.decodedValues = append(st.decodedValues, oldVal)
-		state.setBorrowedPayload(prev)
 	}
 
 	st.setStatePos(strKey, req.id, pos)
@@ -480,25 +501,28 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	bucket.FillPercent = b.bucketFillPercent
 	defer func() { _ = tx.Rollback() }()
 
-	capHint := max(len(active), 1)
-	if capHint <= 8 {
+	capHint := len(active)
+	singleState := capHint == 1
+	if capHint == 0 {
+		capHint = 1
+	} else if capHint <= 8 {
 		capHint = 8
 	} else {
 		capHint = 1 << bits.Len(uint(capHint-1))
 	}
 	att := attemptStatePool.Get()
-	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, b.snapshotOps.Enabled)
+	withUnique := b.unique.Schema != nil && len(b.unique.Schema.Unique) != 0
+	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, b.snapshotOps.Enabled, withUnique)
 	if cap(att.prepared) < capHint {
 		att.prepared = slices.Grow(att.prepared, capHint)
 	}
-	if cap(att.accepted) < capHint {
-		att.accepted = slices.Grow(att.accepted, capHint)
-	}
-	if cap(att.states) < capHint {
+	if !singleState && cap(att.states) < capHint {
 		att.states = slices.Grow(att.states, capHint)
 	}
 
-	att.prepareStateMap(b.strKey, capHint)
+	if !singleState {
+		att.prepareStateMap(b.strKey, capHint)
+	}
 	defer attemptStatePool.Put(att)
 
 	b.prepareActive(att, active)
@@ -597,10 +621,11 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	return nil, true, nil
 }
 
-func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, withSnapshots bool) {
+func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, singleState bool, withSnapshots bool, withUnique bool) {
 	st.bucket = bucket
 	st.statsEnabled = statsEnabled
 	st.release = release
+	st.singleState = singleState
 	if cap(st.ownedPayloads) < capHint {
 		st.ownedPayloads = slices.Grow(st.ownedPayloads, capHint)
 	}
@@ -608,14 +633,16 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 	if cap(st.decodedValues) < decodedCapHint {
 		st.decodedValues = slices.Grow(st.decodedValues, decodedCapHint)
 	}
-	if cap(st.uniqueIdxs) < capHint {
-		st.uniqueIdxs = slices.Grow(st.uniqueIdxs, capHint)
-	}
-	if cap(st.uniqueOldVals) < capHint {
-		st.uniqueOldVals = slices.Grow(st.uniqueOldVals, capHint)
-	}
-	if cap(st.uniqueNewVals) < capHint {
-		st.uniqueNewVals = slices.Grow(st.uniqueNewVals, capHint)
+	if withUnique {
+		if cap(st.uniqueIdxs) < capHint {
+			st.uniqueIdxs = slices.Grow(st.uniqueIdxs, capHint)
+		}
+		if cap(st.uniqueOldVals) < capHint {
+			st.uniqueOldVals = slices.Grow(st.uniqueOldVals, capHint)
+		}
+		if cap(st.uniqueNewVals) < capHint {
+			st.uniqueNewVals = slices.Grow(st.uniqueNewVals, capHint)
+		}
 	}
 	if withSnapshots {
 		if cap(st.preparedSnapshots) < capHint {
@@ -657,6 +684,8 @@ func (st *attemptState) cleanup() {
 	st.bucket = nil
 	st.statsEnabled = false
 	st.release = nil
+	st.singleState = false
+	st.state = recordState{}
 }
 
 func (st *recordState) payloadBytes() []byte {

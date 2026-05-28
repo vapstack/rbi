@@ -124,6 +124,51 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 		return err
 	}
 
+	if b.sched.maxOps == 1 && b.sched.window == 0 && b.sched.maxQ == 0 {
+		b.sched.mu.Lock()
+		if !b.sched.running && b.sched.queueLen == 0 {
+			if err := b.unavailable(); err != nil {
+				b.sched.mu.Unlock()
+				for i := 0; i < len(reqs); i++ {
+					requestPool.Put(reqs[i])
+				}
+				if stats {
+					b.sched.stats.FallbackClosed.Add(1)
+				}
+				return err
+			}
+			b.sched.running = true
+			if stats {
+				b.sched.stats.Enqueued.Add(1)
+				b.sched.stats.Dequeued.Add(1)
+				atomicSetMax(&b.sched.stats.QueueHighWater, 1)
+			}
+			b.sched.mu.Unlock()
+
+			var err error
+			if err = b.unavailable(); err != nil {
+				assignRequestErr(reqs, err)
+			} else {
+				b.executeDirect(reqs, isolated || len(reqs) != 1)
+				err = firstRequestErr(reqs)
+			}
+			for i := 0; i < len(reqs); i++ {
+				requestPool.Put(reqs[i])
+			}
+
+			b.sched.mu.Lock()
+			if b.sched.queueLen == 0 {
+				b.sched.running = false
+				b.sched.cond.Broadcast()
+			} else {
+				go b.runLoop()
+			}
+			b.sched.mu.Unlock()
+			return err
+		}
+		b.sched.mu.Unlock()
+	}
+
 	job := jobPool.Get()
 	job.reqs = reqs
 	job.isolated = isolated || len(reqs) != 1
@@ -171,6 +216,25 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 	return err
 }
 
+func (b *Batcher) executeDirect(reqs []*request, isolated bool) {
+	b.sched.stats.recordExecuted(1)
+	stats := b.sched.stats.Enabled
+	var started time.Time
+	if stats {
+		started = time.Now()
+	}
+
+	if isolated {
+		b.runAtomic(reqs)
+	} else {
+		b.runShared(reqs)
+	}
+
+	if stats {
+		b.sched.stats.ExecuteNanos.Add(uint64(time.Since(started)))
+	}
+}
+
 func (b *Batcher) runLoop() {
 	for {
 		batch := b.sched.popBatch(b.strKey)
@@ -194,20 +258,18 @@ func (b *Batcher) runLoop() {
 }
 
 func (b *Batcher) executeJobs(batch []*writeJob) {
+	if len(batch) == 1 {
+		job := batch[0]
+		b.executeDirect(job.reqs, job.isolated)
+		finishJobs(batch)
+		return
+	}
+
 	b.sched.stats.recordExecuted(len(batch))
 	stats := b.sched.stats.Enabled
 	var started time.Time
 	if stats {
 		started = time.Now()
-	}
-
-	if len(batch) == 1 && batch[0].isolated {
-		b.runAtomic(batch[0].reqs)
-		finishJobs(batch)
-		if stats {
-			b.sched.stats.ExecuteNanos.Add(uint64(time.Since(started)))
-		}
-		return
 	}
 
 	reqScratch := requestScratchPool.Get(len(batch))
@@ -235,14 +297,24 @@ func (b *Batcher) runShared(batch []*request) {
 		batch[i].Err = nil
 	}
 
-	activeScratch := requestScratchPool.Get(len(batch))
+	activeScratch := batch
+	scratchOwned := false
 	for i := 0; i < len(batch); i++ {
-		req := batch[i]
-		if req.replacedBy == nil {
-			activeScratch = append(activeScratch, req)
+		if batch[i].replacedBy != nil {
+			activeScratch = requestScratchPool.Get(len(batch))
+			scratchOwned = true
+			for j := 0; j < len(batch); j++ {
+				req := batch[j]
+				if req.replacedBy == nil {
+					activeScratch = append(activeScratch, req)
+				}
+			}
+			break
 		}
 	}
-	defer requestScratchPool.Put(activeScratch)
+	if scratchOwned {
+		defer requestScratchPool.Put(activeScratch)
+	}
 
 	for {
 		retryWithoutReq, done, fatalErr := b.attempt(activeScratch, false)
@@ -254,20 +326,35 @@ func (b *Batcher) runShared(batch []*request) {
 			return
 		}
 
-		write := 0
 		removed := false
-		for i := 0; i < len(activeScratch); i++ {
-			req := activeScratch[i]
-			if !removed && req == retryWithoutReq {
-				removed = true
-				continue
+		if scratchOwned {
+			write := 0
+			for i := 0; i < len(activeScratch); i++ {
+				req := activeScratch[i]
+				if !removed && req == retryWithoutReq {
+					removed = true
+					continue
+				}
+				if write != i {
+					activeScratch[write] = req
+				}
+				write++
 			}
-			if write != i {
-				activeScratch[write] = req
+			activeScratch = activeScratch[:write]
+		} else {
+			scratch := requestScratchPool.Get(len(activeScratch) - 1)
+			for i := 0; i < len(activeScratch); i++ {
+				req := activeScratch[i]
+				if !removed && req == retryWithoutReq {
+					removed = true
+					continue
+				}
+				scratch = append(scratch, req)
 			}
-			write++
+			activeScratch = scratch
+			scratchOwned = true
+			defer requestScratchPool.Put(activeScratch)
 		}
-		activeScratch = activeScratch[:write]
 		if !removed {
 			assignRequestErr(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
 			return

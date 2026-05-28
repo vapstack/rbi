@@ -2,6 +2,7 @@ package wexec
 
 import (
 	"fmt"
+	"slices"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -291,93 +292,165 @@ func (ctx UniqueContext) checkOnWriteMulti(idxs []uint64, oldVals, newVals []uns
 		return nil
 	}
 
-	pos := uniqueUint64IntMapPool.Get(len(idxs))
-	defer uniqueUint64IntMapPool.Put(pos)
-
-	idxs, oldVals, newVals = collapseUniqueWriteMulti(idxs, oldVals, newVals, pos)
-
-	leaving := uniqueLeavingOuterPool.Get()
-	defer uniqueLeavingOuterPool.Put(leaving)
-
-	seen := uniqueSeenOuterPool.Get()
-	defer uniqueSeenOuterPool.Put(seen)
-
-	for i, idx := range idxs {
-		oldVal := oldVals[i]
-		var newVal unsafe.Pointer
-		if newVals != nil {
-			newVal = newVals[i]
+	ordered := true
+	for i := 1; i < len(idxs); i++ {
+		if idxs[i] <= idxs[i-1] {
+			ordered = false
+			break
 		}
-		if oldVal == nil {
-			continue
-		}
-
-		if newVal == nil {
-			for _, acc := range ctx.Schema.Unique {
-				single, ok, isNil := acc.UniqueGetter(oldVal)
-				if !ok || isNil {
-					continue
-				}
-				m := leaving[acc.Name]
-				if m == nil {
-					m = uniqueLeavingInnerPool.Get()
-					leaving[acc.Name] = m
-				}
-				ids := m[single]
-				ids = ids.BuildAdded(idx)
-				m[single] = ids
-			}
-			continue
-		}
-
-		for _, acc := range ctx.Schema.Unique {
-			if !acc.Modified(oldVal, newVal) {
-				continue
-			}
-			single, ok, isNil := acc.UniqueGetter(oldVal)
-			if !ok || isNil {
-				continue
-			}
-			m := leaving[acc.Name]
-			if m == nil {
-				m = uniqueLeavingInnerPool.Get()
-				leaving[acc.Name] = m
-			}
-			ids := m[single]
-			ids = ids.BuildAdded(idx)
-			m[single] = ids
-		}
+	}
+	if !ordered {
+		pos := uniqueUint64IntMapPool.Get(len(idxs))
+		idxs, oldVals, newVals = collapseUniqueWriteMulti(idxs, oldVals, newVals, pos)
+		uniqueUint64IntMapPool.Put(pos)
 	}
 
 	if newVals == nil {
 		return nil
 	}
 
+	seen := uniqueSeenOuterPool.Get()
+	var leaving map[string]map[keycodec.IndexLookupKey]posting.List
+	current := ctx.Current()
+
 	for i, idx := range idxs {
+		oldVal := oldVals[i]
 		newVal := newVals[i]
 		if newVal == nil {
 			continue
 		}
-
-		if oldVals[i] == nil {
-			for _, acc := range ctx.Schema.Unique {
-				if err := ctx.checkBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-
 		for _, acc := range ctx.Schema.Unique {
-			if !acc.Modified(oldVals[i], newVal) {
+			if oldVal != nil && !acc.Modified(oldVal, newVal) {
 				continue
 			}
-			if err := ctx.checkBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
+			needLeaving, err := ctx.checkBatchCandidateMulti(current, idx, newVal, acc, seen, leaving)
+			if err != nil {
+				uniqueSeenOuterPool.Put(seen)
+				if leaving != nil {
+					uniqueLeavingOuterPool.Put(leaving)
+				}
+				return err
+			}
+			if !needLeaving {
+				continue
+			}
+			leaving = uniqueLeavingOuterPool.Get()
+			for j, old := range oldVals {
+				if old == nil {
+					continue
+				}
+				next := newVals[j]
+				if next == nil {
+					for _, leavingAcc := range ctx.Schema.Unique {
+						single, ok, isNil := leavingAcc.UniqueGetter(old)
+						if !ok || isNil {
+							continue
+						}
+						m := leaving[leavingAcc.Name]
+						if m == nil {
+							m = uniqueLeavingInnerPool.Get()
+							leaving[leavingAcc.Name] = m
+						}
+						ids := m[single]
+						ids = ids.BuildAdded(idxs[j])
+						m[single] = ids
+					}
+					continue
+				}
+				for _, leavingAcc := range ctx.Schema.Unique {
+					if !leavingAcc.Modified(old, next) {
+						continue
+					}
+					single, ok, isNil := leavingAcc.UniqueGetter(old)
+					if !ok || isNil {
+						continue
+					}
+					m := leaving[leavingAcc.Name]
+					if m == nil {
+						m = uniqueLeavingInnerPool.Get()
+						leaving[leavingAcc.Name] = m
+					}
+					ids := m[single]
+					ids = ids.BuildAdded(idxs[j])
+					m[single] = ids
+				}
+			}
+			_, err = ctx.checkBatchCandidateMulti(current, idx, newVal, acc, seen, leaving)
+			if err != nil {
+				uniqueSeenOuterPool.Put(seen)
+				uniqueLeavingOuterPool.Put(leaving)
 				return err
 			}
 		}
 	}
+	uniqueSeenOuterPool.Put(seen)
+	if leaving != nil {
+		uniqueLeavingOuterPool.Put(leaving)
+	}
 	return nil
+}
+
+func (ctx UniqueContext) checkBatchCandidateMulti(
+	current *snapshot.View,
+	idx uint64,
+	ptr unsafe.Pointer,
+	acc schema.IndexedFieldAccessor,
+	seen map[string]map[keycodec.IndexLookupKey]uint64,
+	leaving map[string]map[keycodec.IndexLookupKey]posting.List,
+) (bool, error) {
+
+	single, ok, isNil := acc.UniqueGetter(ptr)
+	if !ok || isNil {
+		return false, nil
+	}
+
+	sm := seen[acc.Name]
+	if sm == nil {
+		sm = uniqueSeenInnerPool.Get()
+		seen[acc.Name] = sm
+	}
+	if prev, ok := sm[single]; ok && prev != idx {
+		return false, fmt.Errorf("%w: duplicate value for field %v within batch", ctx.UniqueViolation, acc.Name)
+	}
+	sm[single] = idx
+
+	ids := current.FieldLookupPostingRetainedKey(acc.Name, single)
+	if ids.IsEmpty() {
+		return false, nil
+	}
+
+	if leaving == nil {
+		if ids.Cardinality() == 1 && ids.Contains(idx) {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	var lv posting.List
+	if fm := leaving[acc.Name]; fm != nil {
+		lv = fm[single]
+	}
+
+	if lv.IsEmpty() {
+		if ids.Cardinality() == 1 && ids.Contains(idx) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+	}
+
+	iter := ids.Iter()
+	defer iter.Release()
+	for iter.HasNext() {
+		other := iter.Next()
+		if other == idx {
+			continue
+		}
+		if lv.Contains(other) {
+			continue
+		}
+		return false, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+	}
+	return false, nil
 }
 
 func (ctx UniqueContext) checkBatchCandidate(
@@ -464,6 +537,12 @@ func (b *Batcher) filterAccepted(att *attemptState, atomicAll bool) error {
 		return nil
 	}
 
+	if cap(att.accepted) < len(att.prepared) {
+		att.accepted = slices.Grow(att.accepted, len(att.prepared))
+	}
+	if cap(att.acceptedSnapshots) < len(att.preparedSnapshots) {
+		att.acceptedSnapshots = slices.Grow(att.acceptedSnapshots, len(att.preparedSnapshots))
+	}
 	att.accepted = att.accepted[:0]
 	att.acceptedSnapshots = att.acceptedSnapshots[:0]
 	uniqueState := uniqueBatchCheckState{

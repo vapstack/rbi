@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -113,6 +114,93 @@ func TestBatchAPISubmitAndCancel(t *testing.T) {
 	cancel.Cancel()
 	if got := readAttemptPayload(t, raw, bucket, 3); got != nil {
 		t.Fatalf("payload after canceled batch = %v, want nil", got)
+	}
+}
+
+func TestDirectSubmitDrainsConcurrentQueuedJob(t *testing.T) {
+	var events []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var first atomic.Bool
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, _ string) error {
+		if first.CompareAndSwap(false, true) {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return tx.Commit()
+	})
+	ex.snapshotOps = SnapshotOps{}
+	ex.sched.maxOps = 1
+	ex.sched.window = 0
+	ex.sched.maxQ = 0
+
+	rec1 := attemptRec{V: 1}
+	batch1 := ex.NewBatch(1)
+	if err := batch1.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&rec1), nil, nil, nil); err != nil {
+		t.Fatalf("AddSet first: %v", err)
+	}
+	done1 := make(chan error, 1)
+	go func() {
+		done1 <- batch1.Submit(false)
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first submit did not reach commit")
+	}
+
+	rec2 := attemptRec{V: 2}
+	batch2 := ex.NewBatch(1)
+	if err := batch2.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&rec2), nil, nil, nil); err != nil {
+		t.Fatalf("AddSet second: %v", err)
+	}
+	done2 := make(chan error, 1)
+	go func() {
+		done2 <- batch2.Submit(false)
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		ex.sched.mu.Lock()
+		queued := ex.sched.queueLen
+		running := ex.sched.running
+		ex.sched.mu.Unlock()
+		if queued == 1 && running {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("second submit was not queued while direct submit was running: queue=%d running=%v", queued, running)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(releaseFirst)
+
+	select {
+	case err := <-done1:
+		if err != nil {
+			t.Fatalf("first submit error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first submit did not finish")
+	}
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("second submit error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued submit was not drained")
+	}
+
+	if got := readAttemptPayload(t, raw, bucket, 1); !bytes.Equal(got, []byte{1}) {
+		t.Fatalf("id=1 payload = %v, want [1]", got)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 2); !bytes.Equal(got, []byte{2}) {
+		t.Fatalf("id=2 payload = %v, want [2]", got)
 	}
 }
 
