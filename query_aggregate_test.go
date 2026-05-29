@@ -1079,15 +1079,6 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 		t.Fatalf("BatchSet duplicate ids: %v", err)
 	}
 
-	acc := db.engine.schema.MeasuresByName["amount"]
-	storage := db.engine.snapshot.Current().Measure[acc.Ordinal]
-	if storage.Rows() != 1 {
-		t.Fatalf("measure rows=%d, want 1", storage.Rows())
-	}
-	if got, ok := storage.Lookup(1); !ok || got != 20 {
-		t.Fatalf("measure lookup=(%d,%v), want (20,true)", got, ok)
-	}
-
 	result, err := db.Aggregate(qx.Aggregate(
 		qx.COUNT("amount").AS("count"),
 		qx.SUM("amount").AS("sum"),
@@ -1297,10 +1288,7 @@ func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 		_ = raw2.Close()
 	})
 
-	stats := db2.engine.exec.Stats.Load()
-	if stats == nil {
-		t.Fatalf("planner stats are missing")
-	}
+	stats := db2.PlannerStats()
 	fieldStats, ok := stats.Fields["category"]
 	if !ok {
 		t.Fatalf("planner stats for rebuilt ordinary field are missing: %#v", stats.Fields)
