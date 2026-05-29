@@ -134,15 +134,6 @@ func ReleaseMeasureEntryBufs(bufs [][]MeasureEntry) {
 	}
 }
 
-func CleanupBuildMeasureStates(buildOK *bool, states [][][]MeasureEntry) {
-	if *buildOK {
-		return
-	}
-	for i := range states {
-		ReleaseMeasureEntryBufs(states[i])
-	}
-}
-
 func NewMeasureStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorage {
 	if entries == nil {
 		return MeasureStorage{}

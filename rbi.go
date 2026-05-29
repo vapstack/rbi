@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1116,7 +1117,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 	}
 
 	db.refreshPlannerStatsLocked()
-	forceMemoryCleanup(true)
+	debug.FreeOSMemory()
 	return nil
 }
 

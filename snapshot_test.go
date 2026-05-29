@@ -1432,7 +1432,11 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *t
 	if !ok || pinned != old {
 		t.Fatalf("expected current snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1523,6 +1527,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *t
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -1541,7 +1546,11 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedSetRollback(t *test
 	if !ok || pinned != old {
 		t.Fatalf("expected current snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1634,6 +1643,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedSetRollback(t *test
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -1652,7 +1662,11 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchSetBeforeCommit
 	if !ok || pinned != old {
 		t.Fatalf("expected current snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1756,6 +1770,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchSetBeforeCommit
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -1822,7 +1837,11 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1903,6 +1922,7 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -1921,7 +1941,11 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -2035,6 +2059,7 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -2050,7 +2075,11 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
 	}
-	defer db.engine.snapshot.Unpin(old.Seq, holdRef)
+	defer func() {
+		if holdRef != nil {
+			db.engine.snapshot.Unpin(old.Seq, holdRef)
+		}
+	}()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -2204,6 +2233,7 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	}
 
 	db.engine.snapshot.Unpin(old.Seq, holdRef)
+	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 

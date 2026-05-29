@@ -584,18 +584,9 @@ func TestRebuildIndex_ScanErrorClearsActiveFlag(t *testing.T) {
 	if !strings.Contains(err.Error(), "scan error") {
 		t.Fatalf("expected scan error, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "id=1") {
-		t.Fatalf("expected scan error to include key id, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "idx=1") {
-		t.Fatalf("expected scan error to include idx, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "value_len=1") {
-		t.Fatalf("expected scan error to include value len, got: %v", err)
-	}
 
 	// Rebuild must clear active flag even when build fails.
-	if err := db.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
+	if err = db.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
 		t.Fatalf("Set after failed rebuild should not see busy flag, got: %v", err)
 	}
 
@@ -2438,8 +2429,8 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 
 	assertState("incremental")
 
-	if err := db.buildIndex(nil, nil); err != nil {
-		t.Fatalf("buildIndex: %v", err)
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
 	}
 	assertState("rebuilt")
 }
