@@ -244,14 +244,12 @@ func (rb *bitmap32) cloneSharedInto(dst *bitmap32) *bitmap32 {
 
 // retain increments the shared reference count for rb and returns it.
 func (rb *bitmap32) retain() *bitmap32 {
-	if rb != nil {
-		rb.refs.Add(1)
-	}
+	rb.refs.Add(1)
 	return rb
 }
 
 func (rb *bitmap32) uniquelyOwned() bool {
-	return rb == nil || rb.refs.Load() == 1
+	return rb.refs.Load() == 1
 }
 
 // isUniquelyOwned reports whether rb can be mutated without copy-on-write cloning.
@@ -1751,7 +1749,7 @@ func (rb *bitmap32) or(x2 *bitmap32) {
 		return
 	}
 
-	outSize := countUnionKeys(rb.highlowcontainer.keys[:length1], x2.highlowcontainer.keys[:length2])
+	outSize := countUnionKeys16(rb.highlowcontainer.keys[:length1], x2.highlowcontainer.keys[:length2])
 	rb.highlowcontainer.grow(outSize)
 
 	pos1 := length1 - 1

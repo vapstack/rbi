@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/binsearch"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
@@ -1110,7 +1109,7 @@ func RebuildLenFieldStorageFromIndexView(universe posting.List, fieldOV FieldInd
 
 func newLenFieldStorageFromMapOwned(universe posting.List, lengths map[uint32]posting.List, nonEmpty posting.List) (FieldStorage, bool) {
 	if len(lengths) == 0 || universe.IsEmpty() {
-		posting.ReleaseMap(lengths)
+		posting.ReleaseMapU32(lengths)
 		clear(lengths)
 		return FieldStorage{}, false
 	}
@@ -2200,7 +2199,7 @@ func (r *fieldIndexChunkedRoot) pagePosForChunk(chunk int) (int, int) {
 	if chunk < 0 || chunk >= r.chunkCount {
 		return len(r.pages), 0
 	}
-	page := binsearch.IntUpper(r.chunkPrefix[1:], chunk)
+	page := searchIntUpper(r.chunkPrefix[1:], chunk)
 	if page >= len(r.pages) {
 		return len(r.pages), 0
 	}
@@ -2222,7 +2221,7 @@ func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
 	if limit >= r.chunkCount {
 		return r.keyCount
 	}
-	page := binsearch.IntLower(r.chunkPrefix[1:], limit)
+	page := searchIntLower(r.chunkPrefix[1:], limit)
 	if r.pages == nil || page >= len(r.pages) {
 		return r.keyCount
 	}
@@ -2240,7 +2239,7 @@ func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
 		}
 		return r.rowPrefix[len(r.rowPrefix)-1]
 	}
-	page := binsearch.IntLower(r.chunkPrefix[1:], limit)
+	page := searchIntLower(r.chunkPrefix[1:], limit)
 	if r.pages == nil || page >= len(r.pages) {
 		if len(r.rowPrefix) == 0 {
 			return 0
@@ -2307,13 +2306,13 @@ func (r *fieldIndexChunkedRoot) posForRank(rank int) fieldIndexChunkPos {
 	if rank >= r.keyCount {
 		return r.endPos()
 	}
-	page := binsearch.IntUpper(r.prefix[1:], rank)
+	page := searchIntUpper(r.prefix[1:], rank)
 	if page >= len(r.pages) {
 		return r.endPos()
 	}
 	pageRef := r.pages[page]
 	localRank := rank - r.prefix[page]
-	refIdx := binsearch.IntUpper(pageRef.prefix[1:], localRank)
+	refIdx := searchIntUpper(pageRef.prefix[1:], localRank)
 	if refIdx >= len(pageRef.refs) {
 		return r.endPos()
 	}
@@ -2647,4 +2646,32 @@ func (r *fieldIndexChunkedRoot) touchChunkIndexFrom(start int, key keycodec.Inde
 		return r.chunkPrefix[page+1] - 1
 	}
 	return r.chunkPrefix[page] + refIdx
+}
+
+func searchIntLower(s []int, v int) int {
+	l := len(s)
+	i, j := 0, l
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if s[h] < v {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
+
+func searchIntUpper(s []int, v int) int {
+	l := len(s)
+	i, j := 0, l
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if s[h] <= v {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
 }

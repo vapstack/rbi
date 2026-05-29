@@ -262,9 +262,6 @@ func (bc *containerBitmap) uniquelyOwned() bool {
 }
 
 func (bc *containerBitmap) release() {
-	if bc == nil {
-		return
-	}
 	if bc.refs.Add(-1) != 0 {
 		return
 	}
@@ -279,9 +276,6 @@ func (bc *containerBitmap) release() {
 func (bc *containerBitmap) Release() { bc.release() }
 
 func efficientContainerFromTempBitmap(temp *containerBitmap) container16 {
-	if temp == nil {
-		return nil
-	}
 	result := temp.toEfficientContainer()
 	if returned, ok := result.(*containerBitmap); !ok || returned != temp {
 		temp.release()

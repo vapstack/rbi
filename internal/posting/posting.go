@@ -1448,9 +1448,6 @@ func (p List) Iter() Iterator {
 }
 
 func (p List) andIntoLarge(dst *largePosting) {
-	if dst == nil {
-		return
-	}
 	if p.ptr == nil {
 		dst.clear()
 		return
@@ -2445,7 +2442,19 @@ func ReleaseAll(ids []List) {
 	}
 }
 
-func ReleaseMap[K comparable](m map[K]List) {
+func ReleaseMapU32(m map[uint32]List) {
+	for _, ids := range m {
+		ids.Release()
+	}
+}
+
+func ReleaseMapU64(m map[uint64]List) {
+	for _, ids := range m {
+		ids.Release()
+	}
+}
+
+func ReleaseMapString(m map[string]List) {
 	for _, ids := range m {
 		ids.Release()
 	}

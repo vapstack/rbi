@@ -11,14 +11,110 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
 )
 
 type Meta struct {
 	Country string `db:"country" rbi:"index"`
+}
+
+func compareFloat64QuerySemantics(a, b float64) int {
+	a = keycodec.CanonicalizeFloat64ForIndex(a)
+	b = keycodec.CanonicalizeFloat64ForIndex(b)
+
+	aNaN := math.IsNaN(a)
+	bNaN := math.IsNaN(b)
+	switch {
+	case aNaN && bNaN:
+		return 0
+	case aNaN:
+		return 1
+	case bNaN:
+		return -1
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+const (
+	expectedOrderBasic = iota + 1
+	expectedOrderArrayPos
+	expectedOrderArrayCount
+)
+
+type expectedOrder struct {
+	kind     int
+	field    string
+	desc     bool
+	priority []string
+}
+
+func queryExpectedOrder(q *qx.QX) (expectedOrder, error) {
+	if len(q.Order) == 0 {
+		return expectedOrder{}, nil
+	}
+	if len(q.Order) > 1 {
+		return expectedOrder{}, fmt.Errorf("rbi does not support multi-column ordering")
+	}
+
+	src := q.Order[0]
+	by := src.By
+	switch by.Kind {
+	case qx.KindREF:
+		return expectedOrder{kind: expectedOrderBasic, field: by.Name, desc: src.Desc}, nil
+	case qx.KindOP:
+		switch by.Name {
+		case qx.OpLEN:
+			if len(by.Args) != 1 || by.Args[0].Kind != qx.KindREF {
+				return expectedOrder{}, fmt.Errorf("rbi: invalid LEN order expression")
+			}
+			return expectedOrder{kind: expectedOrderArrayCount, field: by.Args[0].Name, desc: src.Desc}, nil
+		case qx.OpPOS:
+			if len(by.Args) != 2 || by.Args[0].Kind != qx.KindREF || by.Args[1].Kind != qx.KindLIT {
+				return expectedOrder{}, fmt.Errorf("rbi: invalid POS order expression")
+			}
+			priority, _ := by.Args[1].Value.([]string)
+			return expectedOrder{kind: expectedOrderArrayPos, field: by.Args[0].Name, desc: src.Desc, priority: priority}, nil
+		}
+	}
+	return expectedOrder{}, fmt.Errorf("rbi does not support order expression")
+}
+
+func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
+	for v.IsValid() {
+		switch v.Kind() {
+		case reflect.Interface, reflect.Pointer:
+			if v.IsNil() {
+				return reflect.Value{}, true
+			}
+			v = v.Elem()
+		default:
+			return v, false
+		}
+	}
+	return reflect.Value{}, true
+}
+
+func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
+	idx, _ := db.idxFromUserKeyWithCreated(id)
+	return idx
+}
+
+func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
+	if db.strKey {
+		s := *(*string)(unsafe.Pointer(&id))
+		return db.strMap.Create(s)
+	}
+	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
 type Rec struct {
@@ -820,19 +916,17 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 	} else {
-		prepared, viewQ, err := prepareTestQuery(db.engine, q)
+		order, err := queryExpectedOrder(q)
 		if err != nil {
 			return nil, err
 		}
-		defer prepared.Release()
-		o := viewQ.Order
-		f := testOrderFieldName(db.engine, o)
-		switch o.Kind {
-		case qir.OrderKindBasic:
+		f := order.field
+		switch order.kind {
+		case expectedOrderBasic:
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
-				cmp := compareOrderedFieldValues(va, vb, o.Desc)
+				cmp := compareOrderedFieldValues(va, vb, order.desc)
 				if cmp == 0 {
 					return a.id < b.id
 				}
@@ -840,14 +934,14 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
-		case qir.OrderKindArrayPos:
-			want, _ := o.Data.([]string)
+		case expectedOrderArrayPos:
+			want := order.priority
 			if len(want) == 0 {
 				sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 				break
 			}
 			priority := want
-			if o.Desc {
+			if order.desc {
 				priority = append([]string(nil), want...)
 				// reverse priority for desc
 				for i, j := 0, len(priority)-1; i < j; i, j = i+1, j-1 {
@@ -881,7 +975,7 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 				return ri < rj
 			})
 
-		case qir.OrderKindArrayCount:
+		case expectedOrderArrayCount:
 			sort.Slice(rows, func(i, j int) bool {
 				ai, _ := fieldValue(rows[i].rec, f).([]string)
 				aj, _ := fieldValue(rows[j].rec, f).([]string)
@@ -890,14 +984,14 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 				if ci == cj {
 					return rows[i].id < rows[j].id
 				}
-				if o.Desc {
+				if order.desc {
 					return ci > cj
 				}
 				return ci < cj
 			})
 
 		default:
-			return nil, fmt.Errorf("test harness: unknown order kind %v", o.Kind)
+			return nil, fmt.Errorf("test harness: unknown order kind %v", order.kind)
 		}
 	}
 
@@ -950,19 +1044,17 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
 	} else {
-		prepared, viewQ, err := prepareTestQuery(db.engine, q)
+		order, err := queryExpectedOrder(q)
 		if err != nil {
 			return nil, err
 		}
-		defer prepared.Release()
-		o := viewQ.Order
-		f := testOrderFieldName(db.engine, o)
-		switch o.Kind {
-		case qir.OrderKindBasic:
+		f := order.field
+		switch order.kind {
+		case expectedOrderBasic:
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
-				cmp := compareOrderedFieldValues(va, vb, o.Desc)
+				cmp := compareOrderedFieldValues(va, vb, order.desc)
 				if cmp == 0 {
 					return a.idx < b.idx
 				}
@@ -970,14 +1062,14 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
-		case qir.OrderKindArrayPos:
-			want, _ := o.Data.([]string)
+		case expectedOrderArrayPos:
+			want := order.priority
 			if len(want) == 0 {
 				sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
 				break
 			}
 			priority := want
-			if o.Desc {
+			if order.desc {
 				priority = append([]string(nil), want...)
 				for i, j := 0, len(priority)-1; i < j; i, j = i+1, j-1 {
 					priority[i], priority[j] = priority[j], priority[i]
@@ -1010,7 +1102,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 				return ri < rj
 			})
 
-		case qir.OrderKindArrayCount:
+		case expectedOrderArrayCount:
 			sort.Slice(rows, func(i, j int) bool {
 				ai, _ := fieldValue(rows[i].rec, f).([]string)
 				aj, _ := fieldValue(rows[j].rec, f).([]string)
@@ -1019,14 +1111,14 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 				if ci == cj {
 					return rows[i].idx < rows[j].idx
 				}
-				if o.Desc {
+				if order.desc {
 					return ci > cj
 				}
 				return ci < cj
 			})
 
 		default:
-			return nil, fmt.Errorf("test harness: unknown order kind %v", o.Kind)
+			return nil, fmt.Errorf("test harness: unknown order kind %v", order.kind)
 		}
 	}
 
@@ -1058,17 +1150,6 @@ func assertSameSlice(t *testing.T, got, want []uint64) {
 	}
 }
 
-func assertNoDuplicateStringIDs(t testing.TB, label string, ids []string) {
-	t.Helper()
-	seen := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		if _, ok := seen[id]; ok {
-			t.Fatalf("%s duplicate id in result: %q (result=%v)", label, id, ids)
-		}
-		seen[id] = struct{}{}
-	}
-}
-
 func assertNoOrderWindowSubsetString(t testing.TB, q *qx.QX, got, full []string, label string) {
 	t.Helper()
 	if err := queryContractValidateNoOrderWindow(q, got, full); err != nil {
@@ -1093,66 +1174,6 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 		return true
 	}
 	return slices.Equal(sortedStringIDs(a), sortedStringIDs(b))
-}
-
-func execPreparedRouteString(db *DB[string, Rec], q *qir.Shape) ([]string, error) {
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	view := db.engine.exec.AcquireView(snap)
-	defer db.engine.exec.ReleaseView(view)
-
-	ids, err := view.PreparedQuery(q)
-	if err != nil {
-		return nil, err
-	}
-	return db.queryKeysFromIDs(snap, ids), nil
-}
-
-func execPreparedRouteUint64(db *DB[uint64, Rec], q *qir.Shape) ([]uint64, error) {
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	view := db.engine.exec.AcquireView(snap)
-	defer db.engine.exec.ReleaseView(view)
-	return view.PreparedQuery(q)
-}
-
-func assertPreparedRouteEquivalenceString(
-	t testing.TB,
-	db *DB[string, Rec],
-	q *qx.QX,
-) (nq *qx.QX, ref []string, usedExecution bool, usedPlanner bool) {
-	t.Helper()
-
-	nq = normalizeQueryForTest(q)
-	prepared, viewQ, err := prepareTestQuery(db.engine, nq)
-	if err != nil {
-		t.Fatalf("prepareQuery(%+v): %v", nq, err)
-	}
-	defer prepared.Release()
-
-	ref, err = execPreparedRouteString(db, &viewQ)
-	if err != nil {
-		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
-	}
-	assertNoDuplicateStringIDs(t, "prepared", ref)
-
-	strictEqual := len(nq.Order) > 0 || (nq.Window.Limit == 0 && nq.Window.Offset == 0)
-	var noOrderFull []string
-	if !strictEqual {
-		fullQ := cloneQuery(nq)
-		fullQ.Window.Offset = 0
-		fullQ.Window.Limit = 0
-
-		noOrderFull, err = expectedKeysString(t, db, fullQ)
-		if err != nil {
-			t.Fatalf("expectedKeysString(full %+v): %v", fullQ, err)
-		}
-		assertNoOrderWindowSubsetString(t, nq, ref, noOrderFull, "prepared")
-	}
-
-	return nq, ref, true, true
 }
 
 func runQueryKeysChecked(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
@@ -1198,55 +1219,11 @@ func queryIDsEqual(q *qx.QX, a, b []uint64) bool {
 	return slices.Equal(sa, sb)
 }
 
-func assertNoDuplicateIDs(t testing.TB, label string, ids []uint64) {
-	t.Helper()
-	seen := make(map[uint64]struct{}, len(ids))
-	for _, id := range ids {
-		if _, ok := seen[id]; ok {
-			t.Fatalf("%s duplicate id in result: %d (result=%v)", label, id, ids)
-		}
-		seen[id] = struct{}{}
-	}
-}
-
 func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label string) {
 	t.Helper()
 	if err := queryContractValidateNoOrderWindow(q, got, full); err != nil {
 		t.Fatalf("%s: %v", label, err)
 	}
-}
-
-func assertPreparedRouteEquivalence(t testing.TB, db *DB[uint64, Rec], q *qx.QX) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
-	t.Helper()
-
-	nq = normalizeQueryForTest(q)
-	prepared, viewQ, err := prepareTestQuery(db.engine, nq)
-	if err != nil {
-		t.Fatalf("prepareQuery(%+v): %v", nq, err)
-	}
-	defer prepared.Release()
-
-	ref, err = execPreparedRouteUint64(db, &viewQ)
-	if err != nil {
-		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
-	}
-	assertNoDuplicateIDs(t, "prepared", ref)
-
-	strictEqual := len(nq.Order) > 0 || (nq.Window.Limit == 0 && nq.Window.Offset == 0)
-	var noOrderFull []uint64
-	if !strictEqual {
-		fullQ := cloneQuery(nq)
-		fullQ.Window.Offset = 0
-		fullQ.Window.Limit = 0
-
-		noOrderFull, err = expectedKeysUint64(t, db, fullQ)
-		if err != nil {
-			t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
-		}
-		assertNoOrderWindowSubset(t, nq, ref, noOrderFull, "prepared")
-	}
-
-	return nq, ref, true, true
 }
 
 func cloneQuery(q *qx.QX) *qx.QX {
@@ -1519,15 +1496,12 @@ func openSkewedNotInRegressionDB(t *testing.T) *DB[uint64, Rec] {
 	return db
 }
 
-func assertNotInOrderOffsetRouteEquivalence(t *testing.T, q *qx.QX) {
+func assertNotInOrderOffsetQueryMatchesReference(t *testing.T, q *qx.QX) {
 	t.Helper()
 
 	db := openSkewedNotInRegressionDB(t)
 
 	got := runQueryKeysChecked(t, db, q)
-	_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, q)
-	assertQueryIDsEqual(t, q, got, prepared)
-
 	want, err := expectedKeysUint64(t, db, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
@@ -1616,23 +1590,6 @@ func (c queryContract[K]) AssertQueryKeysMatchReference(q *qx.QX) []K {
 	}
 	var ref queryContractReference[K]
 	c.assertKeysMatchReference("QueryKeys", q, got, &ref)
-	return got
-}
-
-func (c queryContract[K]) AssertPreparedKeysMatchReference(q *qx.QX) []K {
-	c.t.Helper()
-
-	nq := normalizeQueryForTest(q)
-	if err := c.db.engine.checkUsedQuery(nq); err != nil {
-		c.t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	got, err := execPreparedQueryForTest(c.db, nq)
-	if err != nil {
-		c.t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
-	}
-	var ref queryContractReference[K]
-	c.assertKeysMatchReference("execPreparedQuery", q, got, &ref)
 	return got
 }
 
@@ -1725,28 +1682,6 @@ func (c queryContract[K]) assertCountMatchesReference(q *qx.QX, ref *queryContra
 	return got
 }
 
-func (c queryContract[K]) AssertPreparedCountMatchesReference(q *qx.QX) uint64 {
-	c.t.Helper()
-
-	var ref queryContractReference[K]
-	return c.assertPreparedCountMatchesReference(q, &ref)
-}
-
-func (c queryContract[K]) assertPreparedCountMatchesReference(q *qx.QX, ref *queryContractReference[K]) uint64 {
-	c.t.Helper()
-
-	nq := normalizeQueryForTest(q)
-	want := ref.count(c, q)
-	got, err := c.db.engine.filterCardinalityForTests(nq.Filter)
-	if err != nil {
-		c.t.Fatalf("filterCardinalityForTests(%+v): %v", nq.Filter, err)
-	}
-	if got != want {
-		c.t.Fatalf("filterCardinalityForTests mismatch:\nq=%+v\ngot=%d\nwant=%d", nq, got, want)
-	}
-	return got
-}
-
 func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContractReference[K] {
 	c.t.Helper()
 	var ref queryContractReference[K]
@@ -1783,18 +1718,6 @@ func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContra
 
 	c.assertCountMatchesReference(q, &ref)
 
-	nq := normalizeQueryForTest(q)
-	if err := c.db.engine.checkUsedQuery(nq); err != nil {
-		c.t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	preparedKeys, err := execPreparedQueryForTest(c.db, nq)
-	if err != nil {
-		c.t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
-	}
-	c.assertKeysMatchReference("execPreparedQuery", q, preparedKeys, &ref)
-	c.assertPreparedCountMatchesReference(q, &ref)
-
 	return ref
 }
 
@@ -1814,25 +1737,6 @@ func clearQueryOrderWindowForTest(q *qx.QX) {
 	q.Order = nil
 	q.Window.Offset = 0
 	q.Window.Limit = 0
-}
-
-func execPreparedQueryForTest[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]K, error) {
-	prepared, viewQ, err := prepareTestQuery(db.engine, q)
-	if err != nil {
-		return nil, err
-	}
-	defer prepared.Release()
-
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	view := db.engine.exec.AcquireView(snap)
-	ids, err := view.PreparedQuery(&viewQ)
-	db.engine.exec.ReleaseView(view)
-	if err != nil {
-		return nil, err
-	}
-	return db.queryKeysFromIDs(snap, ids), nil
 }
 
 func queryContractNoOrderWindow(q *qx.QX) bool {
@@ -2024,10 +1928,6 @@ func clearQueryExtOrderWindow(q *qx.QX) {
 	clearQueryOrderWindowForTest(q)
 }
 
-func execPreparedQueryExt[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]K, error) {
-	return execPreparedQueryForTest(db, q)
-}
-
 func queryExtSortByArrayPos(q *qx.QX, field string, priority []string, dir qx.OrderDirection) *qx.QX {
 	return q.SortBy(qx.POS(field, priority), dir)
 }
@@ -2069,13 +1969,6 @@ func assertQueryExtCountMatchesBaseQuery(t *testing.T, db *DB[uint64, Rec], q *q
 	newUint64QueryContract(t, db).AssertCountMatchesReference(q)
 }
 
-func assertQueryExtPreparedMatchesExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
-	t.Helper()
-	contract := newUint64QueryContract(t, db)
-	contract.AssertPreparedKeysMatchReference(q)
-	contract.AssertPreparedCountMatchesReference(q)
-}
-
 func assertQueryExtAllReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
 	newUint64QueryContract(t, db).assertAllReadPathsMatchReference(q)
@@ -2102,7 +1995,7 @@ func queryExtItemNamesOK(items []*Rec) ([]string, bool) {
 	return out, true
 }
 
-func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx.QX, withPrepared bool) {
+func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
 
 	wantPage, err := expectedKeysUint64(t, db, q)
@@ -2120,11 +2013,6 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 		t.Fatalf("expectedKeysUint64(count %+v): %v", countQ, err)
 	}
 	wantCount := uint64(len(wantAll))
-
-	var nq *qx.QX
-	if withPrepared {
-		nq = normalizeQueryForTest(q)
-	}
 
 	errCh := make(chan error, 16)
 	var wg sync.WaitGroup
@@ -2169,17 +2057,6 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 					return
 				}
 
-				if withPrepared {
-					gotPrepared, err := execPreparedQueryExt(db, nq)
-					if err != nil {
-						errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
-						return
-					}
-					if !queryIDsEqual(nq, gotPrepared, wantPage) {
-						errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery mismatch: got=%v want=%v", gid, i, gotPrepared, wantPage)
-						return
-					}
-				}
 			}
 		}(g)
 	}

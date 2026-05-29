@@ -145,7 +145,7 @@ func (state *IndexState) Reset() {
 		state.fixed = nil
 	}
 	if state.lengths != nil {
-		posting.ReleaseMap(state.lengths)
+		posting.ReleaseMapU32(state.lengths)
 		indexdata.ReleaseLenPostingMap(state.lengths)
 		state.lengths = nil
 	}

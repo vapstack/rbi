@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
@@ -265,7 +266,19 @@ func readMeasureIndexSections(reader *bufio.Reader, compatible map[string]bool) 
 	return out, nil
 }
 
-func sortedMapFieldNames[T any](m map[string]T) []string {
+func sortedMapPlannerFieldNames(m map[string]qexec.PlannerFieldStats) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for f := range m {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedMapFieldNames(m map[string]*schema.Field) []string {
 	if len(m) == 0 {
 		return nil
 	}

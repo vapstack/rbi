@@ -6,7 +6,6 @@ import (
 	"slices"
 	"sync/atomic"
 
-	"github.com/vapstack/rbi/internal/binsearch"
 	"github.com/vapstack/rbi/internal/pooled"
 )
 
@@ -585,7 +584,7 @@ func (s MeasureStorage) LookupSteps() uint64 {
 }
 
 func (r *measureFlatRoot) lookup(ID uint64) (uint64, bool) {
-	if pos, ok := binsearch.Uint64(r.ids, ID); ok {
+	if pos, ok := searchUint64(r.ids, ID); ok {
 		return r.values[pos], true
 	}
 	return 0, false
@@ -608,8 +607,22 @@ func (r *measureChunkedRoot) lookup(ID uint64) (uint64, bool) {
 	}
 
 	chunk := r.refsByID[chunkPos].chunk
-	if pos, ok := binsearch.Uint64(chunk.ids, ID); ok {
+	if pos, ok := searchUint64(chunk.ids, ID); ok {
 		return chunk.values[pos], true
 	}
 	return 0, false
+}
+
+func searchUint64(s []uint64, v uint64) (int, bool) {
+	l := len(s)
+	i, j := 0, l
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if s[h] < v {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i, i < l && s[i] == v
 }

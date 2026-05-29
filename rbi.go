@@ -8,25 +8,87 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/internal/rebuild"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
+
+const (
+	defaultOptionsAnalyzeInterval                  = time.Hour
+	defaultBucketFillPercent                       = 0.8
+	defaultSnapshotMaterializedPredCacheMaxEntries = 24
+	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
+	defaultAutoBatchWindow                         = 50 * time.Microsecond
+	defaultAutoBatchMax                            = 64
+	defaultAutoBatchMaxQueue                       = 512
+	defaultSnapshotStrMapCompactDepth              = 256
+	defaultNumericRangeBucketSize                  = 512
+	defaultNumericRangeBucketMinFieldKeys          = 8192
+	defaultNumericRangeBucketMinSpanKeys           = 1024
+)
+
+// IndexKind declares how a struct field participates in RBI secondary storage.
+type IndexKind uint8
+
+const (
+	IndexDefault IndexKind = iota
+	IndexUnique
+	IndexMeasure
+)
+
+// ValueIndexer defines how a field value is converted into a canonical string
+// representation used as an index key in rbi.
+//
+// A type that implements ValueIndexer is responsible for ensuring that
+// IndexingValue returns a valid and stable string for every value that may
+// appear in indexed data. This includes handling nil receivers if the type
+// is a pointer or otherwise nillable. The caller does not perform nil
+// checks before invoking IndexingValue.
+//
+// IndexingValue must return a deterministic string: the same value must
+// always produce the same indexing key.
+//
+// The returned string is compared lexicographically when evaluating
+// range queries (>, >=, <, <=). Implementation must ensure that the
+// produced ordering matches the intent.
+type ValueIndexer interface {
+	IndexingValue() string
+}
+
+// Codec overrides default msgpack encoding/decoding for *V.
+//
+// EncodeRBI must write the full encoded form of the receiver to w.
+// DecodeRBI must populate the receiver from the encoded form read from r.
+//
+// RBI does not retry decoding with msgpack when DecodeRBI returns an error.
+// If fallback decoding is needed, implement it inside the
+// custom codec, for example by using github.com/vmihailenco/msgpack/v5.
+type Codec interface {
+	EncodeRBI(io.Writer) error
+	DecodeRBI(io.Reader) error
+}
+
+var codecType = reflect.TypeFor[Codec]()
 
 var (
 	ErrNotStructType     = errors.New("value is not a struct")
@@ -42,20 +104,6 @@ var (
 
 	errPersistedIndexStale   = errors.New("persisted index is stale")
 	errPersistedIndexInvalid = errors.New("persisted index is invalid")
-)
-
-const (
-	defaultOptionsAnalyzeInterval                  = time.Hour
-	defaultBucketFillPercent                       = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries = 24
-	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
-	defaultAutoBatchWindow                         = 50 * time.Microsecond
-	defaultAutoBatchMax                            = 64
-	defaultAutoBatchMaxQueue                       = 512
-	defaultSnapshotStrMapCompactDepth              = 256
-	defaultNumericRangeBucketSize                  = 512
-	defaultNumericRangeBucketMinFieldKeys          = 8192
-	defaultNumericRangeBucketMinSpanKeys           = 1024
 )
 
 // Options configures indexer and how it works with a bbolt database.
@@ -555,14 +603,12 @@ func (db *DB[K, V]) initBatcher() {
 		BucketFillPercent:  db.options.BucketFillPercent,
 		RejectEmptyPayload: db.decodeFn == nil,
 		RootMu:             &db.mu,
-		Commit: func(tx *bbolt.Tx, op string) error {
-			return commitTx(tx, op, db.testHooks)
-		},
-		StrKey:  db.strKey,
-		StrMap:  db.strMap,
-		Indexed: db.engine != nil,
-		Ops:     &ops,
-		Schema:  db.schema,
+		Commit:             commitTx,
+		StrKey:             db.strKey,
+		StrMap:             db.strMap,
+		Indexed:            db.engine != nil,
+		Ops:                &ops,
+		Schema:             db.schema,
 	}
 
 	if db.engine != nil {
@@ -582,7 +628,6 @@ func (db *DB[K, V]) initBatcher() {
 		cfg.IndexPublishOps = wexec.IndexPublishOps{
 			PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
 				return publishAfterCommitLocked(
-					db.testHooks,
 					&db.broken,
 					db.logger,
 					db.engine,
@@ -601,17 +646,182 @@ func (db *DB[K, V]) initBatcher() {
 	db.batcher = wexec.NewBatcher(cfg)
 }
 
+func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
+	seq, err := currentBucketSequence(db.bolt, db.bucket)
+	if err != nil {
+		return err
+	}
+	qe := db.engine
+	result, err := rebuild.Build(rebuild.Config{
+		Bolt:              db.bolt,
+		Bucket:            db.bucket,
+		Schema:            qe.schema,
+		Current:           qe.snapshot.Current(),
+		StrKey:            db.strKey,
+		StrMap:            db.strMap,
+		SkipFields:        skipFields,
+		SkipMeasureFields: skipMeasureFields,
+		Decode:            db.decodeBuildIndexRecord,
+		Release:           db.releaseBuildIndexRecord,
+	}, rebuild.State{
+		Index:             qe.index,
+		NilIndex:          qe.nilIndex,
+		LenIndex:          qe.lenIndex,
+		LenZeroComplement: qe.lenZeroComplement,
+		Measure:           qe.measure,
+		Universe:          qe.universe,
+		LenLoaded:         qe.lenIndexLoaded,
+	})
+	if err != nil {
+		return err
+	}
+	if result.Publish {
+		st := result.Storage
+		result.Storage = snapshot.Storage{}
+		qe.publishStorageSnapshotNoLock(seq, db.strMap, st)
+	}
+	qe.lenIndexLoaded = result.LenLoaded
+	if result.Stats {
+		db.stats.BuildTime = result.BuildTime
+		db.stats.BuildRPS = result.BuildRPS
+	}
+	return nil
+}
+
+func (db *DB[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
+	val, err := db.decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Pointer(val), nil
+}
+
+func (db *DB[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
+	var zero V
+	val := (*V)(ptr)
+	*val = zero
+	db.recPool.Put(val)
+}
+
+func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
+	if db.engine == nil || val == nil {
+		return nil
+	}
+	ptr := unsafe.Pointer(val)
+	for _, acc := range db.engine.schema.StringValidation {
+		var fieldErr error
+		acc.WriteBuild(ptr, schema.BuildSink{
+			Field: acc.Name,
+			Err:   &fieldErr,
+		})
+		if fieldErr != nil {
+			return fieldErr
+		}
+	}
+	return nil
+}
+
+const (
+	nilIndexEntryKey = indexdata.NilIndexEntryKey
+)
+
+func (db *DB[K, V]) loadIndex() (
+	skipFields map[string]struct{},
+	skipMeasureFields map[string]struct{},
+	plannerStats *qexec.PlannerStatsSnapshot,
+	err error,
+) {
+	currentSeq, err := currentBucketSequence(db.bolt, db.bucket)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
+	}
+	start := time.Now()
+	result, err := persist.Load(persist.LoadConfig{
+		File:            db.rbiFile,
+		DBPath:          db.bolt.Path(),
+		Bucket:          db.bucket,
+		CurrentSeq:      currentSeq,
+		Schema:          db.schema,
+		StrMapCompactAt: defaultSnapshotStrMapCompactDepth,
+		Errors: persist.Errors{
+			Stale:   errPersistedIndexStale,
+			Invalid: errPersistedIndexInvalid,
+		},
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			result.Storage.Release()
+		}
+	}()
+
+	qe := db.engine
+	indexdata.ReleaseFieldStorageSlots(qe.index)
+	indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
+	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
+	indexdata.ReleaseMeasureStorageSlots(qe.measure)
+	if qe.lenZeroComplement != nil {
+		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
+	}
+	qe.universe.Release()
+	qe.lenIndexLoaded = result.LenLoaded
+
+	publishStrMap := result.StrMap
+	if !db.strKey {
+		publishStrMap = nil
+	}
+	st := result.Storage
+	result.Storage = snapshot.Storage{}
+	qe.publishStorageSnapshotNoLock(currentSeq, publishStrMap, st)
+	installed = true
+
+	if db.strKey {
+		db.strMap = result.StrMap
+	}
+	db.stats.LoadTime = time.Since(start)
+
+	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
+}
+
+func (db *DB[K, V]) storeIndex() error {
+	return db.engine.storeIndex(db.rbiFile, db.bolt, db.bucket)
+}
+
+func (qe *queryEngine) storeIndex(rbiFile string, bolt *bbolt.DB, bucket []byte) error {
+	seq, err := currentBucketSequence(bolt, bucket)
+	if err != nil {
+		return fmt.Errorf("store: reading bucket sequence: %w", err)
+	}
+	snap, snapSeq, ref := qe.snapshot.PinCurrent()
+	defer qe.snapshot.Unpin(snapSeq, ref)
+
+	if snap.Seq != seq {
+		return fmt.Errorf("store: snapshot sequence mismatch: snapshot=%d bucket=%d", snap.Seq, seq)
+	}
+	statsVersion := qe.exec.StatsVersion.Load()
+	if statsVersion == 0 {
+		statsVersion = 1
+	} else {
+		statsVersion++
+	}
+	plannerStats := qe.exec.PlannerStatsSnapshotForPersist(snap, statsVersion)
+	return persist.Store(persist.StoreConfig{
+		File:         rbiFile,
+		BucketSeq:    seq,
+		Schema:       qe.schema,
+		Snapshot:     snap,
+		PlannerStats: plannerStats,
+	})
+}
+
 type rebuilder struct {
 	active   atomic.Bool
 	inflight atomic.Int64
 	mu       sync.Mutex
 	cond     *sync.Cond
-}
-
-type testHooks struct {
-	beforeCommit       func(op string) error
-	afterCommitPublish func(op string)
-	beforeStoreIndex   func() error
 }
 
 type (
@@ -654,8 +864,6 @@ type (
 		mu sync.RWMutex
 
 		stats Stats[K]
-
-		testHooks *testHooks
 	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
@@ -1053,7 +1261,7 @@ func (qe *queryEngine) publishStorageSnapshotNoLock(seq uint64, strMap *strmap.M
 	}
 }
 
-func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger *log.Logger, engine *queryEngine, seq uint64, op string, publish func()) (err error) {
+func publishAfterCommitLocked(broken *atomic.Bool, logger *log.Logger, engine *queryEngine, seq uint64, op string, publish func()) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if broken.CompareAndSwap(false, true) {
@@ -1070,23 +1278,11 @@ func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger 
 			engine.snapshot.DropStaged(seq)
 		}
 	}()
-	if testHooks != nil {
-		if hook := testHooks.afterCommitPublish; hook != nil {
-			hook(op)
-		}
-	}
 	publish()
 	return nil
 }
 
-func commitTx(tx *bbolt.Tx, op string, testHooks *testHooks) error {
-	if testHooks != nil {
-		if hook := testHooks.beforeCommit; hook != nil {
-			if err := hook(op); err != nil {
-				return err
-			}
-		}
-	}
+func commitTx(tx *bbolt.Tx, _ string) error {
 	return tx.Commit()
 }
 
@@ -1401,7 +1597,7 @@ func (db *DB[K, V]) Truncate() error {
 		if _, err = bucket.NextSequence(); err != nil {
 			return fmt.Errorf("advance bucket sequence: %w", err)
 		}
-		if err = commitTx(tx, "truncate", db.testHooks); err != nil {
+		if err = commitTx(tx, "truncate"); err != nil {
 			return fmt.Errorf("commit error: %w", err)
 		}
 		return nil
@@ -1434,7 +1630,7 @@ func (db *DB[K, V]) Truncate() error {
 		StrMap:            nextStrMap,
 	})
 	db.engine.snapshot.Stage(snap)
-	if err = commitTx(tx, "truncate", db.testHooks); err != nil {
+	if err = commitTx(tx, "truncate"); err != nil {
 		db.engine.snapshot.DropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
@@ -1450,7 +1646,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.engine.universe = nextUniverse
-	if err = publishAfterCommitLocked(db.testHooks, &db.broken, db.logger, db.engine, seq, "truncate", func() {
+	if err = publishAfterCommitLocked(&db.broken, db.logger, db.engine, seq, "truncate", func() {
 		db.engine.installViewNoLock(snap)
 		if db.strMap != nil {
 			db.strMap.MarkCommittedPublished(snap.StrMap)
@@ -1488,4 +1684,152 @@ func (db *DB[K, V]) Bolt() *bbolt.DB {
 // BucketName returns a name of the bucket at which the data is stored.
 func (db *DB[K, V]) BucketName() []byte {
 	return slices.Clone(db.bucket)
+}
+
+var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
+	New: func() *msgpack.Encoder { return msgpack.NewEncoder(io.Discard) },
+	Cleanup: func(enc *msgpack.Encoder) {
+		enc.Reset(io.Discard)
+	},
+}
+
+var msgpackDecPool = pooled.Pointers[msgpack.Decoder]{
+	New: func() *msgpack.Decoder {
+		return msgpack.NewDecoder(strings.NewReader(""))
+	},
+}
+
+var decodeReaderPool = pooled.Pointers[bytes.Reader]{
+	Clear: true,
+}
+
+func defaultCodecMethods[V any]() (func(*V, io.Writer) error, func(*V, io.Reader) error, error) {
+	t := reflect.TypeFor[*V]()
+	if !t.Implements(codecType) {
+		return nil, nil, nil
+	}
+	if _, bad := reflect.TypeFor[V]().MethodByName("DecodeRBI"); bad {
+		return nil, nil, fmt.Errorf("invalid Codec implementation for %v: DecodeRBI must have pointer receiver", t)
+	}
+
+	encodeMethod, ok := t.MethodByName("EncodeRBI")
+	if !ok {
+		return nil, nil, nil
+	}
+	encodeFn, ok := encodeMethod.Func.Interface().(func(*V, io.Writer) error)
+	if !ok {
+		return nil, nil, nil
+	}
+
+	decodeMethod, ok := t.MethodByName("DecodeRBI")
+	if !ok {
+		return nil, nil, nil
+	}
+	decodeFn, ok := decodeMethod.Func.Interface().(func(*V, io.Reader) error)
+	if !ok {
+		return nil, nil, nil
+	}
+
+	return encodeFn, decodeFn, nil
+}
+
+func (db *DB[K, V]) decode(b []byte) (*V, error) {
+	v := db.recPool.Get()
+
+	reader := decodeReaderPool.Get()
+	defer decodeReaderPool.Put(reader)
+
+	reader.Reset(b)
+
+	if db.decodeFn != nil {
+		if err := db.decodeFn(v, reader); err != nil {
+			db.ReleaseRecords(v)
+			return nil, err
+		}
+		return v, nil
+	}
+
+	dec := msgpackDecPool.Get()
+	defer msgpackDecPool.Put(dec)
+
+	dec.Reset(reader)
+
+	if err := dec.Decode(v); err != nil {
+		db.ReleaseRecords(v)
+		return nil, err
+	}
+	return v, nil
+}
+
+func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
+	if db.encodeFn != nil {
+		return db.encodeFn(v, b)
+	}
+	enc := msgpackEncPool.Get()
+	enc.Reset(b)
+	err := enc.Encode(v)
+	msgpackEncPool.Put(enc)
+	return err
+}
+
+func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
+
+func validateBucketName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidBucketName)
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if i == 0 {
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+				continue
+			}
+			return fmt.Errorf(
+				"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
+				ErrInvalidBucketName,
+				name,
+			)
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return fmt.Errorf(
+			"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
+			ErrInvalidBucketName,
+			name,
+		)
+	}
+	return nil
+}
+
+var (
+	registryMu sync.Mutex
+	registry   = make(map[string]struct{})
+)
+
+func regInstance(dbPath, bucket string) error {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("error getting absolute file path: %w", err)
+	}
+
+	key := abs + "::" + bucket
+	if _, exists := registry[key]; exists {
+		return fmt.Errorf("rbi is already open for \"%v\" at %v", bucket, dbPath)
+	}
+
+	registry[key] = struct{}{}
+	return nil
+}
+
+func unregInstance(dbPath, bucket string) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	absPath, _ := filepath.Abs(dbPath)
+	key := absPath + "::" + bucket
+	delete(registry, key)
 }

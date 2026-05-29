@@ -3552,11 +3552,11 @@ func rangeProbeSupportsCheapPostingFilter(keepProbeHits bool, probeLen int) bool
 	return probeLen <= rangePostingFilterKeepProbeMaxBuckets
 }
 
-func applyRangeProbePostingFilter[T rangePostingFilterProbe](
+func applyRangeProbePostingFilter(
 	dst posting.List,
 	keepProbeHits bool,
 	probeLen int,
-	probe T,
+	probe fieldIndexRangeProbe,
 ) (posting.List, bool) {
 
 	if dst.IsEmpty() {

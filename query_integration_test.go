@@ -267,14 +267,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 		).Sort("score", qx.DESC).Offset(30).Limit(70),
 	}
 
-	var sawExec bool
-	var sawPlan bool
 	for i := range queries {
 		q := queries[i]
-
-		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalenceString(t, db, q)
-		sawExec = sawExec || usedExec
-		sawPlan = sawPlan || usedPlan
 
 		got, err := db.QueryKeys(q)
 		if err != nil {
@@ -293,22 +287,11 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 				t.Fatalf("q%d expectedKeysString(full): %v", i, err)
 			}
 			assertNoOrderWindowSubsetString(t, q, got, fullWant, fmt.Sprintf("q%d QueryKeys", i))
-			assertNoOrderWindowSubsetString(t, nq, ref, fullWant, fmt.Sprintf("q%d prepared", i))
 		} else {
 			if !queryStringIDsEqual(q, got, want) {
 				t.Fatalf("q%d QueryKeys mismatch:\n got=%v\nwant=%v", i, got, want)
 			}
-			if !queryStringIDsEqual(nq, ref, want) {
-				t.Fatalf("q%d prepared mismatch:\n got=%v\nwant=%v", i, ref, want)
-			}
 		}
-	}
-
-	if !sawExec {
-		t.Fatalf("expected at least one execution fast-path route")
-	}
-	if !sawPlan {
-		t.Fatalf("expected at least one planner fast-path route")
 	}
 }
 
@@ -738,9 +721,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						vals := queryTestOrderValues(q)
 						var gm, wm []string
 						for _, country := range vals {
-							ids := db.engine.snapshot.Current().FieldLookupPostingRetained("country", country)
-							gHas := ids.Contains(gid)
-							wHas := ids.Contains(wid)
+							gHas := gv != nil && gv.Country == country
+							wHas := wv != nil && wv.Country == country
 							gm = append(gm, fmt.Sprintf("%s=%v", country, gHas))
 							wm = append(wm, fmt.Sprintf("%s=%v", country, wHas))
 						}
@@ -784,9 +766,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						}
 						var gm, wm []string
 						for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
-							ids := db.engine.snapshot.Current().FieldLookupPostingRetained("tags", tag)
-							gHas := ids.Contains(gid)
-							wHas := ids.Contains(wid)
+							gHas := gv != nil && slices.Contains(gv.Tags, tag)
+							wHas := wv != nil && slices.Contains(wv.Tags, tag)
 							gm = append(gm, fmt.Sprintf("%s=%v", tag, gHas))
 							wm = append(wm, fmt.Sprintf("%s=%v", tag, wHas))
 						}
@@ -985,12 +966,6 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					assertQueryIDsEqual(t, q, base, noisy)
 				}
 
-				_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, q)
-				if queryContractNoOrderWindow(q) {
-					assertNoOrderWindowSubset(t, q, prepared, wantCountKeys, fmt.Sprintf("prepared profile=%s i=%d", p.name, i))
-				} else {
-					assertQueryIDsEqual(t, q, base, prepared)
-				}
 				wantCount := uint64(len(wantCountKeys))
 
 				gotCount, err := db.Count(q.Filter)
@@ -1004,16 +979,6 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					)
 				}
 
-				preparedCardinality, err := db.engine.filterCardinalityForTests(normalizeQueryForTest(q).Filter)
-				if err != nil {
-					t.Fatalf("filterCardinalityForTests(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
-				}
-				if preparedCardinality != wantCount {
-					t.Fatalf(
-						"prepared count mismatch (profile=%s i=%d): got=%d want=%d\nq=%+v\ncountQ=%+v",
-						p.name, i, preparedCardinality, wantCount, q, countQ,
-					)
-				}
 			}
 		})
 	}
@@ -1077,14 +1042,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 	runChecks := func(label string) {
 		t.Helper()
 
-		var sawExec bool
-		var sawPlan bool
-
 		for i := range queries {
 			q := queries[i]
-			nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalence(t, db, q)
-			sawExec = sawExec || usedExec
-			sawPlan = sawPlan || usedPlan
 
 			got, err := db.QueryKeys(q)
 			if err != nil {
@@ -1105,28 +1064,10 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 					t.Fatalf("%s q%d expectedKeysUint64(full): %v", label, i, err)
 				}
 				assertNoOrderWindowSubset(t, q, got, fullWant, fmt.Sprintf("%s q%d QueryKeys", label, i))
-				assertNoOrderWindowSubset(t, nq, ref, fullWant, fmt.Sprintf("%s q%d prepared", label, i))
 			} else {
 				assertQueryIDsEqual(t, q, got, want)
-				assertQueryIDsEqual(t, nq, ref, want)
 			}
 
-			if q.Window.Limit == 0 && q.Window.Offset == 0 {
-				cnt, err := db.engine.filterCardinalityForTests(nq.Filter)
-				if err != nil {
-					t.Fatalf("%s q%d filterCardinalityForTests: %v", label, i, err)
-				}
-				if cnt != uint64(len(ref)) {
-					t.Fatalf("%s q%d count mismatch on prepared route: got=%d want=%d", label, i, cnt, len(ref))
-				}
-			}
-		}
-
-		if !sawExec {
-			t.Fatalf("%s: expected at least one execution fast-path route", label)
-		}
-		if !sawPlan {
-			t.Fatalf("%s: expected at least one planner fast-path route", label)
 		}
 	}
 

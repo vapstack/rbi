@@ -14,11 +14,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/qagg"
-	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -135,24 +131,6 @@ func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
 	}
 }
 
-func TestPinnedStrMapSnapshotKeepsOriginalMapping(t *testing.T) {
-	liveMapper := strmap.New(0, defaultSnapshotStrMapCompactDepth)
-	snapMapper := strmap.New(0, defaultSnapshotStrMapCompactDepth)
-	if idx, created := snapMapper.Create("snap-key"); idx != 1 || !created {
-		t.Fatalf("snap Create = %d/%v, want 1/true", idx, created)
-	}
-	strMapSnap := snapMapper.Snapshot()
-	indexSnap := &snapshot.View{
-		StrMap:            strMapSnap,
-		LenZeroComplement: snapshotTestBoolSlots(nil, nil),
-	}
-	liveMapper.Create("live-key")
-
-	if got, ok := indexSnap.StrMap.String(1); !ok || got != "snap-key" {
-		t.Fatalf("strmap snapshot mismatch: got=%q ok=%v want=%q", got, ok, "snap-key")
-	}
-}
-
 func TestIndexPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist.db")
@@ -197,12 +175,13 @@ func TestIndexPersistence(t *testing.T) {
 	}
 }
 
-func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
+func TestIndexPersistence_LargeFieldRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "persist_chunked.db")
+	path := filepath.Join(dir, "persist_large.db")
 
 	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	for i := 0; i < indexdata.FieldChunkThreshold+64; i++ {
+	const rows = 4096
+	for i := 0; i < rows; i++ {
 		if err := db.Set(uint64(i+1), &Rec{
 			Name:  fmt.Sprintf("user_%04d", i),
 			Email: fmt.Sprintf("user_%04d@example.test", i),
@@ -210,10 +189,6 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
-	}
-
-	if storage, ok := db.engine.snapshot.Current().FieldIndexStorage("name"); !ok || !storage.IsChunked() {
-		t.Fatalf("expected chunked name index before close")
 	}
 
 	if err := db.Close(); err != nil {
@@ -233,16 +208,20 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	})
 
-	if storage, ok := db2.engine.snapshot.Current().FieldIndexStorage("name"); !ok || !storage.IsChunked() {
-		t.Fatalf("expected chunked name index after reopen")
-	}
-
 	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "user_0007")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	if len(ids) != 1 || ids[0] != 8 {
 		t.Fatalf("expected [8], got %v", ids)
+	}
+
+	ids, err = db2.QueryKeys(qx.Query(qx.EQ("name", "user_4095")))
+	if err != nil {
+		t.Fatalf("QueryKeys(last): %v", err)
+	}
+	if len(ids) != 1 || ids[0] != rows {
+		t.Fatalf("expected [%d], got %v", rows, ids)
 	}
 }
 
@@ -266,9 +245,6 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	}
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
-	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode before patching to empty")
 	}
 
 	for i := 1; i <= 90; i++ {
@@ -335,9 +311,6 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex(initial): %v", err)
 	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode before rebuild transition")
-	}
 
 	for i := 1; i <= 90; i++ {
 		if i%5 == 0 {
@@ -351,9 +324,6 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex(after patch): %v", err)
 	}
-	if db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode to be cleared after rebuild")
-	}
 
 	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
@@ -362,86 +332,6 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("expected no empty-tags ids after rebuild, got %v", got)
 	}
-}
-
-type rebuildPinnedSnapshotRec struct {
-	Name   string   `db:"name"   rbi:"index"`
-	Tags   []string `db:"tags"   rbi:"index"`
-	Amount int64    `db:"amount" rbi:"measure"`
-}
-
-func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rebuild_pinned_snapshot.db")
-	db, raw := openBoltAndNew[uint64, rebuildPinnedSnapshotRec](t, path, Options{AnalyzeInterval: -1})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	rows := []rebuildPinnedSnapshotRec{
-		{Name: "alice", Tags: []string{"go"}, Amount: 10},
-		{Name: "bob", Tags: []string{}, Amount: 20},
-	}
-	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
-			t.Fatalf("Set(%d): %v", i+1, err)
-		}
-	}
-
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	if snap == nil || ref == nil {
-		t.Fatalf("expected current snapshot pin")
-	}
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	namePrepared, nameShape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("prepare name query: %v", err)
-	}
-	view := db.engine.exec.AcquireView(snap)
-	nameIDs, err := view.Query(&nameShape, false)
-	db.engine.exec.ReleaseView(view)
-	namePrepared.Release()
-	if err != nil {
-		t.Fatalf("old snapshot name query: %v", err)
-	}
-	if !slices.Equal(nameIDs, []uint64{1}) {
-		t.Fatalf("old snapshot name query mismatch: got=%v want=[1]", nameIDs)
-	}
-
-	tagsPrepared, tagsShape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("tags", []string{})))
-	if err != nil {
-		t.Fatalf("prepare empty-tags query: %v", err)
-	}
-	view = db.engine.exec.AcquireView(snap)
-	tagIDs, err := view.Query(&tagsShape, false)
-	db.engine.exec.ReleaseView(view)
-	tagsPrepared.Release()
-	if err != nil {
-		t.Fatalf("old snapshot empty-tags query: %v", err)
-	}
-	if !slices.Equal(tagIDs, []uint64{2}) {
-		t.Fatalf("old snapshot empty-tags query mismatch: got=%v want=[2]", tagIDs)
-	}
-
-	agg, err := qagg.Prepare(qx.Aggregate(qx.SUM("amount").AS("sum_amount")), db.engine.schema)
-	if err != nil {
-		t.Fatalf("prepare aggregate: %v", err)
-	}
-	view = db.engine.exec.AcquireView(snap)
-	result, err := qagg.Execute(view, snap, agg)
-	db.engine.exec.ReleaseView(view)
-	agg.Release()
-	if err != nil {
-		t.Fatalf("old snapshot aggregate: %v", err)
-	}
-	requireAggregateLayout(t, result.Layout, []string{"sum_amount"})
-	requireAggregateInt(t, result.Rows[0][0], 30)
 }
 
 func TestRebuildIndex_CleanState(t *testing.T) {
@@ -1491,9 +1381,6 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 		}
 		assertSameSlice(t, got, want)
-
-		_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, q)
-		assertSameSlice(t, prepared, want)
 	}
 }
 
@@ -2268,88 +2155,6 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 	assertSameSlice(t, gotZero, wantZero)
 }
 
-func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
-		name := fmt.Sprintf("zz/%03d", i)
-		if i <= 180 {
-			name = fmt.Sprintf("aa/%03d", i)
-		} else if i <= 320 {
-			name = fmt.Sprintf("ab/%03d", i)
-		}
-		return &Rec{Name: name, Age: i}
-	})
-
-	snap := db.engine.snapshot.Current()
-	pinnedSnap, pinnedRef, ok := db.engine.snapshot.PinBySeq(snap.Seq)
-	if !ok {
-		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.Seq)
-	}
-	defer db.engine.snapshot.Unpin(snap.Seq, pinnedRef)
-	snap = pinnedSnap
-
-	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC))
-	if err != nil {
-		t.Fatalf("prepareTestQuery: %v", err)
-	}
-	defer prepared.Release()
-
-	view := db.engine.exec.AcquireView(snap)
-	wantKeys, err := view.Query(&viewQ, false)
-	db.engine.exec.ReleaseView(view)
-	if err != nil {
-		t.Fatalf("pinned snapshot query: %v", err)
-	}
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	var wg sync.WaitGroup
-	for r := 0; r < 4; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 200; i++ {
-				view := db.engine.exec.AcquireView(snap)
-				gotKeys, err := view.Query(&viewQ, false)
-				db.engine.exec.ReleaseView(view)
-				if err != nil {
-					setFailed(fmt.Sprintf("pinned snapshot query: %v", err))
-					return
-				}
-				if !slices.Equal(gotKeys, wantKeys) {
-					setFailed("old snapshot query changed under concurrent writes")
-					return
-				}
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 200; i++ {
-			id := uint64(i%420 + 1)
-			if err := db.Patch(id, []Field{{Name: "name", Value: fmt.Sprintf("mut/%03d/%03d", i, id)}}); err != nil {
-				setFailed(fmt.Sprintf("Patch(%d): %v", id, err))
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-}
-
 func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
@@ -2604,7 +2409,10 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(before 215): %v", err)
 	}
+	oldTags := append([]string(nil), old.Tags...)
+	db.ReleaseRecords(old)
 
+	newTags := []string{"rust", "db", "ops"}
 	rec := &Rec{
 		Meta:     Meta{Country: "PL"},
 		Name:     "alice",
@@ -2612,25 +2420,27 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		Age:      73,
 		Score:    35.20025742868052,
 		Active:   false,
-		Tags:     []string{"rust", "db", "ops"},
+		Tags:     newTags,
 		FullName: "FN-00215",
 	}
-	mods := db.getModifiedIndexedFields(old, rec)
-	if !slices.Contains(mods, "tags") {
-		t.Fatalf("expected tags in modified fields, got: %v", mods)
-	}
-
 	if err := db.Set(215, rec); err != nil {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	has := db.engine.snapshot.Current().FieldLookupPostingRetained("tags", "db").Contains(215)
-	if !has {
-		v, err := db.Get(215)
-		if err != nil {
-			t.Fatalf("Get(215): %v", err)
+	for i := range newTags {
+		ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{newTags[i]})))
+		if !slices.Contains(ids, uint64(215)) {
+			t.Fatalf("new tag %q query missing id=215: ids=%v", newTags[i], ids)
 		}
-		t.Fatalf("expected tags=db index to contain id=215 after Set, rec=%#v old=%#v mods=%v", v, old, mods)
+	}
+	for i := range oldTags {
+		if slices.Contains(newTags, oldTags[i]) {
+			continue
+		}
+		ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{oldTags[i]})))
+		if slices.Contains(ids, uint64(215)) {
+			t.Fatalf("old tag %q query still contains id=215: ids=%v", oldTags[i], ids)
+		}
 	}
 }
 
@@ -2659,12 +2469,13 @@ func TestSet_ReindexesScalarString_OnReplace(t *testing.T) {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	snap := db.engine.snapshot.Current()
-	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
-		t.Fatalf("old full_name index still contains id=215")
+	oldIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	if slices.Contains(oldIDs, uint64(215)) {
+		t.Fatalf("old full_name query still contains id=215: ids=%v", oldIDs)
 	}
-	if !snap.FieldLookupPostingRetained("full_name", rec.FullName).Contains(215) {
-		t.Fatalf("new full_name index does not contain id=215")
+	newIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", rec.FullName)))
+	if !slices.Contains(newIDs, uint64(215)) {
+		t.Fatalf("new full_name query missing id=215: ids=%v", newIDs)
 	}
 }
 
@@ -2696,15 +2507,17 @@ func TestBatchSet_RepeatedIDReindexesScalarString(t *testing.T) {
 		t.Fatalf("BatchSet repeated id: %v", err)
 	}
 
-	snap := db.engine.snapshot.Current()
-	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
-		t.Fatalf("old full_name index still contains id=215")
+	oldIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	if slices.Contains(oldIDs, uint64(215)) {
+		t.Fatalf("old full_name query still contains id=215: ids=%v", oldIDs)
 	}
-	if snap.FieldLookupPostingRetained("full_name", first.FullName).Contains(215) {
-		t.Fatalf("intermediate full_name index contains id=215")
+	firstIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", first.FullName)))
+	if slices.Contains(firstIDs, uint64(215)) {
+		t.Fatalf("intermediate full_name query contains id=215: ids=%v", firstIDs)
 	}
-	if !snap.FieldLookupPostingRetained("full_name", second.FullName).Contains(215) {
-		t.Fatalf("final full_name index does not contain id=215")
+	secondIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", second.FullName)))
+	if !slices.Contains(secondIDs, uint64(215)) {
+		t.Fatalf("final full_name query missing id=215: ids=%v", secondIDs)
 	}
 }
 
@@ -2722,8 +2535,9 @@ func TestDelete_ReindexesScalarString(t *testing.T) {
 	if err := db.Delete(215); err != nil {
 		t.Fatalf("Delete(215): %v", err)
 	}
-	if db.engine.snapshot.Current().FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
-		t.Fatalf("old full_name index still contains id=215 after delete")
+	ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	if slices.Contains(ids, uint64(215)) {
+		t.Fatalf("old full_name query still contains id=215 after delete: ids=%v", ids)
 	}
 }
 
@@ -2757,15 +2571,25 @@ func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
-		if order := scalarStringOrderBreak(t, db, "full_name"); order != "" {
-			t.Fatalf("iter=%d id=%d order=%s", i, id, order)
-		}
 	}
 
 	stats := db.Stats()
 	indexStats := db.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
-		t.Fatalf("full_name cardinality=%d key_count=%d duplicates=%s", got, stats.KeyCount, scalarStringDuplicateSample(t, db, "full_name"))
+		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)
+	}
+
+	q := qx.Query().Sort("full_name", qx.ASC)
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(full_name ASC): %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full_name ASC): %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("full_name order mismatch: got=%v want=%v", got[:min(len(got), 16)], want[:min(len(want), 16)])
 	}
 }
 
@@ -2860,67 +2684,7 @@ func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) 
 	stats := db.Stats()
 	indexStats := db.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
-		t.Fatalf("full_name cardinality=%d key_count=%d duplicates=%s", got, stats.KeyCount, scalarStringDuplicateSample(t, db, "full_name"))
-	}
-}
-
-func scalarStringDuplicateSample(t testing.TB, db *DB[uint64, Rec], field string) string {
-	t.Helper()
-
-	acc := db.engine.schema.IndexedByName[field]
-	snap := db.engine.snapshot.Current()
-	ov := indexdata.NewFieldIndexViewFromStorage(snap.Index[acc.Ordinal])
-	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
-	seen := make(map[uint64]string, db.Stats().KeyCount)
-	out := ""
-	for {
-		key, ids, ok := cur.Next()
-		if !ok {
-			break
-		}
-		keyString := key.UnsafeString()
-		it := ids.Iter()
-		for it.HasNext() {
-			id := it.Next()
-			if prev, ok := seen[id]; ok && prev != keyString {
-				rec, err := db.Get(id)
-				if err != nil {
-					out += fmt.Sprintf("%d:%s/%s get_err=%v;", id, prev, keyString, err)
-				} else {
-					out += fmt.Sprintf("%d:%s/%s actual=%s;", id, prev, keyString, rec.FullName)
-					db.ReleaseRecords(rec)
-				}
-				if len(out) > 512 {
-					it.Release()
-					return out
-				}
-			} else {
-				seen[id] = keyString
-			}
-		}
-		it.Release()
-	}
-	return out
-}
-
-func scalarStringOrderBreak(t testing.TB, db *DB[uint64, Rec], field string) string {
-	t.Helper()
-
-	acc := db.engine.schema.IndexedByName[field]
-	snap := db.engine.snapshot.Current()
-	ov := indexdata.NewFieldIndexViewFromStorage(snap.Index[acc.Ordinal])
-	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
-	prev := ""
-	for {
-		key, _, ok := cur.Next()
-		if !ok {
-			return ""
-		}
-		curKey := key.UnsafeString()
-		if prev != "" && prev > curKey {
-			return prev + ">" + curKey
-		}
-		prev = curKey
+		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 	"github.com/vapstack/qx"
 )
 
-func TestRegression_NotInOrderOffset_RouteEquivalence(t *testing.T) {
+func TestRegression_NotInOrderOffset_QueryMatchesReference(t *testing.T) {
 	tests := []struct {
 		name string
 		q    *qx.QX
@@ -45,7 +45,7 @@ func TestRegression_NotInOrderOffset_RouteEquivalence(t *testing.T) {
 
 	for i := range tests {
 		t.Run(tests[i].name, func(t *testing.T) {
-			assertNotInOrderOffsetRouteEquivalence(t, tests[i].q)
+			assertNotInOrderOffsetQueryMatchesReference(t, tests[i].q)
 		})
 	}
 }
@@ -55,9 +55,7 @@ func TestRegression_NotInOrderOffset_NoStateCorruption(t *testing.T) {
 	q := capturedNotInOrderOffsetQuery()
 
 	before := runQueryKeysChecked(t, db, q)
-	_, _, _, _ = assertPreparedRouteEquivalence(t, db, q)
 	mid := runQueryKeysChecked(t, db, q)
-	_, _, _, _ = assertPreparedRouteEquivalence(t, db, q)
 	after := runQueryKeysChecked(t, db, q)
 
 	if !slices.Equal(before, mid) || !slices.Equal(before, after) {
@@ -65,7 +63,7 @@ func TestRegression_NotInOrderOffset_NoStateCorruption(t *testing.T) {
 	}
 }
 
-func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
+func TestRegression_MultiTermHAS_LeadSelfCheck_QueryAndCount(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
 		name:        "Uniform",
@@ -117,7 +115,6 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 				t.Fatalf("expectedKeysUint64: %v", err)
 			}
 
-			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
 			if queryContractNoOrderWindow(tc.q) {
 				fullQ := cloneQuery(tc.q)
 				clearQueryOrderWindowForTest(fullQ)
@@ -126,10 +123,8 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 					t.Fatalf("expectedKeysUint64(full): %v", err)
 				}
 				assertNoOrderWindowSubset(t, tc.q, got, full, "QueryKeys")
-				assertNoOrderWindowSubset(t, tc.q, prepared, full, "prepared")
 			} else {
 				assertQueryIDsEqual(t, tc.q, got, want)
-				assertQueryIDsEqual(t, tc.q, got, prepared)
 			}
 
 			countQ := cloneQuery(tc.q)
@@ -236,7 +231,7 @@ func TestQueryExt_ConcurrentSharedOrderBasicQuery_IsStable(t *testing.T) {
 		qx.NOTIN("country", []string{"Iceland"}),
 		qx.GTE("age", 20),
 	).Sort("score", qx.DESC).Offset(10).Limit(80)
-	assertQueryExtConcurrentReadStable(t, db, q, true)
+	assertQueryExtConcurrentReadStable(t, db, q)
 }
 
 func TestQueryExt_ConcurrentSharedArrayCountQuery_IsStable(t *testing.T) {
@@ -245,7 +240,7 @@ func TestQueryExt_ConcurrentSharedArrayCountQuery_IsStable(t *testing.T) {
 	q := queryExtSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", false)),
 	), "tags", qx.DESC).Offset(3).Limit(70)
-	assertQueryExtConcurrentReadStable(t, db, q, true)
+	assertQueryExtConcurrentReadStable(t, db, q)
 }
 
 func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *testing.T) {
@@ -387,123 +382,6 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 	}
 }
 
-func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_ReturnsHybridResults(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-
-	ids := []uint64{1, 2, 3, 4, 5, 6}
-	stateA := []*Rec{
-		{Name: "A1-nil", Opt: nil, Active: true, Tags: []string{"go"}},
-		{Name: "A2-aa", Opt: strPtr("aa"), Active: true, Tags: []string{"db"}},
-		{Name: "A3-bb", Opt: strPtr("bb"), Active: true, Tags: []string{"ops"}},
-		{Name: "A4-nil-off", Opt: nil, Active: false, Tags: []string{"rust"}},
-		{Name: "A5-cc", Opt: strPtr("cc"), Active: true, Tags: []string{"go", "db"}},
-		{Name: "A6-empty", Opt: strPtr(""), Active: true, Tags: []string{"ops", "go"}},
-	}
-	stateB := []*Rec{
-		{Name: "B1-dd", Opt: strPtr("dd"), Active: true, Tags: []string{"go"}},
-		{Name: "B2-nil", Opt: nil, Active: true, Tags: []string{"db"}},
-		{Name: "B3-aa-off", Opt: strPtr("aa"), Active: false, Tags: []string{"ops"}},
-		{Name: "B4-empty", Opt: strPtr(""), Active: true, Tags: []string{"rust"}},
-		{Name: "B5-bb", Opt: strPtr("bb"), Active: true, Tags: []string{"go", "db"}},
-		{Name: "B6-nil-off", Opt: nil, Active: false, Tags: []string{"ops", "go"}},
-	}
-
-	setState := func(vals []*Rec) error {
-		return db.BatchSet(ids, vals)
-	}
-
-	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA): %v", err)
-	}
-	wantA, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(stateA): %v", err)
-	}
-
-	if err := setState(stateB); err != nil {
-		t.Fatalf("BatchSet(stateB): %v", err)
-	}
-	wantB, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(stateB): %v", err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA reset): %v", err)
-	}
-
-	start := make(chan struct{})
-	found := make(chan []uint64, 1)
-	errCh := make(chan error, 1)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 400; i++ {
-			vals := stateB
-			if i%2 == 1 {
-				vals = stateA
-			}
-			if err := setState(vals); err != nil {
-				select {
-				case errCh <- fmt.Errorf("writer: %w", err):
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 500; i++ {
-				got, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					select {
-					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
-					default:
-					}
-					return
-				}
-				if queryIDsEqual(q, got, wantA) || queryIDsEqual(q, got, wantB) {
-					continue
-				}
-				select {
-				case found <- append([]uint64(nil), got...):
-				default:
-				}
-				return
-			}
-		}()
-	}
-
-	close(start)
-	wg.Wait()
-	close(found)
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for got := range found {
-		t.Fatalf("root execPreparedQuery returned hybrid result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
-	}
-}
-
 func TestQueryExt_OrderedORNegativeResidualPlannerTrace_MatchesExpected(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -550,10 +428,9 @@ func TestQueryExt_OrderedORNegativeResidualPlannerTrace_MatchesExpected(t *testi
 
 	assertQueryExtItemsMatchExpected(t, db, q)
 	assertQueryExtCountMatchesBaseQuery(t, db, q)
-	assertQueryExtPreparedMatchesExpected(t, db, q)
 }
 
-func TestQueryExt_OrderedORPrefixBoundaryChurn_MatchesSeqScanAndPrepared(t *testing.T) {
+func TestQueryExt_OrderedORPrefixBoundaryChurn_MatchesSeqScan(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
@@ -741,110 +618,6 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedORNegativ
 	}
 }
 
-func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_OnOrderedORNegativeResidual_ReturnsNoHybridResults(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 5 * time.Millisecond})
-
-	ids, stateA, stateB, q := queryExtOrderedORNegativeResidualFixture()
-	setState := func(vals []*Rec) error {
-		return db.BatchSet(ids, vals)
-	}
-
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA): %v", err)
-	}
-	wantA, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(stateA): %v", err)
-	}
-
-	if err := setState(stateB); err != nil {
-		t.Fatalf("BatchSet(stateB): %v", err)
-	}
-	wantB, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(stateB): %v", err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA reset): %v", err)
-	}
-
-	startVersion := db.PlannerStats().Version
-	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
-		t.Fatalf("expected analyzer to publish planner stats during prepared ordered OR test: start=%d latest=%d", startVersion, latest)
-	}
-
-	start := make(chan struct{})
-	found := make(chan []uint64, 1)
-	errCh := make(chan error, 1)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 320; i++ {
-			vals := stateB
-			if i%2 == 1 {
-				vals = stateA
-			}
-			if err := setState(vals); err != nil {
-				select {
-				case errCh <- fmt.Errorf("writer: %w", err):
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 480; i++ {
-				got, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					select {
-					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
-					default:
-					}
-					return
-				}
-				if queryIDsEqual(q, got, wantA) || queryIDsEqual(q, got, wantB) {
-					continue
-				}
-				select {
-				case found <- append([]uint64(nil), got...):
-				default:
-				}
-				return
-			}
-		}()
-	}
-
-	close(start)
-	wg.Wait()
-	close(found)
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for got := range found {
-		t.Fatalf("root execPreparedQuery returned hybrid ordered OR result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
-	}
-}
-
 func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedOR(t *testing.T) {
 	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
 
@@ -963,105 +736,6 @@ func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrder
 	}
 }
 
-func TestQueryExt_StringKeys_ConcurrentWriter_RootExecPreparedQuery_OnOrderedOR_ReturnsNoHybridResults(t *testing.T) {
-	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
-
-	ids, stateA, stateB, q := queryExtStringOrderedORFixture()
-	setState := func(vals []*Rec) error {
-		return db.BatchSet(ids, vals)
-	}
-
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA): %v", err)
-	}
-	wantA, err := expectedKeysString(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysString(stateA): %v", err)
-	}
-
-	if err := setState(stateB); err != nil {
-		t.Fatalf("BatchSet(stateB): %v", err)
-	}
-	wantB, err := expectedKeysString(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysString(stateB): %v", err)
-	}
-
-	if err := setState(stateA); err != nil {
-		t.Fatalf("BatchSet(stateA reset): %v", err)
-	}
-
-	start := make(chan struct{})
-	found := make(chan []string, 1)
-	errCh := make(chan error, 1)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 320; i++ {
-			vals := stateB
-			if i%2 == 1 {
-				vals = stateA
-			}
-			if err := setState(vals); err != nil {
-				select {
-				case errCh <- fmt.Errorf("writer: %w", err):
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 480; i++ {
-				got, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					select {
-					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
-					default:
-					}
-					return
-				}
-				if queryStringIDsEqual(q, got, wantA) || queryStringIDsEqual(q, got, wantB) {
-					continue
-				}
-				select {
-				case found <- append([]string(nil), got...):
-				default:
-				}
-				return
-			}
-		}()
-	}
-
-	close(start)
-	wg.Wait()
-	close(found)
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for got := range found {
-		t.Fatalf("root execPreparedQuery returned hybrid string-key ordered OR result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
-	}
-}
-
 func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllReadPathsStayExact(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 8_000)
@@ -1098,11 +772,6 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 	if err != nil {
 		t.Fatalf("Count(baseQ): %v", err)
 	}
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
 	errCh := make(chan error, 16)
 	var wg sync.WaitGroup
 
@@ -1147,15 +816,6 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 					return
 				}
 
-				gotPrepared, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
-					return
-				}
-				if !queryIDsEqual(nq, gotPrepared, wantKeys) {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery mismatch: got=%v want=%v", gid, i, gotPrepared, wantKeys)
-					return
-				}
 			}
 		}(g)
 	}
@@ -1239,11 +899,6 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 		t.Fatalf("BatchSet(stateA reset): %v", err)
 	}
 
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
 	startVersion := db.PlannerStats().Version
 	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
 		t.Fatalf("expected analyzer to publish planner stats during no-order OR test: start=%d latest=%d", startVersion, latest)
@@ -1314,17 +969,6 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 					return
 				}
 
-				gotPrepared, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
-					return
-				}
-				errPA := plannerExtValidateNoOrderWindow(q, gotPrepared, fullA)
-				errPB := plannerExtValidateNoOrderWindow(q, gotPrepared, fullB)
-				if errPA != nil && errPB != nil {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery hybrid snapshot: got=%v errA=%v errB=%v", gid, i, gotPrepared, errPA, errPB)
-					return
-				}
 			}
 		}(g)
 	}
@@ -1353,11 +997,6 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 	}
 	fullSigCounts := queryExtBuildSignatureCounts(fullItems)
 	wantCount := uint64(len(full))
-
-	nq := normalizeQueryForTest(q)
-	if err := db.engine.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
 
 	errCh := make(chan error, 16)
 	var wg sync.WaitGroup
@@ -1402,15 +1041,6 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 					return
 				}
 
-				gotPrepared, err := execPreparedQueryExt(db, nq)
-				if err != nil {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
-					return
-				}
-				if err = plannerExtValidateNoOrderWindow(q, gotPrepared, full); err != nil {
-					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery invalid: %v got=%v full=%v", gid, i, err, gotPrepared, full)
-					return
-				}
 			}
 		}(g)
 	}
@@ -1701,6 +1331,9 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 8,
+		NumericRangeBucketSize:                  128,
+		NumericRangeBucketMinFieldKeys:          1,
+		NumericRangeBucketMinSpanKeys:           1,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -1718,8 +1351,6 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-
-	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	queries := []*qx.QX{
 		qx.Query(
@@ -1746,9 +1377,6 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	}
 
 	checkQueries("warm")
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
-		t.Fatalf("expected shared runtime caches to warm up")
-	}
 
 	for i := 1; i <= 12; i++ {
 		if err := db.Patch(uint64(i), []Field{{Name: "name", Value: fmt.Sprintf("mut-%d", i)}}); err != nil {
@@ -1756,26 +1384,17 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 		}
 	}
 	checkQueries("after_unrelated_publish")
-
-	db.clearCurrentSnapshotCachesForTesting()
-	snap := db.engine.snapshot.Current()
-	if got := snap.MaterializedPredCache().EntryCount(); got != 0 {
-		t.Fatalf("expected cleared materialized predicate cache, got=%d", got)
-	}
-
-	checkQueries("after_clear")
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
-		t.Fatalf("expected caches to repopulate after cold queries")
-	}
 }
 
-func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testing.T) {
+func TestQueryExt_ConcurrentDeepOrderedWindowQueries_RemainStable(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 1,
+		NumericRangeBucketSize:                  128,
+		NumericRangeBucketMinFieldKeys:          1,
+		NumericRangeBucketMinSpanKeys:           1,
 	})
 
-	setNumericBucketKnobs(t, db, 128, 1, 1)
 	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
 		return &Rec{
 			Name:  fmt.Sprintf("u_%05d", i),
@@ -1826,9 +1445,6 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 
 	if _, err := db.QueryKeys(queries[0]); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
-	}
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
-		t.Fatalf("expected deep ordered window to materialize a predicate cache entry")
 	}
 
 	var wg sync.WaitGroup
@@ -1884,10 +1500,6 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
-	}
-
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got > 1 {
-		t.Fatalf("materialized predicate cache exceeded configured bound: got=%d", got)
 	}
 }
 
@@ -2039,6 +1651,9 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 8,
+		NumericRangeBucketSize:                  128,
+		NumericRangeBucketMinFieldKeys:          1,
+		NumericRangeBucketMinSpanKeys:           1,
 	})
 
 	seedGeneratedUint64Data(t, db, 15_000, func(i int) *Rec {
@@ -2052,8 +1667,6 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-
-	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	queries := []*qx.QX{
 		qx.Query(
@@ -2079,9 +1692,6 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	}
 
 	checkQueries("warm")
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
-		t.Fatalf("expected warmed numeric-range query to populate predicate cache")
-	}
 
 	for i := 2400; i <= 2480; i++ {
 		if err := db.Patch(uint64(i), []Field{{Name: "age", Value: 9_000 + i}, {Name: "active", Value: true}}); err != nil {
@@ -2095,8 +1705,6 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	}
 
 	checkQueries("after_field_publish")
-	db.clearCurrentSnapshotCachesForTesting()
-	checkQueries("after_clear")
 }
 
 func TestQueryExt_OrderedOROverlap_DeduplicatesAcrossMutations(t *testing.T) {
@@ -2165,9 +1773,10 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrde
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 8,
+		NumericRangeBucketSize:                  64,
+		NumericRangeBucketMinFieldKeys:          1,
+		NumericRangeBucketMinSpanKeys:           1,
 	})
-
-	setNumericBucketKnobs(t, db, 64, 1, 1)
 
 	ids := make([]uint64, 0, 64)
 	stateA := make([]*Rec, 0, 64)

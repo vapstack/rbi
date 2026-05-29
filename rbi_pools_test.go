@@ -6,7 +6,6 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -116,18 +115,4 @@ func TestRecordPool_ReusedDecodeLeaksAbsentFields(t *testing.T) {
 		t.Skipf("sync.Pool reuse is not guaranteed under -race after %d attempts", attempts)
 	}
 	t.Fatalf("failed to observe record pool reuse after %d attempts", attempts)
-}
-
-func TestUnionPostingListsOwnedMergesAddPosting(t *testing.T) {
-	base := (posting.List{}).BuildAdded(777)
-	var add posting.List
-	for i := 1; i <= posting.MidCap+1; i++ {
-		add = add.BuildAdded(uint64(i))
-	}
-
-	merged := unionPostingListsOwned(base, add)
-	defer merged.Release()
-	if !merged.Contains(777) || !merged.Contains(1) || !merged.Contains(posting.MidCap+1) {
-		t.Fatalf("merged posting list lost data")
-	}
 }

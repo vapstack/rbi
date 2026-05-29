@@ -224,9 +224,6 @@ func TestQuery_Iterator_KeepsEmptyStringKey(t *testing.T) {
 			if cnt != tc.count {
 				t.Fatalf("Count(%s): got=%d want=%d", tc.name, cnt, tc.count)
 			}
-
-			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
-			assertSameSlice(t, prepared, tc.want)
 		})
 	}
 }

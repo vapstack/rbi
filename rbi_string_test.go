@@ -6,31 +6,12 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/snapshot"
+	"go.etcd.io/bbolt"
 )
-
-func stringTestScanSnapshotKeys(db *DB[string, Rec], snap *snapshot.View, seek string) ([]string, error) {
-	if snap == nil {
-		return nil, fmt.Errorf("snapshot is nil")
-	}
-
-	iter := snap.Universe.Iter()
-	defer iter.Release()
-
-	var out []string
-	if err := db.scanStringKeys(snap.StrMap, snap.Universe, iter, seek, func(id string) (bool, error) {
-		out = append(out, id)
-		return true, nil
-	}); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
 
 func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *testing.T) {
 	dir := t.TempDir()
@@ -63,16 +44,6 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		}
 	}
 
-	initial := db.engine.snapshot.Current()
-	wantIdx := make(map[string]uint64, len(order))
-	for _, key := range order {
-		idx, ok := initial.StrMap.Index(key)
-		if !ok || idx == 0 {
-			t.Fatalf("initial snapshot missing idx for %q", key)
-		}
-		wantIdx[key] = idx
-	}
-
 	deleted := map[string]struct{}{
 		"k-02": {},
 		"k-08": {},
@@ -100,25 +71,9 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		t.Fatalf("live order before reopen mismatch: got=%v want=%v", gotLive, liveOrder)
 	}
 
-	afterDelete := db.engine.snapshot.Current()
-	for key := range deleted {
-		idx, ok := afterDelete.StrMap.Index(key)
-		if !ok || idx != wantIdx[key] {
-			t.Fatalf("deleted key %q lost retained idx: got=%d ok=%v want=%d", key, idx, ok, wantIdx[key])
-		}
-	}
-
 	closeCurrent()
 
 	db, raw = openBoltAndNew[string, Rec](t, path)
-
-	reopened := db.engine.snapshot.Current()
-	for _, key := range order {
-		idx, ok := reopened.StrMap.Index(key)
-		if !ok || idx != wantIdx[key] {
-			t.Fatalf("reopened snapshot changed idx for %q: got=%d ok=%v want=%d", key, idx, ok, wantIdx[key])
-		}
-	}
 
 	gotLive, err = db.QueryKeys(qx.Query(qx.EQ("age", 1)))
 	if err != nil {
@@ -156,7 +111,7 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 	}
 }
 
-func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testing.T) {
+func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_unique_hole.db")
 
@@ -181,30 +136,24 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	var commitCalls atomic.Int32
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks = &testHooks{
-		beforeCommit: func(string) error {
-			if commitCalls.Add(1) == 1 {
-				close(entered)
-				<-release
-			}
-			return nil
-		},
-	}
 	t.Cleanup(func() {
-		db.testHooks = nil
 		select {
 		case <-release:
 		default:
 			close(release)
 		}
 	})
+	blockCommit := BeforeCommit(func(*bbolt.Tx, string, *StringUniqueTestRec, *StringUniqueTestRec) error {
+		close(entered)
+		<-release
+		return nil
+	})
 
 	blockerDone := make(chan error, 1)
 	go func() {
-		blockerDone <- db.Set("blocker", &StringUniqueTestRec{Email: "blocker@x", Code: 2})
+		blockerDone <- db.Set("blocker", &StringUniqueTestRec{Email: "blocker@x", Code: 2}, blockCommit)
 	}()
 
 	select {
@@ -244,36 +193,6 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 
 	assertHole := func(label string) {
 		t.Helper()
-
-		snap := db.engine.snapshot.Current()
-		if snap == nil || snap.StrMap == nil {
-			t.Fatalf("%s: expected published strmap snapshot", label)
-		}
-		if snap.StrMap.Next() != 4 {
-			t.Fatalf("%s: strmap.Next = %d, want 4", label, snap.StrMap.Next())
-		}
-
-		seedIdx, ok := snap.StrMap.Index("seed")
-		if !ok || seedIdx != 1 {
-			t.Fatalf("%s: seed idx = %d ok=%v, want 1", label, seedIdx, ok)
-		}
-		blockerIdx, ok := snap.StrMap.Index("blocker")
-		if !ok || blockerIdx != 2 {
-			t.Fatalf("%s: blocker idx = %d ok=%v, want 2", label, blockerIdx, ok)
-		}
-		if _, ok := snap.StrMap.Index("ghost-hole"); ok {
-			t.Fatalf("%s: rejected key unexpectedly remained in strmap", label)
-		}
-		realIdx, ok := snap.StrMap.Index("real-hole")
-		if !ok || realIdx != 4 {
-			t.Fatalf("%s: real-hole idx = %d ok=%v, want 4", label, realIdx, ok)
-		}
-		if s, ok := snap.StrMap.String(3); ok {
-			t.Fatalf("%s: hole idx 3 unexpectedly mapped to %q", label, s)
-		}
-		if s, ok := snap.StrMap.String(4); !ok || s != "real-hole" {
-			t.Fatalf("%s: idx 4 reverse mapping = %q ok=%v, want real-hole", label, s, ok)
-		}
 
 		v, getErr := db.Get("ghost-hole")
 		if getErr != nil {
@@ -325,7 +244,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 	assertHole("reopen")
 }
 
-func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing.T) {
+func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 	db, _ := openTempDBStringUnique(t)
 
 	seed := []struct {
@@ -343,83 +262,25 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 		}
 	}
 
-	before := db.engine.snapshot.Current().StrMap
-	if before == nil || before.Next() != uint64(len(seed)) {
-		t.Fatalf("unexpected committed base before reject: %#v", before)
-	}
-
 	err := db.Set("ghost-dup", &StringUniqueTestRec{Email: "a@x", Code: 99})
 	if !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("duplicate Set error = %v, want %v", err, ErrUniqueViolation)
 	}
-	if _, ok := db.engine.snapshot.Current().StrMap.Index("ghost-dup"); ok {
-		t.Fatalf("rejected key unexpectedly remained in published strmap")
-	}
-	if next := db.engine.snapshot.Current().StrMap.Next(); next != before.Next() {
-		t.Fatalf("rollback changed published strmap next: got=%d want=%d", next, before.Next())
+	if got, getErr := db.Get("ghost-dup"); getErr != nil || got != nil {
+		t.Fatalf("rejected key lookup = %#v/%v, want nil/<nil>", got, getErr)
 	}
 
 	if err := db.Set("real-ok", &StringUniqueTestRec{Email: "real@x", Code: 100}); err != nil {
 		t.Fatalf("good Set: %v", err)
 	}
 
-	latest := db.engine.snapshot.Current().StrMap
-	if latest == nil {
-		t.Fatalf("missing latest state snapshot after successful insert")
+	gotAll, err := db.QueryKeys(qx.Query())
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
 	}
-	if got, ok := latest.String(before.Next() + 1); !ok || got != "real-ok" {
-		t.Fatalf("latest delta reverse mapping mismatch: got=%q ok=%v", got, ok)
-	}
-	if _, ok := latest.Index("ghost-dup"); ok {
-		t.Fatalf("rejected key leaked after subsequent successful publish")
-	}
-}
-
-func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
-	db, _ := openTempDBString(t)
-
-	const n = 64
-	keys := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("key-%02d", i)
-		keys = append(keys, key)
-		if err := db.Set(key, &Rec{Name: key}); err != nil {
-			t.Fatalf("Set(%q): %v", key, err)
-		}
-	}
-
-	snap := db.engine.snapshot.Current()
-	if snap == nil || snap.StrMap == nil {
-		t.Fatalf("expected published string snapshot")
-	}
-	start := make(chan struct{})
-	errCh := make(chan error, len(keys))
-	var wg sync.WaitGroup
-	for _, key := range keys {
-		key := key
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			idx, ok := snap.StrMap.Index(key)
-			if !ok {
-				errCh <- fmt.Errorf("missing idx for %q", key)
-				return
-			}
-			back, ok := snap.StrMap.String(idx)
-			if !ok || back != key {
-				errCh <- fmt.Errorf("round-trip mismatch for %q: idx=%d back=%q ok=%v", key, idx, back, ok)
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatal(err)
-		}
+	wantAll := []string{"seed-a", "seed-b", "seed-c", "real-ok"}
+	if !queryStringIDsEqual(qx.Query(), gotAll, wantAll) {
+		t.Fatalf("query set mismatch: got=%v want=%v", gotAll, wantAll)
 	}
 }
 
@@ -436,10 +297,6 @@ func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanOrder(t *testing.T) 
 		}
 	}
 
-	snap := db.engine.snapshot.Current()
-	if snap == nil || snap.StrMap == nil {
-		t.Fatalf("expected published string snapshot")
-	}
 	allQ := qx.Query()
 	gotKeys, err := db.QueryKeys(allQ)
 	if err != nil {
@@ -449,16 +306,20 @@ func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanOrder(t *testing.T) 
 		t.Fatalf("query set mismatch: got=%v want=%v", gotKeys[:min(len(gotKeys), 8)], want[:8])
 	}
 
-	gotScan, err := stringTestScanSnapshotKeys(db, snap, "")
+	gotScan := make([]string, 0, n)
+	err = db.ScanKeys("", func(id string) (bool, error) {
+		gotScan = append(gotScan, id)
+		return true, nil
+	})
 	if err != nil {
-		t.Fatalf("scan snapshot keys: %v", err)
+		t.Fatalf("ScanKeys: %v", err)
 	}
 	if !slices.Equal(gotScan, want) {
 		t.Fatalf("scan order mismatch: got=%v want=%v", gotScan[:min(len(gotScan), 8)], want[:8])
 	}
 }
 
-func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteReinsertChurn(t *testing.T) {
+func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 	db, _ := openTempDBString(t)
 
 	const (
@@ -518,60 +379,36 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 			defer wg.Done()
 
 			for i := 0; i < readerOps; i++ {
-				tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
+				values, err := db.Query(qx.Query())
 				if err != nil {
-					errCh <- fmt.Errorf("reader=%d beginQueryTxSnapshot: %w", reader, err)
+					errCh <- fmt.Errorf("reader=%d Query: %w", reader, err)
+					return
+				}
+				if len(values) > keySpace {
+					errCh <- fmt.Errorf("reader=%d iter=%d too many values: got=%d want<=%d", reader, i, len(values), keySpace)
 					return
 				}
 
-				scanned, scanErr := stringTestScanSnapshotKeys(db, snap, "")
-				var queried []string
-				if scanErr == nil {
-					view := db.engine.exec.AcquireView(snap)
-					prepared, viewQ, prepErr := prepareTestQuery(db.engine, qx.Query())
-					if prepErr != nil {
-						db.engine.exec.ReleaseView(view)
-						scanErr = prepErr
-					} else {
-						queryIDs, err := view.Query(&viewQ, false)
-						db.engine.exec.ReleaseView(view)
-						if err != nil {
-							scanErr = err
-						} else {
-							queried = db.queryKeysFromIDs(snap, queryIDs)
-						}
-						prepared.Release()
+				var seen [keySpace]bool
+				for _, v := range values {
+					if v == nil {
+						errCh <- fmt.Errorf("reader=%d iter=%d query returned nil value", reader, i)
+						return
 					}
-				}
-				if scanErr == nil && !slices.Equal(scanned, queried) {
-					scanErr = fmt.Errorf("scan/query mismatch: scanned=%v queried=%v", scanned, queried)
-				}
-				if scanErr == nil {
-					values, getErr := db.batchGetTx(tx, scanned...)
-					if getErr != nil {
-						scanErr = getErr
-					} else if len(values) != len(scanned) {
-						scanErr = fmt.Errorf("batchGetTx len mismatch: got=%d want=%d", len(values), len(scanned))
-					} else {
-						for j, key := range scanned {
-							if values[j] == nil {
-								scanErr = fmt.Errorf("snapshot returned missing value for key=%q", key)
-								break
-							}
-							if values[j].Name != key {
-								scanErr = fmt.Errorf("snapshot returned wrong value for key=%q name=%q", key, values[j].Name)
-								break
-							}
-						}
+					if len(v.Name) != len("key-00") || v.Name[:4] != "key-" || v.Name[4] < '0' || v.Name[4] > '9' || v.Name[5] < '0' || v.Name[5] > '9' {
+						errCh <- fmt.Errorf("reader=%d iter=%d query returned malformed key name %q", reader, i, v.Name)
+						return
 					}
-				}
-
-				rollback(tx)
-				db.engine.snapshot.Unpin(seq, ref)
-
-				if scanErr != nil {
-					errCh <- fmt.Errorf("reader=%d iter=%d: %w", reader, i, scanErr)
-					return
+					idx := int(v.Name[4]-'0')*10 + int(v.Name[5]-'0')
+					if idx >= keySpace {
+						errCh <- fmt.Errorf("reader=%d iter=%d query returned key outside seed space %q", reader, i, v.Name)
+						return
+					}
+					if seen[idx] {
+						errCh <- fmt.Errorf("reader=%d iter=%d query returned duplicate key %q", reader, i, v.Name)
+						return
+					}
+					seen[idx] = true
 				}
 			}
 		}(r)

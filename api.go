@@ -1,14 +1,600 @@
 package rbi
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/internal/wexec"
 	"go.etcd.io/bbolt"
 )
+
+// ExecOption configures execution behavior for a write operation.
+//
+// Different write methods may honor different options.
+type ExecOption[K ~string | ~uint64, V any] func(*execOptions[K, V])
+
+// BeforeProcess registers a lightweight pre-processing callback for Set,
+// BatchSet, Patch, and BatchPatch.
+//
+// BeforeProcess runs wherever RBI first has a mutable value available:
+//   - For Set/BatchSet it runs on the caller-owned input value before RBI
+//     performs encoding, cloning, queueing, or transactional work.
+//   - For Patch/BatchPatch it runs on the mutable post-patch working copy
+//     after RBI applies the patch and before BeforeStore/BeforeCommit.
+//
+// BeforeProcess:
+//   - Receives only the key and mutable input value.
+//   - May modify the value in place.
+//   - May return an error to abort the operation.
+//   - Must not retain the value pointer after it returns, because the pointer
+//     may refer either to caller-owned input (Set/BatchSet) or to an
+//     RBI-owned working copy (Patch/BatchPatch).
+//   - For Set/BatchSet, the caller must avoid concurrent mutations of the same
+//     value until the write returns.
+//   - For Patch/BatchPatch, the hook may be invoked more than once for the
+//     same logical operation when the auto-batcher retries a request.
+//   - Is ignored by Delete and BatchDelete.
+//
+// Because BeforeProcess may run on caller-owned values for Set/BatchSet, RBI
+// does not protect against aliasing, repeated pointers inside BatchSet, or
+// mutations remaining visible to the caller after a later write failure. Use
+// BeforeStore when isolation or oldValue access is required.
+//
+// BeforeProcess may be passed more than once. Hooks passed to New are invoked
+// before per-operation hooks.
+func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) ExecOption[K, V] {
+	if fn == nil {
+		return nil
+	}
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, value unsafe.Pointer) error {
+			return fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
+		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeProcess = append(cfg.beforeProcess, f) }
+	}
+
+	f := func(key keycodec.DataKey, value unsafe.Pointer) error {
+		return fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
+	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeProcess = append(cfg.beforeProcess, f) }
+}
+
+// NoBatch forces a write call to execute in its own internal batch.
+//
+// For Set, Patch, and Delete it keeps the request from being coalesced with
+// neighboring writes.
+//
+// For BatchSet, BatchPatch, and BatchDelete it is redundant because those
+// methods already execute as isolated internal batches.
+func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
+	cfg.noBatch = true
+}
+
+// BeforeStore registers a callback invoked for every insert or update just
+// before RBI starts processing the value for storage and index maintenance.
+//
+// The callback receives oldValue as the currently stored record (or nil for
+// inserts) and newValue as a mutable working copy that will be encoded,
+// persisted, passed to BeforeCommit, and used for index updates.
+//
+// BeforeStore:
+//   - May modify newValue.
+//   - Must not modify oldValue.
+//   - Must not retain oldValue or newValue pointers after it returns.
+//   - May be invoked more than once for the same logical write operation;
+//     external side effects must therefore be idempotent or avoided.
+//
+// BeforeStore is invoked only for records that are being inserted or updated.
+// Delete operations and missing Patch targets do not invoke it.
+//
+// For Set/BatchSet, RBI normally snapshots the input value through
+// encode/decode before BeforeStore runs so it can safely isolate retries and
+// caller-owned objects. If the value only becomes encodable after
+// BeforeStore normalizes it, or if the caller can produce an independent copy
+// faster than RBI's fallback snapshotting, pass CloneFunc. If CloneFunc is not
+// provided and *V implements `Clone() *V`, RBI uses that method automatically.
+//
+// BeforeStore may be passed more than once. Hooks passed to New are invoked
+// before per-operation hooks.
+func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *V) error) ExecOption[K, V] {
+	if fn == nil {
+		return nil
+	}
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(oldValue), (*V)(newValue))
+		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeStore = append(cfg.beforeStore, f) }
+	}
+
+	f := func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+		return fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(oldValue), (*V)(newValue))
+	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeStore = append(cfg.beforeStore, f) }
+}
+
+// CloneFunc registers a cloning function used by Set/BatchSet when BeforeStore
+// hooks are present.
+//
+// When provided, RBI uses CloneFunc to create an internal baseline copy before
+// BeforeStore runs instead of snapshotting the value through encode/decode.
+// This is useful for values that only become encodable after
+// BeforeStore normalizes them, and it may also reduce cloning overhead when
+// the caller can produce an independent copy faster than RBI's fallback
+// snapshotting.
+//
+// CloneFunc:
+//   - Receives the write key and source value.
+//   - Must return an independent copy that does not alias the input.
+//   - Must not mutate the input.
+//   - Must return non-nil for non-nil input.
+//   - Must be deterministic and free of external side effects.
+//
+// If CloneFunc is not provided and *V implements Clone() *V, RBI uses that
+// method automatically. Otherwise, RBI falls back to encode/decode snapshotting
+// before BeforeStore for Set/BatchSet.
+// Patch/BatchPatch ignore CloneFunc because they already rebuild a fresh
+// working copy from stored bytes.
+//
+// CloneFunc may be passed more than once. The last non-nil CloneFunc wins.
+// When passed to New, CloneFunc becomes the default for matching write
+// operations on the returned DB.
+func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K, V] {
+	if fn == nil {
+		return nil
+	}
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+			cloned := fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
+			if cloned == nil {
+				return nil, errCloneNil
+			}
+			return unsafe.Pointer(cloned), nil
+		}
+		return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
+	}
+
+	f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+		cloned := fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
+		if cloned == nil {
+			return nil, errCloneNil
+		}
+		return unsafe.Pointer(cloned), nil
+	}
+	return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
+}
+
+// BeforeCommit registers a callback invoked inside the write transaction just
+// before it is committed.
+//
+// The callback:
+//   - May perform additional reads or writes through the provided tx.
+//   - May return an error to abort the operation; in this case the
+//     transaction will be rolled back and index state will not be updated.
+//   - Must not modify oldValue or newValue.
+//   - Must not retain oldValue or newValue.
+//   - Must not commit or roll back the transaction.
+//   - Must not modify records or bucket sequence in the bucket managed by this DB instance
+//     (or by any other DB instance with enabled indexing),
+//     because such writes bypass index synchronization.
+//   - Must not call any methods on the DB instance. Depending on execution mode,
+//     BeforeCommit may run while RBI holds internal locks, so re-entering the
+//     same DB can deadlock or become mode-dependent.
+//
+// BeforeCommit is invoked only for records that exist or are being written.
+// Patch/Delete operations skip missing records and do not invoke callbacks for them.
+//
+// BeforeCommit may be passed more than once. Callbacks passed to New are invoked
+// before per-operation callbacks.
+func BeforeCommit[K ~string | ~uint64, V any](fn func(tx *bbolt.Tx, key K, oldValue, newValue *V) error) ExecOption[K, V] {
+	if fn == nil {
+		return nil
+	}
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(tx, keycodec.UserKeyFromDataKey[K](key, true), (*V)(oldValue), (*V)(newValue))
+		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeCommit = append(cfg.beforeCommit, f) }
+	}
+
+	f := func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+		return fn(tx, keycodec.UserKeyFromDataKey[K](key, false), (*V)(oldValue), (*V)(newValue))
+	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeCommit = append(cfg.beforeCommit, f) }
+}
+
+// PatchStrict configures Patch and BatchPatch to return an error if the patch
+// contains unknown field names.
+//
+// When passed to New, PatchStrict becomes the default for all patch operations
+// on the returned DB. Passing PatchStrict to non-patch write methods has no effect.
+func PatchStrict[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
+	cfg.patchStrict = true
+}
+
+type execOptions[K ~string | ~uint64, V any] struct {
+	beforeProcess []wexec.BeforeProcessHook
+	beforeStore   []wexec.BeforeStoreHook
+	beforeCommit  []wexec.BeforeCommitHook
+	cloneValue    wexec.CloneFunc
+	noBatch       bool
+	patchStrict   bool
+}
+
+var errCloneNil = errors.New("clone returned nil")
+
+func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts []ExecOption[K, V]) {
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
+}
+
+func defaultCloneValue[V any]() func(*V) *V {
+	method, ok := reflect.TypeFor[*V]().MethodByName("Clone")
+	if !ok {
+		return nil
+	}
+	clone, ok := method.Func.Interface().(func(*V) *V)
+	if !ok {
+		return nil
+	}
+	return clone
+}
+
+func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOptions[K, V] {
+	if cfg.cloneValue == nil {
+		clone := defaultCloneValue[V]()
+		if clone != nil {
+			cfg.cloneValue = func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+				cloned := clone((*V)(value))
+				if cloned == nil {
+					return nil, errCloneNil
+				}
+				return unsafe.Pointer(cloned), nil
+			}
+		}
+	}
+	if len(cfg.beforeProcess) > 0 {
+		cfg.beforeProcess = append([]wexec.BeforeProcessHook(nil), cfg.beforeProcess...)
+		cfg.beforeProcess = cfg.beforeProcess[:len(cfg.beforeProcess):len(cfg.beforeProcess)]
+	}
+	if len(cfg.beforeStore) > 0 {
+		cfg.beforeStore = append([]wexec.BeforeStoreHook(nil), cfg.beforeStore...)
+		cfg.beforeStore = cfg.beforeStore[:len(cfg.beforeStore):len(cfg.beforeStore)]
+	}
+	if len(cfg.beforeCommit) > 0 {
+		cfg.beforeCommit = append([]wexec.BeforeCommitHook(nil), cfg.beforeCommit...)
+		cfg.beforeCommit = cfg.beforeCommit[:len(cfg.beforeCommit):len(cfg.beforeCommit)]
+	}
+	return cfg
+}
+
+func (db *DB[K, V]) resolveExecOptions(opts []ExecOption[K, V]) execOptions[K, V] {
+	cfg := db.execOptions
+	applyExecOptions(&cfg, opts)
+	return cfg
+}
+
+// PatchOption controls MakePatch behaviour.
+type PatchOption uint8
+
+const (
+	// PatchJSON makes MakePatch emit json tag names when present.
+	// Fields without a json tag fall back to their Go struct field name.
+	PatchJSON PatchOption = 1 << iota
+)
+
+// MakePatch builds and returns a patch describing fields that changed between
+// oldVal and newVal.
+//
+// The patch includes both indexed and non-indexed fields. For every modified
+// field it adds a Field entry whose Name uses the db tag when present or
+// Go struct field name otherwise.
+//
+// When PatchJSON is passed, Name uses the json tag when present or
+// Go struct field name otherwise.
+//
+// Value is always a deep copy taken from newVal.
+//
+// If newVal is nil, it returns an empty slice.
+func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) []Field {
+	useJSON := false
+	for _, opt := range opts {
+		if opt == PatchJSON {
+			useJSON = true
+		}
+	}
+	return db.makePatch(oldVal, newVal, nil, useJSON)
+}
+
+// MakePatchInto is like MakePatch, but writes the result into the provided
+// buffer to reduce allocations.
+//
+// dst is treated as scratch space: it will be reset to length 0 and then filled
+// with the resulting patch. The returned slice may refer to the same underlying
+// array or a grown one if capacity is insufficient.
+//
+// If newVal is nil, it returns an empty slice.
+func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) []Field {
+	useJSON := false
+	for _, opt := range opts {
+		if opt == PatchJSON {
+			useJSON = true
+		}
+	}
+	return db.makePatch(oldVal, newVal, dst, useJSON)
+}
+
+type patchScratch struct {
+	seen []bool
+}
+
+var patchScratchPool = pooled.Pointers[patchScratch]{
+	Cleanup: func(scratch *patchScratch) {
+		clear(scratch.seen[:cap(scratch.seen)])
+		scratch.seen = scratch.seen[:0]
+	},
+}
+
+func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) []Field {
+	target = target[:0]
+
+	if newVal == nil {
+		return target
+	}
+
+	var rvOld, rvNew reflect.Value
+	if oldVal != nil {
+		rvOld = reflect.ValueOf(oldVal).Elem()
+	}
+	rvNew = reflect.ValueOf(newVal).Elem()
+
+	scratch := patchScratchPool.Get()
+	patchAccess := db.schema.Patch.Access
+	scratch.seen = slices.Grow(scratch.seen[:0], len(patchAccess))[:len(patchAccess)]
+	defer patchScratchPool.Put(scratch)
+
+	newPtr := unsafe.Pointer(newVal)
+	oldPtr := unsafe.Pointer(nil)
+	if oldVal != nil {
+		oldPtr = unsafe.Pointer(oldVal)
+	}
+
+	db.forEachModifiedIndexedField(oldVal, newVal, func(acc schema.IndexedFieldAccessor) bool {
+		if acc.PatchOrdinal < 0 {
+			return true
+		}
+		patchAcc := patchAccess[acc.PatchOrdinal]
+		var value any
+		if patchAcc.CopyValue != nil {
+			value = patchAcc.CopyValue(newPtr)
+		} else {
+			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
+		}
+		name := patchAcc.Field.DBName
+		if useJSON {
+			name = patchAcc.Field.JSONName
+		}
+		scratch.seen[acc.PatchOrdinal] = true
+		target = append(target, Field{
+			Name:  name,
+			Value: value,
+		})
+		return true
+	})
+
+	for ordinal, patchAcc := range patchAccess {
+		if scratch.seen[ordinal] {
+			continue
+		}
+
+		var newValue any
+		if rvOld.IsValid() {
+			if patchAcc.ValueEqual != nil {
+				if patchAcc.ValueEqual(oldPtr, newPtr) {
+					continue
+				}
+			} else {
+				oldValue := rvOld.FieldByIndex(patchAcc.Field.Index).Interface()
+				newValue = rvNew.FieldByIndex(patchAcc.Field.Index).Interface()
+				if reflect.DeepEqual(oldValue, newValue) {
+					continue
+				}
+			}
+		}
+		if patchAcc.CopyValue != nil {
+			newValue = patchAcc.CopyValue(newPtr)
+		} else if newValue == nil {
+			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
+		} else {
+			newValue = deepCopyValue(newValue)
+		}
+		name := patchAcc.Field.DBName
+		if useJSON {
+			name = patchAcc.Field.JSONName
+		}
+
+		target = append(target, Field{
+			Name:  name,
+			Value: newValue,
+		})
+	}
+
+	return target
+}
+
+func patchItemsForWrite(fields []Field) []schema.PatchItem {
+	// Field and schema.PatchItem are layout-identical; wexec copies this view
+	// into request-owned storage immediately.
+	return unsafe.Slice((*schema.PatchItem)(unsafe.SliceData(fields)), len(fields))
+}
+
+func (db *DB[K, V]) userKeyFromBytes(b []byte) K {
+	return keycodec.UserKeyFromBytes[K](b, db.strKey)
+}
+
+func (db *DB[K, V]) forEachModifiedAccessor(accessors []schema.IndexedFieldAccessor, v1 *V, v2 *V, fn func(schema.IndexedFieldAccessor) bool) {
+	if fn == nil {
+		return
+	}
+	if len(accessors) == 0 {
+		return
+	}
+	if v1 == nil || v2 == nil {
+		for _, acc := range accessors {
+			if !fn(acc) {
+				return
+			}
+		}
+		return
+	}
+	ptr1 := unsafe.Pointer(v1)
+	ptr2 := unsafe.Pointer(v2)
+	for _, acc := range accessors {
+		if acc.Modified(ptr1, ptr2) && !fn(acc) {
+			return
+		}
+	}
+}
+
+func (db *DB[K, V]) forEachModifiedIndexedField(v1 *V, v2 *V, fn func(schema.IndexedFieldAccessor) bool) {
+	if db.engine == nil {
+		return
+	}
+	db.forEachModifiedAccessor(db.engine.schema.Indexed, v1, v2, fn)
+}
+
+func deepCopyValue(src any) any {
+	if src == nil {
+		return nil
+	}
+	origin := reflect.ValueOf(src)
+
+	for origin.Kind() == reflect.Interface {
+		if origin.IsNil() {
+			return nil
+		}
+		origin = origin.Elem()
+	}
+
+	switch origin.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return origin.Interface()
+	}
+
+	visited := make(map[uintptr]reflect.Value)
+	clone := deepCopy(origin, visited)
+	return clone.Interface()
+}
+
+func deepCopy(origin reflect.Value, visited map[uintptr]reflect.Value) reflect.Value {
+	if !origin.IsValid() {
+		return origin
+	}
+
+	kind := origin.Kind()
+
+	switch kind {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface:
+		if origin.IsNil() {
+			return origin
+		}
+	}
+
+	switch kind {
+	case reflect.Ptr, reflect.Map, reflect.Slice:
+		addr := origin.Pointer()
+		if clone, ok := visited[addr]; ok {
+			return clone
+		}
+	}
+
+	switch kind {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return origin
+
+	case reflect.Struct:
+		s := reflect.New(origin.Type()).Elem()
+		s.Set(origin)
+		for i := 0; i < origin.NumField(); i++ {
+			sf := s.Field(i)
+			if !sf.CanSet() {
+				continue
+			}
+			clone := deepCopy(origin.Field(i), visited)
+			sf.Set(clone)
+		}
+		return s
+
+	case reflect.Ptr:
+		ptr := reflect.New(origin.Elem().Type())
+		visited[origin.Pointer()] = ptr
+		clone := deepCopy(origin.Elem(), visited)
+		ptr.Elem().Set(clone)
+		return ptr
+
+	case reflect.Slice:
+		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Cap())
+		visited[origin.Pointer()] = s
+		for i := 0; i < origin.Len(); i++ {
+			clone := deepCopy(origin.Index(i), visited)
+			s.Index(i).Set(clone)
+		}
+		return s
+
+	case reflect.Map:
+		m := reflect.MakeMap(origin.Type())
+		visited[origin.Pointer()] = m
+		for _, key := range origin.MapKeys() {
+			keyClone := deepCopy(key, visited)
+			valClone := deepCopy(origin.MapIndex(key), visited)
+			m.SetMapIndex(keyClone, valClone)
+		}
+		return m
+
+	case reflect.Array:
+		a := reflect.New(origin.Type()).Elem()
+		for i := 0; i < origin.Len(); i++ {
+			clone := deepCopy(origin.Index(i), visited)
+			a.Index(i).Set(clone)
+		}
+		return a
+
+	case reflect.Interface:
+		clone := deepCopy(origin.Elem(), visited)
+		if !clone.IsValid() {
+			return reflect.Zero(origin.Type())
+		}
+		return clone.Convert(origin.Type())
+
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return reflect.Zero(origin.Type())
+
+	default:
+		panic(fmt.Errorf("rbi: deepCopy: unsupported value kind: %v", kind))
+	}
+}
 
 // Get returns the value stored by id or nil if key was not found.
 func (db *DB[K, V]) Get(id K) (*V, error) {
@@ -84,33 +670,6 @@ func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 		s[i] = value
 	}
 	return s, nil
-}
-
-// batchGetTxCompact retrieves multiple values by IDs using an existing read
-// transaction and returns only existing records (without nil holes).
-func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []K) ([]*V, error) {
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return nil, fmt.Errorf("bucket does not exist")
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
-	out := make([]*V, 0, len(ids))
-	var keyBuf [8]byte
-	for _, id := range ids {
-		v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
-		if v == nil {
-			continue
-		}
-		value, err := db.decode(v)
-		if err != nil {
-			return out, fmt.Errorf("decode: %w", err)
-		}
-		out = append(out, value)
-	}
-	return out, nil
 }
 
 // ScanKeys iterates over keys in the in-memory index snapshot and calls fn for

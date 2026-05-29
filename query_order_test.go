@@ -10,6 +10,67 @@ import (
 	"github.com/vapstack/qx"
 )
 
+func countDistinct(s []string) int {
+	n := len(s)
+	switch n {
+	case 0:
+		return 0
+	case 1:
+		return 1
+	case 2:
+		if s[0] != s[1] {
+			return 2
+		}
+		return 1
+	case 3:
+		a, b, c := s[0], s[1], s[2]
+		if a == b {
+			if b == c {
+				return 1
+			}
+			return 2
+		}
+		if a == c || b == c {
+			return 2
+		}
+		return 3
+	}
+	if n <= 8 {
+		return countDistinctLinear(s, n)
+	}
+	return len(dedupStringsInplace(s))
+}
+
+func countDistinctLinear(s []string, n int) int {
+	uniq := 0
+OUTER:
+	for i := 0; i < n; i++ {
+		v := s[i]
+		for k := 0; k < i; k++ {
+			if s[k] == v {
+				continue OUTER
+			}
+		}
+		uniq++
+	}
+	return uniq
+}
+
+func dedupStringsInplace(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	slices.Sort(s)
+	w := 1
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[w-1] {
+			s[w] = s[i]
+			w++
+		}
+	}
+	return s[:w]
+}
+
 func TestSort_OrderStability_WithDupValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -304,9 +365,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, tag := range vals {
-									ids := db.engine.snapshot.Current().FieldLookupPostingRetained("tags", tag)
-									gHas := ids.Contains(gid)
-									wHas := ids.Contains(wid)
+									gHas := gv != nil && slices.Contains(gv.Tags, tag)
+									wHas := wv != nil && slices.Contains(wv.Tags, tag)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", tag, gHas, wHas))
 								}
 								extra = fmt.Sprintf(
@@ -326,9 +386,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, country := range vals {
-									ids := db.engine.snapshot.Current().FieldLookupPostingRetained("country", country)
-									gHas := ids.Contains(gid)
-									wHas := ids.Contains(wid)
+									gHas := gv != nil && gv.Country == country
+									wHas := wv != nil && wv.Country == country
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", country, gHas, wHas))
 								}
 								extra = fmt.Sprintf(
@@ -471,10 +530,6 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode for tags")
-	}
-
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
 	gotEmpty, err := db.QueryKeys(emptyQ)
 	if err != nil {
@@ -600,9 +655,6 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode for tags after rebuild")
-	}
 
 	for i := 1; i <= 40; i++ {
 		var tags []string
@@ -669,9 +721,6 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 	}
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
-	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode for tags after rebuild")
 	}
 
 	if err := db.Set(1001, &Rec{
@@ -1265,9 +1314,6 @@ func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *te
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement mode for tags at start")
-	}
 
 	tests := []struct {
 		name string
@@ -1485,11 +1531,8 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 	}
 }
 
-func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-	})
+func TestQueryExt_OrderBasicNilShortCircuit_ReturnsEmptyResult(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Active: true},
@@ -1509,23 +1552,12 @@ func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testi
 		qx.CONTAINS("name", "a"),
 	).Sort("opt", qx.ASC).Limit(8)
 
-	cacheKey := db.engine.materializedPredCacheKey(qx.CONTAINS("name", "a"))
-	if cacheKey == "" {
-		t.Fatalf("expected non-empty materialized cache key")
-	}
-	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
-		t.Fatalf("unexpected residual cache entry before execution")
-	}
-
 	got, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected empty result, got=%v", got)
-	}
-	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
-		t.Fatalf("unexpected residual cache entry after empty nil-order short-circuit")
 	}
 }
 

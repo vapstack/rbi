@@ -95,6 +95,29 @@ func TestManagerDropStagedUnpinnedDeletesEntry(t *testing.T) {
 	}
 }
 
+func TestManagerPinCurrentIgnoresStagedFutureSnapshot(t *testing.T) {
+	m := NewManager(true)
+
+	current := &View{Seq: 1}
+	staged := &View{Seq: 2}
+	m.Publish(current)
+	m.Stage(staged)
+
+	got, seq, ref := m.PinCurrent()
+	if got != current || seq != current.Seq || ref == nil {
+		t.Fatalf("expected PinCurrent to return published current snapshot")
+	}
+	m.Unpin(seq, ref)
+	m.DropStaged(staged.Seq)
+
+	if m.Current() != current {
+		t.Fatal("expected staged snapshot not to replace current")
+	}
+	if managerTestRef(m, staged.Seq) != nil {
+		t.Fatal("expected staged snapshot ref to be removed after drop")
+	}
+}
+
 func TestManagerRetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing.T) {
 	m := NewManager(true)
 
@@ -127,5 +150,128 @@ func TestManagerRetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing.T) {
 	}
 	if managerTestRef(m, second.Seq) == nil {
 		t.Fatalf("expected latest snapshot to survive old-snapshot prune")
+	}
+}
+
+func TestManagerPinCurrentTracksReaderAcrossPublishAndPrunesOnUnpin(t *testing.T) {
+	m := NewManager(true)
+
+	first := &View{Seq: 1}
+	second := &View{Seq: 2}
+	m.Publish(first)
+
+	got, seq, ref := m.PinCurrent()
+	if got != first || seq != first.Seq || ref == nil {
+		t.Fatalf("expected current snapshot pin")
+	}
+	if stats := m.Stats(first, nil); stats.PinnedRefs != 1 {
+		t.Fatalf("expected one current snapshot ref, stats=%+v", stats)
+	}
+
+	m.Publish(second)
+
+	stats := m.Stats(second, nil)
+	if stats.RegistrySize != 2 || stats.PinnedRefs != 1 {
+		t.Fatalf("expected old snapshot ref pin to survive publish, stats=%+v", stats)
+	}
+
+	m.Unpin(seq, ref)
+	stats = m.Stats(second, nil)
+	if stats.RegistrySize != 1 || stats.PinnedRefs != 0 {
+		t.Fatalf("expected current snapshot ref pins to drop after unpin, stats=%+v", stats)
+	}
+	if m.Current() != second {
+		t.Fatal("expected latest snapshot to remain current after old unpin")
+	}
+}
+
+func TestManagerDuplicatePinsOnRetiredSnapshotPruneOnlyOnLastUnpin(t *testing.T) {
+	m := NewManager(true)
+
+	first := &View{Seq: 1}
+	second := &View{Seq: 2}
+	m.Publish(first)
+
+	got1, ref1, ok := m.PinBySeq(first.Seq)
+	if !ok || got1 != first || ref1 == nil {
+		t.Fatalf("expected first pin to return first snapshot")
+	}
+	got2, ref2, ok := m.PinBySeq(first.Seq)
+	if !ok || got2 != first || ref2 != ref1 {
+		t.Fatalf("expected duplicate pin to reuse first snapshot ref")
+	}
+
+	if stats := m.Stats(first, nil); stats.Sequence != first.Seq || stats.RegistrySize != 1 || stats.PinnedRefs != 1 {
+		t.Fatalf("unexpected stats before retire: %+v", stats)
+	}
+
+	m.Publish(second)
+	if m.Current() != second {
+		t.Fatal("expected second snapshot to become current")
+	}
+	if held := managerTestRef(m, first.Seq); held != ref1 || held.snap != nil {
+		t.Fatalf("expected retired pinned snapshot to keep nilled ref")
+	}
+	if stats := m.Stats(second, nil); stats.Sequence != second.Seq || stats.RegistrySize != 2 || stats.PinnedRefs != 1 {
+		t.Fatalf("unexpected stats after retire: %+v", stats)
+	}
+
+	m.Unpin(first.Seq, ref1)
+	if held := managerTestRef(m, first.Seq); held != ref1 || held.refs.Load() != 1 {
+		t.Fatalf("expected first unpin to keep retired snapshot ref")
+	}
+	if stats := m.Stats(second, nil); stats.RegistrySize != 2 || stats.PinnedRefs != 1 {
+		t.Fatalf("unexpected stats after first unpin: %+v", stats)
+	}
+
+	m.Unpin(first.Seq, ref2)
+	if managerTestRef(m, first.Seq) != nil {
+		t.Fatalf("expected retired snapshot ref to be pruned after last unpin")
+	}
+	if m.Current() != second {
+		t.Fatal("expected latest snapshot to remain current after last unpin")
+	}
+	if stats := m.Stats(second, nil); stats.Sequence != second.Seq || stats.RegistrySize != 1 || stats.PinnedRefs != 0 {
+		t.Fatalf("unexpected stats after last unpin: %+v", stats)
+	}
+}
+
+func TestManagerStatsCountsDistinctPinnedSnapshotsAcrossRotation(t *testing.T) {
+	m := NewManager(true)
+
+	first := &View{Seq: 1}
+	second := &View{Seq: 2}
+	third := &View{Seq: 3}
+	m.Publish(first)
+
+	_, refA, ok := m.PinBySeq(first.Seq)
+	if !ok || refA == nil {
+		t.Fatalf("expected first snapshot to be pinnable")
+	}
+
+	m.Publish(second)
+
+	_, refB, ok := m.PinBySeq(second.Seq)
+	if !ok || refB == nil {
+		t.Fatalf("expected second snapshot to be pinnable")
+	}
+
+	m.Publish(third)
+
+	if stats := m.Stats(third, nil); stats.Sequence != third.Seq || stats.RegistrySize != 3 || stats.PinnedRefs != 2 {
+		t.Fatalf("unexpected stats with two distinct retired pinned snapshots: %+v", stats)
+	}
+
+	m.Unpin(first.Seq, refA)
+	if stats := m.Stats(third, nil); stats.Sequence != third.Seq || stats.RegistrySize != 2 || stats.PinnedRefs != 1 {
+		t.Fatalf("unexpected stats after first unpin: %+v", stats)
+	}
+
+	m.Unpin(second.Seq, refB)
+	if stats := m.Stats(third, nil); stats.Sequence != third.Seq || stats.RegistrySize != 1 || stats.PinnedRefs != 0 {
+		t.Fatalf("unexpected stats after second unpin: %+v", stats)
+	}
+	if m.Current() != third {
+		t.Fatal("expected latest snapshot to remain current")
 	}
 }

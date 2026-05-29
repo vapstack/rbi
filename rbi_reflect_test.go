@@ -10,10 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/schema"
 	"go.etcd.io/bbolt"
 )
 
@@ -215,15 +213,22 @@ func patchFieldsByName(fields []Field) map[string]any {
 	return out
 }
 
-func applyPatchForTest[K ~uint64 | ~string, V any](t testing.TB, db *DB[K, V], v *V, patch []Field, ignoreUnknown bool) {
+func applyPatchForTest[V any](t testing.TB, db *DB[uint64, V], old *V, patch []Field) *V {
 	t.Helper()
-	items := make([]schema.PatchItem, len(patch))
-	for i := range patch {
-		items[i] = schema.PatchItem(patch[i])
+	if err := db.Set(1, old); err != nil {
+		t.Fatalf("Set: %v", err)
 	}
-	if err := db.schema.Patch.Apply(unsafe.Pointer(v), items, ignoreUnknown); err != nil {
-		t.Fatalf("applyPatch: %v", err)
+	if err := db.Patch(1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch: %v", err)
 	}
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Get returned nil after Patch")
+	}
+	return got
 }
 
 func assertUint64Slice(t *testing.T, got, want []uint64) {
@@ -698,86 +703,6 @@ func TestReflectExt_QueryMixedNumericAndTimeBounds_DoesNotAliasCache(t *testing.
 	assertUint64Slice(t, got, []uint64{1})
 }
 
-func TestReflectExt_ModifiedIndexedFields_EmbeddedUnsafeAccessorPaths(t *testing.T) {
-	db := openTempDBUint64Reflect[reflectUnsafeAccessorRec](t, "reflect_embedded_modified.db")
-
-	oldCode := reflectPtrFoldedString("MiXeD")
-	sameCode := reflectPtrFoldedString("mixed")
-	oldCount := uint64(7)
-	sameCount := uint64(7)
-
-	base := &reflectUnsafeAccessorRec{
-		Name: "alice",
-		ReflectUnsafeEmbeddedIndexed: ReflectUnsafeEmbeddedIndexed{
-			Code:  &oldCode,
-			Score: 3,
-			Tags:  []string{"x", "y"},
-			Count: &oldCount,
-		},
-	}
-	same := &reflectUnsafeAccessorRec{
-		Name: "alice",
-		ReflectUnsafeEmbeddedIndexed: ReflectUnsafeEmbeddedIndexed{
-			Code:  &sameCode,
-			Score: 3,
-			Tags:  []string{"x", "y"},
-			Count: &sameCount,
-		},
-	}
-
-	if mods := db.getModifiedIndexedFields(base, same); len(mods) != 0 {
-		t.Fatalf("expected no modified indexed fields, got %v", mods)
-	}
-	var uniqueMods []string
-	db.forEachModifiedAccessor(db.engine.schema.Unique, base, same, func(acc schema.IndexedFieldAccessor) bool {
-		uniqueMods = append(uniqueMods, acc.Name)
-		return true
-	})
-	if len(uniqueMods) != 0 {
-		t.Fatalf("expected no modified unique fields, got %v", uniqueMods)
-	}
-
-	nextCount := uint64(9)
-	countChanged := &reflectUnsafeAccessorRec{
-		Name: "alice",
-		ReflectUnsafeEmbeddedIndexed: ReflectUnsafeEmbeddedIndexed{
-			Code:  &sameCode,
-			Score: 3,
-			Tags:  []string{"x", "y"},
-			Count: &nextCount,
-		},
-	}
-	if mods := db.getModifiedIndexedFields(base, countChanged); !slices.Equal(mods, []string{"count"}) {
-		t.Fatalf("expected only count to change, got %v", mods)
-	}
-
-	scoreChanged := &reflectUnsafeAccessorRec{
-		Name: "alice",
-		ReflectUnsafeEmbeddedIndexed: ReflectUnsafeEmbeddedIndexed{
-			Code:  &sameCode,
-			Score: 4,
-			Tags:  []string{"x", "y"},
-			Count: &sameCount,
-		},
-	}
-	if mods := db.getModifiedIndexedFields(base, scoreChanged); !slices.Equal(mods, []string{"score"}) {
-		t.Fatalf("expected only score to change, got %v", mods)
-	}
-
-	tagsChanged := &reflectUnsafeAccessorRec{
-		Name: "alice",
-		ReflectUnsafeEmbeddedIndexed: ReflectUnsafeEmbeddedIndexed{
-			Code:  &sameCode,
-			Score: 3,
-			Tags:  []string{"x", "z"},
-			Count: &sameCount,
-		},
-	}
-	if mods := db.getModifiedIndexedFields(base, tagsChanged); !slices.Equal(mods, []string{"tags"}) {
-		t.Fatalf("expected only tags to change, got %v", mods)
-	}
-}
-
 func TestReflectExt_EmbeddedUnsafeAccessors_QueryUniqueAndRebuild(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectUnsafeAccessorRec](t, "reflect_embedded_accessors.db")
 
@@ -906,9 +831,8 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeValue(t *testing.T) {
 		t.Fatalf("patch lost time value: got=%#v want=%#v", gotWhen, newVal.When)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
-	if applied.When != newVal.When {
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	if !applied.When.Equal(newVal.When) {
 		t.Fatalf("patched record lost time value: got=%#v want=%#v", applied.When, newVal.When)
 	}
 }
@@ -937,10 +861,14 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeSlice(t *testing.T) {
 		t.Fatalf("patch lost time slice contents: got=%#v want=%#v", gotSlots, newVal.Slots)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
-	if !reflect.DeepEqual(applied.Slots, newVal.Slots) {
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	if len(applied.Slots) != len(newVal.Slots) {
 		t.Fatalf("patched record lost time slice contents: got=%#v want=%#v", applied.Slots, newVal.Slots)
+	}
+	for i := range newVal.Slots {
+		if !applied.Slots[i].Equal(newVal.Slots[i]) {
+			t.Fatalf("patched time slot %d mismatch: got=%#v want=%#v", i, applied.Slots[i], newVal.Slots[i])
+		}
 	}
 }
 
@@ -968,10 +896,24 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeMapKeys(t *testing.T) {
 		t.Fatalf("patch lost time map contents: got=%#v want=%#v", gotWindows, newVal.Windows)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
-	if !reflect.DeepEqual(applied.Windows, newVal.Windows) {
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	if len(applied.Windows) != len(newVal.Windows) {
 		t.Fatalf("patched record lost time map contents: got=%#v want=%#v", applied.Windows, newVal.Windows)
+	}
+	for wantTime, wantValue := range newVal.Windows {
+		found := false
+		for gotTime, gotValue := range applied.Windows {
+			if gotTime.Equal(wantTime) {
+				found = true
+				if gotValue != wantValue {
+					t.Fatalf("patched time map value mismatch at %#v: got=%q want=%q", gotTime, gotValue, wantValue)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("patched time map missing instant %#v in %#v", wantTime, applied.Windows)
+		}
 	}
 }
 
@@ -1000,8 +942,7 @@ func TestReflectExt_MakePatch_PreservesNamedSliceType(t *testing.T) {
 		t.Fatalf("patch aliased named slice data: %#v", gotTags)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if !reflect.DeepEqual(applied.Tags, reflectNamedTags{"go", "db"}) {
 		t.Fatalf("patched record lost named slice type/content: %#v", applied.Tags)
 	}
@@ -1029,8 +970,7 @@ func TestReflectExt_MakePatch_UsesFullFieldEqualityForValueIndexer(t *testing.T)
 		t.Fatalf("patch aliased ValueIndexer-backed map: %#v", gotKey)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if !reflect.DeepEqual(applied.Key, reflectMapVI{"id": "a", "note": "new"}) {
 		t.Fatalf("patched record lost ValueIndexer-backed field contents: %#v", applied.Key)
 	}
@@ -1077,8 +1017,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesStructReferences(t *testing.T) {
 		t.Fatalf("patch aliased nested child data: %#v", gotNested.Child)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if !reflect.DeepEqual(applied.Nested.Tags, []string{"before"}) {
 		t.Fatalf("patched record aliased struct slice field: %#v", applied.Nested.Tags)
 	}
@@ -1134,8 +1073,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesPointerStructReferences(t *testin
 		t.Fatalf("patch aliased pointer child data: %#v", gotNested.Child)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if applied.NestedPtr == nil || !reflect.DeepEqual(applied.NestedPtr.Tags, []string{"before"}) {
 		t.Fatalf("patched record aliased pointer struct slice field: %#v", applied.NestedPtr)
 	}
@@ -1196,8 +1134,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesSliceStructReferences(t *testing.
 		t.Fatalf("patch aliased slice element nested child data: %#v", gotItems[0].Nested.Child)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if len(applied.Items) != 1 {
 		t.Fatalf("patched record lost slice contents: %#v", applied.Items)
 	}

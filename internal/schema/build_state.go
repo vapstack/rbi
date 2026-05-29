@@ -131,15 +131,15 @@ func (s *BuildFieldLocalState) FlushAllInto(dst *BuildFieldState) {
 }
 
 func (s *BuildFieldLocalState) Release() {
-	posting.ReleaseMap(s.vals)
+	posting.ReleaseMapString(s.vals)
 	indexdata.ReleasePostingMap(s.vals)
 	s.vals = nil
 
-	posting.ReleaseMap(s.fixed)
+	posting.ReleaseMapU64(s.fixed)
 	indexdata.ReleaseFixedPostingMap(s.fixed)
 	s.fixed = nil
 
-	posting.ReleaseMap(s.lenMap)
+	posting.ReleaseMapU32(s.lenMap)
 	s.lenMap = nil
 
 	s.nils.Release()
@@ -162,7 +162,7 @@ func (s *BuildFieldState) Release() {
 	s.nils.Release()
 	s.nils = posting.List{}
 
-	posting.ReleaseMap(s.lenMap)
+	posting.ReleaseMapU32(s.lenMap)
 	s.lenMap = nil
 }
 

@@ -1,11 +1,18 @@
 package qexec
 
 import (
+	"fmt"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/internal/strmap"
 )
 
 type correctnessRowLess func(aID uint64, a *Rec, bID uint64, b *Rec) bool
@@ -316,6 +323,797 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 		t.Fatalf("PreparedQuery: %v", err)
 	}
 	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 0, 0))
+}
+
+func TestQueryCorrectness_PreparedQueryConcurrentReadOnlyViews(t *testing.T) {
+	db := newCorrectnessDB(t)
+
+	priority := []string{"tag_mid", "go", "db"}
+	activeWideAge := func(_ uint64, r *Rec) bool {
+		return r.Active && r.Age >= 25
+	}
+	hasPriorityTag := func(_ uint64, r *Rec) bool {
+		return hasAnyString(r.Tags, priority...)
+	}
+	cases := []struct {
+		q    *qx.QX
+		want []uint64
+	}{
+		{
+			q:    qx.Query(qx.EQ("active", true), qx.GTE("age", 25)).Sort("score", qx.DESC).Offset(1).Limit(4),
+			want: expectedRecIDs(db, activeWideAge, scoreDesc, 1, 4),
+		},
+		{
+			q:    qx.Query(qx.HASANY("tags", priority)).SortBy(qx.POS("tags", priority), qx.ASC).Offset(1).Limit(5),
+			want: expectedRecIDs(db, hasPriorityTag, tagPosAsc(priority), 1, 5),
+		},
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan string, 16)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 50; i++ {
+				tc := cases[(gid+i)&1]
+				prepared, shape, err := prepareTestQuery(db.engine, tc.q)
+				if err != nil {
+					errCh <- "prepareTestQuery: " + err.Error()
+					return
+				}
+				got, err := db.engine.currentQueryViewForTests().PreparedQuery(&shape)
+				prepared.Release()
+				if err != nil {
+					errCh <- "PreparedQuery: " + err.Error()
+					return
+				}
+				if !queryIDsEqual(tc.q, got, tc.want) {
+					errCh <- "PreparedQuery mismatch"
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func qexecPreparedCurrentQuery(db *DB[uint64, Rec], q *qx.QX) ([]uint64, error) {
+	prepared, shape, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		return nil, err
+	}
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	view := db.engine.exec.AcquireView(snap)
+	got, err := view.PreparedQuery(&shape)
+	db.engine.exec.ReleaseView(view)
+	db.engine.snapshot.Unpin(seq, ref)
+	prepared.Release()
+	return got, err
+}
+
+func qexecAssertPreparedRouteMatchesQuery(t testing.TB, db *DB[uint64, Rec], q *qx.QX) {
+	t.Helper()
+
+	nq := qx.Normalize(qx.Clone(q))
+	got, err := qexecPreparedCurrentQuery(db, nq)
+	if err != nil {
+		t.Fatalf("PreparedQuery(%+v): %v", nq, err)
+	}
+	if err = testValidateNoDuplicateKeys("prepared", got); err != nil {
+		t.Fatal(err)
+	}
+
+	if testQueryNoOrderPage(nq) {
+		fullQ := qx.Clone(nq)
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
+		full, err := db.QueryKeys(fullQ)
+		if err != nil {
+			t.Fatalf("QueryKeys(full %+v): %v", fullQ, err)
+		}
+		if err = testValidateNoOrderPage(nq, got, full); err != nil {
+			t.Fatalf("prepared no-order page mismatch: %v\ngot=%v\nfull=%v", err, got, full)
+		}
+		return
+	}
+
+	want, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	if !queryIDsEqual(nq, got, want) {
+		t.Fatalf("prepared query mismatch:\nq=%+v\nnq=%+v\ngot=%v\nwant=%v", q, nq, got, want)
+	}
+}
+
+func qexecSeedNotInOrderOffsetData(t *testing.T, db *DB[uint64, Rec]) {
+	t.Helper()
+
+	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland"}
+	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve"}
+	tags := [][]string{{"go", "db"}, {"java"}, {"rust", "go"}, {"ops"}, {"go", "go", "db"}, {}}
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		var opt *string
+		if i&3 == 0 {
+			s := fmt.Sprintf("opt-%d", i)
+			opt = &s
+		}
+		return &Rec{
+			Meta:     Meta{Country: countries[(i*17+3)%len(countries)]},
+			Name:     names[(i*11+5)%len(names)],
+			Age:      18 + i%50,
+			Score:    float64((i*7919)%30_000) + float64(i%997)/1000,
+			Active:   i&1 == 0,
+			Tags:     append([]string(nil), tags[(i*7+1)%len(tags)]...),
+			FullName: fmt.Sprintf("FN-%05d", i),
+			Opt:      opt,
+		}
+	})
+}
+
+func TestQueryCorrectness_PreparedRouteNotInOrderOffset(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	qexecSeedNotInOrderOffsetData(t, db)
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "captured_shape",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).Sort("score", qx.ASC).Offset(446).Limit(70),
+		},
+		{
+			name: "different_values",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"DE", "PL"}),
+				qx.NOTIN("country", []string{"Thailand", "US"}),
+			).Sort("score", qx.ASC).Offset(210).Limit(90),
+		},
+		{
+			name: "desc_order",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).Sort("score", qx.DESC).Offset(446).Limit(70),
+		},
+		{
+			name: "without_offset",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).Sort("score", qx.ASC).Limit(70),
+		},
+	}
+
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			qexecAssertPreparedRouteMatchesQuery(t, db, tests[i].q)
+		})
+	}
+}
+
+func TestQueryCorrectness_PreparedRouteMultiTermHASLead(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	seedGeneratedUint64Data(t, db, 512, func(i int) *Rec {
+		tags := []string{"go"}
+		if i <= 180 {
+			tags = []string{"db", "rust", "infra"}
+		} else if i&1 == 0 {
+			tags = []string{"db", "rust"}
+		} else if i%3 == 0 {
+			tags = []string{"db", "infra"}
+		}
+		return &Rec{
+			Meta:     Meta{Country: []string{"NL", "PL", "DE", "US"}[i&3]},
+			Name:     fmt.Sprintf("user-%03d", i),
+			Age:      18 + i%71,
+			Score:    float64(i % 97),
+			Active:   i&1 == 0,
+			Tags:     tags,
+			FullName: fmt.Sprintf("FN-%05d", i),
+		}
+	})
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "no_order_limit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Limit(120),
+		},
+		{
+			name: "no_order_offset_limit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Offset(40).Limit(80),
+		},
+		{
+			name: "ordered_offset_limit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Sort("age", qx.ASC).Offset(20).Limit(90),
+		},
+	}
+
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			qexecAssertPreparedRouteMatchesQuery(t, db, tests[i].q)
+		})
+	}
+}
+
+func TestQueryCorrectness_PreparedPinnedSnapshotStableDuringConcurrentPublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	ids := make([]uint64, 420)
+	vals := make([]*Rec, 420)
+	for i := range ids {
+		id := uint64(i + 1)
+		name := fmt.Sprintf("zz/%03d", id)
+		if id <= 180 {
+			name = fmt.Sprintf("aa/%03d", id)
+		} else if id <= 320 {
+			name = fmt.Sprintf("ab/%03d", id)
+		}
+		ids[i] = id
+		vals[i] = &Rec{Name: name, Age: int(id)}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet(seed): %v", err)
+	}
+
+	snap := db.engine.snapshot.Current()
+	pinned, ref, ok := db.engine.snapshot.PinBySeq(snap.Seq)
+	if !ok {
+		t.Fatalf("PinBySeq(%d): false", snap.Seq)
+	}
+	defer db.engine.snapshot.Unpin(pinned.Seq, ref)
+
+	q := qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC)
+	prepared, shape, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.exec.AcquireView(pinned)
+	want, err := view.PreparedQuery(&shape)
+	db.engine.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("PreparedQuery(seed): %v", err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 200; i++ {
+				view := db.engine.exec.AcquireView(pinned)
+				got, err := view.PreparedQuery(&shape)
+				db.engine.exec.ReleaseView(view)
+				if err != nil {
+					select {
+					case errCh <- "PreparedQuery: " + err.Error():
+					default:
+					}
+					return
+				}
+				if !slices.Equal(got, want) {
+					select {
+					case errCh <- "pinned snapshot query changed under concurrent publish":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 200; i++ {
+			id := uint64(i%420 + 1)
+			if err := db.Patch(id, []Field{{Name: "name", Value: fmt.Sprintf("mut/%03d/%03d", i, id)}}); err != nil {
+				select {
+				case errCh <- fmt.Sprintf("Patch(%d): %v", id, err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryCorrectness_PreparedPinnedNumericRangeSnapshotStableDuringConcurrentPublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const total = 2048
+	ids := make([]uint64, total)
+	vals := make([]*Rec, total)
+	for i := range ids {
+		id := uint64(i + 1)
+		ids[i] = id
+		vals[i] = &Rec{Name: fmt.Sprintf("user-%04d", id), Age: int(id)}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet(seed): %v", err)
+	}
+	setNumericBucketKnobs(t, db, 64, 1, 1)
+
+	snap := db.engine.snapshot.Current()
+	pinned, ref, ok := db.engine.snapshot.PinBySeq(snap.Seq)
+	if !ok {
+		t.Fatalf("PinBySeq(%d): false", snap.Seq)
+	}
+	defer db.engine.snapshot.Unpin(pinned.Seq, ref)
+
+	q := qx.Query(qx.GTE("age", 1536))
+	prepared, shape, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.exec.AcquireView(pinned)
+	want, err := view.PreparedQuery(&shape)
+	db.engine.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("PreparedQuery(seed): %v", err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 200; i++ {
+				view := db.engine.exec.AcquireView(pinned)
+				got, err := view.PreparedQuery(&shape)
+				db.engine.exec.ReleaseView(view)
+				if err != nil {
+					select {
+					case errCh <- "PreparedQuery: " + err.Error():
+					default:
+					}
+					return
+				}
+				if !queryIDsEqual(q, got, want) {
+					select {
+					case errCh <- "pinned numeric range query changed under concurrent publish":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 200; i++ {
+			id := uint64(i%total + 1)
+			if err := db.Patch(id, []Field{{Name: "age", Value: total + i + 1}}); err != nil {
+				select {
+				case errCh <- fmt.Sprintf("Patch(%d): %v", id, err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryCorrectness_PreparedQueryConcurrentPublishKeepsWholeSnapshot(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	optAA, optBB, optCC, optDD := "aa", "bb", "cc", "dd"
+	empty := ""
+	ids := []uint64{1, 2, 3, 4, 5, 6}
+	stateA := []*Rec{
+		{Name: "A1-nil", Opt: nil, Active: true, Tags: []string{"go"}},
+		{Name: "A2-aa", Opt: &optAA, Active: true, Tags: []string{"db"}},
+		{Name: "A3-bb", Opt: &optBB, Active: true, Tags: []string{"ops"}},
+		{Name: "A4-nil-off", Opt: nil, Active: false, Tags: []string{"rust"}},
+		{Name: "A5-cc", Opt: &optCC, Active: true, Tags: []string{"go", "db"}},
+		{Name: "A6-empty", Opt: &empty, Active: true, Tags: []string{"ops", "go"}},
+	}
+	stateB := []*Rec{
+		{Name: "B1-dd", Opt: &optDD, Active: true, Tags: []string{"go"}},
+		{Name: "B2-nil", Opt: nil, Active: true, Tags: []string{"db"}},
+		{Name: "B3-aa-off", Opt: &optAA, Active: false, Tags: []string{"ops"}},
+		{Name: "B4-empty", Opt: &empty, Active: true, Tags: []string{"rust"}},
+		{Name: "B5-bb", Opt: &optBB, Active: true, Tags: []string{"go", "db"}},
+		{Name: "B6-nil-off", Opt: nil, Active: false, Tags: []string{"ops", "go"}},
+	}
+	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
+
+	if err := db.BatchSet(ids, stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(stateA): %v", err)
+	}
+	if err = db.BatchSet(ids, stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(stateB): %v", err)
+	}
+	if err = db.BatchSet(ids, stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 240; i++ {
+			vals := stateB
+			if i&1 == 1 {
+				vals = stateA
+			}
+			if err := db.BatchSet(ids, vals); err != nil {
+				select {
+				case errCh <- "BatchSet: " + err.Error():
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 320; i++ {
+				got, err := qexecPreparedCurrentQuery(db, q)
+				if err != nil {
+					select {
+					case errCh <- "PreparedQuery: " + err.Error():
+					default:
+					}
+					return
+				}
+				if queryIDsEqual(q, got, wantA) || queryIDsEqual(q, got, wantB) {
+					continue
+				}
+				select {
+				case errCh <- "PreparedQuery returned hybrid snapshot":
+				default:
+				}
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryCorrectness_PreparedOrderedORConcurrentPublishKeepsWholeSnapshot(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	ids := []uint64{1, 2, 3, 4, 5, 6, 7, 8}
+	stateA := []*Rec{
+		{Meta: Meta{Country: "US"}, Name: "A1", Age: 31, Score: 80, Active: true, Tags: []string{"go"}},
+		{Meta: Meta{Country: "DE"}, Name: "A2", Age: 26, Score: 70, Active: false, Tags: []string{"db"}},
+		{Meta: Meta{Country: "NL"}, Name: "A3", Age: 40, Score: 60, Active: true, Tags: []string{"ops"}},
+		{Meta: Meta{Country: "PL"}, Name: "A4", Age: 20, Score: 50, Active: true, Tags: []string{"rust"}},
+		{Meta: Meta{Country: "US"}, Name: "A5", Age: 45, Score: 40, Active: false, Tags: []string{"go", "ops"}},
+		{Meta: Meta{Country: "DE"}, Name: "A6", Age: 33, Score: 30, Active: true, Tags: []string{"java"}},
+		{Meta: Meta{Country: "JP"}, Name: "A7", Age: 55, Score: 20, Active: true, Tags: []string{"db"}},
+		{Meta: Meta{Country: "US"}, Name: "A8", Age: 29, Score: 10, Active: true, Tags: []string{"ops"}},
+	}
+	stateB := []*Rec{
+		{Meta: Meta{Country: "US"}, Name: "B1", Age: 28, Score: 15, Active: false, Tags: []string{"go"}},
+		{Meta: Meta{Country: "DE"}, Name: "B2", Age: 30, Score: 25, Active: true, Tags: []string{"ops"}},
+		{Meta: Meta{Country: "NL"}, Name: "B3", Age: 41, Score: 35, Active: true, Tags: []string{"go"}},
+		{Meta: Meta{Country: "PL"}, Name: "B4", Age: 22, Score: 45, Active: true, Tags: []string{"db"}},
+		{Meta: Meta{Country: "US"}, Name: "B5", Age: 47, Score: 55, Active: true, Tags: []string{"ops"}},
+		{Meta: Meta{Country: "DE"}, Name: "B6", Age: 21, Score: 65, Active: false, Tags: []string{"java"}},
+		{Meta: Meta{Country: "JP"}, Name: "B7", Age: 57, Score: 75, Active: true, Tags: []string{"go", "db"}},
+		{Meta: Meta{Country: "US"}, Name: "B8", Age: 35, Score: 85, Active: true, Tags: []string{"rust"}},
+	}
+	q := qx.Query(qx.OR(
+		qx.AND(qx.EQ("active", true), qx.HASANY("tags", []string{"go", "ops"})),
+		qx.AND(qx.EQ("country", "DE"), qx.GTE("age", 25)),
+	)).Sort("score", qx.DESC).Offset(1).Limit(5)
+
+	if err := db.BatchSet(ids, stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(stateA): %v", err)
+	}
+	if err = db.BatchSet(ids, stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(stateB): %v", err)
+	}
+	if err = db.BatchSet(ids, stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 220; i++ {
+			vals := stateB
+			if i&1 == 1 {
+				vals = stateA
+			}
+			if err := db.BatchSet(ids, vals); err != nil {
+				select {
+				case errCh <- "BatchSet: " + err.Error():
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 320; i++ {
+				got, err := qexecPreparedCurrentQuery(db, q)
+				if err != nil {
+					select {
+					case errCh <- "PreparedQuery: " + err.Error():
+					default:
+					}
+					return
+				}
+				if queryIDsEqual(q, got, wantA) || queryIDsEqual(q, got, wantB) {
+					continue
+				}
+				select {
+				case errCh <- "PreparedQuery returned hybrid ordered OR snapshot":
+				default:
+				}
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnapshot(t *testing.T) {
+	var zero Rec
+	rt, err := schema.Compile(reflect.TypeOf(zero), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	exec := NewRuntime(Config{
+		Schema:                         rt,
+		AnalyzeInterval:                -1,
+		NumericRangeBucketSize:         testNumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys: testNumericRangeMinKeys,
+		NumericRangeBucketMinSpanKeys:  testNumericRangeMinSpan,
+	})
+	cfg := snapshot.CacheConfig{
+		MatPredMaxEntries: testMatPredCacheMaxEntries,
+		MatPredMaxCard:    testMatPredCacheMaxCard,
+	}
+	qe := &queryEngine{
+		snapshot: snapshot.NewManager(false),
+		schema:   rt,
+		exec:     exec,
+		cfg:      cfg,
+	}
+	sm := strmap.New(0, 256)
+
+	keys := []string{"id-1", "id-2", "id-3", "id-4", "id-5", "id-6", "id-7"}
+	ids := make([]uint64, len(keys))
+	for i := range keys {
+		idx, _ := sm.Create(keys[i])
+		ids[i] = idx
+	}
+
+	stateA := []*Rec{
+		{Name: "aa/00", Active: true, Score: 10, Meta: Meta{Country: "US"}},
+		{Name: "aa/01", Active: false, Score: 40, Meta: Meta{Country: "FR"}},
+		{Name: "aa/02", Active: true, Score: 70, Meta: Meta{Country: "NL"}},
+		{Name: "ab/00", Active: false, Score: 30, Meta: Meta{Country: "NL"}},
+		{Name: "ab/01", Active: true, Score: 60, Meta: Meta{Country: "US"}},
+		{Name: "ac/00", Active: true, Score: 50, Meta: Meta{Country: "FR"}},
+		{Name: "zz/00", Active: true, Score: 5, Meta: Meta{Country: "DE"}},
+	}
+	stateB := []*Rec{
+		{Name: "aa/00", Active: false, Score: 10, Meta: Meta{Country: "US"}},
+		{Name: "aa/03", Active: true, Score: 20, Meta: Meta{Country: "FR"}},
+		{Name: "aa/04", Active: true, Score: 40, Meta: Meta{Country: "DE"}},
+		{Name: "ab/00", Active: true, Score: 30, Meta: Meta{Country: "NL"}},
+		{Name: "ab/02", Active: false, Score: 60, Meta: Meta{Country: "US"}},
+		{Name: "ab/03", Active: true, Score: 80, Meta: Meta{Country: "NL"}},
+		{Name: "ac/00", Active: true, Score: 50, Meta: Meta{Country: "FR"}},
+	}
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.PREFIX("name", "aa/"),
+				qx.EQ("active", true),
+			),
+			qx.AND(
+				qx.PREFIX("name", "ab/"),
+				qx.EQ("country", "NL"),
+			),
+			qx.AND(
+				qx.EQ("name", "aa/03"),
+				qx.LT("score", 25.0),
+			),
+		),
+	).Sort("name", qx.ASC).Offset(1).Limit(3)
+
+	cur := make([]*Rec, len(ids))
+	seq := uint64(1)
+	publish := func(vals []*Rec) {
+		entries := make([]snapshot.BatchEntry, len(ids))
+		for i := range ids {
+			var old unsafe.Pointer
+			if cur[i] != nil {
+				old = unsafe.Pointer(cur[i])
+			}
+			cur[i] = vals[i]
+			entries[i] = snapshot.BatchEntry{ID: ids[i], Old: old, New: unsafe.Pointer(vals[i])}
+		}
+		next := snapshot.BuildPrepared(seq, qe.snapshot.Current(), rt, cfg, sm, nil, entries)
+		qe.snapshot.Publish(next)
+		seq++
+	}
+	queryCurrent := func() ([]uint64, error) {
+		prepared, shape, err := prepareTestQuery(qe, q)
+		if err != nil {
+			return nil, err
+		}
+		snap, snapSeq, ref := qe.snapshot.PinCurrent()
+		view := qe.exec.AcquireView(snap)
+		got, err := view.PreparedQuery(&shape)
+		qe.exec.ReleaseView(view)
+		qe.snapshot.Unpin(snapSeq, ref)
+		prepared.Release()
+		return got, err
+	}
+
+	publish(stateA)
+	wantA, err := queryCurrent()
+	if err != nil {
+		t.Fatalf("PreparedQuery(stateA): %v", err)
+	}
+	publish(stateB)
+	wantB, err := queryCurrent()
+	if err != nil {
+		t.Fatalf("PreparedQuery(stateB): %v", err)
+	}
+	publish(stateA)
+
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 320; i++ {
+			vals := stateB
+			if i&1 == 1 {
+				vals = stateA
+			}
+			publish(vals)
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 480; i++ {
+				got, err := queryCurrent()
+				if err != nil {
+					select {
+					case errCh <- "PreparedQuery: " + err.Error():
+					default:
+					}
+					return
+				}
+				if slices.Equal(got, wantA) || slices.Equal(got, wantB) {
+					continue
+				}
+				select {
+				case errCh <- "PreparedQuery returned hybrid string-key ordered OR snapshot":
+				default:
+				}
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
 }
 
 func TestQueryCorrectness_PublicWrappersAndCacheModes(t *testing.T) {

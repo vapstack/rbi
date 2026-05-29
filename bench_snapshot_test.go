@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/qcache"
+	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/snapshot"
 )
 
@@ -24,6 +26,53 @@ const benchTurnoverRingSize = 64
 const benchColdPoolWarmCycles = 2
 const benchHotWarmMaxCycles = 6
 const benchHotWarmStableCycles = 2
+
+func benchSnapshotHasMaterializedPred(s *snapshot.View, key string) bool {
+	if parsed, ok := qcache.MaterializedPredKeyFromEncoded(key); ok {
+		return s.HasMaterializedPredKey(parsed)
+	}
+	if key == "" {
+		return s.HasMaterializedPredKey(qcache.MaterializedPredKey{})
+	}
+	return s.HasMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque(key))
+}
+
+func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
+	return qe.exec.FieldNameByOrdinal(ordinal)
+}
+
+func prepareTestExpr(qe *queryEngine, expr qx.Expr) (*qir.Query, qir.Expr, error) {
+	var (
+		prepared *qir.Query
+		err      error
+	)
+	if qe == nil {
+		prepared, err = qir.PrepareCountExprsNoResolve(expr)
+	} else {
+		prepared, err = qir.PrepareCountExprsResolved(qe.schema.IndexedByName, expr)
+	}
+	if err != nil {
+		return nil, qir.Expr{}, err
+	}
+	return prepared, prepared.Expr, nil
+}
+
+func (qe *queryEngine) materializedPredCacheKey(expr qx.Expr) string {
+	prepared, compiled, err := prepareTestExpr(qe, expr)
+	if err != nil {
+		return ""
+	}
+	defer prepared.Release()
+	field := qe.fieldNameByOrdinal(compiled.FieldOrdinal)
+	switch v := compiled.Value.(type) {
+	case string:
+		return qcache.MaterializedPredKeyForScalar(field, compiled.Op, v).String()
+	case nil:
+		return ""
+	default:
+		return ""
+	}
+}
 
 type benchCacheMode struct {
 	suffix string
@@ -504,7 +553,7 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
 	oldSnap := db.engine.snapshot.Current()
-	if _, ok := snapshotExtLoadMaterializedPred(oldSnap, cacheKey); !ok {
+	if !benchSnapshotHasMaterializedPred(oldSnap, cacheKey) {
 		t.Fatalf("expected old snapshot cache hit before turnover")
 	}
 	state := newBenchReadModeState[uint64, UserBench](
@@ -519,7 +568,7 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	if newSnap == oldSnap || newSnap.Seq == oldSnap.Seq {
 		t.Fatalf("expected Cold to publish a new snapshot")
 	}
-	if _, ok := snapshotExtLoadMaterializedPred(newSnap, cacheKey); !ok {
+	if !benchSnapshotHasMaterializedPred(newSnap, cacheKey) {
 		t.Fatalf("expected unchanged-field materialized cache to survive turnover")
 	}
 }

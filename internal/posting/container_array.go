@@ -17,9 +17,6 @@ func (ac *containerArray) uniquelyOwned() bool {
 }
 
 func (ac *containerArray) release() {
-	if ac == nil {
-		return
-	}
 	if ac.refs.Add(-1) != 0 {
 		return
 	}

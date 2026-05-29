@@ -5,6 +5,8 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
@@ -12,6 +14,44 @@ type snapshotBatchRec struct {
 	Name  string  `rbi:"index"`
 	Age   int     `rbi:"index"`
 	Score float64 `rbi:"measure"`
+}
+
+type snapshotBatchStorageRec struct {
+	Name string   `rbi:"index"`
+	Tags []string `rbi:"index"`
+	Opt  *string  `rbi:"index"`
+}
+
+func snapshotBatchStorageRuntime(t *testing.T) *schema.Runtime {
+	t.Helper()
+	rt, err := schema.Compile(reflect.TypeOf(snapshotBatchStorageRec{}), schema.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+func snapshotBatchFieldContains(s *View, field, key string, id uint64) bool {
+	ids := s.FieldLookupPostingRetained(field, key)
+	ok := ids.Contains(id)
+	ids.Release()
+	return ok
+}
+
+func snapshotBatchNilContains(s *View, field string, id uint64) bool {
+	acc := s.IndexedFieldByName[field]
+	ids := indexdata.NewFieldIndexViewFromStorage(s.NilIndex[acc.Ordinal]).LookupPostingRetained(indexdata.NilIndexEntryKey)
+	ok := ids.Contains(id)
+	ids.Release()
+	return ok
+}
+
+func snapshotBatchLenContains(s *View, field string, ln uint64, id uint64) bool {
+	acc := s.IndexedFieldByName[field]
+	ids := indexdata.NewFieldIndexViewFromStorage(s.LenIndex[acc.Ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln))
+	ok := ids.Contains(id)
+	ids.Release()
+	return ok
 }
 
 func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
@@ -93,5 +133,108 @@ func TestBuildPreparedDeleteAllBuildsEmptySnapshot(t *testing.T) {
 	if !ids.IsEmpty() {
 		ids.Release()
 		t.Fatal("expected delete-all snapshot to drop index storage")
+	}
+}
+
+func TestBuildPreparedKeepsPreviousSnapshotStorageImmutableAcrossUpdateAndDelete(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	opt := "zzz"
+	oldRecords := []snapshotBatchStorageRec{
+		{Name: "bob", Tags: []string{"go", "db"}},
+		{Name: "alice", Tags: []string{"go"}},
+	}
+	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
+		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	newRec := snapshotBatchStorageRec{Name: "charlie", Tags: []string{"go"}, Opt: &opt}
+	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&oldRecords[0]), New: unsafe.Pointer(&newRec)},
+		{ID: 2, Old: unsafe.Pointer(&oldRecords[1])},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if !snapshotBatchFieldContains(prev, "Name", "bob", 1) {
+		t.Fatal("previous snapshot lost original scalar posting")
+	}
+	if snapshotBatchFieldContains(prev, "Name", "charlie", 1) {
+		t.Fatal("previous snapshot sees updated scalar posting")
+	}
+	if !snapshotBatchFieldContains(next, "Name", "charlie", 1) {
+		t.Fatal("next snapshot is missing updated scalar posting")
+	}
+	if snapshotBatchFieldContains(next, "Name", "bob", 1) {
+		t.Fatal("next snapshot kept stale scalar posting")
+	}
+	if !snapshotBatchLenContains(prev, "Tags", 2, 1) {
+		t.Fatal("previous snapshot lost original len posting")
+	}
+	if snapshotBatchLenContains(prev, "Tags", 1, 1) {
+		t.Fatal("previous snapshot sees updated len posting")
+	}
+	if !snapshotBatchLenContains(next, "Tags", 1, 1) {
+		t.Fatal("next snapshot is missing updated len posting")
+	}
+	if snapshotBatchLenContains(next, "Tags", 2, 1) {
+		t.Fatal("next snapshot kept stale len posting")
+	}
+	if !snapshotBatchNilContains(prev, "Opt", 1) {
+		t.Fatal("previous snapshot lost nil-index membership")
+	}
+	if snapshotBatchNilContains(next, "Opt", 1) {
+		t.Fatal("next snapshot kept stale nil-index membership")
+	}
+	if !snapshotBatchFieldContains(next, "Opt", opt, 1) {
+		t.Fatal("next snapshot is missing updated opt posting")
+	}
+	if !prev.Universe.Contains(2) || prev.Universe.Cardinality() != 2 {
+		t.Fatal("previous snapshot universe changed after delete")
+	}
+	if next.Universe.Contains(2) || next.Universe.Cardinality() != 1 {
+		t.Fatal("next snapshot universe is inconsistent after delete")
+	}
+}
+
+func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpdate(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	oldRecords := []snapshotBatchStorageRec{
+		{Name: "u1", Tags: []string{"go"}},
+		{Name: "u2"},
+		{Name: "u3"},
+		{Name: "u4"},
+	}
+	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
+		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
+		{ID: 3, New: unsafe.Pointer(&oldRecords[2])},
+		{ID: 4, New: unsafe.Pointer(&oldRecords[3])},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	acc := prev.IndexedFieldByName["Tags"]
+	if !prev.LenZeroComplement[acc.Ordinal] {
+		t.Fatal("expected previous snapshot to use zero-complement len index")
+	}
+	if !snapshotBatchLenContains(prev, "Tags", 1, 1) {
+		t.Fatal("previous snapshot len=1 posting is missing id=1")
+	}
+
+	newRec := snapshotBatchStorageRec{Name: "u1", Tags: []string{}}
+	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&oldRecords[0]), New: unsafe.Pointer(&newRec)},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if !snapshotBatchLenContains(prev, "Tags", 1, 1) {
+		t.Fatal("previous snapshot lost len=1 posting")
+	}
+	if snapshotBatchLenContains(next, "Tags", 1, 1) {
+		t.Fatal("next snapshot kept stale len=1 posting")
 	}
 }

@@ -864,7 +864,7 @@ func BenchmarkPostingReleaseMap(b *testing.B) {
 		posts["small"] = small.Clone()
 		posts["mid"] = mid.Clone()
 		posts["large"] = large.Clone()
-		ReleaseMap(posts)
+		ReleaseMapString(posts)
 	}
 }
 

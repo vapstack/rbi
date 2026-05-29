@@ -697,8 +697,7 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 		t.Fatalf("expected exactly one changed field, got %#v", patch)
 	}
 
-	applied := *oldVal
-	applyPatchForTest(t, db, &applied, patch, false)
+	applied := applyPatchForTest(t, db, oldVal, patch)
 	if applied.Tags == nil || len(applied.Tags) != 0 {
 		t.Fatalf("patched record lost non-nil empty slice: %#v", applied.Tags)
 	}
@@ -2015,33 +2014,6 @@ func TestIOExt_BatchGet_DuplicateIDsProduceIndependentCopies(t *testing.T) {
 	}
 }
 
-func TestIOExt_BatchGetTxCompact_PreservesExistingOrderAndDuplicates(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "two"})
-	ioExtMustSetRec(t, db, 3, &Rec{Name: "three"})
-
-	var vals []*Rec
-	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		var err error
-		vals, err = db.batchGetTxCompact(tx, []uint64{3, 9, 1, 3, 2})
-		return err
-	}); err != nil {
-		t.Fatalf("batchGetTxCompact: %v", err)
-	}
-	if len(vals) != 4 {
-		t.Fatalf("expected 4 existing values, got %d", len(vals))
-	}
-	got := []string{vals[0].Name, vals[1].Name, vals[2].Name, vals[3].Name}
-	want := []string{"three", "one", "three", "two"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("unexpected compact order: got=%v want=%v", got, want)
-	}
-	if vals[0] == vals[2] {
-		t.Fatal("duplicate id in compact BatchGet reused the same pointer")
-	}
-}
-
 func TestIOExt_SeqScan_ReturnsDetachedCopies(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
@@ -2392,17 +2364,6 @@ func TestIOExt_Set_CommitFailure_RollsBackNeighborBucketAndKeepsSequence(t *test
 
 	beforeSeq := readBucketSequence(t, db.Bolt(), db.BucketName())
 	injected := errors.New("inject commit fail")
-	db.testHooks = &testHooks{
-		beforeCommit: func(op string) error {
-			if op == "set" {
-				return injected
-			}
-			return nil
-		},
-	}
-	defer func() {
-		db.testHooks = nil
-	}()
 
 	err := db.Set("ghost", &Product{SKU: "ghost", Price: 11}, BeforeCommit(func(tx *bbolt.Tx, key string, oldValue, newValue *Product) error {
 		if oldValue != nil || newValue == nil || key != "ghost" {
@@ -2412,7 +2373,10 @@ func TestIOExt_Set_CommitFailure_RollsBackNeighborBucketAndKeepsSequence(t *test
 		if err != nil {
 			return fmt.Errorf("create audit bucket: %w", err)
 		}
-		return audit.Put([]byte(auditKey), []byte(newValue.SKU))
+		if err = audit.Put([]byte(auditKey), []byte(newValue.SKU)); err != nil {
+			return err
+		}
+		return injected
 	}))
 	if !errors.Is(err, injected) {
 		t.Fatalf("expected %v, got %v", injected, err)

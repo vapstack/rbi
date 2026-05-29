@@ -1028,9 +1028,6 @@ func (rc *containerRun) uniquelyOwned() bool {
 }
 
 func (rc *containerRun) release() {
-	if rc == nil {
-		return
-	}
 	if rc.refs.Add(-1) != 0 {
 		return
 	}
@@ -2388,9 +2385,6 @@ func (rc *containerRun) andNotRun(b *containerRun) container16 {
 }
 
 func efficientContainerFromTempRun(temp *containerRun, card int) container16 {
-	if temp == nil {
-		return nil
-	}
 	result := temp.toEfficientContainerFromCardinality(card)
 	if returned, ok := result.(*containerRun); !ok || returned != temp {
 		temp.release()
@@ -2399,9 +2393,6 @@ func efficientContainerFromTempRun(temp *containerRun, card int) container16 {
 }
 
 func efficientContainerFromTempRunAuto(temp *containerRun) container16 {
-	if temp == nil {
-		return nil
-	}
 	result := temp.toEfficientContainer()
 	if returned, ok := result.(*containerRun); !ok || returned != temp {
 		temp.release()

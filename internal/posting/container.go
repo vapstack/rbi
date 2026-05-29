@@ -148,7 +148,7 @@ var containerIndexPoolCapacities = [...]int{
 const maxPooledContainerIndexCapacity = 1 << 16
 
 func (ra *containerIndex) ensureInline() {
-	if ra == nil || ra.keys != nil || ra.containers != nil {
+	if ra.keys != nil {
 		return
 	}
 	ra.keys = ra.inlineKeys[:0]
@@ -166,13 +166,17 @@ func containerIndexPoolIndex(size int) int {
 }
 
 func (ra *containerIndex) aliases(other *containerIndex) bool {
-	if ra == nil || other == nil {
-		return false
-	}
-	return slicesShareBacking(ra.keys, other.keys) || slicesShareBacking(ra.containers, other.containers)
+	return slicesShareBackingU16(ra.keys, other.keys) || slicesShareBackingC16(ra.containers, other.containers)
 }
 
-func slicesShareBacking[T any](a, b []T) bool {
+func slicesShareBackingU16(a, b []uint16) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	return unsafe.SliceData(a) == unsafe.SliceData(b)
+}
+
+func slicesShareBackingC16(a, b []container16) bool {
 	if cap(a) == 0 || cap(b) == 0 {
 		return false
 	}
@@ -340,7 +344,7 @@ func (ra *containerIndex) moveKeyValueAt(src, dst int) {
 	ra.containers[src] = nil
 }
 
-func countUnionKeys[T ~uint16 | ~uint32](left, right []T) int {
+func countUnionKeys16(left, right []uint16) int {
 	count := 0
 	pos1 := 0
 	pos2 := 0
@@ -360,11 +364,31 @@ func countUnionKeys[T ~uint16 | ~uint32](left, right []T) int {
 	return count + len(left) - pos1 + len(right) - pos2
 }
 
-func (ra *containerIndex) resize(newsize int) {
-	clear(ra.keys[newsize:])
-	clear(ra.containers[newsize:])
-	ra.keys = ra.keys[:newsize]
-	ra.containers = ra.containers[:newsize]
+func countUnionKeys32(left, right []uint32) int {
+	count := 0
+	pos1 := 0
+	pos2 := 0
+	for pos1 < len(left) && pos2 < len(right) {
+		s1 := left[pos1]
+		s2 := right[pos2]
+		if s1 < s2 {
+			pos1++
+		} else if s1 > s2 {
+			pos2++
+		} else {
+			pos1++
+			pos2++
+		}
+		count++
+	}
+	return count + len(left) - pos1 + len(right) - pos2
+}
+
+func (ra *containerIndex) resize(newSize int) {
+	clear(ra.keys[newSize:])
+	clear(ra.containers[newSize:])
+	ra.keys = ra.keys[:newSize]
+	ra.containers = ra.containers[:newSize]
 }
 
 func (ra *containerIndex) clear() {
@@ -378,9 +402,6 @@ func (ra *containerIndex) clearContainerAtIndex(i int) {
 }
 
 func (ra *containerIndex) releaseContainersInRange(start int) {
-	if start < 0 {
-		start = 0
-	}
 	for i := start; i < len(ra.containers); i++ {
 		if c := ra.containers[i]; c != nil {
 			c.release()

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -339,6 +340,72 @@ func TestPublishedReadPagesRoundTrip(t *testing.T) {
 		if gotKey, ok := got.snapshotNoLock().String(hole); ok {
 			t.Fatalf("expected hole at %d, got %q", hole, gotKey)
 		}
+	}
+}
+
+func TestSnapshotConcurrentIndexStringLookup(t *testing.T) {
+	m := New(0, 256)
+
+	const n = 64
+	keys := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		keys = append(keys, key)
+		m.Create(key)
+	}
+
+	snap := m.Snapshot()
+	start := make(chan struct{})
+	errCh := make(chan error, len(keys))
+	var wg sync.WaitGroup
+	for i := range keys {
+		key := keys[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			idx, ok := snap.Index(key)
+			if !ok {
+				errCh <- fmt.Errorf("missing idx for %q", key)
+				return
+			}
+			back, ok := snap.String(idx)
+			if !ok || back != key {
+				errCh <- fmt.Errorf("round-trip mismatch for %q: idx=%d back=%q ok=%v", key, idx, back, ok)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSnapshotKeepsOriginalMappingAfterMapperMutation(t *testing.T) {
+	m := New(0, 256)
+	if idx, created := m.Create("snap-key"); idx != 1 || !created {
+		t.Fatalf("Create(snap-key) = %d/%v, want 1/true", idx, created)
+	}
+	snap := m.Snapshot()
+	if idx, created := m.Create("live-key"); idx != 2 || !created {
+		t.Fatalf("Create(live-key) = %d/%v, want 2/true", idx, created)
+	}
+
+	if got, ok := snap.String(1); !ok || got != "snap-key" {
+		t.Fatalf("snapshot reverse mismatch: got=%q ok=%v want snap-key", got, ok)
+	}
+	if _, ok := snap.Index("live-key"); ok {
+		t.Fatalf("old snapshot saw future key")
+	}
+
+	latest := m.Snapshot()
+	if got, ok := latest.String(2); !ok || got != "live-key" {
+		t.Fatalf("latest reverse mismatch: got=%q ok=%v want live-key", got, ok)
 	}
 }
 

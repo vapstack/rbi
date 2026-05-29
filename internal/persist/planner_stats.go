@@ -38,7 +38,7 @@ func writePlannerStatsSnapshot(writer *bufio.Writer, s *qexec.PlannerStatsSnapsh
 		return fmt.Errorf("encode: writing planner stats universe: %w", err)
 	}
 
-	fields := sortedMapFieldNames(s.Fields)
+	fields := sortedMapPlannerFieldNames(s.Fields)
 	if err := writeSidecarUvarint(writer, uint64(len(fields))); err != nil {
 		return fmt.Errorf("encode: writing planner stats field count: %w", err)
 	}

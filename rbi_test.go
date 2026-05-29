@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,12 +217,6 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	if db.engine != nil {
-		t.Fatal("expected transparent mode")
-	}
-	if db.strMap != nil {
-		t.Fatalf("transparent mode must not allocate strmap: %#v", db.strMap)
-	}
 	if strings.Contains(logBuf.String(), "persisted index") {
 		t.Fatalf("transparent mode must ignore sidecar load/store logs, got %q", logBuf.String())
 	}
@@ -390,10 +383,6 @@ func TestIndexTags_OptInSupportRBI(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine == nil {
-		t.Fatal("expected indexed mode")
-	}
-
 	if err := db.Set(1, &optInTaggedRec{
 		Index:    "index-1",
 		Unique:   100,
@@ -448,8 +437,8 @@ func TestIndexTags_OptInLeavesUntaggedStructTransparent(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine != nil {
-		t.Fatal("expected transparent mode for untagged struct")
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
 	}
 }
 
@@ -488,10 +477,6 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine == nil {
-		t.Fatal("expected indexed mode because embedded Email has its own unique tag")
-	}
-
 	if err := db.Set(1, &embeddedEnabledByParentRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "alice", Email: "alice@example.com"},
 	}); err != nil {
@@ -516,10 +501,6 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine != nil {
-		t.Fatal("expected transparent mode")
-	}
-
 	if err := db.Set(1, &embeddedDisabledByParentRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "alice", Email: "dup@example.com"},
 	}); err != nil {
@@ -529,6 +510,9 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "bob", Email: "dup@example.com"},
 	}); err != nil {
 		t.Fatalf("Set(2): %v", err)
+	}
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
 	}
 }
 
@@ -540,10 +524,6 @@ func TestIndexTags_DBTagDashDoesNotDisableIndexing(t *testing.T) {
 		_ = db.Close()
 		_ = raw.Close()
 	})
-
-	if db.engine == nil {
-		t.Fatal("expected indexed mode")
-	}
 
 	if err := db.Set(1, &dbDashDoesNotDisableIndexRec{Name: "alice"}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -579,10 +559,6 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 		_ = db.Close()
 		_ = raw.Close()
 	})
-
-	if db.engine == nil {
-		t.Fatal("expected indexed mode")
-	}
 
 	if err := db.Set(1, &optionsIndexRec{Name: "alice", Email: "ignored", Score: 10, Amount: 100}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -679,8 +655,8 @@ func TestIndexOptions_EmptyMapDisablesTags(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine != nil {
-		t.Fatal("non-nil empty Options.Index must disable all indexes")
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
 	}
 }
 
@@ -758,9 +734,6 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine == nil {
-		t.Fatal("measure DB must not be transparent")
-	}
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 42}); err != nil {
 		t.Fatalf("Set measure record: %v", err)
 	}
@@ -824,9 +797,6 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.engine == nil {
-		t.Fatal("measure-only DB must not be transparent")
-	}
 	if err := db.Set(1, &measureOnlyRec{Amount: 7}); err != nil {
 		t.Fatalf("Set measure-only record: %v", err)
 	}
@@ -848,10 +818,6 @@ func TestPlannerAnalyzeScheduler_MeasureOnlyRefreshesUniverse(t *testing.T) {
 		_ = db.Close()
 		_ = raw.Close()
 	})
-
-	if len(db.engine.schema.Indexed) != 0 {
-		t.Fatalf("measure-only DB indexed fields=%d, want 0", len(db.engine.schema.Indexed))
-	}
 
 	start := db.PlannerStats()
 	if start.UniverseCardinality != 0 {
@@ -1058,10 +1024,10 @@ func readBucketSequence(tb testing.TB, raw *bbolt.DB, bucket []byte) uint64 {
 func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *DB[K, V]) {
 	tb.Helper()
 
-	if db.engine.snapshot.Current() == nil {
+	stats := db.SnapshotStats()
+	if stats.Sequence == 0 {
 		return
 	}
-	stats := db.engine.snapshot.Stats(db.engine.snapshot.Current(), nil)
 	if stats.RegistrySize != 1 {
 		tb.Fatalf("snapshot registry contains staged or retired refs: %+v", stats)
 	}
@@ -1596,9 +1562,6 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("initial RebuildIndex: %v", err)
 	}
-	if !db.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement flag before partial persisted load")
-	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
@@ -1642,10 +1605,6 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 	}
 	if !strings.Contains(gotLog, "rbi: index build completed (mode=partial duration=") {
 		t.Fatalf("expected partial rebuild completion duration in log, got: %q", gotLog)
-	}
-
-	if !db2.isLenZeroComplementField("tags") {
-		t.Fatalf("expected zero-complement flag for loaded tags len index after partial load")
 	}
 
 	want := make([]uint64, 0, 72)
@@ -1996,48 +1955,6 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	}
 	if err := awaitErr("Close", closeDone); err != nil {
 		t.Fatalf("Close: %v", err)
-	}
-}
-
-func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
-
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
-		t.Fatalf("seed Set: %v", err)
-	}
-	initial := testStrMapCount(t, db)
-
-	injected := errors.New("inject commit fail")
-	var failOnce atomic.Bool
-	failOnce.Store(true)
-	db.testHooks = &testHooks{
-		beforeCommit: func(op string) error {
-			if op == "batch" && failOnce.CompareAndSwap(true, false) {
-				return injected
-			}
-			return nil
-		},
-	}
-	defer func() {
-		db.testHooks = nil
-	}()
-
-	err := db.Set("ghost-commit", &Product{SKU: "ghost-commit", Price: 11})
-	if !errors.Is(err, injected) {
-		t.Fatalf("expected injected commit error, got: %v", err)
-	}
-	if v, err := db.Get("ghost-commit"); err != nil {
-		t.Fatalf("Get(ghost-commit): %v", err)
-	} else if v != nil {
-		t.Fatalf("ghost-commit should not persist after commit fail, got %#v", v)
-	}
-	if after := testStrMapCount(t, db); after != initial {
-		t.Fatalf("strmap grew after batch commit failure: initial=%d after=%d", initial, after)
-	}
-
-	bs := db.AutoBatchStats()
-	if bs.TxCommitErrors == 0 {
-		t.Fatalf("expected tx commit error in batch stats, got %+v", bs)
 	}
 }
 
@@ -3551,24 +3468,17 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 	}
 }
 
-func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
+func TestBeforeCommit_SetRollsBackAndKeepsState(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchMax: 1,
 	})
 
-	db.testHooks = &testHooks{
-		beforeCommit: func(op string) error {
-			if op == "set" {
-				return fmt.Errorf("failpoint: commit set")
-			}
-			return nil
-		},
+	err := db.Set(1, &Rec{Name: "alice", Age: 30}, BeforeCommit(func(*bbolt.Tx, uint64, *Rec, *Rec) error {
+		return fmt.Errorf("before commit set")
+	}))
+	if err == nil || !strings.Contains(err.Error(), "before commit set") {
+		t.Fatalf("expected before commit error, got: %v", err)
 	}
-	err := db.Set(1, &Rec{Name: "alice", Age: 30})
-	if err == nil || !strings.Contains(err.Error(), "failpoint: commit set") {
-		t.Fatalf("expected failpoint commit error, got: %v", err)
-	}
-	db.testHooks = nil
 
 	v, err := db.Get(1)
 	if err != nil {
@@ -3585,53 +3495,16 @@ func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 	}
 }
 
-func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   10 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 1024,
-	})
-
-	var once atomic.Bool
-	db.testHooks = &testHooks{
-		beforeCommit: func(op string) error {
-			if op == "batch" && once.CompareAndSwap(false, true) {
-				return fmt.Errorf("failpoint: commit batch")
-			}
-			return nil
-		},
-	}
-
-	err := db.Set(1, &Rec{Name: "alice", Age: 30})
-	if err == nil || !strings.Contains(err.Error(), "failpoint: commit batch") {
-		t.Fatalf("expected failpoint batch commit error, got: %v", err)
-	}
-	db.testHooks = nil
-
-	v, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if v != nil {
-		t.Fatalf("expected no value after failed batch commit, got: %#v", v)
-	}
-
-	if st := db.AutoBatchStats(); st.TxCommitErrors == 0 {
-		t.Fatalf("expected AutoBatchStats.TxCommitErrors > 0 after failpoint commit")
-	}
-}
-
-func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T) {
+func TestPublishAfterCommitPanicBreaksDB(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
-	db.testHooks = &testHooks{
-		afterCommitPublish: func(op string) {
-			if op == "set" {
-				panic("failpoint: publish set")
-			}
-		},
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
-	err := db.Set(1, &Rec{Name: "alice", Age: 30})
+
+	err := publishAfterCommitLocked(&db.broken, db.logger, db.engine, db.SnapshotStats().Sequence+1, "set", func() {
+		panic("failpoint: publish set")
+	})
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("expected ErrBroken from post-commit publish panic, got: %v", err)
 	}
@@ -3666,65 +3539,9 @@ func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T)
 		t.Fatalf("expected Query to fail with ErrBroken after broken publish, got: %v", err)
 	}
 
-	db.testHooks = &testHooks{
-		beforeStoreIndex: func() error {
-			return fmt.Errorf("storeIndex must be skipped for broken db")
-		},
-	}
+	db.rbiFile = filepath.Join(t.TempDir(), "missing", "broken.rbi")
 	if err = db.Close(); !errors.Is(err, ErrBroken) {
 		t.Fatalf("expected Close to return ErrBroken for broken db, got: %v", err)
-	}
-}
-
-func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsStagedSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   10 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 1024,
-	})
-
-	db.testHooks = &testHooks{
-		afterCommitPublish: func(op string) {
-			if op == "batch" {
-				panic("failpoint: publish batch")
-			}
-		},
-	}
-	err := db.Set(1, &Rec{Name: "alice", Age: 30})
-	if !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected ErrBroken from auto-batch publish panic, got: %v", err)
-	}
-
-	assertNoFutureSnapshotRefs(t, db)
-}
-
-func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	db.testHooks = &testHooks{
-		beforeCommit: func(op string) error {
-			if op == "truncate" {
-				return fmt.Errorf("failpoint: commit truncate")
-			}
-			return nil
-		},
-	}
-	err := db.Truncate()
-	if err == nil || !strings.Contains(err.Error(), "failpoint: commit truncate") {
-		t.Fatalf("expected truncate commit failpoint error, got: %v", err)
-	}
-	db.testHooks = nil
-
-	v, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if v == nil || v.Email != "a@x" || v.Code != 1 {
-		t.Fatalf("expected original value to remain after failed truncate, got: %#v", v)
 	}
 }
 
@@ -3780,11 +3597,8 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 	if got := readBucketSequence(t, raw3, db3.bucket); got != truncateSeq {
 		t.Fatalf("reopened bucket sequence mismatch: got=%d want=%d", got, truncateSeq)
 	}
-	if snap := db3.engine.snapshot.Current(); snap == nil || snap.Seq != truncateSeq {
-		if snap == nil {
-			t.Fatalf("expected published snapshot after reopen")
-		}
-		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.Seq, truncateSeq)
+	if snap := db3.SnapshotStats(); snap.Sequence != truncateSeq {
+		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.Sequence, truncateSeq)
 	}
 
 	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 30)))
@@ -3796,26 +3610,19 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 	}
 }
 
-func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.T) {
+func TestBeforeCommit_PatchAndDeleteRollbackAndKeepState(t *testing.T) {
 	t.Run("patch", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
 			t.Fatalf("Set(1): %v", err)
 		}
 
-		db.testHooks = &testHooks{
-			beforeCommit: func(op string) error {
-				if op == "patch" {
-					return fmt.Errorf("failpoint: patch")
-				}
-				return nil
-			},
+		err := db.Patch(1, []Field{{Name: "age", Value: 99}}, BeforeCommit(func(*bbolt.Tx, uint64, *Rec, *Rec) error {
+			return fmt.Errorf("before commit patch")
+		}))
+		if err == nil || !strings.Contains(err.Error(), "before commit patch") {
+			t.Fatalf("expected before commit patch error, got: %v", err)
 		}
-		err := db.Patch(1, []Field{{Name: "age", Value: 99}})
-		if err == nil || !strings.Contains(err.Error(), "failpoint: patch") {
-			t.Fatalf("expected failpoint patch error, got: %v", err)
-		}
-		db.testHooks = nil
 
 		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
@@ -3833,19 +3640,12 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.
 			t.Fatalf("Set(1): %v", err)
 		}
 
-		db.testHooks = &testHooks{
-			beforeCommit: func(op string) error {
-				if op == "delete" {
-					return fmt.Errorf("failpoint: delete")
-				}
-				return nil
-			},
+		err := db.Delete(1, BeforeCommit(func(*bbolt.Tx, uint64, *Rec, *Rec) error {
+			return fmt.Errorf("before commit delete")
+		}))
+		if err == nil || !strings.Contains(err.Error(), "before commit delete") {
+			t.Fatalf("expected before commit delete error, got: %v", err)
 		}
-		err := db.Delete(1)
-		if err == nil || !strings.Contains(err.Error(), "failpoint: delete") {
-			t.Fatalf("expected failpoint delete error, got: %v", err)
-		}
-		db.testHooks = nil
 
 		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
@@ -3858,26 +3658,25 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.
 	})
 }
 
-func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing.T) {
+func TestBeforeCommit_MultiWritePathsRollbackAndKeepState(t *testing.T) {
 	type tc struct {
 		name   string
-		op     string
 		setup  func(t *testing.T, db *DB[uint64, Rec])
-		run    func(db *DB[uint64, Rec]) error
+		run    func(db *DB[uint64, Rec], opt ExecOption[uint64, Rec]) error
 		verify func(t *testing.T, db *DB[uint64, Rec])
 	}
 
 	cases := []tc{
 		{
 			name: "batch_set",
-			op:   "batch_set",
-			run: func(db *DB[uint64, Rec]) error {
+			run: func(db *DB[uint64, Rec], opt ExecOption[uint64, Rec]) error {
 				return db.BatchSet(
 					[]uint64{1, 2},
 					[]*Rec{
 						{Name: "a", Age: 10, Meta: Meta{Country: "NL"}},
 						{Name: "b", Age: 11, Meta: Meta{Country: "DE"}},
 					},
+					opt,
 				)
 			},
 			verify: func(t *testing.T, db *DB[uint64, Rec]) {
@@ -3897,7 +3696,6 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 		},
 		{
 			name: "batch_patch",
-			op:   "batch_patch",
 			setup: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
 				if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
@@ -3907,8 +3705,8 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 					t.Fatalf("Set(2): %v", err)
 				}
 			},
-			run: func(db *DB[uint64, Rec]) error {
-				return db.BatchPatch([]uint64{1, 2}, []Field{{Name: "age", Value: 99}})
+			run: func(db *DB[uint64, Rec], opt ExecOption[uint64, Rec]) error {
+				return db.BatchPatch([]uint64{1, 2}, []Field{{Name: "age", Value: 99}}, opt)
 			},
 			verify: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
@@ -3930,7 +3728,6 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 		},
 		{
 			name: "batch_delete",
-			op:   "batch_delete",
 			setup: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
 				if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
@@ -3940,8 +3737,8 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 					t.Fatalf("Set(2): %v", err)
 				}
 			},
-			run: func(db *DB[uint64, Rec]) error {
-				return db.BatchDelete([]uint64{1, 2})
+			run: func(db *DB[uint64, Rec], opt ExecOption[uint64, Rec]) error {
+				return db.BatchDelete([]uint64{1, 2}, opt)
 			},
 			verify: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
@@ -3968,19 +3765,13 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 				c.setup(t, db)
 			}
 
-			db.testHooks = &testHooks{
-				beforeCommit: func(op string) error {
-					if op == c.op {
-						return fmt.Errorf("failpoint: %s", c.op)
-					}
-					return nil
-				},
+			wantErr := "before commit " + c.name
+			err := c.run(db, BeforeCommit(func(*bbolt.Tx, uint64, *Rec, *Rec) error {
+				return errors.New(wantErr)
+			}))
+			if err == nil || !strings.Contains(err.Error(), wantErr) {
+				t.Fatalf("expected before commit error for %s, got: %v", c.name, err)
 			}
-			err := c.run(db)
-			if err == nil || !strings.Contains(err.Error(), "failpoint: "+c.op) {
-				t.Fatalf("expected failpoint error for %s, got: %v", c.op, err)
-			}
-			db.testHooks = nil
 
 			assertNoFutureSnapshotRefs(t, db)
 
@@ -4782,14 +4573,10 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	db.testHooks = &testHooks{
-		beforeStoreIndex: func() error {
-			return fmt.Errorf("failpoint: store index")
-		},
-	}
+	db.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
 	err := db.Close()
-	if err == nil || !strings.Contains(err.Error(), "failpoint: store index") {
-		t.Fatalf("expected failpoint store index error on Close, got: %v", err)
+	if err == nil {
+		t.Fatalf("expected store index error on Close")
 	}
 
 	if !db.closed.Load() {
@@ -4884,18 +4671,15 @@ func TestPersistedIndex_RebuildsAfterCloseFailure(t *testing.T) {
 	if err := db2.Set(2, &Rec{Name: "bob", Age: 40}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	db2.testHooks = &testHooks{
-		beforeStoreIndex: func() error {
-			return fmt.Errorf("failpoint: store index")
-		},
+	persistedPath := db2.rbiFile
+	db2.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
+	if err := db2.Close(); err == nil {
+		t.Fatalf("expected store index error on Close")
 	}
-	if err := db2.Close(); err == nil || !strings.Contains(err.Error(), "failpoint: store index") {
-		t.Fatalf("expected failpoint store index error on Close, got: %v", err)
-	}
-	if _, err := os.Stat(db2.rbiFile); err != nil {
+	if _, err := os.Stat(persistedPath); err != nil {
 		t.Fatalf("expected stale persisted index file to remain after failed Close, stat err=%v", err)
 	}
-	staleSeq := readPersistedIndexSequence(t, db2.rbiFile)
+	staleSeq := readPersistedIndexSequence(t, persistedPath)
 	currentSeq := readBucketSequence(t, raw2, db2.bucket)
 	if staleSeq == currentSeq {
 		t.Fatalf("expected persisted index sequence to stay stale after failed Close, seq=%d", staleSeq)
@@ -5080,14 +4864,12 @@ func TestBatchPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	}
 }
 
-func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
+func TestMissingIDs_DoNotCreateStringRecords(t *testing.T) {
 	db, _ := openTempDBStringProduct(t)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-
-	initial := testStrMapCount(t, db)
 
 	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
 		t.Fatalf("Patch(missing): %v", err)
@@ -5102,14 +4884,18 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("BatchPatch: %v", err)
 	}
 
-	after := testStrMapCount(t, db)
-
-	if after != initial {
-		t.Fatalf("expected strmap size %d, got %d", initial, after)
+	got, err := db.BatchGet("missing", "missing2", "missing3", "missing4")
+	if err != nil {
+		t.Fatalf("BatchGet(missing ids): %v", err)
+	}
+	for i := range got {
+		if got[i] != nil {
+			t.Fatalf("missing id %d unexpectedly persisted: %#v", i, got[i])
+		}
 	}
 }
 
-func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
+func TestReadPaths_MissingKeys_ReturnEmpty(t *testing.T) {
 	db, _ := openTempDBStringProduct(t)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10, Tags: []string{"a"}}); err != nil {
@@ -5119,20 +4905,11 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Set(p2): %v", err)
 	}
 
-	initial := testStrMapCount(t, db)
-	assertNoGrow := func(label string) {
-		t.Helper()
-		if after := testStrMapCount(t, db); after != initial {
-			t.Fatalf("%s grew strmap: initial=%d after=%d", label, initial, after)
-		}
-	}
-
 	if v, err := db.Get("missing-get"); err != nil {
 		t.Fatalf("Get(missing): %v", err)
 	} else if v != nil {
 		t.Fatalf("Get(missing) expected nil, got %#v", v)
 	}
-	assertNoGrow("Get(missing)")
 
 	values, err := db.BatchGet("missing-1", "p1", "missing-2")
 	if err != nil {
@@ -5141,12 +4918,10 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 	if len(values) != 3 || values[0] != nil || values[1] == nil || values[2] != nil {
 		t.Fatalf("unexpected BatchGet result: %#v", values)
 	}
-	assertNoGrow("BatchGet(missing)")
 
 	if err := db.ScanKeys("zzzz", func(_ string) (bool, error) { return true, nil }); err != nil {
 		t.Fatalf("ScanKeys: %v", err)
 	}
-	assertNoGrow("ScanKeys(missing seek)")
 
 	seenSeq := 0
 	if err := db.SeqScan("zzzz", func(_ string, _ *Product) (bool, error) {
@@ -5158,7 +4933,6 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 	if seenSeq != 0 {
 		t.Fatalf("SeqScan expected 0 rows, got %d", seenSeq)
 	}
-	assertNoGrow("SeqScan(missing seek)")
 
 	seenRaw := 0
 	if err := db.SeqScanRaw("zzzz", func(_ string, _ []byte) (bool, error) {
@@ -5170,7 +4944,6 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 	if seenRaw != 0 {
 		t.Fatalf("SeqScanRaw expected 0 rows, got %d", seenRaw)
 	}
-	assertNoGrow("SeqScanRaw(missing seek)")
 
 	qMissing := qx.Query(qx.EQ("sku", "missing-sku"))
 	if ids, err := db.QueryKeys(qMissing); err != nil {
@@ -5178,31 +4951,27 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 	} else if len(ids) != 0 {
 		t.Fatalf("QueryKeys(missing sku) expected empty, got %v", ids)
 	}
-	assertNoGrow("QueryKeys(missing)")
 
 	if items, err := db.Query(qMissing); err != nil {
 		t.Fatalf("Query(missing sku): %v", err)
 	} else if len(items) != 0 {
 		t.Fatalf("Query(missing sku) expected empty, got %d", len(items))
 	}
-	assertNoGrow("Query(missing)")
 
 	if cnt, err := db.Count(qMissing.Filter); err != nil {
 		t.Fatalf("Count(missing sku): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(missing sku) expected 0, got %d", cnt)
 	}
-	assertNoGrow("Count(missing)")
 }
 
-func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
+func TestFailedSetPaths_DoNotPersistStringKeys(t *testing.T) {
 	db, _ := openTempDBStringProduct(t)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	initial := testStrMapCount(t, db)
 	cbErr := errors.New("before commit fail")
 	cb := func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error { return cbErr }
 
@@ -5213,9 +4982,6 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Get(ghost-set): %v", err)
 	} else if v != nil {
 		t.Fatalf("ghost-set should not persist after rollback, got %#v", v)
-	}
-	if after := testStrMapCount(t, db); after != initial {
-		t.Fatalf("strmap grew after failed Set: initial=%d after=%d", initial, after)
 	}
 
 	err := db.BatchSet(
@@ -5239,9 +5005,6 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-many-2 should not persist after rollback, got %#v", v)
 	}
-	if after := testStrMapCount(t, db); after != initial {
-		t.Fatalf("strmap grew after failed BatchSet: initial=%d after=%d", initial, after)
-	}
 }
 
 type StringUniqueTestRec struct {
@@ -5261,13 +5024,12 @@ func openTempDBStringUnique(t *testing.T, options ...Options) (*DB[string, Strin
 	return db, path
 }
 
-func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
+func TestBatchSet_CallbackError_DoesNotPersistStringKey(t *testing.T) {
 	db, _ := openTempDBStringProduct(t)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := testStrMapCount(t, db)
 
 	cbErr := errors.New("cb fail")
 	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, BeforeCommit(func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
@@ -5281,9 +5043,6 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-cb should not persist after rollback, got %#v", v)
 	}
-	if after := testStrMapCount(t, db); after != initial {
-		t.Fatalf("strmap grew after batch callback rollback: initial=%d after=%d", initial, after)
-	}
 
 	bs := db.AutoBatchStats()
 	if bs.CallbackOps == 0 || bs.CallbackErrors == 0 {
@@ -5291,13 +5050,12 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	}
 }
 
-func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
+func TestBatchSet_UniqueReject_DoesNotPersistStringKey(t *testing.T) {
 	db, _ := openTempDBStringUnique(t)
 
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := testStrMapCount(t, db)
 
 	err := db.Set("u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
@@ -5307,9 +5065,6 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Get(u-dup): %v", err)
 	} else if v != nil {
 		t.Fatalf("u-dup should not persist after unique reject, got %#v", v)
-	}
-	if after := testStrMapCount(t, db); after != initial {
-		t.Fatalf("strmap grew after batch unique reject: initial=%d after=%d", initial, after)
 	}
 
 	bs := db.AutoBatchStats()

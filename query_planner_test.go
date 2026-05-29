@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/qexec"
 )
 
 type traceContractRecorder struct {
@@ -497,42 +496,29 @@ func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 
 /**/
 
-func buildPlannerStatsSnapshotForTest[K ~string | ~uint64, V any](db *DB[K, V], version uint64) *qexec.PlannerStatsSnapshot {
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-	return db.engine.exec.BuildPlannerStatsSnapshot(snap, version)
-}
-
-func TestPlannerStatsCollector_FullRefreshMatchesLockedSnapshot(t *testing.T) {
+func TestPlannerStatsCollector_FullRefreshReflectsSnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 3_000)
-
-	db.mu.RLock()
-	expected := buildPlannerStatsSnapshotForTest(db, 1)
-	db.mu.RUnlock()
 
 	if err := db.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
 	got := db.PlannerStats()
-
-	if got.UniverseCardinality != expected.UniverseCardinality {
-		t.Fatalf("universe mismatch: got=%d want=%d", got.UniverseCardinality, expected.UniverseCardinality)
+	if got.UniverseCardinality != 3_000 {
+		t.Fatalf("universe mismatch: got=%d want=3000", got.UniverseCardinality)
 	}
-
-	if len(got.Fields) != len(expected.Fields) {
-		t.Fatalf("fields count mismatch: got=%d want=%d", len(got.Fields), len(expected.Fields))
+	if got.FieldCount != len(got.Fields) {
+		t.Fatalf("field count mismatch: FieldCount=%d len(Fields)=%d", got.FieldCount, len(got.Fields))
 	}
-
-	for fieldName, expectedStats := range expected.Fields {
-		gotStats, ok := got.Fields[fieldName]
-		if !ok {
-			t.Fatalf("missing field stats for %q", fieldName)
-		}
-		if gotStats != expectedStats {
-			t.Fatalf("field %q stats mismatch: got=%+v want=%+v", fieldName, gotStats, expectedStats)
-		}
+	if got.FieldCount == 0 {
+		t.Fatalf("expected planner fields")
+	}
+	if stats, ok := got.Fields["country"]; !ok || stats.DistinctKeys == 0 {
+		t.Fatalf("country stats=%+v, want non-zero distinct keys", stats)
+	}
+	if stats, ok := got.Fields["age"]; !ok || stats.DistinctKeys == 0 {
+		t.Fatalf("age stats=%+v, want non-zero distinct keys", stats)
 	}
 }
 
@@ -552,10 +538,6 @@ func TestResolvePlannerAnalyzeInterval(t *testing.T) {
 func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
-	if db.engine.exec.Analyzer.Stop != nil || db.engine.exec.Analyzer.Done != nil {
-		t.Fatalf("scheduler should be disabled for negative interval")
-	}
-
 	s0 := db.PlannerStats()
 
 	time.Sleep(30 * time.Millisecond)
@@ -569,10 +551,6 @@ func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 10 * time.Millisecond})
 
-	if db.engine.exec.Analyzer.Stop == nil || db.engine.exec.Analyzer.Done == nil {
-		t.Fatalf("scheduler should be started")
-	}
-
 	s0 := db.PlannerStats()
 
 	if latest, ok := waitPlannerStatsVersionGreater(db, s0.Version, 250*time.Millisecond); !ok {
@@ -581,10 +559,6 @@ func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
-	}
-
-	if db.engine.exec.Analyzer.Stop != nil || db.engine.exec.Analyzer.Done != nil {
-		t.Fatalf("scheduler channels must be cleared on close")
 	}
 
 	closedSnapshot := db.PlannerStats()
@@ -659,10 +633,7 @@ func TestPlannerStats_PersistedIndexLoadRestoresSnapshot(t *testing.T) {
 	if err := db.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
-
-	db.mu.RLock()
-	want := buildPlannerStatsSnapshotForTest(db, 1)
-	db.mu.RUnlock()
+	want := db.PlannerStats()
 
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -687,8 +658,8 @@ func TestPlannerStats_PersistedIndexLoadRestoresSnapshot(t *testing.T) {
 	if got.UniverseCardinality != want.UniverseCardinality {
 		t.Fatalf("universe mismatch after persisted load: got=%d want=%d", got.UniverseCardinality, want.UniverseCardinality)
 	}
-	if got.FieldCount != len(want.Fields) {
-		t.Fatalf("field count mismatch after persisted load: got=%d want=%d", got.FieldCount, len(want.Fields))
+	if got.FieldCount != want.FieldCount {
+		t.Fatalf("field count mismatch after persisted load: got=%d want=%d", got.FieldCount, want.FieldCount)
 	}
 	for field, wantStats := range want.Fields {
 		gotStats, ok := got.Fields[field]

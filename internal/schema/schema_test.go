@@ -76,6 +76,10 @@ type schemaTestOptionRec struct {
 	Amount int64  `db:"amount"`
 }
 
+type schemaTestMeasureOnlyRec struct {
+	Amount int64 `db:"amount" rbi:"measure"`
+}
+
 type SchemaTestShadowedUniqueEmbedded struct {
 	Code string `db:"inner_code" json:"innerCode" rbi:"unique"`
 }
@@ -172,6 +176,22 @@ func TestCompileOptionsNilEmptyAndNameResolution(t *testing.T) {
 	}
 }
 
+func TestCompileMeasureOnlyHasNoOrdinaryIndexedFields(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestMeasureOnlyRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(rt.Indexed) != 0 {
+		t.Fatalf("indexed fields=%d want 0", len(rt.Indexed))
+	}
+	if len(rt.Fields) != 0 {
+		t.Fatalf("ordinary fields=%d want 0", len(rt.Fields))
+	}
+	if _, ok := rt.MeasureFields["amount"]; !ok {
+		t.Fatal("missing measure field")
+	}
+}
+
 type schemaTestAccessorRec struct {
 	Name   string       `db:"name" rbi:"index"`
 	Age    int64        `db:"age" rbi:"index"`
@@ -188,6 +208,27 @@ type schemaTestStableOrdinalRec struct {
 	Z string `rbi:"index"`
 	A string `rbi:"index"`
 	M int    `rbi:"index"`
+}
+
+type schemaTestPtrFoldedString string
+
+func (s *schemaTestPtrFoldedString) IndexingValue() string {
+	if s == nil {
+		return "<nil>"
+	}
+	return strings.ToLower(string(*s))
+}
+
+type SchemaTestUnsafeEmbeddedIndexed struct {
+	Code  *schemaTestPtrFoldedString `db:"code" rbi:"unique"`
+	Score int                        `db:"score" rbi:"index"`
+	Tags  []string                   `db:"tags" rbi:"index"`
+	Count *uint64                    `db:"count" rbi:"index"`
+}
+
+type schemaTestUnsafeAccessorRec struct {
+	Name string `db:"name" rbi:"index"`
+	SchemaTestUnsafeEmbeddedIndexed
 }
 
 func TestIndexedAccessorsAssignStableSortedOrdinals(t *testing.T) {
@@ -279,6 +320,120 @@ func TestIndexedAccessorsEmitKeysAndDetectChanges(t *testing.T) {
 	key, ok, isNil := rt.IndexedByName["unique"].UniqueGetter(oldPtr)
 	if !ok || isNil || key.StringKey() != "u1" {
 		t.Fatalf("unique getter key=%+v ok=%v isNil=%v", key, ok, isNil)
+	}
+}
+
+func TestIndexedAccessorsDetectEmbeddedUnsafePathChanges(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestUnsafeAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	oldCode := schemaTestPtrFoldedString("MiXeD")
+	sameCode := schemaTestPtrFoldedString("mixed")
+	oldCount := uint64(7)
+	sameCount := uint64(7)
+
+	base := schemaTestUnsafeAccessorRec{
+		Name: "alice",
+		SchemaTestUnsafeEmbeddedIndexed: SchemaTestUnsafeEmbeddedIndexed{
+			Code:  &oldCode,
+			Score: 3,
+			Tags:  []string{"x", "y"},
+			Count: &oldCount,
+		},
+	}
+	same := schemaTestUnsafeAccessorRec{
+		Name: "alice",
+		SchemaTestUnsafeEmbeddedIndexed: SchemaTestUnsafeEmbeddedIndexed{
+			Code:  &sameCode,
+			Score: 3,
+			Tags:  []string{"x", "y"},
+			Count: &sameCount,
+		},
+	}
+
+	basePtr := unsafe.Pointer(&base)
+	samePtr := unsafe.Pointer(&same)
+
+	var mods []string
+	for i := range rt.Indexed {
+		if rt.Indexed[i].Modified(basePtr, samePtr) {
+			mods = append(mods, rt.Indexed[i].Name)
+		}
+	}
+	if len(mods) != 0 {
+		t.Fatalf("expected no modified indexed fields, got %v", mods)
+	}
+	var uniqueMods []string
+	for i := range rt.Unique {
+		if rt.Unique[i].Modified(basePtr, samePtr) {
+			uniqueMods = append(uniqueMods, rt.Unique[i].Name)
+		}
+	}
+	if len(uniqueMods) != 0 {
+		t.Fatalf("expected no modified unique fields, got %v", uniqueMods)
+	}
+
+	nextCount := uint64(9)
+	countChanged := schemaTestUnsafeAccessorRec{
+		Name: "alice",
+		SchemaTestUnsafeEmbeddedIndexed: SchemaTestUnsafeEmbeddedIndexed{
+			Code:  &sameCode,
+			Score: 3,
+			Tags:  []string{"x", "y"},
+			Count: &nextCount,
+		},
+	}
+	mods = mods[:0]
+	nextPtr := unsafe.Pointer(&countChanged)
+	for i := range rt.Indexed {
+		if rt.Indexed[i].Modified(basePtr, nextPtr) {
+			mods = append(mods, rt.Indexed[i].Name)
+		}
+	}
+	if !slices.Equal(mods, []string{"count"}) {
+		t.Fatalf("expected only count to change, got %v", mods)
+	}
+
+	scoreChanged := schemaTestUnsafeAccessorRec{
+		Name: "alice",
+		SchemaTestUnsafeEmbeddedIndexed: SchemaTestUnsafeEmbeddedIndexed{
+			Code:  &sameCode,
+			Score: 4,
+			Tags:  []string{"x", "y"},
+			Count: &sameCount,
+		},
+	}
+	mods = mods[:0]
+	nextPtr = unsafe.Pointer(&scoreChanged)
+	for i := range rt.Indexed {
+		if rt.Indexed[i].Modified(basePtr, nextPtr) {
+			mods = append(mods, rt.Indexed[i].Name)
+		}
+	}
+	if !slices.Equal(mods, []string{"score"}) {
+		t.Fatalf("expected only score to change, got %v", mods)
+	}
+
+	tagsChanged := schemaTestUnsafeAccessorRec{
+		Name: "alice",
+		SchemaTestUnsafeEmbeddedIndexed: SchemaTestUnsafeEmbeddedIndexed{
+			Code:  &sameCode,
+			Score: 3,
+			Tags:  []string{"x", "z"},
+			Count: &sameCount,
+		},
+	}
+	mods = mods[:0]
+	nextPtr = unsafe.Pointer(&tagsChanged)
+	for i := range rt.Indexed {
+		if rt.Indexed[i].Modified(basePtr, nextPtr) {
+			mods = append(mods, rt.Indexed[i].Name)
+		}
+	}
+	if !slices.Equal(mods, []string{"tags"}) {
+		t.Fatalf("expected only tags to change, got %v", mods)
 	}
 }
 

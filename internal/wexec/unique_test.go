@@ -440,6 +440,37 @@ func TestSharedStringSetBeforeCommitFailureRetriesNeighborWithRolledBackStringKe
 	}
 }
 
+func TestSharedStringSetCommitFailureRollsBackStringKey(t *testing.T) {
+	commitErr := errors.New("commit failed")
+	var events []string
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(*bbolt.Tx, string) error {
+		return commitErr
+	})
+
+	req := stringSetAttemptReq("ghost", 2)
+	executeBatchForTest(ex, []*request{req})
+
+	if err := <-req.Done; !errors.Is(err, commitErr) {
+		t.Fatalf("request error = %v, want commit error", err)
+	}
+	if got := readStringAttemptPayload(t, raw, bucket, "ghost"); got != nil {
+		t.Fatalf("ghost payload persisted: %v", got)
+	}
+	snap := ex.unique.Current()
+	if snap.StrMap.Next() != 1 {
+		t.Fatalf("strmap next = %d, want 1", snap.StrMap.Next())
+	}
+	if _, ok := snap.StrMap.Index("ghost"); ok {
+		t.Fatalf("failed key appeared in published strmap")
+	}
+	if _, ok := ex.strMap.Snapshot().Index("ghost"); ok {
+		t.Fatalf("failed key remained in live strmap")
+	}
+	if st := ex.Stats(); st.TxCommitErrors == 0 {
+		t.Fatalf("TxCommitErrors = 0 after failed commit")
+	}
+}
+
 func TestExecuteJobsRepeatedPatchUniqueFirstBeforeCommitErrorRetriesFollowerFromOriginalState(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	uniqueErr := errors.New("unique violation")

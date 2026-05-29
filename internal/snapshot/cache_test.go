@@ -1216,3 +1216,37 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 		t.Fatalf("reloaded inherited numeric full-span posting changed after prev release: got=%v want=%v", reloaded.ToArray(), want)
 	}
 }
+
+func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnpin(t *testing.T) {
+	m := NewManager(true)
+
+	first := testMatPredView(4, 0)
+	first.Seq = 7
+	first.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user"), testPosting(1))
+	m.Publish(first)
+
+	pinned, ref, ok := m.PinBySeq(first.Seq)
+	if !ok || pinned != first {
+		t.Fatal("expected first snapshot to be pinnable")
+	}
+
+	second := testMatPredView(4, 0)
+	second.Seq = first.Seq
+	second.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	m.Publish(second)
+
+	if first.MaterializedPredCache() == nil || first.NumericRangeBucketCache() == nil {
+		t.Fatal("expected pinned retired same-seq snapshot to retain runtime caches before unpin")
+	}
+
+	m.Unpin(first.Seq, ref)
+	if first.MaterializedPredCache() != nil || first.NumericRangeBucketCache() != nil {
+		t.Fatal("expected retired same-seq snapshot runtime caches to be released after last unpin")
+	}
+	if m.Current() != second {
+		t.Fatal("expected same-seq replacement to remain current after old unpin")
+	}
+
+	second.releaseRuntimeCaches()
+}

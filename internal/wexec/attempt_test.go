@@ -49,6 +49,9 @@ func TestAttemptCommitFailureDropsStagedSnapshotAndSkipsPublish(t *testing.T) {
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
 		t.Fatalf("payload persisted after failed commit: %v", got)
 	}
+	if st := ex.Stats(); st.TxCommitErrors == 0 {
+		t.Fatalf("TxCommitErrors = 0 after failed commit")
+	}
 }
 
 func TestAttemptPublishRunsAfterSuccessfulCommit(t *testing.T) {

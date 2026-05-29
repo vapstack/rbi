@@ -3,6 +3,7 @@ package posting
 import (
 	"slices"
 	"testing"
+	"unsafe"
 )
 
 func ownContainerRun(rc *containerRun) *containerRun {
@@ -246,6 +247,13 @@ func TestContainerRunNotCopyAndInotRangeToggle(t *testing.T) {
 	}
 }
 
+func slicesShareBackingI16(a, b []interval16) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	return unsafe.SliceData(a) == unsafe.SliceData(b)
+}
+
 func TestContainerRunInotEmptyRangeIsNoOp(t *testing.T) {
 	rc := ownContainerRun(&containerRun{iv: make([]interval16, 2, 4)})
 	rc.iv[0] = newInterval16Range(10, 12)
@@ -258,7 +266,7 @@ func TestContainerRunInotEmptyRangeIsNoOp(t *testing.T) {
 	if result != rc {
 		t.Fatalf("empty-range inot must return the receiver, got %T", result)
 	}
-	if !slicesShareBacking(beforeBacking, rc.iv) {
+	if !slicesShareBackingI16(beforeBacking, rc.iv) {
 		t.Fatalf("empty-range inot must not replace writable storage")
 	}
 	if cap(rc.iv) != beforeCap {
@@ -281,7 +289,7 @@ func TestContainerRunInotReusesWritableStorage(t *testing.T) {
 	if result != rc {
 		t.Fatalf("writable inot should keep run identity, got %T", result)
 	}
-	if !slicesShareBacking(beforeBacking, rc.iv) {
+	if !slicesShareBackingI16(beforeBacking, rc.iv) {
 		t.Fatalf("writable inot unexpectedly replaced backing storage")
 	}
 	if cap(rc.iv) != beforeCap {
@@ -304,7 +312,7 @@ func TestContainerRunInotReplacesStorageWhenCapacityIsTight(t *testing.T) {
 	if result != rc {
 		t.Fatalf("tight-capacity inot should still return the receiver when the result stays run, got %T", result)
 	}
-	if slicesShareBacking(beforeBacking, rc.iv) {
+	if slicesShareBackingI16(beforeBacking, rc.iv) {
 		t.Fatalf("tight-capacity inot must replace storage via donor path")
 	}
 	if cap(rc.iv) <= beforeCap {
@@ -323,7 +331,7 @@ func TestContainerRunInotWritablePathCanReturnArray(t *testing.T) {
 	if _, ok := result.(*containerArray); !ok {
 		t.Fatalf("expected array from small flipped range, got %T", result)
 	}
-	if !slicesShareBacking(beforeBacking, rc.iv) {
+	if !slicesShareBackingI16(beforeBacking, rc.iv) {
 		t.Fatalf("small writable inot unexpectedly replaced run backing")
 	}
 	assertRunIntervalsInvariant(t, rc)

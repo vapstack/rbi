@@ -757,7 +757,7 @@ func (lp *largePosting) or(other *largePosting) {
 		return
 	}
 
-	outSize := countUnionKeys(lp.highlowcontainer.keys[:length1], other.highlowcontainer.keys[:length2])
+	outSize := countUnionKeys32(lp.highlowcontainer.keys[:length1], other.highlowcontainer.keys[:length2])
 	lp.highlowcontainer.grow(outSize)
 
 	pos1 := length1 - 1
@@ -1108,13 +1108,17 @@ func largeArrayPoolIndex(size int) int {
 }
 
 func (la *largeArray) aliases(other *largeArray) bool {
-	if la == nil || other == nil {
-		return false
-	}
-	return slicesShareBacking64(la.keys, other.keys) || slicesShareBacking64(la.containers, other.containers)
+	return slicesShareBackingU32(la.keys, other.keys) || slicesShareBackingB32(la.containers, other.containers)
 }
 
-func slicesShareBacking64[T any](a, b []T) bool {
+func slicesShareBackingU32(a, b []uint32) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	return unsafe.SliceData(a) == unsafe.SliceData(b)
+}
+
+func slicesShareBackingB32(a, b []*bitmap32) bool {
 	if cap(a) == 0 || cap(b) == 0 {
 		return false
 	}
@@ -1409,9 +1413,7 @@ func (la *largeArray) removeAtIndex(i int) {
 	la.containers[last] = nil
 	la.keys = la.keys[:last]
 	la.containers = la.containers[:last]
-	if removed != nil {
-		removed.release()
-	}
+	removed.release()
 }
 
 func (la *largeArray) setContainerAtIndex(i int, c *bitmap32) {
