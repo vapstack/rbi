@@ -988,10 +988,6 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 8_000)
 
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(base): %v", err)
-	}
-
 	queries := []*qx.QX{
 		qx.Query(
 			qx.EQ("active", true),

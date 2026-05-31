@@ -43,7 +43,7 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 		_ = db.Close()
 		_ = raw.Close()
 	})
-	db.DisableSync()
+	db.disableSync()
 
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -78,7 +78,7 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 		}
 	}
 
-	db.EnableSync()
+	db.enableSync()
 
 	return db, raw, uint64(writeBenchSeedCount)
 }

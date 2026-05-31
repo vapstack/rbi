@@ -1,12 +1,10 @@
 package rbi
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -243,10 +241,6 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
 	for i := 1; i <= 90; i++ {
 		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string(nil)}}); err != nil {
 			t.Fatalf("Patch(%d): %v", i, err)
@@ -291,7 +285,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	}
 }
 
-func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
+func TestLenIndex_ZeroComplementClearsStaleFlagsAfterPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 90; i++ {
@@ -308,10 +302,6 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 		}
 	}
 
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(initial): %v", err)
-	}
-
 	for i := 1; i <= 90; i++ {
 		if i%5 == 0 {
 			continue
@@ -321,20 +311,16 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 		}
 	}
 
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(after patch): %v", err)
-	}
-
 	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("expected no empty-tags ids after rebuild, got %v", got)
+		t.Fatalf("expected no empty-tags ids after patch, got %v", got)
 	}
 }
 
-func TestRebuildIndex_CleanState(t *testing.T) {
+func TestIndex_DeleteCleanState(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
@@ -354,33 +340,17 @@ func TestRebuildIndex_CleanState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cnt != 2 {
-		t.Fatalf("before rebuild: expected 2, got %d", cnt)
+		t.Fatalf("expected count 2, got %d", cnt)
 	}
 
-	if err = db.RebuildIndex(); err != nil {
-		t.Fatal(err)
-	}
-
-	// verify state (1, 3)
 	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	if len(ids) != 2 || ids[0] != 1 || ids[1] != 3 {
-		t.Fatalf("after rebuild: expected [1, 3], got %v", ids)
-	}
-}
-
-func TestRebuildIndex_ClosedReturnsErrClosed(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	if err := db.RebuildIndex(); !errors.Is(err, ErrClosed) {
-		t.Fatalf("expected ErrClosed, got: %v", err)
+		t.Fatalf("expected [1, 3], got %v", ids)
 	}
 }
 
@@ -450,460 +420,7 @@ func TestQuery_MissingBucket_EmptyIndexResultStillRequiresSequenceTx(t *testing.
 	}
 }
 
-func TestRebuildIndex_ScanErrorClearsActiveFlag(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.BucketName())
-		if b == nil {
-			return fmt.Errorf("bucket missing")
-		}
-		var keyBuf [8]byte
-		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf), []byte{0xff})
-	}); err != nil {
-		t.Fatalf("corrupt value: %v", err)
-	}
-
-	err := db.RebuildIndex()
-	if err == nil {
-		t.Fatal("expected rebuild error on corrupted value")
-	}
-	if !strings.Contains(err.Error(), "scan error") {
-		t.Fatalf("expected scan error, got: %v", err)
-	}
-
-	// Rebuild must clear active flag even when build fails.
-	if err = db.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
-		t.Fatalf("Set after failed rebuild should not see busy flag, got: %v", err)
-	}
-
-	err = db.RebuildIndex()
-	if err == nil || !strings.Contains(err.Error(), "scan error") {
-		t.Fatalf("second RebuildIndex: expected scan error, got: %v", err)
-	}
-}
-
-func TestRebuildIndex_StopTheWorld(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-
-	go func() {
-		err := db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-		scanDone <- err
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawRebuildBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawRebuildBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawRebuildBusy {
-		t.Fatal("expected ErrRebuildInProgress while rebuild waits for in-flight reader")
-	}
-
-	select {
-	case err := <-rebuildDone:
-		t.Fatalf("rebuild must wait for in-flight reader, got early result: %v", err)
-	default:
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-}
-
-func TestRebuildIndex_ConcurrentCallReturnsErrRebuildInProgress(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-
-	go func() {
-		err := db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-		scanDone <- err
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	if err := db.RebuildIndex(); !errors.Is(err, ErrRebuildInProgress) {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatalf("expected ErrRebuildInProgress from concurrent rebuild, got: %v", err)
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex(first): %v", err)
-	}
-}
-
-func TestRebuildIndex_StopsTruncateWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-
-	go func() {
-		err := db.SeqScan(0, func(_ uint64, _ *UniqueTestRec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-		scanDone <- err
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawBusy {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatal("expected rebuild to become active")
-	}
-
-	if err := db.Truncate(); !errors.Is(err, ErrRebuildInProgress) {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatalf("expected ErrRebuildInProgress from Truncate during rebuild, got: %v", err)
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	if err := db.Truncate(); err != nil {
-		t.Fatalf("Truncate(after rebuild): %v", err)
-	}
-}
-
-func TestRebuildIndex_RejectsSetWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-
-	go func() {
-		err := db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-		scanDone <- err
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawBusy {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatal("expected rebuild to become active")
-	}
-
-	if err := db.Set(2, &Rec{Name: "bob", Age: 31}); !errors.Is(err, ErrRebuildInProgress) {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatalf("expected ErrRebuildInProgress from Set during rebuild, got: %v", err)
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	if err := db.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
-		t.Fatalf("Set(after rebuild): %v", err)
-	}
-}
-
-func TestRebuildIndex_ConcurrentCloseReturnsErrClosed(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-
-	go func() {
-		err := db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-		scanDone <- err
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	closeDone := make(chan error, 1)
-	go func() {
-		closeDone <- db.Close()
-	}()
-
-	closedDeadline := time.Now().Add(2 * time.Second)
-	for !db.closed.Load() && time.Now().Before(closedDeadline) {
-		time.Sleep(1 * time.Millisecond)
-	}
-	if !db.closed.Load() {
-		close(releaseScan)
-		<-scanDone
-		<-closeDone
-		<-rebuildDone
-		t.Fatal("db.closed was not set by Close in time")
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close timed out")
-	}
-
-	select {
-	case err := <-rebuildDone:
-		if !errors.Is(err, ErrClosed) {
-			t.Fatalf("expected ErrClosed from rebuild racing with close, got: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("RebuildIndex timed out")
-	}
-}
-
-func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 1024,
-	})
-
-	setStarted := make(chan struct{})
-	releaseSet := make(chan struct{})
-	setDone := make(chan error, 1)
-
-	go func() {
-		setDone <- db.Set(1, &Rec{Name: "alice", Age: 30}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
-			close(setStarted)
-			<-releaseSet
-			return nil
-		}))
-	}()
-
-	select {
-	case <-setStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("batched set callback did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawBusy {
-		close(releaseSet)
-		<-setDone
-		<-rebuildDone
-		t.Fatal("expected rebuild to become active while batched set is in flight")
-	}
-
-	select {
-	case err := <-rebuildDone:
-		close(releaseSet)
-		<-setDone
-		t.Fatalf("rebuild must wait for in-flight batched set, got early result: %v", err)
-	default:
-	}
-
-	close(releaseSet)
-	if err := <-setDone; err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	if st := db.AutoBatchStats(); st.Enqueued == 0 {
-		t.Fatalf("expected auto-batch enqueue for Set path, got stats: %+v", st)
-	}
-
-	v, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if v == nil || v.Age != 30 || v.Name != "alice" {
-		t.Fatalf("unexpected value after rebuild: %#v", v)
-	}
-
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 30)))
-	if err != nil {
-		t.Fatalf("QueryKeys(age=30): %v", err)
-	}
-	if len(ids) != 1 || ids[0] != 1 {
-		t.Fatalf("expected [1] after batched set + rebuild, got %v", ids)
-	}
-}
-
-func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
+func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   2 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -931,7 +448,6 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 		readers   = 3
 		writerOps = 220
 		readerOps = 320
-		rebuilds  = 48
 	)
 
 	queries := []*qx.QX{
@@ -943,21 +459,7 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 1+writers+readers)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < rebuilds; i++ {
-			if err := db.RebuildIndex(); err != nil {
-				errCh <- fmt.Errorf("rebuild iter=%d: %w", i, err)
-				return
-			}
-			if i%3 == 0 {
-				time.Sleep(1 * time.Millisecond)
-			}
-		}
-	}()
+	errCh := make(chan error, writers+readers)
 
 	for w := 0; w < writers; w++ {
 		w := w
@@ -977,7 +479,7 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 						Tags:     []string{fmt.Sprintf("w%d", w%4), fmt.Sprintf("grp-%d", i%7)},
 						FullName: fmt.Sprintf("FN-%05d", id),
 					}
-					if err := db.Set(id, rec); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+					if err := db.Set(id, rec); err != nil {
 						errCh <- fmt.Errorf("writer=%d Set(id=%d): %w", w, id, err)
 						return
 					}
@@ -987,12 +489,12 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 						{Name: "active", Value: i%2 == 0},
 						{Name: "country", Value: countries[(w+i)%len(countries)]},
 					}
-					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+					if err := db.Patch(id, patch); err != nil {
 						errCh <- fmt.Errorf("writer=%d Patch(id=%d): %w", w, id, err)
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+					if err := db.Delete(id); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(id=%d): %w", w, id, err)
 						return
 					}
@@ -1008,15 +510,15 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < readerOps; i++ {
 				q := queries[(r+i)%len(queries)]
-				if _, err := db.QueryKeys(q); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+				if _, err := db.QueryKeys(q); err != nil {
 					errCh <- fmt.Errorf("reader=%d QueryKeys(i=%d): %w", r, i, err)
 					return
 				}
-				if _, err := db.Query(q); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+				if _, err := db.Query(q); err != nil {
 					errCh <- fmt.Errorf("reader=%d Query(i=%d): %w", r, i, err)
 					return
 				}
-				if _, err := db.Count(q.Filter); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+				if _, err := db.Count(q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader=%d Count(i=%d): %w", r, i, err)
 					return
 				}
@@ -1031,10 +533,6 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	}
 	if t.Failed() {
 		t.FailNow()
-	}
-
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(final): %v", err)
 	}
 
 	checkQueries := []*qx.QX{
@@ -1072,208 +570,6 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 		t.Fatalf("final count mismatch: count=%d seqscan=%d", cnt, seqCount)
 	}
 }
-
-func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-	go func() {
-		scanDone <- db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawBusy {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatal("expected rebuild to become active")
-	}
-
-	statsDone := make(chan IndexStats, 1)
-	go func() {
-		statsDone <- db.IndexStats()
-	}()
-
-	select {
-	case st := <-statsDone:
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatalf("Stats returned while rebuild still active: %+v", st)
-	case <-time.After(80 * time.Millisecond):
-	}
-
-	close(releaseScan)
-	if err := <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err := <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	select {
-	case st := <-statsDone:
-		if st.Size == 0 {
-			t.Fatalf("expected IndexStats.Size > 0, got %+v", st)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("IndexStats did not return after rebuild completion")
-	}
-}
-
-func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	scanStarted := make(chan struct{})
-	releaseScan := make(chan struct{})
-	scanDone := make(chan error, 1)
-	go func() {
-		scanDone <- db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-			close(scanStarted)
-			<-releaseScan
-			return false, nil
-		})
-	}()
-
-	select {
-	case <-scanStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start in time")
-	}
-
-	rebuildDone := make(chan error, 1)
-	go func() {
-		rebuildDone <- db.RebuildIndex()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	sawBusy := false
-	for time.Now().Before(deadline) {
-		_, err := db.Get(1)
-		if errors.Is(err, ErrRebuildInProgress) {
-			sawBusy = true
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !sawBusy {
-		close(releaseScan)
-		<-scanDone
-		<-rebuildDone
-		t.Fatal("expected rebuild to become active")
-	}
-
-	expectBusy := func(op string, err error) {
-		t.Helper()
-		if !errors.Is(err, ErrRebuildInProgress) {
-			t.Fatalf("%s: expected ErrRebuildInProgress, got: %v", op, err)
-		}
-	}
-
-	_, err := db.Get(1)
-	expectBusy("Get", err)
-
-	_, err = db.BatchGet(1, 2)
-	expectBusy("BatchGet", err)
-
-	err = db.ScanKeys(0, func(_ uint64) (bool, error) {
-		return true, nil
-	})
-	expectBusy("ScanKeys", err)
-
-	err = db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
-		return true, nil
-	})
-	expectBusy("SeqScan", err)
-
-	err = db.SeqScanRaw(0, func(_ uint64, _ []byte) (bool, error) {
-		return true, nil
-	})
-	expectBusy("SeqScanRaw", err)
-
-	_, err = db.QueryKeys(qx.Query())
-	expectBusy("QueryKeys", err)
-
-	_, err = db.Query(qx.Query())
-	expectBusy("Query", err)
-
-	_, err = db.Count()
-	expectBusy("Count", err)
-
-	err = db.Set(2, &Rec{Name: "bob", Age: 31})
-	expectBusy("Set", err)
-
-	err = db.BatchSet(
-		[]uint64{2, 3},
-		[]*Rec{
-			{Name: "setmany-2", Age: 21},
-			{Name: "setmany-3", Age: 22},
-		},
-	)
-	expectBusy("BatchSet", err)
-
-	err = db.Patch(1, []Field{{Name: "age", Value: 35}})
-	expectBusy("Patch", err)
-
-	err = db.BatchPatch([]uint64{1, 2}, []Field{{Name: "age", Value: 37}})
-	expectBusy("BatchPatch", err)
-
-	err = db.Delete(1)
-	expectBusy("Delete", err)
-
-	err = db.BatchDelete([]uint64{1, 2})
-	expectBusy("BatchDelete", err)
-
-	err = db.Truncate()
-	expectBusy("Truncate", err)
-
-	err = db.RebuildIndex()
-	expectBusy("RebuildIndex(second)", err)
-
-	close(releaseScan)
-	if err = <-scanDone; err != nil {
-		t.Fatalf("SeqScan: %v", err)
-	}
-	if err = <-rebuildDone; err != nil {
-		t.Fatalf("RebuildIndex(first): %v", err)
-	}
-}
-
-/**/
 
 type PtrIntRec struct {
 	Name   string `db:"name"   rbi:"index"`
@@ -1384,7 +680,7 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 	}
 }
 
-func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
+func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 	db, path := openTempDBUint64PtrInt(t)
 	opts := testOptions(Options{
 		EnableAutoBatchStats: true,
@@ -1473,10 +769,9 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 
 	check("delta", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
-	check("rebuild", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 
 	plannerStats := db.PlannerStats()
 	fs, ok := plannerStats.Fields["rank"]
@@ -1516,6 +811,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 		}
 	}()
 
+	opts.DisableIndexLoad = true
 	reopened, err := New[uint64, PtrIntRec](raw, opts)
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
@@ -1530,7 +826,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 	check("reopen", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 }
 
-func TestPointerNil_RebuildClearsStaleNilBase(t *testing.T) {
+func TestPointerNil_PatchClearsStaleNilState(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t)
 
 	if err := db.Set(1, &PtrIntRec{Name: "nil", Rank: nil}); err != nil {
@@ -1539,15 +835,8 @@ func TestPointerNil_RebuildClearsStaleNilBase(t *testing.T) {
 	if err := db.Set(2, &PtrIntRec{Name: "ten", Rank: intPtr(10)}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(initial): %v", err)
-	}
-
 	if err := db.Patch(1, []Field{{Name: "rank", Value: 20}}); err != nil {
 		t.Fatalf("Patch(1 rank=20): %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(after patch): %v", err)
 	}
 
 	gotNil, err := db.QueryKeys(qx.Query(qx.EQ("rank", nil)))
@@ -1555,7 +844,7 @@ func TestPointerNil_RebuildClearsStaleNilBase(t *testing.T) {
 		t.Fatalf("QueryKeys(EQ nil): %v", err)
 	}
 	if len(gotNil) != 0 {
-		t.Fatalf("expected no nil rows after rebuild, got %v", gotNil)
+		t.Fatalf("expected no nil rows after patch, got %v", gotNil)
 	}
 
 	gotIn, err := db.QueryKeys(qx.Query(qx.IN("rank", []any{nil, 20})))
@@ -1647,10 +936,6 @@ func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
 	if err := db.Set(2, &PtrIntRec{Name: "b", Rank: nil}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
 	q := qx.Query().Sort("rank", qx.ASC).Limit(2)
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -1674,10 +959,6 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
 	q := normalizeQueryForTest(qx.Query(
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.ASC).Offset(1).Limit(3))
@@ -1709,9 +990,6 @@ func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
 		if err := db.Set(id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 	if err := db.Patch(1, []Field{{Name: "opt", Value: "zeta"}}); err != nil {
 		t.Fatalf("Patch(1 opt=zeta): %v", err)
@@ -2233,11 +1511,6 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 	}
 
 	assertState("incremental")
-
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-	assertState("rebuilt")
 }
 
 func TestIndexExt_DBFloatSignedZeroBetweenBoundsMatchesExpected(t *testing.T) {

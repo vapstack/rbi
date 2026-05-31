@@ -9,51 +9,51 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-func (s *View) FieldIndexStorage(field string) (indexdata.FieldStorage, bool) {
-	if s.Index == nil {
+func (v *View) FieldIndexStorage(field string) (indexdata.FieldStorage, bool) {
+	if v.Index == nil {
 		return indexdata.FieldStorage{}, false
 	}
-	acc, ok := s.IndexedFieldByName[field]
-	if !ok || acc.Ordinal >= len(s.Index) {
+	acc, ok := v.IndexedFieldByName[field]
+	if !ok || acc.Ordinal >= len(v.Index) {
 		return indexdata.FieldStorage{}, false
 	}
-	storage := s.Index[acc.Ordinal]
+	storage := v.Index[acc.Ordinal]
 	return storage, storage.KeyCount() > 0
 }
 
-func (s *View) NilFieldNameSet() map[string]struct{} {
-	if s.NilIndex == nil {
+func (v *View) NilFieldNameSet() map[string]struct{} {
+	if v.NilIndex == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.IndexedFieldByName))
-	for f, acc := range s.IndexedFieldByName {
-		if acc.Ordinal < len(s.NilIndex) && s.NilIndex[acc.Ordinal].KeyCount() > 0 {
+	fields := make(map[string]struct{}, len(v.IndexedFieldByName))
+	for f, acc := range v.IndexedFieldByName {
+		if acc.Ordinal < len(v.NilIndex) && v.NilIndex[acc.Ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
 	return fields
 }
 
-func (s *View) FieldNameSet() map[string]struct{} {
-	if s.Index == nil {
+func (v *View) FieldNameSet() map[string]struct{} {
+	if v.Index == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.IndexedFieldByName))
-	for f, acc := range s.IndexedFieldByName {
-		if acc.Ordinal < len(s.Index) && s.Index[acc.Ordinal].KeyCount() > 0 {
+	fields := make(map[string]struct{}, len(v.IndexedFieldByName))
+	for f, acc := range v.IndexedFieldByName {
+		if acc.Ordinal < len(v.Index) && v.Index[acc.Ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
 	return fields
 }
 
-func (s *View) LenFieldNameSet() map[string]struct{} {
-	if s.LenIndex == nil {
+func (v *View) LenFieldNameSet() map[string]struct{} {
+	if v.LenIndex == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.IndexedFieldByName))
-	for f, acc := range s.IndexedFieldByName {
-		if !acc.Field.Slice || acc.Ordinal >= len(s.LenIndex) || s.LenIndex[acc.Ordinal].KeyCount() == 0 {
+	fields := make(map[string]struct{}, len(v.IndexedFieldByName))
+	for f, acc := range v.IndexedFieldByName {
+		if !acc.Field.Slice || acc.Ordinal >= len(v.LenIndex) || v.LenIndex[acc.Ordinal].KeyCount() == 0 {
 			continue
 		}
 		fields[f] = struct{}{}
@@ -61,34 +61,34 @@ func (s *View) LenFieldNameSet() map[string]struct{} {
 	return fields
 }
 
-func (s *View) FieldLookupPostingRetained(field, key string) posting.List {
-	if s.Index == nil {
+func (v *View) FieldLookupPostingRetained(field, key string) posting.List {
+	if v.Index == nil {
 		return posting.List{}
 	}
-	acc, ok := s.IndexedFieldByName[field]
-	if !ok || acc.Ordinal >= len(s.Index) {
+	acc, ok := v.IndexedFieldByName[field]
+	if !ok || acc.Ordinal >= len(v.Index) {
 		return posting.List{}
 	}
-	return indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal]).LookupPostingRetained(key)
+	return indexdata.NewFieldIndexViewFromStorage(v.Index[acc.Ordinal]).LookupPostingRetained(key)
 }
 
-func (s *View) FieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
-	if s.Index == nil {
+func (v *View) FieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
+	if v.Index == nil {
 		return posting.List{}
 	}
-	acc, ok := s.IndexedFieldByName[field]
-	if !ok || acc.Ordinal >= len(s.Index) {
+	acc, ok := v.IndexedFieldByName[field]
+	if !ok || acc.Ordinal >= len(v.Index) {
 		return posting.List{}
 	}
-	ov := indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal])
+	ov := indexdata.NewFieldIndexViewFromStorage(v.Index[acc.Ordinal])
 	if key.IsNumeric() {
 		return ov.LookupPostingRetainedKey(key.IndexKey())
 	}
 	return ov.LookupPostingRetained(key.StringKey())
 }
 
-func (s *View) UniverseCardinality() uint64 {
-	return s.Universe.Cardinality()
+func (v *View) UniverseCardinality() uint64 {
+	return v.Universe.Cardinality()
 }
 
 type universeOwner struct {
@@ -118,48 +118,48 @@ func (o *universeOwner) release() {
 	snapshotUniverseOwnerPool.Put(o)
 }
 
-func (s *View) ensureUniverseOwner() {
-	if s.universeOwner != nil {
+func (v *View) ensureUniverseOwner() {
+	if v.universeOwner != nil {
 		return
 	}
-	s.universeOwner = newSnapshotUniverseOwner(s.Universe)
-	s.Universe = s.universeOwner.ids
+	v.universeOwner = newSnapshotUniverseOwner(v.Universe)
+	v.Universe = v.universeOwner.ids
 }
 
-func (s *View) retainSharedOwnedStorageFrom(prev *View) {
-	if prev != nil && s.universeOwner == nil && prev.universeOwner != nil && s.Universe == prev.Universe {
-		s.universeOwner = prev.universeOwner
+func (v *View) retainSharedOwnedStorageFrom(prev *View) {
+	if prev != nil && v.universeOwner == nil && prev.universeOwner != nil && v.Universe == prev.Universe {
+		v.universeOwner = prev.universeOwner
 	}
-	if s.universeOwner != nil {
-		if prev != nil && s.universeOwner == prev.universeOwner {
-			s.universeOwner.retain()
+	if v.universeOwner != nil {
+		if prev != nil && v.universeOwner == prev.universeOwner {
+			v.universeOwner.retain()
 		}
-		s.Universe = s.universeOwner.ids
+		v.Universe = v.universeOwner.ids
 	} else {
-		s.ensureUniverseOwner()
+		v.ensureUniverseOwner()
 	}
 	if prev != nil {
-		indexdata.RetainSharedFieldStorageSlots(s.Index, prev.Index)
-		indexdata.RetainSharedFieldStorageSlots(s.NilIndex, prev.NilIndex)
-		indexdata.RetainSharedFieldStorageSlots(s.LenIndex, prev.LenIndex)
-		indexdata.RetainSharedMeasureStorageSlots(s.Measure, prev.Measure)
+		indexdata.RetainSharedFieldStorageSlots(v.Index, prev.Index)
+		indexdata.RetainSharedFieldStorageSlots(v.NilIndex, prev.NilIndex)
+		indexdata.RetainSharedFieldStorageSlots(v.LenIndex, prev.LenIndex)
+		indexdata.RetainSharedMeasureStorageSlots(v.Measure, prev.Measure)
 	}
 }
 
-func (s *View) releaseStorage() {
-	if s.universeOwner != nil {
-		s.universeOwner.release()
+func (v *View) releaseStorage() {
+	if v.universeOwner != nil {
+		v.universeOwner.release()
 	}
-	indexdata.ReleaseFieldStorageSlots(s.Index)
-	indexdata.ReleaseFieldStorageSlots(s.NilIndex)
-	indexdata.ReleaseFieldStorageSlots(s.LenIndex)
-	indexdata.ReleaseMeasureStorageSlots(s.Measure)
-	if s.LenZeroComplement != nil {
-		pooled.ReleaseBoolSlice(s.LenZeroComplement)
+	indexdata.ReleaseFieldStorageSlots(v.Index)
+	indexdata.ReleaseFieldStorageSlots(v.NilIndex)
+	indexdata.ReleaseFieldStorageSlots(v.LenIndex)
+	indexdata.ReleaseMeasureStorageSlots(v.Measure)
+	if v.LenZeroComplement != nil {
+		pooled.ReleaseBoolSlice(v.LenZeroComplement)
 	}
-	s.Index = nil
-	s.NilIndex = nil
-	s.LenIndex = nil
-	s.Measure = nil
-	s.LenZeroComplement = nil
+	v.Index = nil
+	v.NilIndex = nil
+	v.LenIndex = nil
+	v.Measure = nil
+	v.LenZeroComplement = nil
 }

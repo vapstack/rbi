@@ -46,7 +46,7 @@ type qaggBenchDBKey struct {
 }
 
 type qaggBenchDB struct {
-	rt   *schema.Runtime
+	rt   *schema.Schema
 	exec *qexec.Runtime
 	snap *snapshot.View
 }
@@ -67,7 +67,7 @@ var (
 	qaggBenchDecision aggregateRouteDecision
 
 	qaggBenchSchemaMu sync.Mutex
-	qaggBenchSchema   *schema.Runtime
+	qaggBenchSchema   *schema.Schema
 
 	qaggBenchDBsMu sync.Mutex
 	qaggBenchDBs   = make(map[qaggBenchDBKey]*qaggBenchDB)
@@ -84,7 +84,7 @@ var (
 	}
 )
 
-func qaggBenchRuntime(b testing.TB) *schema.Runtime {
+func qaggBenchRuntime(b testing.TB) *schema.Schema {
 	b.Helper()
 
 	qaggBenchSchemaMu.Lock()

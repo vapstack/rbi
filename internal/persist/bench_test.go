@@ -36,7 +36,7 @@ var (
 )
 
 type persistBenchFixture struct {
-	rt    *schema.Runtime
+	rt    *schema.Schema
 	snap  *snapshot.View
 	stats *qexec.PlannerStatsSnapshot
 }
@@ -487,7 +487,7 @@ func BenchmarkLoadRejects(b *testing.B) {
 			DBPath:     "bench.db",
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq + 1,
-			Schema:     &schema.Runtime{},
+			Schema:     &schema.Schema{},
 			Errors:     Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
 		}
 		b.SetBytes(int64(buf.Len()))
@@ -511,7 +511,7 @@ func BenchmarkLoadRejects(b *testing.B) {
 			DBPath:     "bench.db",
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq,
-			Schema:     &schema.Runtime{},
+			Schema:     &schema.Schema{},
 			Errors:     Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
 		}
 		b.SetBytes(1)
@@ -564,7 +564,7 @@ func benchmarkReadPlannerStatsSnapshot(b *testing.B, payload []byte, compatible 
 	benchPersistSink = total
 }
 
-func benchmarkLoadPayloadBytes(b *testing.B, payload []byte, rt *schema.Runtime) {
+func benchmarkLoadPayloadBytes(b *testing.B, payload []byte, s *schema.Schema) {
 	reader := bytes.NewReader(payload)
 	br := bufio.NewReaderSize(reader, benchPersistBufferSize)
 	var total uint64
@@ -574,7 +574,7 @@ func benchmarkLoadPayloadBytes(b *testing.B, payload []byte, rt *schema.Runtime)
 	for i := 0; i < b.N; i++ {
 		reader.Reset(payload)
 		br.Reset(reader)
-		result, err := loadPayload(br, rt, benchPersistStrMapCompactAt)
+		result, err := loadPayload(br, s, benchPersistStrMapCompactAt)
 		if err != nil {
 			b.Fatalf("loadPayload: %v", err)
 		}
@@ -632,7 +632,7 @@ func (fx *persistBenchFixture) release() {
 	fx.snap.Universe.Release()
 }
 
-func benchPersistRuntime(tagsDBName, amountDBName string) *schema.Runtime {
+func benchPersistRuntime(tagsDBName, amountDBName string) *schema.Schema {
 	name := benchPersistField("name", "name", 0, reflect.String, false, schema.IndexDefault)
 	age := benchPersistField("age", "age", 1, reflect.Int, false, schema.IndexDefault)
 	tags := benchPersistField("tags", tagsDBName, 2, reflect.String, true, schema.IndexDefault)
@@ -662,7 +662,7 @@ func benchPersistRuntime(tagsDBName, amountDBName string) *schema.Runtime {
 	measuresByName := schema.MeasureFieldMap{
 		"amount": {Ordinal: 0, Name: "amount", Field: amount},
 	}
-	return &schema.Runtime{
+	return &schema.Schema{
 		Fields:         fields,
 		MeasureFields:  measureFields,
 		Indexed:        indexed,
@@ -949,13 +949,13 @@ func benchPersistStoreConfig(fx *persistBenchFixture, file string) StoreConfig {
 	}
 }
 
-func benchPersistLoadConfig(rt *schema.Runtime, file string, seq uint64) LoadConfig {
+func benchPersistLoadConfig(s *schema.Schema, file string, seq uint64) LoadConfig {
 	return LoadConfig{
 		File:            file,
 		DBPath:          "bench.db",
 		Bucket:          []byte("bench"),
 		CurrentSeq:      seq,
-		Schema:          rt,
+		Schema:          s,
 		StrMapCompactAt: benchPersistStrMapCompactAt,
 		Errors:          Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
 	}

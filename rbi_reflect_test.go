@@ -453,14 +453,11 @@ func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_POSSort_RemainsScalar
 	assertUint64Slice(t, got, []uint64{2, 1})
 }
 
-func TestReflectExt_ValueIndexerDirectIfaceMap_QueryUniqueAndRebuild(t *testing.T) {
+func TestReflectExt_ValueIndexerDirectIfaceMap_QueryUnique(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectMapVIRec](t, "reflect_map_vi.db")
 
 	if err := db.Set(1, &reflectMapVIRec{Key: reflectMapVI{"id": "MiXeD"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	got, err := db.QueryKeys(qx.Query(qx.EQ("key", "mixed")))
@@ -478,15 +475,12 @@ func TestReflectExt_ValueIndexerDirectIfaceMap_QueryUniqueAndRebuild(t *testing.
 	}
 }
 
-func TestReflectExt_ValueIndexerDirectIfaceWordStruct_QueryUniqueAndRebuild(t *testing.T) {
+func TestReflectExt_ValueIndexerDirectIfaceWordStruct_QueryUnique(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectPtrWordVIRec](t, "reflect_word_vi.db")
 
 	label := "MiXeD"
 	if err := db.Set(1, &reflectPtrWordVIRec{Key: reflectPtrWordVI{Ptr: &label}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	got, err := db.QueryKeys(qx.Query(qx.EQ("key", "mixed")))
@@ -703,7 +697,7 @@ func TestReflectExt_QueryMixedNumericAndTimeBounds_DoesNotAliasCache(t *testing.
 	assertUint64Slice(t, got, []uint64{1})
 }
 
-func TestReflectExt_EmbeddedUnsafeAccessors_QueryUniqueAndRebuild(t *testing.T) {
+func TestReflectExt_EmbeddedUnsafeAccessors_QueryUnique(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectUnsafeAccessorRec](t, "reflect_embedded_accessors.db")
 
 	code1 := reflectPtrFoldedString("MiXeD")
@@ -732,10 +726,6 @@ func TestReflectExt_EmbeddedUnsafeAccessors_QueryUniqueAndRebuild(t *testing.T) 
 		},
 	}); err != nil {
 		t.Fatalf("Set(2): %v", err)
-	}
-
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	got, err := db.QueryKeys(qx.Query(qx.EQ("code", "mixed")))

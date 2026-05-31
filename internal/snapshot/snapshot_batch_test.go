@@ -22,7 +22,7 @@ type snapshotBatchStorageRec struct {
 	Opt  *string  `rbi:"index"`
 }
 
-func snapshotBatchStorageRuntime(t *testing.T) *schema.Runtime {
+func snapshotBatchStorageRuntime(t *testing.T) *schema.Schema {
 	t.Helper()
 	rt, err := schema.Compile(reflect.TypeOf(snapshotBatchStorageRec{}), schema.Config{})
 	if err != nil {
@@ -56,7 +56,7 @@ func snapshotBatchLenContains(s *View, field string, ln uint64, id uint64) bool 
 
 func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	var rec struct{}
-	snap := BuildPrepared(1, nil, &schema.Runtime{}, CacheConfig{}, nil, nil, []BatchEntry{
+	snap := BuildPrepared(1, nil, &schema.Schema{}, CacheConfig{}, nil, nil, []BatchEntry{
 		{ID: 7, New: unsafe.Pointer(&rec)},
 	})
 	defer snap.releaseRuntimeCaches()

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -18,33 +17,13 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/persist"
+	"github.com/vapstack/rbi/internal/engine"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qexec"
-	"github.com/vapstack/rbi/internal/rebuild"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
-)
-
-const (
-	defaultOptionsAnalyzeInterval                  = time.Hour
-	defaultBucketFillPercent                       = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries = 24
-	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
-	defaultAutoBatchWindow                         = 50 * time.Microsecond
-	defaultAutoBatchMax                            = 64
-	defaultAutoBatchMaxQueue                       = 512
-	defaultSnapshotStrMapCompactDepth              = 256
-	defaultNumericRangeBucketSize                  = 512
-	defaultNumericRangeBucketMinFieldKeys          = 8192
-	defaultNumericRangeBucketMinSpanKeys           = 1024
 )
 
 // IndexKind declares how a struct field participates in RBI secondary storage.
@@ -95,7 +74,6 @@ var (
 	ErrClosed            = errors.New("database closed")
 	ErrBroken            = errors.New("index is broken")
 	ErrNoIndex           = errors.New("index is disabled (transparent mode)")
-	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = qexec.ErrInvalidQuery
 	ErrInvalidBucketName = errors.New("invalid bucket name")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
@@ -275,6 +253,20 @@ type Options struct {
 	NumericRangeBucketMinSpanKeys int
 }
 
+const (
+	defaultOptionsAnalyzeInterval                  = time.Hour
+	defaultBucketFillPercent                       = 0.8
+	defaultSnapshotMaterializedPredCacheMaxEntries = 24
+	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
+	defaultAutoBatchWindow                         = 50 * time.Microsecond
+	defaultAutoBatchMax                            = 64
+	defaultAutoBatchMaxQueue                       = 512
+	defaultSnapshotStrMapCompactDepth              = 256
+	defaultNumericRangeBucketSize                  = 512
+	defaultNumericRangeBucketMinFieldKeys          = 8192
+	defaultNumericRangeBucketMinSpanKeys           = 1024
+)
+
 func (o *Options) setDefaults() {
 	if o.Logger == nil {
 		o.Logger = log.Default()
@@ -334,537 +326,7 @@ type Field struct {
 	Value any
 }
 
-// New creates a new indexed DB that uses the provided bbolt database.
-//
-// The generic type V must be a struct; otherwise ErrNotStructType is returned.
-//
-// Zero-valued option fields use defaults.
-//
-// If options.BucketName is empty,
-// the name of the value type V is used as the bucket name.
-// New ensures the bucket exists, optionally loads a persisted index from disk,
-// rebuilds missing parts of the index if allowed, and sets up field metadata
-// and accessors.
-//
-// Any ExecOptions passed to New become defaults applied to subsequent write
-// operations on the returned DB.
-//
-// The resulting DB does not manage the underlying *bbolt.DB lifecycle.
-func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts ...ExecOption[K, V]) (db *DB[K, V], err error) {
-	var v V
-	vtype := reflect.TypeOf(v)
-	if vtype == nil {
-		return nil, ErrNotStructType
-	}
-	if vtype.Kind() != reflect.Struct {
-		return nil, ErrNotStructType
-	}
-	if err = options.validate(); err != nil {
-		return nil, err
-	}
-	options.setDefaults()
-
-	vname := vtype.Name()
-	if options.BucketName != "" {
-		vname = options.BucketName
-	}
-	if vname == "" {
-		return nil, fmt.Errorf("cannot resolve value name of %v", vtype)
-	}
-	if err = validateBucketName(vname); err != nil {
-		return nil, err
-	}
-	if bolt == nil {
-		return nil, fmt.Errorf("bolt instance is nil")
-	}
-	var defaultExecOptions execOptions[K, V]
-	applyExecOptions(&defaultExecOptions, execOpts)
-	defaultExecOptions = freezeExecOptions(defaultExecOptions)
-	encodeFn, decodeFn, err := defaultCodecMethods[V]()
-	if err != nil {
-		return nil, err
-	}
-
-	boltPath := bolt.Path()
-
-	if err = regInstance(boltPath, vname); err != nil {
-		return nil, err
-	}
-	defer unregInstanceOnError(&err, boltPath, vname)
-
-	db = &DB[K, V]{
-		vtype:     vtype,
-		bolt:      bolt,
-		bucket:    []byte(vname),
-		options:   &options,
-		logger:    options.Logger,
-		rebuilder: new(rebuilder),
-
-		rbiFile: bolt.Path() + "." + vname + ".rbi",
-
-		execOptions: defaultExecOptions,
-		encodeFn:    encodeFn,
-		decodeFn:    decodeFn,
-	}
-	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
-
-	var k K
-	if reflect.TypeOf(k).Kind() == reflect.String {
-		db.strKey = true
-	}
-
-	var schemaIndex map[string]schema.IndexKind
-	if options.Index != nil {
-		schemaIndex = make(map[string]schema.IndexKind, len(options.Index))
-		for name, kind := range options.Index {
-			schemaIndex[name] = schema.IndexKind(kind)
-		}
-	}
-	db.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex})
-	if err != nil {
-		return nil, err
-	}
-
-	db.engine, db.strMap, err = newQueryEngineForRuntime(db.schema, db.options, db.strKey)
-	if err != nil {
-		return nil, err
-	}
-
-	err = bolt.Update(func(tx *bbolt.Tx) error {
-		_, e := tx.CreateBucketIfNotExists(db.bucket)
-		return e
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var (
-		loadedPlannerStats       *qexec.PlannerStatsSnapshot
-		loadedFieldCount         int
-		loadedOrdinaryFieldCount int
-		buildMode                string
-	)
-	if db.engine != nil {
-		var (
-			skipFields        map[string]struct{}
-			skipMeasureFields map[string]struct{}
-			rebuildReason     string
-		)
-		if _, err = os.Stat(db.rbiFile); err == nil {
-			if options.DisableIndexLoad {
-				rebuildReason = "persisted index load disabled"
-			} else {
-				skipFields, skipMeasureFields, loadedPlannerStats, err = db.loadIndex()
-				if err != nil {
-					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
-				}
-			}
-		} else if os.IsNotExist(err) {
-			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
-		} else if !os.IsNotExist(err) {
-			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
-		}
-
-		loadedOrdinaryFieldCount = len(skipFields)
-		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
-		totalFieldCount := len(db.schema.Fields) + len(db.schema.MeasureFields)
-		if rebuildReason != "" {
-			buildMode = "full"
-			db.logger.Printf("rbi: %s", rebuildReason)
-			db.logger.Printf(
-				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
-				loadedFieldCount,
-				totalFieldCount,
-			)
-		} else if totalFieldCount > 0 {
-			if loadedFieldCount == 0 {
-				buildMode = "full"
-				db.logger.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
-				db.logger.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
-			} else if loadedFieldCount < totalFieldCount {
-				buildMode = "partial"
-				db.logger.Printf(
-					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
-					loadedFieldCount,
-					totalFieldCount,
-					totalFieldCount-loadedFieldCount,
-				)
-			}
-		}
-
-		buildStarted := time.Now()
-		if err = db.buildIndex(skipFields, skipMeasureFields); err != nil {
-			return nil, fmt.Errorf("error building index: %w", err)
-		}
-		if buildMode != "" {
-			db.logger.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
-		}
-	}
-
-	db.initBatcher()
-
-	if db.engine != nil {
-		db.stats.FieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
-		if err = db.engine.publishCurrentSequenceSnapshotNoLock(db.bolt, db.bucket, db.strMap); err != nil {
-			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
-		}
-
-		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
-			db.engine.exec.PublishLoadedPlannerStats(loadedPlannerStats, db.engine.snapshot.Current())
-
-		} else {
-			if err = db.RefreshPlannerStats(); err != nil {
-				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
-			}
-		}
-
-		db.startPlannerAnalyzeLoop()
-	}
-
-	return db, nil
-}
-
-func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool) (*queryEngine, *strmap.Mapper, error) {
-	if !rt.HasQueryFields() {
-		return nil, nil, nil
-	}
-
-	var strMap *strmap.Mapper
-	if strKey {
-		strMap = strmap.New(0, defaultSnapshotStrMapCompactDepth)
-	}
-
-	qe := &queryEngine{
-		schema:                 rt,
-		universe:               posting.List{},
-		matPredCacheMaxEntries: max(0, options.SnapshotMaterializedPredCacheMaxEntries),
-		matPredCacheMaxCard:    qcache.MaterializedPredMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
-		snapshot:               snapshot.NewManager(options.EnableSnapshotStats),
-		exec: qexec.NewRuntime(qexec.Config{
-			Schema:                         rt,
-			NumericRangeBucketSize:         options.NumericRangeBucketSize,
-			NumericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
-			NumericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
-			AnalyzeInterval:                plannerAnalyzeInterval(options.AnalyzeInterval),
-			TraceSink:                      options.TraceSink,
-			TraceSampleEvery:               options.TraceSampleEvery,
-		}),
-	}
-	slotCount := len(rt.Indexed)
-	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
-	clear(qe.lenZeroComplement)
-	measureSlotCount := len(rt.Measures)
-	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	return qe, strMap, nil
-}
-
-func (db *DB[K, V]) initBatcher() {
-	ops := wexec.RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-			return db.encode((*V)(ptr), buf)
-		},
-		Decode: func(data []byte) (unsafe.Pointer, error) {
-			val, err := db.decode(data)
-			if err != nil {
-				return nil, err
-			}
-			return unsafe.Pointer(val), nil
-		},
-		Release: func(ptr unsafe.Pointer) {
-			db.ReleaseRecords((*V)(ptr))
-		},
-		ValidateIndex: func(ptr unsafe.Pointer) error {
-			return db.validateIndexedStringValues((*V)(ptr))
-		},
-	}
-	cfg := wexec.Config{
-		MaxOps:       db.options.AutoBatchMax,
-		Window:       db.options.AutoBatchWindow,
-		MaxQueue:     db.options.AutoBatchMaxQueue,
-		StatsEnabled: db.options.EnableAutoBatchStats,
-		Unavailable: func() error {
-			if db.closed.Load() {
-				return ErrClosed
-			}
-			if db.broken.Load() {
-				return ErrBroken
-			}
-			return nil
-		},
-		Errors: wexec.ErrorSet{
-			UniqueViolation: ErrUniqueViolation,
-		},
-
-		Bolt:               db.bolt,
-		Bucket:             db.bucket,
-		BucketFillPercent:  db.options.BucketFillPercent,
-		RejectEmptyPayload: db.decodeFn == nil,
-		RootMu:             &db.mu,
-		Commit:             commitTx,
-		StrKey:             db.strKey,
-		StrMap:             db.strMap,
-		Indexed:            db.engine != nil,
-		Ops:                &ops,
-		Schema:             db.schema,
-	}
-
-	if db.engine != nil {
-		cfg.Unique = wexec.UniqueContext{
-			Schema:          db.schema,
-			Current:         db.engine.snapshot.Current,
-			UniqueViolation: ErrUniqueViolation,
-		}
-		cfg.SnapshotOps = wexec.SnapshotOps{
-			Enabled:     true,
-			Manager:     db.engine.snapshot,
-			Schema:      db.schema,
-			CacheConfig: db.engine.snapshotCacheConfig,
-			StrMap:      db.strMap,
-			PatchFields: db.schema.Patch.Fields,
-		}
-		cfg.IndexPublishOps = wexec.IndexPublishOps{
-			PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
-				return publishAfterCommitLocked(
-					&db.broken,
-					db.logger,
-					db.engine,
-					seq,
-					op,
-					func() {
-						db.engine.installViewNoLock(snap)
-						if db.strMap != nil {
-							db.strMap.MarkCommittedPublished(snap.StrMap)
-						}
-					},
-				)
-			},
-		}
-	}
-	db.batcher = wexec.NewBatcher(cfg)
-}
-
-func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
-	seq, err := currentBucketSequence(db.bolt, db.bucket)
-	if err != nil {
-		return err
-	}
-	qe := db.engine
-	result, err := rebuild.Build(rebuild.Config{
-		Bolt:              db.bolt,
-		Bucket:            db.bucket,
-		Schema:            qe.schema,
-		Current:           qe.snapshot.Current(),
-		StrKey:            db.strKey,
-		StrMap:            db.strMap,
-		SkipFields:        skipFields,
-		SkipMeasureFields: skipMeasureFields,
-		Decode:            db.decodeBuildIndexRecord,
-		Release:           db.releaseBuildIndexRecord,
-	}, rebuild.State{
-		Index:             qe.index,
-		NilIndex:          qe.nilIndex,
-		LenIndex:          qe.lenIndex,
-		LenZeroComplement: qe.lenZeroComplement,
-		Measure:           qe.measure,
-		Universe:          qe.universe,
-		LenLoaded:         qe.lenIndexLoaded,
-	})
-	if err != nil {
-		return err
-	}
-	if result.Publish {
-		st := result.Storage
-		result.Storage = snapshot.Storage{}
-		qe.publishStorageSnapshotNoLock(seq, db.strMap, st)
-	}
-	qe.lenIndexLoaded = result.LenLoaded
-	if result.Stats {
-		db.stats.BuildTime = result.BuildTime
-		db.stats.BuildRPS = result.BuildRPS
-	}
-	return nil
-}
-
-func (db *DB[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
-	val, err := db.decode(data)
-	if err != nil {
-		return nil, err
-	}
-	return unsafe.Pointer(val), nil
-}
-
-func (db *DB[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
-	var zero V
-	val := (*V)(ptr)
-	*val = zero
-	db.recPool.Put(val)
-}
-
-func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
-	if db.engine == nil || val == nil {
-		return nil
-	}
-	ptr := unsafe.Pointer(val)
-	for _, acc := range db.engine.schema.StringValidation {
-		var fieldErr error
-		acc.WriteBuild(ptr, schema.BuildSink{
-			Field: acc.Name,
-			Err:   &fieldErr,
-		})
-		if fieldErr != nil {
-			return fieldErr
-		}
-	}
-	return nil
-}
-
-const (
-	nilIndexEntryKey = indexdata.NilIndexEntryKey
-)
-
-func (db *DB[K, V]) loadIndex() (
-	skipFields map[string]struct{},
-	skipMeasureFields map[string]struct{},
-	plannerStats *qexec.PlannerStatsSnapshot,
-	err error,
-) {
-	currentSeq, err := currentBucketSequence(db.bolt, db.bucket)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
-	}
-	start := time.Now()
-	result, err := persist.Load(persist.LoadConfig{
-		File:            db.rbiFile,
-		DBPath:          db.bolt.Path(),
-		Bucket:          db.bucket,
-		CurrentSeq:      currentSeq,
-		Schema:          db.schema,
-		StrMapCompactAt: defaultSnapshotStrMapCompactDepth,
-		Errors: persist.Errors{
-			Stale:   errPersistedIndexStale,
-			Invalid: errPersistedIndexInvalid,
-		},
-	})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	installed := false
-	defer func() {
-		if !installed {
-			result.Storage.Release()
-		}
-	}()
-
-	qe := db.engine
-	indexdata.ReleaseFieldStorageSlots(qe.index)
-	indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
-	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
-	indexdata.ReleaseMeasureStorageSlots(qe.measure)
-	if qe.lenZeroComplement != nil {
-		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
-	}
-	qe.universe.Release()
-	qe.lenIndexLoaded = result.LenLoaded
-
-	publishStrMap := result.StrMap
-	if !db.strKey {
-		publishStrMap = nil
-	}
-	st := result.Storage
-	result.Storage = snapshot.Storage{}
-	qe.publishStorageSnapshotNoLock(currentSeq, publishStrMap, st)
-	installed = true
-
-	if db.strKey {
-		db.strMap = result.StrMap
-	}
-	db.stats.LoadTime = time.Since(start)
-
-	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
-}
-
-func (db *DB[K, V]) storeIndex() error {
-	return db.engine.storeIndex(db.rbiFile, db.bolt, db.bucket)
-}
-
-func (qe *queryEngine) storeIndex(rbiFile string, bolt *bbolt.DB, bucket []byte) error {
-	seq, err := currentBucketSequence(bolt, bucket)
-	if err != nil {
-		return fmt.Errorf("store: reading bucket sequence: %w", err)
-	}
-	snap, snapSeq, ref := qe.snapshot.PinCurrent()
-	defer qe.snapshot.Unpin(snapSeq, ref)
-
-	if snap.Seq != seq {
-		return fmt.Errorf("store: snapshot sequence mismatch: snapshot=%d bucket=%d", snap.Seq, seq)
-	}
-	statsVersion := qe.exec.StatsVersion.Load()
-	if statsVersion == 0 {
-		statsVersion = 1
-	} else {
-		statsVersion++
-	}
-	plannerStats := qe.exec.PlannerStatsSnapshotForPersist(snap, statsVersion)
-	return persist.Store(persist.StoreConfig{
-		File:         rbiFile,
-		BucketSeq:    seq,
-		Schema:       qe.schema,
-		Snapshot:     snap,
-		PlannerStats: plannerStats,
-	})
-}
-
-type rebuilder struct {
-	active   atomic.Bool
-	inflight atomic.Int64
-	mu       sync.Mutex
-	cond     *sync.Cond
-}
-
 type (
-	// DB wraps a bbolt database and maintains secondary indexes over values of type *V
-	// stored in a single bucket. It supports efficient equality and range queries,
-	// as well as array membership and array-length queries for slice fields.
-	//
-	// DB is safe for concurrent use.
-	DB[K ~string | ~uint64, V any] struct {
-		vtype reflect.Type
-
-		bolt   *bbolt.DB
-		bucket []byte
-
-		options *Options
-		logger  *log.Logger
-
-		strKey bool
-		strMap *strmap.Mapper
-
-		schema *schema.Runtime
-
-		engine    *queryEngine // nil in transparent mode
-		rebuilder *rebuilder
-
-		closed atomic.Bool
-		broken atomic.Bool
-
-		batcher *wexec.Batcher
-
-		execOptions execOptions[K, V]
-
-		rbiFile string
-
-		encodeFn func(*V, io.Writer) error
-		decodeFn func(*V, io.Reader) error
-
-		recPool pooled.Pointers[V]
-
-		mu sync.RWMutex
-
-		stats Stats[K]
-	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
 	PlannerStats struct {
@@ -888,9 +350,9 @@ type (
 
 	// Stats is a lightweight database status snapshot.
 	Stats[K ~uint64 | ~string] struct {
-		// BuildTime is the duration of the last index rebuild.
+		// BuildTime is the duration of the startup index build.
 		BuildTime time.Duration
-		// BuildRPS is an approximate throughput (records per second) of the last index rebuild.
+		// BuildRPS is an approximate throughput (records per second) of the startup index build.
 		BuildRPS int
 		// LoadTime is the time spent loading a persisted index from disk on the last successful load.
 		LoadTime time.Duration
@@ -1092,13 +554,369 @@ type (
 	}
 )
 
-// DisableSync disables fsync for bolt writes. Can help with batch inserts.
-// It should not be used during normal operation.
-func (db *DB[K, V]) DisableSync() { db.bolt.NoSync = true }
+// DB wraps a bbolt database and maintains secondary indexes over values of type *V
+// stored in a single bucket. It supports efficient equality and range queries,
+// as well as array membership and array-length queries for slice fields.
+//
+// DB is safe for concurrent use.
+type DB[K ~string | ~uint64, V any] struct {
+	vtype  reflect.Type
+	strKey bool
 
-// EnableSync enables fsync for bolt writes. See DisableSync.
+	bolt   *bbolt.DB
+	bucket []byte
+
+	options     *Options
+	execOptions execOptions[K, V]
+
+	logger  *log.Logger
+	schema  *schema.Schema
+	index   *engine.Index // nil in transparent mode
+	batcher *wexec.Batcher
+
+	closed atomic.Bool
+	broken atomic.Bool
+
+	rbiFile string
+
+	encodeFn func(*V, io.Writer) error
+	decodeFn func(*V, io.Reader) error
+
+	recPool pooled.Pointers[V]
+
+	publishMu sync.RWMutex
+
+	stats Stats[K]
+}
+
+// New creates a new indexed DB that uses the provided bbolt database.
+//
+// The generic type V must be a struct; otherwise ErrNotStructType is returned.
+//
+// Zero-valued option fields use defaults.
+//
+// If options.BucketName is empty,
+// the name of the value type V is used as the bucket name.
+// New ensures the bucket exists, optionally loads a persisted index from disk,
+// builds missing or incompatible startup index data from bbolt, and sets up
+// field metadata and accessors.
+//
+// Any ExecOptions passed to New become defaults applied to subsequent write
+// operations on the returned DB.
+//
+// The resulting DB does not manage the underlying *bbolt.DB lifecycle.
+func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts ...ExecOption[K, V]) (db *DB[K, V], err error) {
+	var v V
+	vtype := reflect.TypeOf(v)
+	if vtype == nil {
+		return nil, ErrNotStructType
+	}
+	if vtype.Kind() != reflect.Struct {
+		return nil, ErrNotStructType
+	}
+	if err = options.validate(); err != nil {
+		return nil, err
+	}
+	options.setDefaults()
+
+	vname := vtype.Name()
+	if options.BucketName != "" {
+		vname = options.BucketName
+	}
+	if vname == "" {
+		return nil, fmt.Errorf("cannot resolve value name of %v", vtype)
+	}
+	if err = validateBucketName(vname); err != nil {
+		return nil, err
+	}
+	if bolt == nil {
+		return nil, fmt.Errorf("bolt instance is nil")
+	}
+	var defaultExecOptions execOptions[K, V]
+	applyExecOptions(&defaultExecOptions, execOpts)
+	defaultExecOptions = freezeExecOptions(defaultExecOptions)
+	encodeFn, decodeFn, err := defaultCodecMethods[V]()
+	if err != nil {
+		return nil, err
+	}
+
+	boltPath := bolt.Path()
+
+	if err = regInstance(boltPath, vname); err != nil {
+		return nil, err
+	}
+	defer unregInstanceOnError(&err, boltPath, vname)
+
+	db = &DB[K, V]{
+		vtype:   vtype,
+		bolt:    bolt,
+		bucket:  []byte(vname),
+		options: &options,
+		logger:  options.Logger,
+
+		rbiFile: bolt.Path() + "." + vname + ".rbi",
+
+		execOptions: defaultExecOptions,
+		encodeFn:    encodeFn,
+		decodeFn:    decodeFn,
+	}
+
+	var k K
+	if reflect.TypeOf(k).Kind() == reflect.String {
+		db.strKey = true
+	}
+
+	var schemaIndex map[string]schema.IndexKind
+	if options.Index != nil {
+		schemaIndex = make(map[string]schema.IndexKind, len(options.Index))
+		for name, kind := range options.Index {
+			schemaIndex[name] = schema.IndexKind(kind)
+		}
+	}
+	db.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex})
+	if err != nil {
+		return nil, err
+	}
+
+	db.index, err = engine.NewIndex(engine.Config{
+		Schema:                                  db.schema,
+		StrKey:                                  db.strKey,
+		SnapshotStats:                           db.options.EnableSnapshotStats,
+		SnapshotMaterializedPredCacheMaxEntries: db.options.SnapshotMaterializedPredCacheMaxEntries,
+		SnapshotMaterializedPredCacheMaxCardinality: db.options.SnapshotMaterializedPredCacheMaxCardinality,
+		NumericRangeBucketSize:                      db.options.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:              db.options.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:               db.options.NumericRangeBucketMinSpanKeys,
+		AnalyzeInterval:                             plannerAnalyzeInterval(db.options.AnalyzeInterval),
+		TraceSink:                                   db.options.TraceSink,
+		TraceSampleEvery:                            db.options.TraceSampleEvery,
+		StrMapCompactAt:                             defaultSnapshotStrMapCompactDepth,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = bolt.Update(func(tx *bbolt.Tx) error {
+		_, e := tx.CreateBucketIfNotExists(db.bucket)
+		return e
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		loadedPlannerStats       *qexec.PlannerStatsSnapshot
+		loadedFieldCount         int
+		loadedOrdinaryFieldCount int
+		buildMode                string
+	)
+	if db.index != nil {
+		var (
+			skipFields        map[string]struct{}
+			skipMeasureFields map[string]struct{}
+			rebuildReason     string
+		)
+		if _, err = os.Stat(db.rbiFile); err == nil {
+			if options.DisableIndexLoad {
+				rebuildReason = "persisted index load disabled"
+			} else {
+				skipFields, skipMeasureFields, loadedPlannerStats, err = db.loadIndex()
+				if err != nil {
+					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
+				}
+			}
+		} else if os.IsNotExist(err) {
+			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
+		} else if !os.IsNotExist(err) {
+			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
+		}
+
+		loadedOrdinaryFieldCount = len(skipFields)
+		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
+		totalFieldCount := len(db.schema.Fields) + len(db.schema.MeasureFields)
+		if rebuildReason != "" {
+			buildMode = "full"
+			db.logger.Printf("rbi: %s", rebuildReason)
+			db.logger.Printf(
+				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
+				loadedFieldCount,
+				totalFieldCount,
+			)
+		} else if totalFieldCount > 0 {
+			if loadedFieldCount == 0 {
+				buildMode = "full"
+				db.logger.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
+				db.logger.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
+			} else if loadedFieldCount < totalFieldCount {
+				buildMode = "partial"
+				db.logger.Printf(
+					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
+					loadedFieldCount,
+					totalFieldCount,
+					totalFieldCount-loadedFieldCount,
+				)
+			}
+		}
+
+		buildStarted := time.Now()
+		if err = db.buildIndex(skipFields, skipMeasureFields); err != nil {
+			return nil, fmt.Errorf("error building index: %w", err)
+		}
+		if buildMode != "" {
+			db.logger.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
+		}
+	}
+
+	db.initBatcher()
+
+	if db.index != nil {
+		db.stats.FieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
+		if err = db.index.PublishCurrentSequenceSnapshot(db.bolt, db.bucket); err != nil {
+			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
+		}
+
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
+			db.index.PublishLoadedPlannerStats(loadedPlannerStats)
+
+		} else {
+			if err = db.RefreshPlannerStats(); err != nil {
+				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+			}
+		}
+
+		db.startPlannerAnalyzeLoop()
+	}
+
+	return db, nil
+}
+
+func (db *DB[K, V]) initBatcher() {
+	ops := wexec.RecordOps{
+		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+			return db.encode((*V)(ptr), buf)
+		},
+		Decode: func(data []byte) (unsafe.Pointer, error) {
+			val, err := db.decode(data)
+			if err != nil {
+				return nil, err
+			}
+			return unsafe.Pointer(val), nil
+		},
+		Release: func(ptr unsafe.Pointer) {
+			db.ReleaseRecords((*V)(ptr))
+		},
+		ValidateIndex: func(ptr unsafe.Pointer) error {
+			return db.validateIndexedStringValues(ptr)
+		},
+	}
+	cfg := wexec.Config{
+		MaxOps:       db.options.AutoBatchMax,
+		Window:       db.options.AutoBatchWindow,
+		MaxQueue:     db.options.AutoBatchMaxQueue,
+		StatsEnabled: db.options.EnableAutoBatchStats,
+		Unavailable: func() error {
+			if db.closed.Load() {
+				return ErrClosed
+			}
+			if db.broken.Load() {
+				return ErrBroken
+			}
+			return nil
+		},
+		Errors: wexec.ErrorSet{
+			UniqueViolation: ErrUniqueViolation,
+		},
+
+		Bolt:               db.bolt,
+		Bucket:             db.bucket,
+		BucketFillPercent:  db.options.BucketFillPercent,
+		RejectEmptyPayload: db.decodeFn == nil,
+		PublishMu:          &db.publishMu,
+		Commit:             commitTx,
+		StrKey:             db.strKey,
+		Indexed:            db.index != nil,
+		Ops:                &ops,
+		Schema:             db.schema,
+	}
+
+	if db.index != nil {
+		db.index.ConfigureWrite(&cfg, &db.broken, db.logger, ErrUniqueViolation, ErrBroken)
+	}
+	db.batcher = wexec.NewBatcher(cfg)
+}
+
+func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
+	result, err := db.index.BuildIndex(db.bolt, db.bucket, skipFields, skipMeasureFields, db.decodeBuildIndexRecord, db.releaseBuildIndexRecord)
+	if err != nil {
+		return err
+	}
+	if result.Stats {
+		db.stats.BuildTime = result.BuildTime
+		db.stats.BuildRPS = result.BuildRPS
+	}
+	return nil
+}
+
+func (db *DB[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
+	val, err := db.decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Pointer(val), nil
+}
+
+func (db *DB[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
+	var zero V
+	val := (*V)(ptr)
+	*val = zero
+	db.recPool.Put(val)
+}
+
+func (db *DB[K, V]) validateIndexedStringValues(ptr unsafe.Pointer) error {
+	if db.index == nil || ptr == nil {
+		return nil
+	}
+	return db.index.ValidateStringValues(ptr)
+}
+
+func (db *DB[K, V]) loadIndex() (
+	skipFields map[string]struct{},
+	skipMeasureFields map[string]struct{},
+	plannerStats *qexec.PlannerStatsSnapshot,
+	err error,
+) {
+	currentSeq, err := currentBucketSequence(db.bolt, db.bucket)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
+	}
+	start := time.Now()
+	result, err := db.index.LoadIndex(db.rbiFile, db.bolt.Path(), db.bucket, currentSeq, defaultSnapshotStrMapCompactDepth, engine.LoadErrors{
+		Stale:   errPersistedIndexStale,
+		Invalid: errPersistedIndexInvalid,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	db.stats.LoadTime = time.Since(start)
+
+	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
+}
+
+func (db *DB[K, V]) storeIndex() error {
+	return db.index.StoreIndex(db.rbiFile, db.bolt, db.bucket)
+}
+
+// disableSync disables fsync for bolt writes. Can help with batch inserts.
+// It should not be used during normal operation.
+//
+// 2026-05-30: removed from public API.
+func (db *DB[K, V]) disableSync() { db.bolt.NoSync = true }
+
+// enableSync enables fsync for bolt writes. See disableSync.
 // By default, fsync is enabled.
-func (db *DB[K, V]) EnableSync() {
+//
+// 2026-05-30: removed from public API.
+func (db *DB[K, V]) enableSync() {
 	db.bolt.NoSync = false
 	_ = db.bolt.Sync()
 }
@@ -1111,86 +929,6 @@ func (db *DB[K, V]) unavailableErr() error {
 		return ErrBroken
 	}
 	return nil
-}
-
-func (db *DB[K, V]) beginOp() error {
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-	if db.rebuilder.active.Load() {
-		return ErrRebuildInProgress
-	}
-
-	db.rebuilder.inflight.Add(1)
-	if err := db.unavailableErr(); err != nil {
-		db.endOp()
-		return err
-	}
-	if db.rebuilder.active.Load() {
-		db.endOp()
-		return ErrRebuildInProgress
-	}
-	return nil
-}
-
-func (db *DB[K, V]) beginOpWait() bool {
-	for {
-		if db.unavailableErr() != nil {
-			return false
-		}
-		if !db.rebuilder.active.Load() {
-			db.rebuilder.inflight.Add(1)
-			if db.unavailableErr() != nil {
-				db.endOp()
-				return false
-			}
-			if !db.rebuilder.active.Load() {
-				return true
-			}
-			db.endOp()
-		}
-		db.rebuilder.mu.Lock()
-		for db.rebuilder.active.Load() {
-			db.rebuilder.cond.Wait()
-		}
-		db.rebuilder.mu.Unlock()
-	}
-}
-
-func (db *DB[K, V]) endOp() {
-	if db.rebuilder.inflight.Add(-1) == 0 {
-		db.rebuilder.mu.Lock()
-		db.rebuilder.cond.Broadcast()
-		db.rebuilder.mu.Unlock()
-	}
-}
-
-func (db *DB[K, V]) beginRebuildSuspend() error {
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-	if !db.rebuilder.active.CompareAndSwap(false, true) {
-		if err := db.unavailableErr(); err != nil {
-			return err
-		}
-		return ErrRebuildInProgress
-	}
-	return nil
-}
-
-func (db *DB[K, V]) endRebuildSuspend() {
-	db.rebuilder.active.Store(false)
-	db.rebuilder.mu.Lock()
-	db.rebuilder.cond.Broadcast()
-	db.rebuilder.mu.Unlock()
-}
-
-func (db *DB[K, V]) waitForInFlightOps() {
-	db.rebuilder.mu.Lock()
-	for db.rebuilder.inflight.Load() > 0 {
-		db.rebuilder.cond.Wait()
-	}
-	db.rebuilder.mu.Unlock()
 }
 
 func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
@@ -1208,118 +946,13 @@ func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 	return seq, nil
 }
 
-func (qe *queryEngine) publishCurrentSequenceSnapshotNoLock(bolt *bbolt.DB, bucket []byte, strMap *strmap.Mapper) error {
-	seq, err := currentBucketSequence(bolt, bucket)
-	if err != nil {
-		return err
-	}
-	var strSnap *strmap.Snapshot
-	if strMap != nil {
-		strSnap = strMap.Snapshot()
-	}
-	prev := qe.snapshot.Current()
-	var snap *snapshot.View
-	if prev != nil {
-		lenZeroComplement := pooled.GetBoolSlice(len(qe.schema.Indexed))[:len(qe.schema.Indexed)]
-		clear(lenZeroComplement)
-		copy(lenZeroComplement, qe.lenZeroComplement)
-		snap = snapshot.NewView(seq, prev, qe.schema, qe.snapshotCacheConfig(), snapshot.Storage{
-			Index:             indexdata.CloneFieldStorageSlots(qe.index, len(qe.schema.Indexed)),
-			NilIndex:          indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.schema.Indexed)),
-			LenIndex:          indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.schema.Indexed)),
-			LenZeroComplement: lenZeroComplement,
-			Measure:           indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.schema.Measures)),
-			Universe:          qe.universe,
-			StrMap:            strSnap,
-		})
-	} else {
-		snap = snapshot.NewView(seq, nil, qe.schema, qe.snapshotCacheConfig(), snapshot.Storage{
-			Index:             qe.index,
-			NilIndex:          qe.nilIndex,
-			LenIndex:          qe.lenIndex,
-			LenZeroComplement: qe.lenZeroComplement,
-			Measure:           qe.measure,
-			Universe:          qe.universe,
-			StrMap:            strSnap,
-		})
-	}
-	qe.installViewNoLock(snap)
-	if strMap != nil {
-		strMap.MarkCommittedPublished(strSnap)
-	}
-	return nil
-}
-
-func (qe *queryEngine) publishStorageSnapshotNoLock(seq uint64, strMap *strmap.Mapper, st snapshot.Storage) {
-	if strMap != nil {
-		st.StrMap = strMap.Snapshot()
-	}
-	snap := snapshot.NewView(seq, qe.snapshot.Current(), qe.schema, qe.snapshotCacheConfig(), st)
-	qe.installViewNoLock(snap)
-	if strMap != nil {
-		strMap.MarkCommittedPublished(st.StrMap)
-	}
-}
-
-func publishAfterCommitLocked(broken *atomic.Bool, logger *log.Logger, engine *queryEngine, seq uint64, op string, publish func()) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			if broken.CompareAndSwap(false, true) {
-				logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, r)
-				if stop := engine.exec.Analyzer.Stop; stop != nil {
-					select {
-					case <-stop:
-					default:
-						close(stop)
-					}
-				}
-			}
-			err = ErrBroken
-			engine.snapshot.DropStaged(seq)
-		}
-	}()
-	publish()
-	return nil
-}
-
 func commitTx(tx *bbolt.Tx, _ string) error {
 	return tx.Commit()
 }
 
-// RebuildIndex discards and rebuilds all in-memory index data.
-// It acquires an exclusive lock for its duration.
-// While rebuild is active, new DB operations fail with ErrRebuildInProgress.
-// While it is safe to call at any time, it might be expensive for large datasets.
-func (db *DB[K, V]) RebuildIndex() error {
-	if err := db.beginRebuildSuspend(); err != nil {
-		return err
-	}
-	defer db.endRebuildSuspend()
-
-	db.waitForInFlightOps()
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-	if db.engine == nil {
-		return ErrNoIndex
-	}
-
-	if err := db.buildIndex(nil, nil); err != nil {
-		return fmt.Errorf("error building index: %w", err)
-	}
-
-	db.refreshPlannerStatsLocked()
-	debug.FreeOSMemory()
-	return nil
-}
-
 // Stats returns a lightweight database status snapshot.
 //
-// In indexed mode it reports the last rebuild/load timings together with the
+// In indexed mode it reports startup build/load timings together with the
 // current published snapshot cardinality and last key.
 //
 // In transparent mode no runtime index snapshot is maintained, so fields that
@@ -1328,25 +961,27 @@ func (db *DB[K, V]) RebuildIndex() error {
 // no indexed fields exist in that mode. Auto-batcher fields remain meaningful
 // in both modes.
 //
-// If the DB is unavailable or already closed and the method cannot enter an
-// operation window, it returns a zero value.
+// If DB is closed or broken, Stats returns a zero value.
 func (db *DB[K, V]) Stats() Stats[K] {
-	if !db.beginOpWait() {
+	if err := db.unavailableErr(); err != nil {
 		return Stats[K]{}
 	}
-	defer db.endOp()
 
-	db.mu.RLock()
+	db.publishMu.RLock()
 	out := db.stats
-	db.mu.RUnlock()
+	db.publishMu.RUnlock()
 
-	if db.engine != nil {
-		snap, seq, ref := db.engine.snapshot.PinCurrent()
-		defer db.engine.snapshot.Unpin(seq, ref)
-
-		out.KeyCount = snap.UniverseCardinality()
-		out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
-		out.SnapshotSequence = snap.Seq
+	if db.index != nil {
+		st := db.index.DBStats()
+		out.KeyCount = st.KeyCount
+		out.SnapshotSequence = st.Sequence
+		if st.HasLast {
+			if db.strKey {
+				out.LastKey = *(*K)(unsafe.Pointer(&st.LastKey))
+			} else {
+				out.LastKey = *(*K)(unsafe.Pointer(&st.LastID))
+			}
+		}
 	}
 
 	queueLen, queueMax, executed, dequeued := db.batcher.BasicStats()
@@ -1361,35 +996,6 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	return out
 }
 
-func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *snapshot.View, keyCount uint64) K {
-	var zero K
-	if snap == nil || keyCount == 0 {
-		return zero
-	}
-
-	var maxIdx uint64
-	if snap.Universe.IsEmpty() {
-		return zero
-	}
-	maxIdx, _ = snap.Universe.Maximum()
-
-	return db.statsKeyFromIdx(snap, maxIdx)
-}
-
-func (db *DB[K, V]) statsKeyFromIdx(snap *snapshot.View, idx uint64) K {
-	var zero K
-	if db.strKey {
-		if snap == nil || snap.StrMap == nil {
-			return zero
-		}
-		if key, ok := snap.StrMap.String(idx); ok {
-			return *(*K)(unsafe.Pointer(&key))
-		}
-		return zero
-	}
-	return *(*K)(unsafe.Pointer(&idx))
-}
-
 // IndexStats returns current expensive index shape and memory diagnostics.
 //
 // In indexed mode it walks the published index snapshot and reports per-field
@@ -1400,71 +1006,31 @@ func (db *DB[K, V]) statsKeyFromIdx(snap *snapshot.View, idx uint64) K {
 // In transparent mode it returns a zero-valued IndexStats because no secondary
 // indexes, universe bitmap, or string-key runtime mapping are maintained.
 //
-// If the DB is unavailable or already closed and the method cannot enter an
-// operation window, it returns a zero value.
+// If DB is closed or broken, IndexStats returns a zero value.
 func (db *DB[K, V]) IndexStats() IndexStats {
-	if !db.beginOpWait() {
-		return IndexStats{}
-	}
-	defer db.endOp()
-
-	if db.engine == nil {
+	if err := db.unavailableErr(); err != nil {
 		return IndexStats{}
 	}
 
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	return db.engine.indexStats(snap)
-}
-
-func (qe *queryEngine) indexStats(snap *snapshot.View) IndexStats {
-	idx := IndexStats{
-		UniqueFieldKeys:        make(map[string]uint64),
-		FieldSize:              make(map[string]uint64),
-		FieldKeyBytes:          make(map[string]uint64),
-		FieldTotalCardinality:  make(map[string]uint64),
-		FieldApproxStructBytes: make(map[string]uint64),
-		FieldApproxHeapBytes:   make(map[string]uint64),
-	}
-	sharedStructBytes := indexdata.FieldStorageSlotsApproxBytes(snap.Index) + indexdata.FieldStorageSlotsApproxBytes(snap.NilIndex)
-	fieldCount := len(qe.schema.Indexed)
-	sharedStructPerField := uint64(0)
-	sharedStructRemainder := uint64(0)
-	if fieldCount > 0 {
-		sharedStructPerField = sharedStructBytes / uint64(fieldCount)
-		sharedStructRemainder = sharedStructBytes % uint64(fieldCount)
+	if db.index == nil {
+		return IndexStats{}
 	}
 
-	for i, acc := range qe.schema.Indexed {
-		name := acc.Name
-		fieldStats := snap.Index[acc.Ordinal].Stats(true)
-		nilStats := snap.NilIndex[acc.Ordinal].Stats(false)
-
-		unique := fieldStats.Unique + nilStats.Unique
-		size := fieldStats.PostingBytes + nilStats.PostingBytes
-		keyLen := fieldStats.KeyBytes + nilStats.KeyBytes
-		card := fieldStats.PostingCardinality + nilStats.PostingCardinality
-
-		idx.UniqueFieldKeys[name] = unique
-		idx.FieldSize[name] = size
-		idx.FieldKeyBytes[name] = keyLen
-		idx.FieldTotalCardinality[name] = card
-		fieldStructBytes := fieldStats.ApproxStructBytes + nilStats.ApproxStructBytes + sharedStructPerField
-		if uint64(i) < sharedStructRemainder {
-			fieldStructBytes++
-		}
-		idx.FieldApproxStructBytes[name] = fieldStructBytes
-		idx.FieldApproxHeapBytes[name] = size + keyLen + fieldStructBytes
-
-		idx.Size += size
-		idx.EntryCount += fieldStats.EntryCount + nilStats.EntryCount
-		idx.KeyBytes += keyLen
-		idx.PostingCardinality += card
-		idx.ApproxStructBytes += fieldStructBytes
+	st := db.index.IndexStats()
+	return IndexStats{
+		UniqueFieldKeys:        st.UniqueFieldKeys,
+		Size:                   st.Size,
+		FieldSize:              st.FieldSize,
+		FieldKeyBytes:          st.FieldKeyBytes,
+		FieldTotalCardinality:  st.FieldTotalCardinality,
+		FieldApproxStructBytes: st.FieldApproxStructBytes,
+		FieldApproxHeapBytes:   st.FieldApproxHeapBytes,
+		EntryCount:             st.EntryCount,
+		KeyBytes:               st.KeyBytes,
+		PostingCardinality:     st.PostingCardinality,
+		ApproxStructBytes:      st.ApproxStructBytes,
+		ApproxHeapBytes:        st.ApproxHeapBytes,
 	}
-	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
-	return idx
 }
 
 func unregInstanceOnError(err *error, boltPath string, vname string) {
@@ -1496,27 +1062,17 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 // returned planner payload is zero-valued.
 func (db *DB[K, V]) PlannerStats() PlannerStats {
 	var out PlannerStats
-	if db.engine == nil {
+	if db.index == nil {
 		return out
 	}
-	out.Fields = make(map[string]PlannerFieldStats)
-
-	if ps := db.engine.exec.Stats.Load(); ps != nil {
-		out.Version = ps.Version
-		out.GeneratedAt = ps.GeneratedAt
-		out.UniverseCardinality = ps.UniverseCardinality
-		out.FieldCount = len(ps.Fields)
-		if out.FieldCount > 0 {
-			out.Fields = make(map[string]PlannerFieldStats, out.FieldCount)
-			for k, v := range ps.Fields {
-				out.Fields[k] = v
-			}
-		}
-	}
-	out.TraceSampleEvery = db.engine.exec.Tracer.SampleEvery()
-	db.engine.exec.Analyzer.Lock()
-	out.AnalyzeInterval = db.engine.exec.Analyzer.Interval
-	db.engine.exec.Analyzer.Unlock()
+	st := db.index.PlannerStats()
+	out.Version = st.Version
+	out.GeneratedAt = st.GeneratedAt
+	out.UniverseCardinality = st.UniverseCardinality
+	out.FieldCount = st.FieldCount
+	out.Fields = st.Fields
+	out.AnalyzeInterval = st.AnalyzeInterval
+	out.TraceSampleEvery = st.TraceSampleEvery
 	return out
 }
 
@@ -1537,12 +1093,12 @@ func (db *DB[K, V]) Close() error {
 
 	db.batcher.WakeWaiters()
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.publishMu.Lock()
+	defer db.publishMu.Unlock()
 
 	var err error
 
-	if db.engine != nil && !db.options.DisableIndexStore && !db.broken.Load() {
+	if db.index != nil && !db.options.DisableIndexStore && !db.broken.Load() {
 		err = db.storeIndex()
 	}
 
@@ -1557,22 +1113,20 @@ func (db *DB[K, V]) Close() error {
 //
 // Truncate does not reclaim disk space.
 func (db *DB[K, V]) Truncate() error {
-	if err := db.beginOp(); err != nil {
+	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	defer db.endOp()
 
 	// Keep writer lock order consistent with batched/single write paths:
-	// open bbolt write tx first, then take db.mu. This avoids tx<->mu inversion
-	// deadlocks against the write executor, which already uses that order.
+	// open bbolt write tx first, then take db.publishMu.
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
 		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.publishMu.Lock()
+	defer db.publishMu.Unlock()
 
 	if err = db.unavailableErr(); err != nil {
 		return err
@@ -1593,7 +1147,7 @@ func (db *DB[K, V]) Truncate() error {
 	if err = bucket.SetSequence(prevSeq); err != nil {
 		return fmt.Errorf("restore bucket sequence: %w", err)
 	}
-	if db.engine == nil {
+	if db.index == nil {
 		if _, err = bucket.NextSequence(); err != nil {
 			return fmt.Errorf("advance bucket sequence: %w", err)
 		}
@@ -1607,51 +1161,13 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	slotCount := len(db.engine.schema.Indexed)
-	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
-	clear(nextLenZeroComplement)
-	measureSlotCount := len(db.engine.schema.Measures)
-	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	nextUniverse := posting.List{}
-	var nextStrMap *strmap.Snapshot
-	if db.strKey {
-		nextStrMap = strmap.EmptySnapshot()
-	}
-	snap := snapshot.NewView(seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.snapshotCacheConfig(), snapshot.Storage{
-		Index:             nextIndex,
-		NilIndex:          nextNilIndex,
-		LenIndex:          nextLenIndex,
-		LenZeroComplement: nextLenZeroComplement,
-		Measure:           nextMeasure,
-		Universe:          nextUniverse,
-		StrMap:            nextStrMap,
-	})
-	db.engine.snapshot.Stage(snap)
+	staged := db.index.StageTruncate(seq)
 	if err = commitTx(tx, "truncate"); err != nil {
-		db.engine.snapshot.DropStaged(seq)
+		db.index.DropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
-	if db.strKey {
-		db.strMap.Truncate()
-	}
-	db.engine.index = nextIndex
-	db.engine.nilIndex = nextNilIndex
-	db.engine.lenIndex = nextLenIndex
-	db.engine.lenZeroComplement = nextLenZeroComplement
-	db.engine.measure = nextMeasure
-
-	// Keep previously published snapshots immutable for concurrent readers.
-	db.engine.universe = nextUniverse
-	if err = publishAfterCommitLocked(&db.broken, db.logger, db.engine, seq, "truncate", func() {
-		db.engine.installViewNoLock(snap)
-		if db.strMap != nil {
-			db.strMap.MarkCommittedPublished(snap.StrMap)
-		}
-	}); err != nil {
+	if err = db.index.PublishCommittedStaged(&db.broken, db.logger, ErrBroken, seq, "truncate", staged); err != nil {
 		return err
 	}
 

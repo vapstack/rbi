@@ -248,8 +248,8 @@ func scoreForDynamicProfile(r *rand.Rand, i int, p dynamicBenchProfile, scoreZip
 func seedBenchDataDynamicProfile(tb testing.TB, db *DB[uint64, UserBench], profile dynamicBenchProfile) {
 	tb.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	r := newRand(profile.seed)
 

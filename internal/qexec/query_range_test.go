@@ -158,9 +158,6 @@ func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	expr := qx.GTE("age", 2_500)
 
 	// Baseline: force classic per-key range scan by requiring an unrealistically
@@ -200,9 +197,6 @@ func TestEvalSimple_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	// Mutate the numeric field used in the range predicate before evaluation.
 	for i := 1; i <= 128; i++ {
@@ -250,9 +244,6 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 2_000),
@@ -291,9 +282,6 @@ func TestCount_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	for i := 1; i <= 256; i++ {
 		err := db.Patch(uint64(i), []Field{
@@ -340,9 +328,6 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	expr := qx.GTE("age", 2_500)
@@ -387,9 +372,6 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
@@ -436,9 +418,6 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
@@ -487,9 +466,6 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -565,9 +541,6 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -662,9 +635,6 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -746,9 +716,6 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -799,9 +766,6 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	// Keep mutated ages outside queried range so bucket fast-path can reuse a
 	// shared base full-span postingResult without cloning it.
@@ -861,9 +825,6 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -921,9 +882,6 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -973,9 +931,6 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -1027,9 +982,6 @@ func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWar
 			Score: float64(20_000 - i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
@@ -1068,9 +1020,6 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 

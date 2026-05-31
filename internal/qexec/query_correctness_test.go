@@ -974,7 +974,7 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 		MatPredMaxCard:    testMatPredCacheMaxCard,
 	}
 	qe := &queryEngine{
-		snapshot: snapshot.NewManager(false),
+		snapshot: snapshot.NewRegistry(false),
 		schema:   rt,
 		exec:     exec,
 		cfg:      cfg,

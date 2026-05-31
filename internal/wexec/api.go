@@ -30,9 +30,8 @@ type ErrorSet struct {
 }
 
 type SnapshotOps struct {
-	Enabled     bool
-	Manager     *snapshot.Manager
-	Schema      *schema.Runtime
+	Manager     *snapshot.Registry
+	Schema      *schema.Schema
 	CacheConfig func() snapshot.CacheConfig
 	StrMap      *strmap.Mapper
 	PatchFields map[string]*schema.Field

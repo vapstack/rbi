@@ -202,9 +202,6 @@ func TestQueryKeys_NoOrderBroadNegativeAll_MatchesExpected(t *testing.T) {
 			},
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.NOTIN("country", []string{"US"}))
 
@@ -1348,9 +1345,6 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 			},
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	queries := []*qx.QX{
 		qx.Query(
@@ -1402,9 +1396,6 @@ func TestQueryExt_ConcurrentDeepOrderedWindowQueries_RemainStable(t *testing.T) 
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	type expectation struct {
 		q     *qx.QX
@@ -1664,9 +1655,6 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	queries := []*qx.QX{
 		qx.Query(
@@ -1730,9 +1718,6 @@ func TestQueryExt_OrderedOROverlap_DeduplicatesAcrossMutations(t *testing.T) {
 			},
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(

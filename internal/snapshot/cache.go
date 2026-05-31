@@ -14,26 +14,26 @@ func inheritNumericRangeBucketCache(next, prev *View) {
 	next.numericRangeBucketCache.InheritFrom(prev.numericRangeBucketCache, next.Index, next.IndexedFieldByName)
 }
 
-func (s *View) initRuntimeCaches(rt *schema.Runtime, cfg CacheConfig) {
-	s.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(len(rt.Indexed), cfg.MatPredMaxCard)
+func (v *View) initRuntimeCaches(s *schema.Schema, cfg CacheConfig) {
+	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(len(s.Indexed), cfg.MatPredMaxCard)
 	if cfg.MatPredMaxEntries > 0 {
-		s.matPredCache = qcache.GetMaterializedPredCache(cfg.MatPredMaxEntries, cfg.MatPredMaxCard)
+		v.matPredCache = qcache.GetMaterializedPredCache(cfg.MatPredMaxEntries, cfg.MatPredMaxCard)
 	}
 }
 
-func (s *View) NumericRangeBucketCache() *qcache.NumericRangeBucketCache {
-	return s.numericRangeBucketCache
+func (v *View) NumericRangeBucketCache() *qcache.NumericRangeBucketCache {
+	return v.numericRangeBucketCache
 }
 
-func (s *View) MaterializedPredCache() *qcache.MaterializedPredCache {
-	return s.matPredCache
+func (v *View) MaterializedPredCache() *qcache.MaterializedPredCache {
+	return v.matPredCache
 }
 
-func (s *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *qcache.NumericRangeBucketEntry {
+func (v *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *qcache.NumericRangeBucketEntry {
 	if storage.KeyCount() == 0 {
 		return nil
 	}
-	cache := s.numericRangeBucketCache
+	cache := v.numericRangeBucketCache
 	if cache == nil {
 		return nil
 	}
@@ -51,30 +51,30 @@ func (s *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage i
 	return entry
 }
 
-func (s *View) MaterializedPredCacheEntryCount() int {
-	if s.matPredCache == nil {
+func (v *View) MaterializedPredCacheEntryCount() int {
+	if v.matPredCache == nil {
 		return 0
 	}
-	return s.matPredCache.EntryCount()
+	return v.matPredCache.EntryCount()
 }
 
-func (s *View) AllowsMaterializedPredCard(card uint64) bool {
-	if s.matPredCache == nil {
+func (v *View) AllowsMaterializedPredCard(card uint64) bool {
+	if v.matPredCache == nil {
 		return false
 	}
-	maxCard := s.matPredCache.MaxCardinality()
+	maxCard := v.matPredCache.MaxCardinality()
 	return maxCard == 0 || card <= maxCard
 }
 
-func (s *View) CanShareModeratelyOversizedMaterializedPred(est uint64) bool {
-	if s.matPredCache == nil || est == 0 {
+func (v *View) CanShareModeratelyOversizedMaterializedPred(est uint64) bool {
+	if v.matPredCache == nil || est == 0 {
 		return false
 	}
-	cacheLimit := s.matPredCache.Limit()
+	cacheLimit := v.matPredCache.Limit()
 	if cacheLimit <= 0 {
 		return false
 	}
-	maxCard := s.matPredCache.MaxCardinality()
+	maxCard := v.matPredCache.MaxCardinality()
 	if maxCard == 0 {
 		return false
 	}
@@ -111,134 +111,134 @@ func inheritMaterializedPredCache(next, prev *View, fields schema.IndexedFieldMa
 	)
 }
 
-func (s *View) LoadMaterializedPredKey(key qcache.MaterializedPredKey) (posting.List, bool) {
-	if key.IsZero() || s.matPredCache == nil {
+func (v *View) LoadMaterializedPredKey(key qcache.MaterializedPredKey) (posting.List, bool) {
+	if key.IsZero() || v.matPredCache == nil {
 		return posting.List{}, false
 	}
-	return s.matPredCache.Load(key)
+	return v.matPredCache.Load(key)
 }
 
-func (s *View) HasMaterializedPredKey(key qcache.MaterializedPredKey) bool {
-	if key.IsZero() || s.matPredCache == nil {
+func (v *View) HasMaterializedPredKey(key qcache.MaterializedPredKey) bool {
+	if key.IsZero() || v.matPredCache == nil {
 		return false
 	}
-	return s.matPredCache.Has(key)
+	return v.matPredCache.Has(key)
 }
 
-func (s *View) StoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) {
-	if key.IsZero() || s.matPredCache == nil {
+func (v *View) StoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) {
+	if key.IsZero() || v.matPredCache == nil {
 		return
 	}
-	s.matPredCache.Store(key, ids)
+	v.matPredCache.Store(key, ids)
 }
 
 // TryStoreMaterializedPredOversizedKey stores a small bounded number of oversized
 // materialized postings per snapshot as a hot-cache fallback.
-func (s *View) TryStoreMaterializedPredOversizedKey(key qcache.MaterializedPredKey, ids posting.List) bool {
-	if key.IsZero() || ids.IsEmpty() || s.matPredCache == nil {
+func (v *View) TryStoreMaterializedPredOversizedKey(key qcache.MaterializedPredKey, ids posting.List) bool {
+	if key.IsZero() || ids.IsEmpty() || v.matPredCache == nil {
 		return false
 	}
-	return s.matPredCache.TryStoreOversized(key, ids)
+	return v.matPredCache.TryStoreOversized(key, ids)
 }
 
-func (s *View) LoadOrStoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) (posting.List, bool) {
-	if key.IsZero() || ids.IsEmpty() || s.matPredCache == nil {
+func (v *View) LoadOrStoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) (posting.List, bool) {
+	if key.IsZero() || ids.IsEmpty() || v.matPredCache == nil {
 		return ids, false
 	}
-	return s.matPredCache.LoadOrStore(key, ids)
+	return v.matPredCache.LoadOrStore(key, ids)
 }
 
-func (s *View) TryLoadOrStoreMaterializedPredOversizedKey(key qcache.MaterializedPredKey, ids posting.List) (posting.List, bool) {
-	if key.IsZero() || ids.IsEmpty() || s.matPredCache == nil {
+func (v *View) TryLoadOrStoreMaterializedPredOversizedKey(key qcache.MaterializedPredKey, ids posting.List) (posting.List, bool) {
+	if key.IsZero() || ids.IsEmpty() || v.matPredCache == nil {
 		return ids, false
 	}
-	return s.matPredCache.TryLoadOrStoreOversized(key, ids)
+	return v.matPredCache.TryLoadOrStoreOversized(key, ids)
 }
 
-func (s *View) MaterializedPredCacheLimit() int {
-	if s.matPredCache == nil {
+func (v *View) MaterializedPredCacheLimit() int {
+	if v.matPredCache == nil {
 		return 0
 	}
-	return s.matPredCache.Limit()
+	return v.matPredCache.Limit()
 }
 
-func (s *View) ClearRuntimeCaches() {
-	if s.numericRangeBucketCache != nil {
-		s.numericRangeBucketCache.ClearEntries()
+func (v *View) ClearRuntimeCaches() {
+	if v.numericRangeBucketCache != nil {
+		v.numericRangeBucketCache.ClearEntries()
 	}
-	if s.matPredCache != nil {
-		s.matPredCache.Clear()
+	if v.matPredCache != nil {
+		v.matPredCache.Clear()
 	}
-	s.runtimeMatPredSeen.Clear()
-	s.runtimeMatPredObserved.Clear()
-	s.runtimeMatPredDirty.Clear()
+	v.runtimeMatPredSeen.Clear()
+	v.runtimeMatPredObserved.Clear()
+	v.runtimeMatPredDirty.Clear()
 }
 
-func (s *View) RuntimeMaterializedPredSeenEntryCount() int {
-	return s.runtimeMatPredSeen.EntryCount()
+func (v *View) RuntimeMaterializedPredSeenEntryCount() int {
+	return v.runtimeMatPredSeen.EntryCount()
 }
 
-func (s *View) RuntimeMaterializedPredObservedEntryCount() int {
-	return s.runtimeMatPredObserved.EntryCount()
+func (v *View) RuntimeMaterializedPredObservedEntryCount() int {
+	return v.runtimeMatPredObserved.EntryCount()
 }
 
-func (s *View) drainRetiredRuntimeCaches() {
-	if s.matPredCache != nil {
-		s.matPredCache.DrainRetired()
+func (v *View) drainRetiredRuntimeCaches() {
+	if v.matPredCache != nil {
+		v.matPredCache.DrainRetired()
 	}
 }
 
-func (s *View) releaseRuntimeCaches() {
-	if s.numericRangeBucketCache != nil {
-		qcache.ReleaseNumericRangeBucketCache(s.numericRangeBucketCache)
-		s.numericRangeBucketCache = nil
+func (v *View) releaseRuntimeCaches() {
+	if v.numericRangeBucketCache != nil {
+		qcache.ReleaseNumericRangeBucketCache(v.numericRangeBucketCache)
+		v.numericRangeBucketCache = nil
 	}
-	if s.matPredCache != nil {
-		s.matPredCache.ReleaseRef()
-		s.matPredCache = nil
+	if v.matPredCache != nil {
+		v.matPredCache.ReleaseRef()
+		v.matPredCache = nil
 	}
-	s.runtimeMatPredSeen.Clear()
-	s.runtimeMatPredObserved.Clear()
-	s.runtimeMatPredDirty.Clear()
+	v.runtimeMatPredSeen.Clear()
+	v.runtimeMatPredObserved.Clear()
+	v.runtimeMatPredDirty.Clear()
 }
 
-func (s *View) ShouldPromoteRuntimeMaterializedPredKey(key qcache.MaterializedPredKey) bool {
+func (v *View) ShouldPromoteRuntimeMaterializedPredKey(key qcache.MaterializedPredKey) bool {
 	if key.IsZero() {
 		return false
 	}
-	return s.runtimeMatPredSeen.TouchOrRemember(key, qcache.RecentKeyLimit(s.MaterializedPredCacheLimit()))
+	return v.runtimeMatPredSeen.TouchOrRemember(key, qcache.RecentKeyLimit(v.MaterializedPredCacheLimit()))
 }
 
-func (s *View) HasRuntimeMaterializedPredSeenKey(key qcache.MaterializedPredKey) bool {
+func (v *View) HasRuntimeMaterializedPredSeenKey(key qcache.MaterializedPredKey) bool {
 	if key.IsZero() {
 		return false
 	}
-	return s.runtimeMatPredSeen.Contains(key)
+	return v.runtimeMatPredSeen.Contains(key)
 }
 
-func (s *View) ShouldPromoteObservedMaterializedPredKey(key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {
+func (v *View) ShouldPromoteObservedMaterializedPredKey(key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {
 	if key.IsZero() || observedWork == 0 || buildWork == 0 {
 		return false
 	}
-	promote, hadWork := s.runtimeMatPredObserved.AddWorkAndShouldPromote(
+	promote, hadWork := v.runtimeMatPredObserved.AddWorkAndShouldPromote(
 		key,
-		qcache.RecentKeyLimit(s.MaterializedPredCacheLimit()),
+		qcache.RecentKeyLimit(v.MaterializedPredCacheLimit()),
 		observedWork,
 		buildWork,
 	)
-	return promote && (hadWork || s.runtimeMatPredDirty.Work(key) == 0)
+	return promote && (hadWork || v.runtimeMatPredDirty.Work(key) == 0)
 }
 
-func (s *View) ObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
+func (v *View) ObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
 	if key.IsZero() {
 		return 0
 	}
-	return s.runtimeMatPredObserved.Work(key)
+	return v.runtimeMatPredObserved.Work(key)
 }
 
-func (s *View) DirtyObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
+func (v *View) DirtyObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
 	if key.IsZero() {
 		return 0
 	}
-	return s.runtimeMatPredDirty.Work(key)
+	return v.runtimeMatPredDirty.Work(key)
 }

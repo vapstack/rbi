@@ -20,7 +20,7 @@ type benchRec struct {
 	Score float64  `rbi:"measure"`
 }
 
-func benchRuntime(b testing.TB) *schema.Runtime {
+func benchRuntime(b testing.TB) *schema.Schema {
 	b.Helper()
 	rt, err := schema.Compile(reflect.TypeOf(benchRec{}), schema.Config{})
 	if err != nil {
@@ -311,7 +311,7 @@ func BenchmarkBuildPreparedAggregatedRepeatedID(b *testing.B) {
 }
 
 func BenchmarkManagerPinUnpinRetired(b *testing.B) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 	current := &View{Seq: 1}
 	m.Publish(current)
 	_, ref, ok := m.PinBySeq(current.Seq)
@@ -332,7 +332,7 @@ func BenchmarkManagerPinUnpinRetired(b *testing.B) {
 }
 
 func BenchmarkManagerPinCurrentStatsUnpin(b *testing.B) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 	m.Publish(&View{Seq: 1})
 
 	b.ReportAllocs()
@@ -349,7 +349,7 @@ func BenchmarkManagerPinCurrentStatsUnpin(b *testing.B) {
 }
 
 func BenchmarkManagerStageDropStaged(b *testing.B) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -360,7 +360,7 @@ func BenchmarkManagerStageDropStaged(b *testing.B) {
 }
 
 func BenchmarkManagerPublishSameSeqReplace(b *testing.B) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 	m.Publish(&View{Seq: 1})
 
 	b.ReportAllocs()

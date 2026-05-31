@@ -62,8 +62,8 @@ func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
 	tb.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	r := newRand(1)
 

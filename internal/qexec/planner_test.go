@@ -805,9 +805,6 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -890,9 +887,6 @@ func TestPlannerORNoOrder_BroadResidualRangeStaysLazyDuringAdaptiveLimit(t *test
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -978,9 +972,6 @@ func TestPlannerORNoOrder_ExactLeadWithComplementRangeResidualNotExhausted(t *te
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -1058,9 +1049,6 @@ func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T
 		if err := db.Set(uint64(i+5), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	q := qx.Query(
@@ -1143,9 +1131,6 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		if err := db.Set(uint64(i+105), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	view := db.engine.currentQueryViewForTests()
@@ -1245,9 +1230,6 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		if err := db.Set(uint64(i+105), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	view := db.engine.currentQueryViewForTests()
@@ -1354,9 +1336,6 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		if err := db.Set(uint64(i+105), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	q := qx.Query(
@@ -1584,9 +1563,6 @@ func TestInitOrderedORBranchEstimates_ExcludesCoveredLeafFromCard(t *testing.T) 
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	if got := view.snap.Universe.Cardinality(); got != 100 {
@@ -1704,9 +1680,6 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -1805,9 +1778,6 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -1916,9 +1886,6 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -2031,9 +1998,6 @@ func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.OR(
@@ -2181,9 +2145,6 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	warm, ok := db.engine.buildPredicatesOrderedWithMode(
@@ -2781,9 +2742,6 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	scoreExpr := qx.GTE("score", 500.0)
 	ageExpr := qx.GTE("age", 500)
@@ -2836,9 +2794,6 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	leaves := []qx.Expr{
 		qx.GTE("score", 500.0),
@@ -2880,9 +2835,6 @@ func TestBuildPredicates_MergesPositiveNumericRangeLeavesOnSameField(t *testing.
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	leaves := []qx.Expr{
 		qx.EQ("active", true),
@@ -2995,9 +2947,6 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
@@ -3063,9 +3012,6 @@ func TestOrderedLimitBaseCoreStats_NullableComplementCacheUsesBuildCardinality(t
 		if err := db.Set(uint64(i+6), rec); err != nil {
 			t.Fatalf("Set(rank_%03d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	view := db.engine.currentQueryViewForTests()

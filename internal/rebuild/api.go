@@ -29,7 +29,7 @@ type State struct {
 type Config struct {
 	Bolt              *bbolt.DB
 	Bucket            []byte
-	Schema            *schema.Runtime
+	Schema            *schema.Schema
 	Current           *snapshot.View
 	StrKey            bool
 	StrMap            *strmap.Mapper

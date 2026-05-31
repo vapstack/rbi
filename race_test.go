@@ -907,8 +907,8 @@ func raceExtraOpenTempDBString(t *testing.T, opts Options) *DB[string, raceExtra
 func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec], n int, gen func(i int) *raceExtraRec) {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
@@ -942,8 +942,8 @@ func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec]
 func raceExtraSeedGeneratedStringData(t *testing.T, db *DB[string, raceExtraRec], keys []string, gen func(i int, key string) *raceExtraRec) {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	batchSize := 32 << 10
 	if len(keys) > 0 && len(keys) < batchSize {
@@ -1014,9 +1014,6 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 			FullName:      fmt.Sprintf("FN-%04d", i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	type tc struct {
 		q    *qx.QX
@@ -1146,9 +1143,6 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 			FullName:      fmt.Sprintf("FN-%04d", i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	queries := []*qx.QX{
 		qx.Query(qx.GTE("age", 2500)),

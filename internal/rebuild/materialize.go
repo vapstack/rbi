@@ -201,13 +201,13 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 	}
 }
 
-func buildLenIndexStorage(rt *schema.Runtime, index []indexdata.FieldStorage, universe posting.List) ([]indexdata.FieldStorage, []bool) {
-	slotCount := len(rt.Indexed)
+func buildLenIndexStorage(s *schema.Schema, index []indexdata.FieldStorage, universe posting.List) ([]indexdata.FieldStorage, []bool) {
+	slotCount := len(s.Indexed)
 	lenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	lenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(lenZeroComplement)
 
-	for _, acc := range rt.Indexed {
+	for _, acc := range s.Indexed {
 		if !acc.Field.Slice {
 			continue
 		}

@@ -100,7 +100,7 @@ func benchmarkBeforeCommit(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.P
 	return nil
 }
 
-func benchmarkRuntime(tb testing.TB) *schema.Runtime {
+func benchmarkRuntime(tb testing.TB) *schema.Schema {
 	tb.Helper()
 
 	rt, err := schema.Compile(reflect.TypeFor[benchmarkWexecRec](), schema.Config{})
@@ -155,7 +155,7 @@ func newBenchmarkExecutor(tb testing.TB, cfg benchmarkExecutorConfig) *Batcher {
 	var unique UniqueContext
 	errs := ErrorSet{}
 	if cfg.indexed {
-		manager := snapshot.NewManager(false)
+		manager := snapshot.NewRegistry(false)
 		storage := snapshot.Storage{}
 		if sm != nil {
 			storage.StrMap = sm.Snapshot()
@@ -167,7 +167,6 @@ func newBenchmarkExecutor(tb testing.TB, cfg benchmarkExecutorConfig) *Batcher {
 		}
 
 		snapOps = SnapshotOps{
-			Enabled:     true,
 			Manager:     manager,
 			Schema:      rt,
 			CacheConfig: benchmarkSnapshotCacheConfig,
@@ -204,7 +203,7 @@ func newBenchmarkExecutor(tb testing.TB, cfg benchmarkExecutorConfig) *Batcher {
 		Bucket:             bucket,
 		BucketFillPercent:  0.8,
 		RejectEmptyPayload: true,
-		RootMu:             &rootMu,
+		PublishMu:          &rootMu,
 		Commit:             benchmarkCommit,
 		StrKey:             cfg.strKey,
 		StrMap:             sm,

@@ -1062,30 +1062,6 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 	return got
 }
 
-func waitAutoBatchExtraStrMapHasKeys[V any](tb testing.TB, db *DB[string, V], keys ...string) {
-	tb.Helper()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		snap := db.strMap.Snapshot()
-		ok := true
-		for _, key := range keys {
-			if _, exists := snap.Index(key); !exists {
-				ok = false
-				break
-			}
-		}
-
-		if ok {
-			return
-		}
-		if time.Now().After(deadline) {
-			tb.Fatalf("timeout waiting for strmap keys %v", keys)
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-}
-
 func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
@@ -1109,57 +1085,6 @@ func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
 	}
 	if after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
 		t.Fatalf("closed write must not enqueue/dequeue, before=%+v after=%+v", before, after)
-	}
-}
-
-func TestAutoBatchExtra_StringAtomicCloseAfterPrepare_RollsBackRawWrites(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
-
-	if err := db.Set("seed", &Product{SKU: "seed", Price: 10}); err != nil {
-		t.Fatalf("seed Set: %v", err)
-	}
-
-	db.mu.Lock()
-	execDone := make(chan error, 1)
-	go func() {
-		execDone <- db.BatchSet(
-			[]string{"atomic-a", "atomic-b"},
-			[]*Product{
-				{SKU: "atomic-a", Price: 21},
-				{SKU: "atomic-b", Price: 22},
-			},
-		)
-	}()
-
-	waitAutoBatchExtraStrMapHasKeys(t, db, "atomic-a", "atomic-b")
-
-	closeDone := make(chan error, 1)
-	go func() {
-		closeDone <- db.Close()
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !db.closed.Load() && time.Now().Before(deadline) {
-		time.Sleep(1 * time.Millisecond)
-	}
-	if !db.closed.Load() {
-		db.mu.Unlock()
-		t.Fatal("Close did not mark db closed in time")
-	}
-	db.mu.Unlock()
-
-	if err := <-execDone; !errors.Is(err, ErrClosed) {
-		t.Fatalf("BatchSet error = %v, want ErrClosed", err)
-	}
-	if err := <-closeDone; err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	if got := readAutoBatchExtraRawValue(t, db, "atomic-a"); got != nil {
-		t.Fatalf("atomic-a must stay absent after atomic close rollback, got=%#v", got)
-	}
-	if got := readAutoBatchExtraRawValue(t, db, "atomic-b"); got != nil {
-		t.Fatalf("atomic-b must stay absent after atomic close rollback, got=%#v", got)
 	}
 }
 

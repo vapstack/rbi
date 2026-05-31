@@ -516,7 +516,8 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	if b.unique.Schema != nil {
 		uniqueFields = len(b.unique.Schema.Unique)
 	}
-	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, b.snapshotOps.Enabled, uniqueFields)
+	withSnapshots := b.indexed && b.snapshotOps.Manager != nil
+	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, withSnapshots, uniqueFields)
 	if cap(att.prepared) < capHint {
 		att.prepared = slices.Grow(att.prepared, capHint)
 	}
@@ -542,8 +543,8 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return nil, true, nil
 	}
 
-	b.dbMu.Lock()
-	defer b.dbMu.Unlock()
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
 
 	if err = b.unavailable(); err != nil {
 		b.rollbackCreatedPrepared(att.prepared)
@@ -570,7 +571,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return retryWithoutReq, false, nil
 	}
 
-	if !b.snapshotOps.Enabled {
+	if !withSnapshots {
 		if _, err = bucket.NextSequence(); err != nil {
 			if b.sched.stats.Enabled {
 				b.sched.stats.TxOpErrors.Add(1)

@@ -58,7 +58,7 @@ func (st *Storage) Release() {
 	*st = Storage{}
 }
 
-func NewView(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, st Storage) *View {
+func NewView(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, st Storage) *View {
 	v := &View{
 		Seq:                seq,
 		Index:              st.Index,
@@ -66,11 +66,11 @@ func NewView(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, st Sto
 		LenIndex:           st.LenIndex,
 		LenZeroComplement:  st.LenZeroComplement,
 		Measure:            st.Measure,
-		IndexedFieldByName: rt.IndexedByName,
+		IndexedFieldByName: s.IndexedByName,
 		Universe:           st.Universe,
 		StrMap:             st.StrMap,
 	}
-	v.initRuntimeCaches(rt, cfg)
+	v.initRuntimeCaches(s, cfg)
 	v.retainSharedOwnedStorageFrom(prev)
 	return v
 }

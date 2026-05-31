@@ -14,7 +14,7 @@ type RegistryStats struct {
 	PinnedRefs   int
 }
 
-type Manager struct {
+type Registry struct {
 	current      atomic.Pointer[View]
 	currentRef   atomic.Pointer[Ref]
 	statsEnabled bool
@@ -31,11 +31,11 @@ type Ref struct {
 }
 
 type PinGuard struct {
-	m *Manager
+	m *Registry
 }
 
-func NewManager(statsEnabled bool) *Manager {
-	return &Manager{
+func NewRegistry(statsEnabled bool) *Registry {
+	return &Registry{
 		bySeq:        make(map[uint64]*Ref, 128),
 		statsEnabled: statsEnabled,
 	}
@@ -60,7 +60,7 @@ func releaseRetiredSnapshots(buf []*View) {
 	snapshotRetiredListPool.Put(buf)
 }
 
-func (sm *Manager) publishRef(s *View) []*View {
+func (sm *Registry) publishRef(s *View) []*View {
 	sm.mu.Lock()
 
 	prev := sm.current.Load()
@@ -87,7 +87,7 @@ func (sm *Manager) publishRef(s *View) []*View {
 	return retired
 }
 
-func (sm *Manager) Stage(s *View) {
+func (sm *Registry) Stage(s *View) {
 	sm.mu.Lock()
 
 	ref := sm.bySeq[s.Seq]
@@ -99,7 +99,7 @@ func (sm *Manager) Stage(s *View) {
 	sm.mu.Unlock()
 }
 
-func (sm *Manager) DropStaged(seq uint64) {
+func (sm *Registry) DropStaged(seq uint64) {
 	sm.mu.Lock()
 
 	ref := sm.bySeq[seq]
@@ -123,14 +123,14 @@ func (sm *Manager) DropStaged(seq uint64) {
 	sm.mu.Unlock()
 }
 
-func (sm *Manager) PinBySeq(seq uint64) (*View, *Ref, bool) {
+func (sm *Registry) PinBySeq(seq uint64) (*View, *Ref, bool) {
 	sm.mu.RLock()
 	snap, ref, ok := sm.pinBySeqLocked(seq)
 	sm.mu.RUnlock()
 	return snap, ref, ok
 }
 
-func (sm *Manager) LockPin() PinGuard {
+func (sm *Registry) PinGuardLock() PinGuard {
 	sm.mu.RLock()
 	return PinGuard{m: sm}
 }
@@ -143,7 +143,7 @@ func (g PinGuard) Unlock() {
 	g.m.mu.RUnlock()
 }
 
-func (sm *Manager) pinBySeqLocked(seq uint64) (*View, *Ref, bool) {
+func (sm *Registry) pinBySeqLocked(seq uint64) (*View, *Ref, bool) {
 	ref := sm.bySeq[seq]
 	if ref == nil || ref.snap == nil {
 		return nil, nil, false
@@ -152,7 +152,7 @@ func (sm *Manager) pinBySeqLocked(seq uint64) (*View, *Ref, bool) {
 	return ref.snap, ref, true
 }
 
-func (sm *Manager) Unpin(seq uint64, ref *Ref) {
+func (sm *Registry) Unpin(seq uint64, ref *Ref) {
 	if ref == nil {
 		return
 	}
@@ -196,7 +196,7 @@ func (sm *Manager) Unpin(seq uint64, ref *Ref) {
 	releaseRetiredSnapshots(retired)
 }
 
-func (sm *Manager) retireSnapshotLocked(seq uint64) []*View {
+func (sm *Registry) retireSnapshotLocked(seq uint64) []*View {
 	ref := sm.bySeq[seq]
 	if current := sm.current.Load(); current != nil && current.Seq == seq {
 		return nil
@@ -209,7 +209,7 @@ func (sm *Manager) retireSnapshotLocked(seq uint64) []*View {
 	return sm.releaseRetiredSnapshotRefLocked(seq, ref)
 }
 
-func (sm *Manager) releaseRetiredSnapshotRefLocked(seq uint64, ref *Ref) []*View {
+func (sm *Registry) releaseRetiredSnapshotRefLocked(seq uint64, ref *Ref) []*View {
 	if current := sm.current.Load(); current != nil && current.Seq == seq {
 		return nil
 	}
@@ -230,20 +230,20 @@ func (sm *Manager) releaseRetiredSnapshotRefLocked(seq uint64, ref *Ref) []*View
 	return retired
 }
 
-func (sm *Manager) StatsEnabled() bool {
+func (sm *Registry) StatsEnabled() bool {
 	return sm.statsEnabled
 }
 
-func (sm *Manager) Current() *View {
+func (sm *Registry) Current() *View {
 	return sm.current.Load()
 }
 
-func (sm *Manager) Publish(s *View) {
+func (sm *Registry) Publish(s *View) {
 	retired := sm.publishRef(s)
 	releaseRetiredSnapshots(retired)
 }
 
-func (sm *Manager) PinCurrent() (*View, uint64, *Ref) {
+func (sm *Registry) PinCurrent() (*View, uint64, *Ref) {
 	sm.mu.RLock()
 	ref := sm.currentRef.Load()
 	if ref == nil {
@@ -256,7 +256,7 @@ func (sm *Manager) PinCurrent() (*View, uint64, *Ref) {
 	return snap, snap.Seq, ref
 }
 
-func (sm *Manager) Stats(s *View, exclude *Ref) RegistryStats {
+func (sm *Registry) Stats(s *View, exclude *Ref) RegistryStats {
 	diag := RegistryStats{
 		Sequence: s.Seq,
 	}

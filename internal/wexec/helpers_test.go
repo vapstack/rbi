@@ -168,7 +168,7 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, uniqueErr erro
 	if len(seed) != 0 {
 		current = snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, rt.Patch.Fields, seed)
 	}
-	manager := snapshot.NewManager(false)
+	manager := snapshot.NewRegistry(false)
 	manager.Publish(current)
 	ex.schema = rt
 	ex.indexed = true
@@ -179,7 +179,6 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, uniqueErr erro
 	}
 	ex.errs = ErrorSet{UniqueViolation: uniqueErr}
 	ex.snapshotOps = SnapshotOps{
-		Enabled:     true,
 		Manager:     manager,
 		Schema:      rt,
 		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
@@ -208,7 +207,7 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 	current := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, sm, rt.Patch.Fields, []snapshot.BatchEntry{
 		{ID: seedIdx, New: unsafe.Pointer(&seed)},
 	})
-	manager := snapshot.NewManager(false)
+	manager := snapshot.NewRegistry(false)
 	manager.Publish(current)
 	sm.MarkCommittedPublished(current.StrMap)
 	putStringAttemptPayload(t, raw, bucket, seedKey, []byte{seedValue})
@@ -226,7 +225,6 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 	}
 	ex.errs = ErrorSet{UniqueViolation: uniqueErr}
 	ex.snapshotOps = SnapshotOps{
-		Enabled:     true,
 		Manager:     manager,
 		Schema:      rt,
 		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
@@ -278,10 +276,9 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	manager := snapshot.NewManager(false)
+	manager := snapshot.NewRegistry(false)
 	var mu sync.RWMutex
 	snapOps := SnapshotOps{
-		Enabled:     true,
 		Manager:     manager,
 		Schema:      rt,
 		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
@@ -303,7 +300,7 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 		Bucket:             bucket,
 		BucketFillPercent:  0.8,
 		RejectEmptyPayload: true,
-		RootMu:             &mu,
+		PublishMu:          &mu,
 		Commit:             commit,
 		Indexed:            true,
 		Ops:                &ops,

@@ -59,7 +59,7 @@ func putRebuildTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec
 	}
 }
 
-func compileRebuildTestSchema(t *testing.T) *schema.Runtime {
+func compileRebuildTestSchema(t *testing.T) *schema.Schema {
 	t.Helper()
 
 	rt, err := schema.Compile(reflect.TypeOf(rebuildTestRec{}), schema.Config{})
@@ -69,9 +69,9 @@ func compileRebuildTestSchema(t *testing.T) *schema.Runtime {
 	return rt
 }
 
-func newRebuildTestState(rt *schema.Runtime) State {
-	slotCount := len(rt.Indexed)
-	measureCount := len(rt.Measures)
+func newRebuildTestState(s *schema.Schema) State {
+	slotCount := len(s.Indexed)
+	measureCount := len(s.Measures)
 	lenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(lenZeroComplement)
 	return State{
@@ -95,11 +95,11 @@ func releaseRebuildTestRec(ptr unsafe.Pointer) {
 	*(*rebuildTestRec)(ptr) = rebuildTestRec{}
 }
 
-func baseRebuildTestConfig(db *bbolt.DB, bucket []byte, rt *schema.Runtime) Config {
+func baseRebuildTestConfig(db *bbolt.DB, bucket []byte, s *schema.Schema) Config {
 	return Config{
 		Bolt:    db,
 		Bucket:  bucket,
-		Schema:  rt,
+		Schema:  s,
 		Decode:  decodeRebuildTestRec,
 		Release: releaseRebuildTestRec,
 	}
@@ -225,7 +225,7 @@ func TestBuildPartialPublishRetainsSkippedStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("base Build: %v", err)
 	}
-	manager := snapshot.NewManager(false)
+	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
 	manager.Publish(prev)
 

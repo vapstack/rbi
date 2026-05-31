@@ -1031,7 +1031,7 @@ func TestTruncate_NoDeadlock_WithConcurrentWriteExecutor(t *testing.T) {
 	// 1) truncate goroutine waits on db.mu
 	// 2) write executor goroutine acquires writer tx and then waits on db.mu
 	// 3) release db.mu and assert both operations complete.
-	db.mu.Lock()
+	db.publishMu.Lock()
 	truncateDone := make(chan error, 1)
 	go func() {
 		truncateDone <- db.Truncate()
@@ -1041,7 +1041,7 @@ func TestTruncate_NoDeadlock_WithConcurrentWriteExecutor(t *testing.T) {
 		writeDone <- db.Set(1, &Rec{Name: "after", Age: 2}, NoBatch[uint64, Rec])
 	}()
 	time.Sleep(20 * time.Millisecond)
-	db.mu.Unlock()
+	db.publishMu.Unlock()
 
 	select {
 	case err := <-truncateDone:
@@ -2795,8 +2795,8 @@ func TestIOExt_BatchPatch_DuplicateIDs_FinalValueMatchesLastPatchAcrossReadPaths
 
 func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.T) {
 	db, _ := openTempDBUint64(t)
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	const keys = 8
 	for i := 1; i <= keys; i++ {
@@ -2948,8 +2948,8 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 
 func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.T) {
 	db, _ := openTempDBStringProduct(t)
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6"}
 	for i, key := range keys {

@@ -18,14 +18,14 @@ type BatchEntry struct {
 	PatchOnly bool
 }
 
-func BuildPrepared(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
-	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, rt, cfg, strMap, entries); ok {
+func BuildPrepared(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, strMap, entries); ok {
 		return snap
 	}
-	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, rt, cfg, strMap, entries); ok {
+	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, strMap, entries); ok {
 		return snap
 	}
-	return buildPreparedSnapshotAggregated(seq, prev, rt, cfg, strMap, patchFields, entries)
+	return buildPreparedSnapshotAggregated(seq, prev, s, cfg, strMap, patchFields, entries)
 }
 
 func cloneFieldIndexBoolSlots(src []bool, size int) []bool {
@@ -140,7 +140,7 @@ func normalizePreparedBatchForSnapshot(entries []BatchEntry) []BatchEntry {
 }
 
 func collectSnapshotBatchEntryDiffs(
-	rt *schema.Runtime,
+	s *schema.Schema,
 	op BatchEntry,
 	deltas *indexedFieldBatchDeltas,
 	measureDeltas *indexdata.MeasureDeltaBatch,
@@ -153,8 +153,8 @@ func collectSnapshotBatchEntryDiffs(
 			if !ok {
 				continue
 			}
-			indexAcc, hasIndex := rt.IndexedByName[fieldDef.DBName]
-			measureAcc, hasMeasure := rt.MeasuresByName[fieldDef.DBName]
+			indexAcc, hasIndex := s.IndexedByName[fieldDef.DBName]
+			measureAcc, hasMeasure := s.MeasuresByName[fieldDef.DBName]
 			if !hasIndex && !hasMeasure {
 				continue
 			}
@@ -182,18 +182,18 @@ func collectSnapshotBatchEntryDiffs(
 	}
 
 	if op.Old == nil || op.New == nil {
-		for _, acc := range rt.Indexed {
+		for _, acc := range s.Indexed {
 			deltas.markTouched(acc.Ordinal)
 			useZeroComplement := acc.Ordinal < len(lenZeroComplement) && lenZeroComplement[acc.Ordinal]
 			acc.CollectBatchDiff(op.ID, op.Old, op.New, useZeroComplement, &deltas.fields[acc.Ordinal])
 		}
-		for _, acc := range rt.Measures {
+		for _, acc := range s.Measures {
 			collectSnapshotMeasureDelta(acc, op.ID, op.Old, op.New, measureDeltas)
 		}
 		return
 	}
 
-	for _, acc := range rt.Indexed {
+	for _, acc := range s.Indexed {
 		if !acc.Modified(op.Old, op.New) {
 			continue
 		}
@@ -201,14 +201,14 @@ func collectSnapshotBatchEntryDiffs(
 		useZeroComplement := acc.Ordinal < len(lenZeroComplement) && lenZeroComplement[acc.Ordinal]
 		acc.CollectBatchDiff(op.ID, op.Old, op.New, useZeroComplement, &deltas.fields[acc.Ordinal])
 	}
-	for _, acc := range rt.Measures {
+	for _, acc := range s.Measures {
 		if acc.Modified(op.Old, op.New) {
 			collectSnapshotMeasureDelta(acc, op.ID, op.Old, op.New, measureDeltas)
 		}
 	}
 }
 
-func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
+func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
 	if prev != nil && !prev.Universe.IsEmpty() {
 		return nil, false
 	}
@@ -239,8 +239,8 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		}
 	}
 
-	fieldStates := schema.GetIndexStates(len(rt.Indexed))
-	measureStates := indexdata.GetMeasureEntrySlots(len(rt.Measures))
+	fieldStates := schema.GetIndexStates(len(s.Indexed))
+	measureStates := indexdata.GetMeasureEntrySlots(len(s.Measures))
 
 	for i := range entries {
 		if hasRepeated && lastByIdx[entries[i].ID] != i {
@@ -249,10 +249,10 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		op := entries[i]
 		ptr := op.New
 
-		for _, acc := range rt.Indexed {
+		for _, acc := range s.Indexed {
 			acc.CollectIndexValue(ptr, op.ID, &fieldStates[acc.Ordinal])
 		}
-		for _, acc := range rt.Measures {
+		for _, acc := range s.Measures {
 			if value, ok := acc.Read(ptr); ok {
 				buf := measureStates[acc.Ordinal]
 				if buf == nil {
@@ -268,9 +268,9 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		uint64IntMapPool.Put(lastByIdx)
 	}
 
-	slotCount := len(rt.Indexed)
+	slotCount := len(s.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i, acc := range rt.Indexed {
+	for i, acc := range s.Indexed {
 		state := &fieldStates[i]
 		storage := state.MaterializeStorage(acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64)
 		if storage.KeyCount() > 0 {
@@ -279,7 +279,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 	}
 
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i := range rt.Indexed {
+	for i := range s.Indexed {
 		if storage := fieldStates[i].MaterializeNilStorage(); storage.KeyCount() > 0 {
 			nextNilIndex[i] = storage
 		}
@@ -288,7 +288,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
-	for i, acc := range rt.Indexed {
+	for i, acc := range s.Indexed {
 		if !acc.Field.Slice {
 			continue
 		}
@@ -298,9 +298,9 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 			nextLenZeroComplement[i] = true
 		}
 	}
-	measureSlotCount := len(rt.Measures)
+	measureSlotCount := len(s.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for i := range rt.Measures {
+	for i := range s.Measures {
 		storage := indexdata.NewMeasureStorageFromEntriesOwned(measureStates[i])
 		nextMeasure[i] = storage
 		measureStates[i] = nil
@@ -317,24 +317,24 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		LenIndex:           nextLenIndex,
 		LenZeroComplement:  nextLenZeroComplement,
 		Measure:            nextMeasure,
-		IndexedFieldByName: rt.IndexedByName,
+		IndexedFieldByName: s.IndexedByName,
 		Universe:           universe,
 		StrMap:             sm,
 	}
-	snap.initRuntimeCaches(rt, cfg)
+	snap.initRuntimeCaches(s, cfg)
 	inheritNumericRangeBucketCache(snap, prev)
 	if prev != nil && snap.matPredCache != nil && prev.matPredCache != nil {
 		var changed []bool
 		for i := range fieldStates {
 			if fieldStates[i].Changed() {
 				if changed == nil {
-					changed = pooled.GetBoolSlice(len(rt.Indexed))[:len(rt.Indexed)]
+					changed = pooled.GetBoolSlice(len(s.Indexed))[:len(s.Indexed)]
 					clear(changed)
 				}
 				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(snap, prev, rt.IndexedByName, changed)
+		inheritMaterializedPredCache(snap, prev, s.IndexedByName, changed)
 		if changed != nil {
 			pooled.ReleaseBoolSlice(changed)
 		}
@@ -345,7 +345,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 	return snap, true
 }
 
-func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
+func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
 	if len(entries) == 0 {
 		return nil, false
 	}
@@ -371,31 +371,31 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 	next := &View{
 		Seq: seq,
 
-		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(rt.Indexed)),
-		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(rt.Indexed)),
-		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(rt.Indexed)),
-		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(rt.Indexed)),
-		Measure:            indexdata.CloneMeasureStorageSlots(prev.Measure, len(rt.Measures)),
-		IndexedFieldByName: rt.IndexedByName,
+		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(s.Indexed)),
+		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(s.Indexed)),
+		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(s.Indexed)),
+		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(s.Indexed)),
+		Measure:            indexdata.CloneMeasureStorageSlots(prev.Measure, len(s.Measures)),
+		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe.Clone(),
 		StrMap:             sm,
 	}
 	next.Universe = next.Universe.BuildMergedOwned(addedUniverse)
-	next.initRuntimeCaches(rt, cfg)
+	next.initRuntimeCaches(s, cfg)
 
-	fieldStates := schema.GetInsertStates(len(rt.Indexed))
-	schema.InitInsertStateHints(fieldStates, rt.Indexed, prev.Index, prev.NilIndex, prev.LenIndex, len(entries))
-	measureDeltas := indexdata.NewMeasureDeltaBatch(len(rt.Measures))
+	fieldStates := schema.GetInsertStates(len(s.Indexed))
+	schema.InitInsertStateHints(fieldStates, s.Indexed, prev.Index, prev.NilIndex, prev.LenIndex, len(entries))
+	measureDeltas := indexdata.NewMeasureDeltaBatch(len(s.Measures))
 
 	for i := range entries {
 		op := entries[i]
 		ptr := op.New
 
-		for _, acc := range rt.Indexed {
+		for _, acc := range s.Indexed {
 			useZeroComplement := acc.Ordinal < len(prev.LenZeroComplement) && prev.LenZeroComplement[acc.Ordinal]
 			acc.CollectInsertValue(ptr, op.ID, useZeroComplement, &fieldStates[acc.Ordinal])
 		}
-		for _, acc := range rt.Measures {
+		for _, acc := range s.Measures {
 			if value, ok := acc.Read(ptr); ok {
 				measureDeltas.Append(acc.Ordinal, op.ID, true, value)
 			}
@@ -404,7 +404,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 
 	inheritMatPred := next.matPredCache != nil && prev.matPredCache != nil
 	var changed []bool
-	for i, acc := range rt.Indexed {
+	for i, acc := range s.Indexed {
 		state := &fieldStates[i]
 		baseIndex := next.Index[i]
 		if storage := acc.MergeInsertStorageOwned(baseIndex, state, true); storage.KeyCount() > 0 {
@@ -430,7 +430,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 		}
 		if inheritMatPred && state.Changed() {
 			if changed == nil {
-				changed = pooled.GetBoolSlice(len(rt.Indexed))[:len(rt.Indexed)]
+				changed = pooled.GetBoolSlice(len(s.Indexed))[:len(s.Indexed)]
 				clear(changed)
 			}
 			changed[i] = true
@@ -442,7 +442,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 	inheritNumericRangeBucketCache(next, prev)
 
 	if inheritMatPred {
-		inheritMaterializedPredCache(next, prev, rt.IndexedByName, changed)
+		inheritMaterializedPredCache(next, prev, s.IndexedByName, changed)
 		if changed != nil {
 			pooled.ReleaseBoolSlice(changed)
 		}
@@ -453,15 +453,15 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, rt *schema.Runtime,
 	return next, true
 }
 
-func buildPreparedSnapshotDeletedAll(seq uint64, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper) *View {
-	slotCount := len(rt.Indexed)
+func buildPreparedSnapshotDeletedAll(seq uint64, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper) *View {
+	slotCount := len(s.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
 
-	measureSlotCount := len(rt.Measures)
+	measureSlotCount := len(s.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 
 	var sm *strmap.Snapshot
@@ -475,26 +475,26 @@ func buildPreparedSnapshotDeletedAll(seq uint64, rt *schema.Runtime, cfg CacheCo
 		LenIndex:           nextLenIndex,
 		LenZeroComplement:  nextLenZeroComplement,
 		Measure:            nextMeasure,
-		IndexedFieldByName: rt.IndexedByName,
+		IndexedFieldByName: s.IndexedByName,
 		StrMap:             sm,
 	}
-	next.initRuntimeCaches(rt, cfg)
+	next.initRuntimeCaches(s, cfg)
 	next.ensureUniverseOwner()
 	return next
 }
 
-func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) *View {
-	fieldStates := schema.GetIndexStates(len(rt.Indexed))
-	measureStates := indexdata.GetMeasureEntrySlots(len(rt.Measures))
+func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) *View {
+	fieldStates := schema.GetIndexStates(len(s.Indexed))
+	measureStates := indexdata.GetMeasureEntrySlots(len(s.Measures))
 
 	for i := range entries {
 		op := entries[i]
 		ptr := op.New
 
-		for _, acc := range rt.Indexed {
+		for _, acc := range s.Indexed {
 			acc.CollectIndexValue(ptr, op.ID, &fieldStates[acc.Ordinal])
 		}
-		for _, acc := range rt.Measures {
+		for _, acc := range s.Measures {
 			if value, ok := acc.Read(ptr); ok {
 				buf := measureStates[acc.Ordinal]
 				if buf == nil {
@@ -507,9 +507,9 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 		}
 	}
 
-	slotCount := len(rt.Indexed)
+	slotCount := len(s.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i, acc := range rt.Indexed {
+	for i, acc := range s.Indexed {
 		state := &fieldStates[i]
 		storage := state.MaterializeStorage(acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64)
 		if storage.KeyCount() > 0 {
@@ -518,7 +518,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 	}
 
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i := range rt.Indexed {
+	for i := range s.Indexed {
 		if storage := fieldStates[i].MaterializeNilStorage(); storage.KeyCount() > 0 {
 			nextNilIndex[i] = storage
 		}
@@ -527,7 +527,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
-	for i, acc := range rt.Indexed {
+	for i, acc := range s.Indexed {
 		if !acc.Field.Slice {
 			continue
 		}
@@ -538,9 +538,9 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 		}
 	}
 
-	measureSlotCount := len(rt.Measures)
+	measureSlotCount := len(s.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for i := range rt.Measures {
+	for i := range s.Measures {
 		storage := indexdata.NewMeasureStorageFromEntriesOwned(measureStates[i])
 		nextMeasure[i] = storage
 		measureStates[i] = nil
@@ -558,12 +558,12 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 		LenIndex:           nextLenIndex,
 		LenZeroComplement:  nextLenZeroComplement,
 		Measure:            nextMeasure,
-		IndexedFieldByName: rt.IndexedByName,
+		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe,
 		universeOwner:      prev.universeOwner,
 		StrMap:             sm,
 	}
-	next.initRuntimeCaches(rt, cfg)
+	next.initRuntimeCaches(s, cfg)
 	schema.ReleaseIndexStates(fieldStates)
 	indexdata.ReleaseMeasureEntrySlots(measureStates)
 	next.retainSharedOwnedStorageFrom(prev)
@@ -573,7 +573,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 func buildPreparedSnapshotAggregated(
 	seq uint64,
 	prev *View,
-	rt *schema.Runtime,
+	s *schema.Schema,
 	cfg CacheConfig,
 	strMap *strmap.Mapper,
 	patchFields map[string]*schema.Field,
@@ -601,12 +601,12 @@ func buildPreparedSnapshotAggregated(
 			if ids.Cardinality() == prevCard && prev.Universe.AndCardinality(ids) == prevCard {
 				if allDelete {
 					ids.Release()
-					return buildPreparedSnapshotDeletedAll(seq, rt, cfg, strMap)
+					return buildPreparedSnapshotDeletedAll(seq, s, cfg, strMap)
 				}
 				if (prev.matPredCache == nil || prev.matPredCache.EntryCount() == 0) &&
 					(prev.numericRangeBucketCache == nil || prev.numericRangeBucketCache.EntryCount() == 0) {
 					ids.Release()
-					return buildPreparedSnapshotFullReplace(seq, prev, rt, cfg, strMap, normalized)
+					return buildPreparedSnapshotFullReplace(seq, prev, s, cfg, strMap, normalized)
 				}
 			}
 		}
@@ -620,25 +620,25 @@ func buildPreparedSnapshotAggregated(
 	next := &View{
 		Seq: seq,
 
-		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(rt.Indexed)),
-		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(rt.Indexed)),
-		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(rt.Indexed)),
-		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(rt.Indexed)),
-		Measure:            indexdata.CloneMeasureStorageSlots(prev.Measure, len(rt.Measures)),
-		IndexedFieldByName: rt.IndexedByName,
+		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(s.Indexed)),
+		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(s.Indexed)),
+		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(s.Indexed)),
+		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(s.Indexed)),
+		Measure:            indexdata.CloneMeasureStorageSlots(prev.Measure, len(s.Measures)),
+		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe,
 		universeOwner:      prev.universeOwner,
 		StrMap:             sm,
 	}
-	next.initRuntimeCaches(rt, cfg)
+	next.initRuntimeCaches(s, cfg)
 
 	deltas := indexedFieldBatchDeltas{
-		fields:  schema.GetBatchStates(len(rt.Indexed)),
-		touched: pooled.GetIntSlice(len(rt.Indexed)),
-		changed: pooled.GetBoolSlice(len(rt.Indexed))[:len(rt.Indexed)],
+		fields:  schema.GetBatchStates(len(s.Indexed)),
+		touched: pooled.GetIntSlice(len(s.Indexed)),
+		changed: pooled.GetBoolSlice(len(s.Indexed))[:len(s.Indexed)],
 	}
 	clear(deltas.changed)
-	measureDeltas := indexdata.NewMeasureDeltaBatch(len(rt.Measures))
+	measureDeltas := indexdata.NewMeasureDeltaBatch(len(s.Measures))
 
 	universeOwned := false
 
@@ -652,7 +652,7 @@ func buildPreparedSnapshotAggregated(
 			ensureSnapshotUniverseOwned(next, &universeOwned)
 			next.Universe = next.Universe.BuildRemoved(op.ID)
 		}
-		collectSnapshotBatchEntryDiffs(rt, op, &deltas, &measureDeltas, prev.LenZeroComplement, patchFields)
+		collectSnapshotBatchEntryDiffs(s, op, &deltas, &measureDeltas, prev.LenZeroComplement, patchFields)
 	}
 
 	inheritMatPred := next.matPredCache != nil && prev.matPredCache != nil
@@ -665,7 +665,7 @@ func buildPreparedSnapshotAggregated(
 	changedAny := false
 	for i := range deltas.touched {
 		ordinal := deltas.touched[i]
-		acc := rt.Indexed[ordinal]
+		acc := s.Indexed[ordinal]
 		state := &deltas.fields[ordinal]
 		baseIndex := next.Index[ordinal]
 		if storage := acc.ApplyBatchStorageOwned(baseIndex, state, true); storage.KeyCount() == 0 {
@@ -700,9 +700,9 @@ func buildPreparedSnapshotAggregated(
 	inheritNumericRangeBucketCache(next, prev)
 	if inheritMatPred {
 		if changedAny {
-			inheritMaterializedPredCache(next, prev, rt.IndexedByName, deltas.changed)
+			inheritMaterializedPredCache(next, prev, s.IndexedByName, deltas.changed)
 		} else {
-			inheritMaterializedPredCache(next, prev, rt.IndexedByName, nil)
+			inheritMaterializedPredCache(next, prev, s.IndexedByName, nil)
 		}
 	}
 	schema.ReleaseBatchStates(deltas.fields)

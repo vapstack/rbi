@@ -28,7 +28,7 @@ type LoadConfig struct {
 	DBPath          string
 	Bucket          []byte
 	CurrentSeq      uint64
-	Schema          *schema.Runtime
+	Schema          *schema.Schema
 	StrMapCompactAt int
 	Errors          Errors
 }
@@ -45,7 +45,7 @@ type LoadResult struct {
 type StoreConfig struct {
 	File         string
 	BucketSeq    uint64
-	Schema       *schema.Runtime
+	Schema       *schema.Schema
 	Snapshot     *snapshot.View
 	PlannerStats *qexec.PlannerStatsSnapshot
 }
@@ -177,7 +177,7 @@ func loadV26(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	return result, nil
 }
 
-func loadPayload(reader *bufio.Reader, rt *schema.Runtime, strMapCompactAt int) (LoadResult, error) {
+func loadPayload(reader *bufio.Reader, s *schema.Schema, strMapCompactAt int) (LoadResult, error) {
 	universe, err := posting.ReadFrom(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading universe: %w", err)
@@ -194,11 +194,11 @@ func loadPayload(reader *bufio.Reader, rt *schema.Runtime, strMapCompactAt int) 
 		return LoadResult{}, err
 	}
 
-	compatible, err := readFieldCompatibility(reader, rt.Fields)
+	compatible, err := readFieldCompatibility(reader, s.Fields)
 	if err != nil {
 		return LoadResult{}, err
 	}
-	measureCompatible, err := readFieldCompatibility(reader, rt.MeasureFields)
+	measureCompatible, err := readFieldCompatibility(reader, s.MeasureFields)
 	if err != nil {
 		return LoadResult{}, err
 	}
@@ -232,16 +232,16 @@ func loadPayload(reader *bufio.Reader, rt *schema.Runtime, strMapCompactAt int) 
 		return LoadResult{}, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{}, len(rt.Fields))
-	for name := range rt.Fields {
+	skipFields := make(map[string]struct{}, len(s.Fields))
+	for name := range s.Fields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
 		if compatible[name] && (hasRegular || hasNil) {
 			skipFields[name] = struct{}{}
 		}
 	}
-	skipMeasureFields := make(map[string]struct{}, len(rt.MeasureFields))
-	for name := range rt.MeasureFields {
+	skipMeasureFields := make(map[string]struct{}, len(s.MeasureFields))
+	for name := range s.MeasureFields {
 		if measureCompatible[name] {
 			if _, hasMeasure := measureIndexes[name]; hasMeasure {
 				skipMeasureFields[name] = struct{}{}
@@ -249,13 +249,13 @@ func loadPayload(reader *bufio.Reader, rt *schema.Runtime, strMapCompactAt int) 
 		}
 	}
 
-	slotCount := len(rt.Indexed)
+	slotCount := len(s.Indexed)
 	index := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	lenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	measureSlotCount := len(rt.Measures)
+	measureSlotCount := len(s.Measures)
 	measure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for _, acc := range rt.Indexed {
+	for _, acc := range s.Indexed {
 		if storage, ok := indexes[acc.Name]; ok {
 			index[acc.Ordinal] = storage
 			delete(indexes, acc.Name)
@@ -269,30 +269,30 @@ func loadPayload(reader *bufio.Reader, rt *schema.Runtime, strMapCompactAt int) 
 			delete(lenIndexes, acc.Name)
 		}
 	}
-	for _, acc := range rt.Measures {
+	for _, acc := range s.Measures {
 		if storage, ok := measureIndexes[acc.Name]; ok {
 			measure[acc.Ordinal] = storage
 			delete(measureIndexes, acc.Name)
 		}
 	}
 
-	lenZeroComplement := detectLenZeroComplement(lenIndex, rt.Indexed)
+	lenZeroComplement := detectLenZeroComplement(lenIndex, s.Indexed)
 	lenLoaded := true
-	for name := range rt.Fields {
+	for name := range s.Fields {
 		if _, ok := skipFields[name]; !ok {
 			lenLoaded = false
 			break
 		}
 	}
 	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range rt.Fields {
+		for name, f := range s.Fields {
 			if !f.Slice {
 				continue
 			}
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			acc, ok := rt.IndexedByName[name]
+			acc, ok := s.IndexedByName[name]
 			if !ok {
 				lenLoaded = false
 				break
@@ -333,7 +333,7 @@ func storeV26(writer *bufio.Writer, cfg StoreConfig) error {
 	return storePayload(writer, cfg.Schema, cfg.Snapshot, cfg.PlannerStats)
 }
 
-func storePayload(writer *bufio.Writer, rt *schema.Runtime, snap *snapshot.View, plannerStats *qexec.PlannerStatsSnapshot) error {
+func storePayload(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, plannerStats *qexec.PlannerStatsSnapshot) error {
 	universe := snap.Universe.Borrow()
 	if err := universe.WriteTo(writer); err != nil {
 		return fmt.Errorf("encode: writing universe: %w", err)
@@ -343,10 +343,10 @@ func storePayload(writer *bufio.Writer, rt *schema.Runtime, snap *snapshot.View,
 		return err
 	}
 
-	if err := writeFields(writer, rt.Fields); err != nil {
+	if err := writeFields(writer, s.Fields); err != nil {
 		return err
 	}
-	if err := writeFields(writer, rt.MeasureFields); err != nil {
+	if err := writeFields(writer, s.MeasureFields); err != nil {
 		return err
 	}
 
@@ -392,7 +392,7 @@ func storePayload(writer *bufio.Writer, rt *schema.Runtime, snap *snapshot.View,
 		}
 	}
 
-	measureFieldNames := sortedMapFieldNames(rt.MeasureFields)
+	measureFieldNames := sortedMapFieldNames(s.MeasureFields)
 	if err := writeSidecarUvarint(writer, uint64(len(measureFieldNames))); err != nil {
 		return fmt.Errorf("encode: writing measure index family len: %w", err)
 	}
@@ -400,7 +400,7 @@ func storePayload(writer *bufio.Writer, rt *schema.Runtime, snap *snapshot.View,
 		if err := writeSidecarString(writer, field); err != nil {
 			return fmt.Errorf("encode: writing measure field %q name: %w", field, err)
 		}
-		acc := rt.MeasuresByName[field]
+		acc := s.MeasuresByName[field]
 		storage := snap.Measure[acc.Ordinal]
 		if err := storage.WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing measure field %q: %w", field, err)

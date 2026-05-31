@@ -654,12 +654,6 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 	}
 
 	for step := 0; step < steps; step++ {
-		if step > 0 && step%23 == 0 {
-			if err := db.RebuildIndex(); err != nil {
-				t.Fatalf("step=%d RebuildIndex: %v", step, err)
-			}
-		}
-
 		switch r.Intn(6) {
 		case 0: // Set
 			id := uint64(1 + r.Intn(48))

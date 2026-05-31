@@ -1148,7 +1148,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	requireAggregateInt(t, result.Rows[0][4], keep)
 }
 
-func TestAggregateRebuildIndexKeepsMultipleMeasureFields(t *testing.T) {
+func TestAggregateStartupBuildKeepsMultipleMeasureFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "two_measure_rebuild.db")
 	db, raw := openBoltAndNew[uint64, aggregateTwoMeasureRec](t, path, Options{AnalyzeInterval: -1})
@@ -1162,9 +1162,16 @@ func TestAggregateRebuildIndexKeepsMultipleMeasureFields(t *testing.T) {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw.Close: %v", err)
+	}
+	db, raw = openBoltAndNew[uint64, aggregateTwoMeasureRec](t, path, Options{
+		AnalyzeInterval:  -1,
+		DisableIndexLoad: true,
+	})
 
 	result, err := db.Aggregate(qx.Aggregate(
 		qx.COUNT("left").AS("left_count"),
@@ -1773,9 +1780,6 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.OR(
 		qx.AND(qx.PREFIX("email", "user00"), qx.EQ("active", true)),
@@ -2165,9 +2169,6 @@ func seedCountORBenchData(t *testing.T, db *DB[uint64, countORBenchRec], n int) 
 	if err := db.BatchSet(ids, vals); err != nil {
 		t.Fatalf("BatchSet: %v", err)
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 }
 
 func countORBenchSharedSeedPath(t *testing.T) string {
@@ -2281,8 +2282,8 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 		_ = db.Close()
 		_ = raw.Close()
 	})
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	countries := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB", "US"}
 	statuses := []string{"active", "trial", "paused", "banned"}
@@ -2310,9 +2311,6 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	}
 	if err := db.BatchSet(ids, vals); err != nil {
 		t.Fatalf("BatchSet: %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	q := qx.Query(

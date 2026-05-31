@@ -232,9 +232,6 @@ func TestQuery_NoOrderLimitUniverseScanCapsLargeLimitAllocation(t *testing.T) {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	tests := []struct {
 		name string
@@ -299,9 +296,6 @@ func TestQuery_LimitDirectScansCapLargeLimitAllocation(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	noOrder := []struct {
@@ -380,9 +374,6 @@ func TestQuery_NoOrderLimitWideNotINUsesGenericPostsAnyState(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.NOTIN("country", terms)).Limit(100_000))
@@ -479,9 +470,6 @@ func TestQuery_DirectPrefixNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
 		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	ids, err := db.QueryKeys(qx.Query(qx.PREFIX("full_name", "Alpha")).Limit(2))
@@ -720,9 +708,6 @@ func TestQuery_OrderBasicBaseFastPathCapsLargeLimitByBaseCard(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	tests := []struct {
@@ -1026,9 +1011,6 @@ func TestQuery_OrderBasicLimit_MergedStringPrefixPreservesTightenedBounds(t *tes
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("email", "user"),
@@ -1105,9 +1087,6 @@ func TestQuery_OrderBasicWithLimit_SkipsHighCardNonOrderPrefixShape(t *testing.T
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.PREFIX("email", "user0019"),
@@ -1149,9 +1128,6 @@ func TestQuery_OrderBasic_CollapsesStringRangeBaseOps(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	q := qx.Query(
@@ -1236,9 +1212,6 @@ func TestQuery_NoOrderLimit_NegatedOverlappingSlicePredicateReturnsComplement(t 
 			Tags:   tags,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.EQ("active", true),
@@ -1285,9 +1258,6 @@ func TestQuery_ORLimit_InvalidSuffixContainsBranchReturnsError(t *testing.T) {
 			Score:  float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	for _, invalid := range []qx.Expr{
 		qx.SUFFIX("email", []string{"@example.com"}),
@@ -1313,9 +1283,6 @@ func TestQuery_NoOrderLimit_EmptyRangeValidatesResidual(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("score", 10.0),
@@ -1335,9 +1302,6 @@ func TestQuery_NoOrderLimit_EmptyLeafValidatesUnsupportedResidual(t *testing.T) 
 			Age:  i,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.HASANY("name", []string{"u_1"}),
@@ -1357,9 +1321,6 @@ func TestQuery_OrderLimit_EmptyBaseLeafValidatesUnsupportedBaseOp(t *testing.T) 
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.HASANY("name", []string{"u_1"}),
@@ -1422,9 +1383,6 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToLeafPredScan(t *testing.T) {
 			Active: i <= rows/2,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.EQ("active", true)).Sort("score", qx.DESC).Limit(10)
 	got, err := db.QueryKeys(q)
@@ -1538,9 +1496,6 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToPostingFilterScanNoTrace(t *
 			Active: i <= rows/2,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.EQ("active", true)).Sort("score", qx.DESC).Limit(10)
 	prepared, viewQ, err := prepareTestQuery(db.engine, q)
@@ -1588,9 +1543,6 @@ func TestQuery_OrderBasicLimit_OffsetPromotionUsesFullWindow(t *testing.T) {
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustLimitQIRExpr(t, db, qx.GTE("age", 100))
@@ -1704,9 +1656,6 @@ func TestQuery_RangeNoOrderWithLimit_DeepOffset_ReturnsValidPage(t *testing.T) {
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.GTE("age", 20)).Offset(4_000).Limit(25)
 
@@ -1740,9 +1689,6 @@ func TestQuery_PrefixNoOrderWithLimit_DeepOffset_ReturnsValidPage(t *testing.T) 
 			FullName: fmt.Sprintf("grp-%02d", i%100),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.PREFIX("full_name", "grp-1")).Offset(750).Limit(30)
 
@@ -1781,9 +1727,6 @@ func TestQuery_RangeNoOrderWithLimit_NilEQDeepOffset_ReturnsValidPage(t *testing
 			Opt:    opt,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(qx.EQ("opt", nil)).Offset(2_500).Limit(40)
 
@@ -1833,9 +1776,6 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 			FullName: fmt.Sprintf("grp-%02d", i%64),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 0),
@@ -1919,9 +1859,6 @@ func TestQuery_LimitRangeNoOrder_NoResidualDoesNotTraceOrderScanWidth(t *testing
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 100),
@@ -2002,9 +1939,6 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 			FullName: fmt.Sprintf("grp-%02d", i%64),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 0),
@@ -2082,9 +2016,6 @@ func TestQuery_LimitBoundExcludedMergePreservesSameFieldResidual(t *testing.T) {
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	ordered := qx.Query(
 		qx.GTE("age", 10),
@@ -2162,9 +2093,6 @@ func TestQuery_OrderBasicLimit_DeclinesNegatedCompositeShape(t *testing.T) {
 			Age:  i,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	prepared, shape, err := prepareTestQuery(db.engine, qx.Query(
 		qx.GTE("age", 10),
@@ -2202,9 +2130,6 @@ func TestQuery_OrderBasicLimit_PreservesInterleavedResidual(t *testing.T) {
 			Tags: tags,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	ageGTE := mustLimitQIRExpr(t, db, qx.GTE("age", 10))
 	tagsEQ := mustLimitQIRExpr(t, db, qx.EQ("tags", []string{"keep"}))
@@ -2238,9 +2163,6 @@ func TestQuery_OrderBasicLimit_ValidatesResidualBeforeEmptyOrderRange(t *testing
 			Age:  i,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	for _, offset := range []int{0, 1} {
 		q := qx.Query(
@@ -2271,9 +2193,6 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	if err := db.Patch(1, []Field{{Name: "age", Value: 10_000}}); err != nil {
 		t.Fatalf("Patch(age): %v", err)
 	}
@@ -2317,9 +2236,6 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	small := qx.Query(
 		qx.LT("score", 4_000.0),
@@ -2363,9 +2279,6 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("score", 0.0),
@@ -2457,9 +2370,6 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 			},
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.EQ("active", true),
@@ -2550,9 +2460,6 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_ForceMaterializesNonBroa
 		if err := db.Set(uint64(i+105), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	q := qx.Query(
@@ -2652,9 +2559,6 @@ func TestQuery_OrderBasic_BuildLimitLeafPred_NullableComplementUsesPositiveProbe
 			t.Fatalf("Set(two_%03d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2715,9 +2619,6 @@ func TestQuery_OrderBasic_NullablePositiveRangeCheapFilterUsesRuntimeProbe(t *te
 			t.Fatalf("Set(rank_%04d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustLimitQIRExpr(t, db, qx.GTE("rank", 1))
@@ -2758,9 +2659,6 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.LT("score", 4_000.0),
@@ -2811,9 +2709,6 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 25),
@@ -2873,9 +2768,6 @@ func TestQuery_OrderBasic_EvalRawBaseOpMaterializesPlannedComplement(t *testing.
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	op := mustLimitQIRExpr(t, db, qx.LT("score", 800.0))
@@ -2920,9 +2812,6 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 25),
@@ -3015,9 +2904,6 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 25),
@@ -3079,9 +2965,6 @@ func TestQuery_OrderBasic_WarmComplementDoesNotPromoteSplitRangeHalves(t *testin
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 4_000),
@@ -3123,9 +3006,6 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 25),
@@ -3179,9 +3059,6 @@ func TestQuery_OrderBasic_WarmBroadExactAndRangeUsesLimitOrderBasicPlan(t *testi
 			Active: i%10 != 0 && i%7 != 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.EQ("active", true),
@@ -3245,9 +3122,6 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GTE("age", 25),

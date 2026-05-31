@@ -57,14 +57,14 @@ type benchmarkSchemaRecord struct {
 }
 
 var (
-	benchmarkSchemaRuntimeSink *Runtime
+	benchmarkSchemaRuntimeSink *Schema
 	benchmarkSchemaAnySink     any
 	benchmarkSchemaBoolSink    bool
 	benchmarkSchemaIntSink     int
 	benchmarkSchemaU64Sink     uint64
 )
 
-func benchmarkSchemaMustCompile(b *testing.B) *Runtime {
+func benchmarkSchemaMustCompile(b *testing.B) *Schema {
 	b.Helper()
 	rt, err := Compile(reflect.TypeFor[benchmarkSchemaRecord](), Config{})
 	if err != nil {

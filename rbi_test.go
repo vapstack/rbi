@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	randv2 "math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,11 +18,19 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/internal/wexec"
 	"go.etcd.io/bbolt"
 )
+
+func newRand(seed int64) *randv2.Rand {
+	s := uint64(seed)
+	return randv2.New(randv2.NewPCG(s, s^0x9e3779b97f4a7c15))
+}
 
 var testDiscardLogger = log.New(io.Discard, "", 0)
 
@@ -288,9 +297,6 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	}
 	if _, err := db.Count(); !errors.Is(err, ErrNoIndex) {
 		t.Fatalf("Count() err=%v want %v", err, ErrNoIndex)
-	}
-	if err := db.RebuildIndex(); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("RebuildIndex err=%v want %v", err, ErrNoIndex)
 	}
 	if err := db.RefreshPlannerStats(); !errors.Is(err, ErrNoIndex) {
 		t.Fatalf("RefreshPlannerStats err=%v want %v", err, ErrNoIndex)
@@ -762,9 +768,6 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 		t.Fatalf("Delete measure record: %v", err)
 	}
 	requireMeasureTaggedSum(t, db, 55)
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	requireMeasureTaggedSum(t, db, 55)
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("amount", int64(100)))); err == nil {
 		t.Fatal("measure field must not be queryable through ordinary planner")
@@ -1559,9 +1562,6 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("initial RebuildIndex: %v", err)
-	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
@@ -1983,7 +1983,7 @@ func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
 	path := filepath.Join(dir, "bench_unique.db")
 
 	db, raw := openBoltAndNew[uint64, UniqueTestRec](b, path)
-	db.DisableSync()
+	db.disableSync()
 	b.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()
@@ -2141,7 +2141,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	}
 }
 
-func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
+func TestStringKeys_StartupBuild_FromScratch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_keys_rebuild.db")
 
@@ -2160,13 +2160,13 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	// remove file to force rebuild
+	// Remove file to force startup build from bbolt.
 	rbiFile := path + ".Rec.rbi"
 	if err := os.Remove(rbiFile); err != nil && !os.IsNotExist(err) {
 		t.Logf("Index file removal failed: %v", err)
 	}
 
-	// reopen and rebuild
+	// Reopen and build the index from stored records.
 	db2, raw2 := openBoltAndNew[string, Rec](t, path)
 	defer func() {
 		if err := db2.Close(); err != nil {
@@ -2185,7 +2185,7 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 			t.Fatalf("QueryKeys: %v", err)
 		}
 		if len(ids) != 1 || ids[0] != k {
-			t.Errorf("rebuild mismatch for key %q: %v", k, ids)
+			t.Errorf("startup build mismatch for key %q: %v", k, ids)
 		}
 	}
 }
@@ -3495,21 +3495,23 @@ func TestBeforeCommit_SetRollsBackAndKeepsState(t *testing.T) {
 	}
 }
 
-func TestPublishAfterCommitPanicBreaksDB(t *testing.T) {
+func TestPublishAfterCommitFailureBreaksDB(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
-		t.Fatalf("Set(1): %v", err)
+	publishField := reflect.ValueOf(db.batcher).Elem().FieldByName("indexPublishOps")
+	publishOps := (*wexec.IndexPublishOps)(unsafe.Pointer(publishField.UnsafeAddr()))
+	oldPublish := publishOps.PublishCommitted
+	publishOps.PublishCommitted = func(seq uint64, op string, _ *snapshot.View) error {
+		return db.index.PublishCommittedView(&db.broken, db.logger, ErrBroken, seq, op, nil)
 	}
+	defer func() {
+		publishOps.PublishCommitted = oldPublish
+	}()
 
-	err := publishAfterCommitLocked(&db.broken, db.logger, db.engine, db.SnapshotStats().Sequence+1, "set", func() {
-		panic("failpoint: publish set")
-	})
+	err := db.Set(1, &Rec{Name: "alice", Age: 30})
 	if !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected ErrBroken from post-commit publish panic, got: %v", err)
+		t.Fatalf("expected Set to fail with ErrBroken after publish failure, got: %v", err)
 	}
-
-	assertNoFutureSnapshotRefs(t, db)
 
 	var got *Rec
 	if viewErr := db.bolt.View(func(tx *bbolt.Tx) error {
@@ -3520,27 +3522,26 @@ func TestPublishAfterCommitPanicBreaksDB(t *testing.T) {
 		var keyBuf [8]byte
 		raw := bucket.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if raw == nil {
-			return fmt.Errorf("record not committed")
+			return fmt.Errorf("record was not committed")
 		}
-		var err error
-		got, err = db.decode(raw)
-		return err
+		var decodeErr error
+		got, decodeErr = db.decode(raw)
+		return decodeErr
 	}); viewErr != nil {
-		t.Fatalf("bolt view after broken publish: %v", viewErr)
+		t.Fatalf("bolt view after publish failure: %v", viewErr)
 	}
 	if got == nil || got.Name != "alice" || got.Age != 30 {
-		t.Fatalf("unexpected committed value after broken publish: %#v", got)
+		t.Fatalf("unexpected committed value after publish failure: %#v", got)
 	}
 
 	if err = db.Set(2, &Rec{Name: "bob", Age: 20}); !errors.Is(err, ErrBroken) {
 		t.Fatalf("expected DB to reject subsequent writes with ErrBroken, got: %v", err)
 	}
-	if _, err = db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected Query to fail with ErrBroken after broken publish, got: %v", err)
+	if _, err := db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected Query to fail with ErrBroken after publish failure, got: %v", err)
 	}
 
-	db.rbiFile = filepath.Join(t.TempDir(), "missing", "broken.rbi")
-	if err = db.Close(); !errors.Is(err, ErrBroken) {
+	if err := db.Close(); !errors.Is(err, ErrBroken) {
 		t.Fatalf("expected Close to return ErrBroken for broken db, got: %v", err)
 	}
 }

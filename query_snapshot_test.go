@@ -608,8 +608,8 @@ func snapshotExtraOpenRawBolt(t *testing.T) (*bbolt.DB, string) {
 func snapshotExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, snapshotExtraRec], n int, gen func(i int) *snapshotExtraRec) {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	batchSize := 32 << 10
 	if n > 0 && n < batchSize {

@@ -28,8 +28,8 @@ func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string)
 func seedBenchDataString(tb testing.TB, db *DB[string, UserBench], n int) {
 	tb.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	r := newRand(7)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -158,7 +158,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 		_ = db.Close()
 		_ = raw.Close()
 	})
-	db.DisableSync()
+	db.disableSync()
 
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -192,7 +192,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 		}
 	}
 
-	db.EnableSync()
+	db.enableSync()
 	return db
 }
 

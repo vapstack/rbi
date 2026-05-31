@@ -140,7 +140,7 @@ type Config struct {
 	Index map[string]IndexKind
 }
 
-type Runtime struct {
+type Schema struct {
 	Fields           map[string]*Field
 	MeasureFields    map[string]*Field
 	Indexed          []IndexedFieldAccessor
@@ -153,12 +153,12 @@ type Runtime struct {
 	HasUnique        bool
 }
 
-func (rt *Runtime) HasQueryFields() bool {
-	return len(rt.Fields) != 0 || len(rt.MeasureFields) != 0
+func (s *Schema) HasQueryFields() bool {
+	return len(s.Fields) != 0 || len(s.MeasureFields) != 0
 }
 
-func (rt *Runtime) PatchNameTouchesUnique(name string) bool {
-	f, ok := rt.Patch.Fields[name]
+func (s *Schema) PatchNameTouchesUnique(name string) bool {
+	f, ok := s.Patch.Fields[name]
 	return ok && f.Unique
 }
 
@@ -214,7 +214,7 @@ type PatchRuntime struct {
 	typ      reflect.Type
 }
 
-func Compile(vtype reflect.Type, config Config) (*Runtime, error) {
+func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 	collector := fieldCollector{config: config}
 	if err := collector.populateFields(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
@@ -254,7 +254,7 @@ func Compile(vtype reflect.Type, config Config) (*Runtime, error) {
 		return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
 	}
 
-	return &Runtime{
+	return &Schema{
 		Fields:           collector.indexFields,
 		MeasureFields:    collector.measureFields,
 		Indexed:          access,

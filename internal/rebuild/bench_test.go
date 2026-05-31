@@ -67,7 +67,7 @@ func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *b
 	return db
 }
 
-func compileRebuildBenchSchema(b *testing.B) *schema.Runtime {
+func compileRebuildBenchSchema(b *testing.B) *schema.Schema {
 	b.Helper()
 
 	rt, err := schema.Compile(reflect.TypeOf(rebuildTestRec{}), schema.Config{})
@@ -127,7 +127,7 @@ func BenchmarkBuildPartialSkippedFields(b *testing.B) {
 		b.Fatalf("base Build: %v", err)
 	}
 
-	manager := snapshot.NewManager(false)
+	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
 	manager.Publish(prev)
 

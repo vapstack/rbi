@@ -22,11 +22,11 @@ type Batcher struct {
 	strKey          bool
 	strMap          *strmap.Mapper
 	unavailable     func() error
-	dbMu            *sync.RWMutex
+	publishMu       *sync.RWMutex
 	commit          func(*bbolt.Tx, string) error
 	indexed         bool
 	ops             *RecordOps
-	schema          *schema.Runtime
+	schema          *schema.Schema
 	unique          UniqueContext
 	snapshotOps     SnapshotOps
 	indexPublishOps IndexPublishOps
@@ -46,13 +46,13 @@ type Config struct {
 	BucketFillPercent  float64
 	RejectEmptyPayload bool
 
-	RootMu          *sync.RWMutex
+	PublishMu       *sync.RWMutex
 	Commit          func(*bbolt.Tx, string) error
 	StrKey          bool
 	StrMap          *strmap.Mapper
 	Indexed         bool
 	Ops             *RecordOps
-	Schema          *schema.Runtime
+	Schema          *schema.Schema
 	Unique          UniqueContext
 	SnapshotOps     SnapshotOps
 	IndexPublishOps IndexPublishOps
@@ -69,7 +69,7 @@ func NewBatcher(cfg Config) *Batcher {
 		strKey:             cfg.StrKey,
 		strMap:             cfg.StrMap,
 		unavailable:        cfg.Unavailable,
-		dbMu:               cfg.RootMu,
+		publishMu:          cfg.PublishMu,
 		commit:             cfg.Commit,
 		indexed:            cfg.Indexed,
 		ops:                cfg.Ops,

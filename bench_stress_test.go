@@ -99,8 +99,8 @@ func buildBenchStressDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[ui
 func seedBenchStressData(tb testing.TB, db *DB[uint64, StressBenchUser], n int) {
 	tb.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	rng := newRand(17)
 	namePrefixes := []string{"u_", "user_", "dev_", "mod_", "news_", "anon_"}

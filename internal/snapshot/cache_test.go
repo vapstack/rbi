@@ -598,7 +598,7 @@ type buildCacheRec struct {
 	Opt   *string `db:"opt" rbi:"index"`
 }
 
-func buildCacheRuntime(t testing.TB) *schema.Runtime {
+func buildCacheRuntime(t testing.TB) *schema.Schema {
 	t.Helper()
 	rt, err := schema.Compile(reflect.TypeOf(buildCacheRec{}), schema.Config{})
 	if err != nil {
@@ -607,9 +607,9 @@ func buildCacheRuntime(t testing.TB) *schema.Runtime {
 	return rt
 }
 
-func buildCacheSeedView(t testing.TB, rt *schema.Runtime, rec *buildCacheRec) *View {
+func buildCacheSeedView(t testing.TB, s *schema.Schema, rec *buildCacheRec) *View {
 	t.Helper()
-	snap := BuildPrepared(1, nil, rt, CacheConfig{MatPredMaxEntries: 64}, nil, rt.Patch.Fields, []BatchEntry{
+	snap := BuildPrepared(1, nil, s, CacheConfig{MatPredMaxEntries: 64}, nil, s.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(rec)},
 	})
 	if snap == nil {
@@ -618,9 +618,9 @@ func buildCacheSeedView(t testing.TB, rt *schema.Runtime, rec *buildCacheRec) *V
 	return snap
 }
 
-func buildCachePatchView(t testing.TB, rt *schema.Runtime, prev *View, oldRec, newRec *buildCacheRec, patch []schema.PatchItem) *View {
+func buildCachePatchView(t testing.TB, s *schema.Schema, prev *View, oldRec, newRec *buildCacheRec, patch []schema.PatchItem) *View {
 	t.Helper()
-	snap := BuildPrepared(2, prev, rt, CacheConfig{MatPredMaxEntries: 64}, nil, rt.Patch.Fields, []BatchEntry{{
+	snap := BuildPrepared(2, prev, s, CacheConfig{MatPredMaxEntries: 64}, nil, s.Patch.Fields, []BatchEntry{{
 		ID:        1,
 		Old:       unsafe.Pointer(oldRec),
 		New:       unsafe.Pointer(newRec),
@@ -1218,7 +1218,7 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 }
 
 func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnpin(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := testMatPredView(4, 0)
 	first.Seq = 7

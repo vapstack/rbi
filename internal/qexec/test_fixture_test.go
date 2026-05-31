@@ -91,7 +91,7 @@ type testOptions struct {
 }
 
 type testDB struct {
-	rt   *schema.Runtime
+	rt   *schema.Schema
 	exec *Runtime
 	snap *snapshot.View
 	seq  uint64
@@ -108,8 +108,8 @@ type DB[K ~string | ~uint64, V any] struct {
 }
 
 type queryEngine struct {
-	snapshot *snapshot.Manager
-	schema   *schema.Runtime
+	snapshot *snapshot.Registry
+	schema   *schema.Schema
 	exec     *Runtime
 	cfg      snapshot.CacheConfig
 	seq      uint64
@@ -179,7 +179,7 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 	})
 
 	qe := &queryEngine{
-		snapshot: snapshot.NewManager(false),
+		snapshot: snapshot.NewRegistry(false),
 		schema:   rt,
 		exec:     exec,
 		cfg: snapshot.CacheConfig{
@@ -277,10 +277,6 @@ func (db *DB[K, V]) Delete(id K) error {
 	}
 	delete(db.values, idx)
 	db.publish([]snapshot.BatchEntry{{ID: idx, Old: unsafe.Pointer(prev)}})
-	return nil
-}
-
-func (db *DB[K, V]) RebuildIndex() error {
 	return nil
 }
 

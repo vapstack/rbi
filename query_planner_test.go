@@ -427,9 +427,6 @@ func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 			},
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.EQ("country", "US"),

@@ -28,7 +28,7 @@ type qaggPinnedSnapshotRec struct {
 }
 
 type qaggTestDB struct {
-	rt   *schema.Runtime
+	rt   *schema.Schema
 	exec *qexec.Runtime
 	snap *snapshot.View
 }

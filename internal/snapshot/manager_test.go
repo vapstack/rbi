@@ -2,14 +2,14 @@ package snapshot
 
 import "testing"
 
-func managerTestRef(m *Manager, seq uint64) *Ref {
+func managerTestRef(m *Registry, seq uint64) *Ref {
 	m.mu.RLock()
 	ref := m.bySeq[seq]
 	m.mu.RUnlock()
 	return ref
 }
 
-func managerTestRegistrySize(m *Manager) int {
+func managerTestRegistrySize(m *Registry) int {
 	m.mu.RLock()
 	n := len(m.bySeq)
 	m.mu.RUnlock()
@@ -17,7 +17,7 @@ func managerTestRegistrySize(m *Manager) int {
 }
 
 func TestManagerPublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := &View{Seq: 7}
 	m.Publish(first)
@@ -56,7 +56,7 @@ func TestManagerPublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
 }
 
 func TestManagerDropStagedPinnedEntryBecomesUnpinnableUntilUnpin(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	staged := &View{Seq: 11}
 	m.Stage(staged)
@@ -84,7 +84,7 @@ func TestManagerDropStagedPinnedEntryBecomesUnpinnableUntilUnpin(t *testing.T) {
 }
 
 func TestManagerDropStagedUnpinnedDeletesEntry(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	staged := &View{Seq: 12}
 	m.Stage(staged)
@@ -96,7 +96,7 @@ func TestManagerDropStagedUnpinnedDeletesEntry(t *testing.T) {
 }
 
 func TestManagerPinCurrentIgnoresStagedFutureSnapshot(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	current := &View{Seq: 1}
 	staged := &View{Seq: 2}
@@ -119,7 +119,7 @@ func TestManagerPinCurrentIgnoresStagedFutureSnapshot(t *testing.T) {
 }
 
 func TestManagerRetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := &View{Seq: 1}
 	second := &View{Seq: 2}
@@ -154,7 +154,7 @@ func TestManagerRetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing.T) {
 }
 
 func TestManagerPinCurrentTracksReaderAcrossPublishAndPrunesOnUnpin(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := &View{Seq: 1}
 	second := &View{Seq: 2}
@@ -186,7 +186,7 @@ func TestManagerPinCurrentTracksReaderAcrossPublishAndPrunesOnUnpin(t *testing.T
 }
 
 func TestManagerDuplicatePinsOnRetiredSnapshotPruneOnlyOnLastUnpin(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := &View{Seq: 1}
 	second := &View{Seq: 2}
@@ -237,7 +237,7 @@ func TestManagerDuplicatePinsOnRetiredSnapshotPruneOnlyOnLastUnpin(t *testing.T)
 }
 
 func TestManagerStatsCountsDistinctPinnedSnapshotsAcrossRotation(t *testing.T) {
-	m := NewManager(true)
+	m := NewRegistry(true)
 
 	first := &View{Seq: 1}
 	second := &View{Seq: 2}

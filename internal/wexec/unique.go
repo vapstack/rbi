@@ -28,7 +28,7 @@ var uniqueUint64IntMapPool = pooled.Maps[uint64, int]{
 }
 
 type UniqueContext struct {
-	Schema          *schema.Runtime
+	Schema          *schema.Schema
 	Current         func() *snapshot.View
 	UniqueViolation error
 }

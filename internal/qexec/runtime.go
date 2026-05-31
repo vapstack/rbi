@@ -12,7 +12,7 @@ import (
 )
 
 type Config struct {
-	Schema *schema.Runtime
+	Schema *schema.Schema
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -25,7 +25,7 @@ type Config struct {
 }
 
 type Runtime struct {
-	Schema *schema.Runtime
+	Schema *schema.Schema
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int

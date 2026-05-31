@@ -111,8 +111,20 @@ func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
 
 func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
 	if db.strKey {
-		s := *(*string)(unsafe.Pointer(&id))
-		return db.strMap.Create(s)
+		var out uint64
+		pos := uint64(0)
+		err := db.ScanKeys(*new(K), func(key K) (bool, error) {
+			pos++
+			if key == id {
+				out = pos
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			panic(err)
+		}
+		return out, false
 	}
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
@@ -183,8 +195,8 @@ func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, opti
 func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	r := newRand(1)
 	ids := make([]uint64, 0, n)
@@ -247,8 +259,8 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(i int) *Rec) {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
@@ -1268,8 +1280,8 @@ type metamorphicDataProfile struct {
 func seedMetamorphicDataProfile(t *testing.T, db *DB[uint64, Rec], n int, p metamorphicDataProfile) {
 	t.Helper()
 
-	db.DisableSync()
-	defer db.EnableSync()
+	db.disableSync()
+	defer db.enableSync()
 
 	r := newRand(173 + int64(n) + int64(p.scoreLevels)*11)
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland", "US", "JP"}

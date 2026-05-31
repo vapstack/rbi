@@ -7,12 +7,12 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 )
 
-func PrepareCount(rt *schema.Runtime, exprs ...qx.Expr) (*qir.Query, error) {
+func PrepareCount(s *schema.Schema, exprs ...qx.Expr) (*qir.Query, error) {
 	switch len(exprs) {
 	case 1:
-		return qir.PrepareCountExprResolved(rt.IndexedByName, exprs[0])
+		return qir.PrepareCountExprResolved(s.IndexedByName, exprs[0])
 	default:
-		return qir.PrepareCountExprsResolved(rt.IndexedByName, exprs...)
+		return qir.PrepareCountExprsResolved(s.IndexedByName, exprs...)
 	}
 }
 

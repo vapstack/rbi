@@ -205,7 +205,7 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 	incompatibleCurrent := persistTestField("drop", 1)
 	storedIncompatible := persistTestField("drop", 1)
 	storedIncompatible.DBName = "drop_old"
-	rt := &schema.Runtime{
+	rt := &schema.Schema{
 		Fields: map[string]*schema.Field{
 			"keep": current,
 			"drop": incompatibleCurrent,
@@ -303,7 +303,7 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 	errInvalid := errors.New("invalid sentinel")
 	errStale := errors.New("stale sentinel")
 	field := persistTestField("field", 0)
-	rt := &schema.Runtime{
+	rt := &schema.Schema{
 		Fields:        map[string]*schema.Field{"field": field},
 		MeasureFields: map[string]*schema.Field{},
 		Indexed:       []schema.IndexedFieldAccessor{{Ordinal: 0, Name: "field", Field: field}},
@@ -363,7 +363,7 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 	field := persistTestField("field", 0)
 	measureField := persistTestField("measure", 0)
-	rt := &schema.Runtime{
+	rt := &schema.Schema{
 		Fields:        map[string]*schema.Field{"field": field},
 		MeasureFields: map[string]*schema.Field{"measure": measureField},
 		Indexed:       []schema.IndexedFieldAccessor{{Ordinal: 0, Name: "field", Field: field}},
@@ -444,7 +444,7 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 		DBPath:          "test.db",
 		Bucket:          []byte("bucket"),
 		CurrentSeq:      11,
-		Schema:          &schema.Runtime{},
+		Schema:          &schema.Schema{},
 		StrMapCompactAt: 0,
 		Errors:          Errors{Stale: errStale, Invalid: errInvalid},
 	})
@@ -469,7 +469,7 @@ func TestLoadRejectsUnsupportedVersion(t *testing.T) {
 		DBPath:          "test.db",
 		Bucket:          []byte("bucket"),
 		CurrentSeq:      1,
-		Schema:          &schema.Runtime{},
+		Schema:          &schema.Schema{},
 		StrMapCompactAt: 0,
 		Errors:          Errors{Stale: errStale, Invalid: errInvalid},
 	})
@@ -491,7 +491,7 @@ func TestStoreRemovesTempFileOnRenameFailure(t *testing.T) {
 	err := Store(StoreConfig{
 		File:      final,
 		BucketSeq: 1,
-		Schema:    &schema.Runtime{},
+		Schema:    &schema.Schema{},
 		Snapshot:  &snapshot.View{},
 	})
 	if err == nil {
@@ -510,7 +510,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	tagsField := persistTestField("tags", 1)
 	tagsField.Slice = true
 	amountField := persistTestField("amount", 0)
-	rt := &schema.Runtime{
+	rt := &schema.Schema{
 		Fields: map[string]*schema.Field{
 			"name": nameField,
 			"tags": tagsField,

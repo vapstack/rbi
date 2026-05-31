@@ -98,11 +98,6 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 320)
 
-	// Force a clean snapshot before mutations to exercise the initial order paths.
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex(base): %v", err)
-	}
-
 	runChecks := func(label string, queries []*qx.QX) {
 		t.Helper()
 		for i, q := range queries {
@@ -301,13 +296,6 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 			var opsLog []string
 
 			for step := 0; step < tc.steps; step++ {
-				if step > 0 && step%27 == 0 {
-					if err := db.RebuildIndex(); err != nil {
-						t.Fatalf("RebuildIndex(seed=%d,step=%d): %v", tc.seed, step, err)
-					}
-					opsLog = append(opsLog, fmt.Sprintf("step=%d rebuild", step))
-				}
-
 				id := uint64(1 + r.IntN(560))
 				switch x := r.IntN(100); {
 				case x < 45:
@@ -526,9 +514,6 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
 	gotEmpty, err := db.QueryKeys(emptyQ)
@@ -570,9 +555,6 @@ func TestQuery_ByArrayCount_AfterLenIndexEmptied(t *testing.T) {
 	if err := db.Set(2, &Rec{Name: "two", Email: "two@example.test"}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test"}); err != nil {
 		t.Fatalf("Set(1 empty tags): %v", err)
 	}
@@ -611,9 +593,6 @@ func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	zeroCount := len(collectIDsByTagDistinctLen(t, db, 0))
 	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(zeroCount + 5).Limit(80)
@@ -651,9 +630,6 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 		if err := db.Set(uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	for i := 1; i <= 40; i++ {
@@ -718,9 +694,6 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 		if err := db.Set(uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	if err := db.Set(1001, &Rec{
@@ -1310,9 +1283,6 @@ func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *te
 		if err := db.Set(id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	tests := []struct {

@@ -91,9 +91,6 @@ func TestExecPlanLeadScanNoOrderMergedRangeLeadUsesEffectiveBounds(t *testing.T)
 			t.Fatalf("Set(%d): %v", age, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	q := qx.Query(
 		qx.GT("age", 10),
@@ -533,9 +530,6 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 			t.Fatalf("seed Set(%d): %v", i+1, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.PREFIX("email", "user1")
 	cacheKey := db.engine.materializedPredCacheKey(expr)
@@ -588,9 +582,6 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 		if err != nil {
 			t.Fatalf("seed Set(%d): %v", i+1, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	expr := qx.PREFIX("email", "user1")
@@ -652,9 +643,6 @@ func TestBuildPredRange_NumericBucketsRunWhenPredicateCacheDisabled(t *testing.T
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustTestQIRExprForDB(t, db, qx.LT("age", 11_000))
@@ -710,9 +698,6 @@ func TestBuildPredRangeCandidate_FullUniversePrefixBecomesAlwaysTrue(t *testing.
 			t.Fatalf("seed Set(%d): %v", i+1, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	p, ok := db.engine.buildPredicateWithMode(qx.PREFIX("email", "user"), false)
 	if !ok {
@@ -738,9 +723,6 @@ func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallba
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	view := db.engine.currentQueryViewForTests()
 	if ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age"); ov.IsChunked() {
 		t.Fatalf("expected base numeric index path for age, got chunked overlay")
@@ -776,9 +758,6 @@ func TestBuildPredRange_FieldIndexNumericPostingFilter_NotComplementMaterialized
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	view := db.engine.currentQueryViewForTests()
 	if ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age"); !ov.IsChunked() {
 		t.Fatalf("expected chunked overlay path for age")
@@ -814,9 +793,6 @@ func TestBuildPredRange_FieldIndexNumericPostingFilter_ComplementMaterializedFal
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected field metadata for age")
@@ -874,9 +850,6 @@ func TestBuildPredRangeCandidate_DoesNotCollapsePartialChunkedRangeToAlwaysTrue(
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	p, ok := db.engine.buildPredicateWithMode(qx.GT("score", 4.0), false)
 	if !ok {
@@ -903,9 +876,6 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.GT("score", 4.0)
 	p, ok := db.engine.buildPredicateWithMode(expr, false)
@@ -987,9 +957,6 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.LT("age", 6_000)
 	p, ok := db.engine.currentQueryViewForTests().buildPredicateWithColdMode(mustTestQIRExprForDB(t, db, expr), true, true)
@@ -1029,9 +996,6 @@ func TestBuildPredicates_DefaultBuildKeepsColdNumericRangesLazy(t *testing.T) {
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	preds, ok := db.engine.buildPredicates([]qx.Expr{
 		qx.EQ("active", true),
@@ -1079,9 +1043,6 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 				Active: i%2 == 0,
 			}
 		})
-		if err := db.RebuildIndex(); err != nil {
-			t.Fatalf("RebuildIndex: %v", err)
-		}
 
 		expr := qx.GT("age", 11_000)
 		cacheKey := db.engine.materializedPredCacheKey(expr)
@@ -1132,9 +1093,6 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 				Active: i%2 == 0,
 			}
 		})
-		if err := db.RebuildIndex(); err != nil {
-			t.Fatalf("RebuildIndex: %v", err)
-		}
 
 		expr := qx.GT("score", 220.0)
 		cacheKey := db.engine.materializedPredCacheKey(expr)
@@ -1176,9 +1134,6 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.GTE("age", 40)
 	view := db.engine.currentQueryViewForTests()
@@ -1241,9 +1196,6 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 			Active: i%2 == 0,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 	expr := qx.GTE("age", 40)
@@ -1302,9 +1254,6 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1365,9 +1314,6 @@ func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEager
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1422,9 +1368,6 @@ func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsW
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1479,9 +1422,6 @@ func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateS
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1540,9 +1480,6 @@ func TestBuildPredicatesOrdered_MergesStringScalarRangeBounds(t *testing.T) {
 			Active: true,
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	leaves := []qx.Expr{
 		qx.GTE("email", "user000400@example.com"),
@@ -1590,9 +1527,6 @@ func TestBuildPredicatesOrdered_MergedStringPrefixPreservesTightenedBounds(t *te
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	leaves := []qx.Expr{
 		qx.GTE("email", "user"),
@@ -1628,9 +1562,6 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1697,9 +1628,6 @@ func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMate
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1752,9 +1680,6 @@ func TestBuildPredicatesOrdered_BroadNullableComplementMaterializesWhenOrderedEa
 		if err := db.Set(uint64(i+5), rec); err != nil {
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
 	}
 
 	view := db.engine.currentQueryViewForTests()
@@ -1816,9 +1741,6 @@ func TestBuildPredicatesOrdered_NonBroadNullableComplementMaterializesWhenOrdere
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1872,9 +1794,6 @@ func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testin
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -1947,9 +1866,6 @@ func TestOrderedORMaterializedRangeLeafCosts_NullableComplementPrefersPositiveCa
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2006,9 +1922,6 @@ func TestOrderedORMaterializedExactRangePredicateCosts_NullableComplementPrefers
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2059,9 +1972,6 @@ func TestMaterializeOrderedORPredicate_PreservesMergedExactRangeBounds(t *testin
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2121,9 +2031,6 @@ func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrdere
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2222,9 +2129,6 @@ func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWh
 			t.Fatalf("Set(rank_%02d): %v", i, err)
 		}
 	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2294,9 +2198,6 @@ func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHit
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2375,9 +2276,6 @@ func TestOrderedORMaterializedPrefixLeafBuildWork_RejectsBroadComplementPrefix(t
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2409,9 +2307,6 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 			SnapshotMaterializedPredCacheMaxEntries: 16,
 		})
 		seed(db)
-		if err := db.RebuildIndex(); err != nil {
-			t.Fatalf("RebuildIndex: %v", err)
-		}
 
 		materialize := func() predicate {
 			p, ok := db.engine.buildPredicateWithMode(expr, false)
@@ -2602,9 +2497,6 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 			}[i%4],
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	vals := pooled.GetStringSlice(2)
 	vals = append(vals, "db", "go")
@@ -2654,9 +2546,6 @@ func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrde
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
@@ -2701,9 +2590,6 @@ func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *tes
 			Score: float64(i),
 		}
 	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	view := db.engine.currentQueryViewForTests()
 
