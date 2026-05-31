@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
@@ -19,10 +20,52 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-const writeBenchSeedBatch = 50_000
-const writeBenchSeedCount = 200_000
-const writeBenchUserBatchSize = 1000
-const writeBenchHighChurnOps = 2048
+func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+
+	var count int
+	prepareReadBenchSnapshot(b, db)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		count = 0
+		if err := db.ScanKeys(0, func(_ uint64) (bool, error) {
+			count++
+			return true, nil
+		}); err != nil {
+			b.Fatalf("ScanKeys: %v", err)
+		}
+	}
+	b.ReportMetric(float64(count), "keys/op")
+}
+
+func Benchmark_Read_Query_Items_SimpleFetch(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	q := qx.Query(qx.EQ("country", "US")).Sort("age", qx.DESC).Limit(20)
+	runReadQueryBench(b, db, q)
+}
+
+func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
+	runReadQueryBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(qx.GTE("age", 20)).Sort("score", qx.DESC).Limit(100)
+	})
+}
+
+func Benchmark_Read_Query_Items_GT_NoMatch(b *testing.B) {
+	// This no-match read microbenchmark mostly measures fixed query overhead;
+	// Cold cache rotation stretches runtime without adding much signal.
+	db := buildBenchDB(b, benchN)
+	q := qx.Query(qx.GT("age", 100))
+	runReadQueryBench(b, db, q)
+}
+
+const (
+	writeBenchSeedBatch     = 100_000
+	writeBenchSeedCount     = 200_000
+	writeBenchUserBatchSize = 1000
+	writeBenchHighChurnOps  = 2048
+)
 
 var writeBenchEncodePool pooled.Buffers
 
@@ -505,9 +548,6 @@ func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	db, _, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -531,9 +571,6 @@ func Benchmark_Write_Update_BeforeStore(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -555,9 +592,6 @@ func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -590,9 +624,6 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
@@ -629,9 +660,6 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testi
 }
 
 func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
@@ -657,9 +685,6 @@ func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skip extended write benchmark in short mode")
-	}
 	for _, tc := range []struct {
 		name string
 		opts Options
@@ -777,4 +802,38 @@ func prepareWriteBenchHighChurn[K ~string | ~uint64, V any](b *testing.B, db *DB
 	churn(b, db)
 	requireBenchSnapshotPublished(b, db.SnapshotStats())
 	b.StartTimer()
+}
+
+func Benchmark_Write_Helper_MakePatch(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	v1 := &UserBench{
+		Country: "ES",
+		Plan:    "free",
+		Status:  "trial",
+		Age:     20,
+		Score:   0.5,
+		Name:    "Test",
+		Email:   "test@example.com",
+		Tags:    []string{"go"},
+		Roles:   []string{"user"},
+	}
+	v2 := &UserBench{
+		Country: "ES",
+		Plan:    "basic",
+		Status:  "active",
+		Age:     20,
+		Score:   0.8,
+		Name:    "Test",
+		Email:   "test@example.com",
+		Tags:    []string{"go", "java"},
+		Roles:   []string{"user", "admin"},
+	}
+
+	buf := make([]Field, 0, 8)
+	b.ResetTimer()
+	for b.Loop() {
+		buf = db.MakePatchInto(v1, v2, buf)
+	}
 }

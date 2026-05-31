@@ -1489,3 +1489,74 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 		}
 	}
 }
+
+func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   10 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1024,
+	})
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	closeDone := make(chan error, 1)
+
+	go func() {
+		firstDone <- db.Set(1, &Rec{Name: "first", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+			close(firstStarted)
+			<-releaseFirst
+			return nil
+		}))
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first batch callback did not start in time")
+	}
+
+	go func() {
+		secondDone <- db.Set(2, &Rec{Name: "second", Age: 20})
+	}()
+
+	go func() {
+		closeDone <- db.Close()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !db.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(1 * time.Millisecond)
+	}
+	if !db.closed.Load() {
+		close(releaseFirst)
+		<-firstDone
+		<-secondDone
+		<-closeDone
+		t.Fatal("db.closed was not set by Close in time")
+	}
+
+	close(releaseFirst)
+
+	awaitErr := func(name string, ch <-chan error) error {
+		t.Helper()
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s timed out", name)
+			return nil
+		}
+	}
+
+	if err := awaitErr("first Set", firstDone); err != nil && !errors.Is(err, ErrClosed) {
+		t.Fatalf("first Set expected nil or ErrClosed, got: %v", err)
+	}
+	if err := awaitErr("second Set", secondDone); !errors.Is(err, ErrClosed) {
+		t.Fatalf("second Set expected ErrClosed, got: %v", err)
+	}
+	if err := awaitErr("Close", closeDone); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

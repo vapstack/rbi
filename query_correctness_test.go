@@ -8,7 +8,129 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"go.etcd.io/bbolt"
 )
+
+func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
+
+	items, err := db.Query(qx.Query(qx.EQ("age", 30)))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer releaseUniqueRecords(db, items...)
+	if len(items) != 1 || items[0] == nil {
+		t.Fatalf("unexpected query result: %#v", items)
+	}
+
+	items[0].Name = "mutated"
+	items[0].Tags[0] = "changed"
+
+	again, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	defer releaseUniqueRecords(db, again)
+	if again == nil || again.Name != "alice" || again.Tags[0] != "go" {
+		t.Fatalf("stored value changed after Query result mutation: %#v", again)
+	}
+}
+
+func TestAPI_Query_ReturnOrderMatchesQueryKeys(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	mustSetAPIRecs(t, db, map[uint64]*Rec{
+		1: {Name: "id-1", Age: 20},
+		2: {Name: "id-2", Age: 40},
+		3: {Name: "id-3", Age: 30},
+	})
+
+	q := qx.Query(qx.GTE("age", 20)).Sort("age", qx.DESC)
+
+	keys, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	items, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer releaseUniqueRecords(db, items...)
+
+	if len(keys) != len(items) {
+		t.Fatalf("Query/QueryKeys length mismatch: keys=%v items=%d", keys, len(items))
+	}
+
+	wantNames := map[uint64]string{
+		1: "id-1",
+		2: "id-2",
+		3: "id-3",
+	}
+	for i, id := range keys {
+		if items[i] == nil || items[i].Name != wantNames[id] {
+			t.Fatalf("position %d mismatch: key=%d item=%#v", i, id, items[i])
+		}
+	}
+}
+
+func TestAPI_Count_IgnoresOrderOffsetLimit(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	mustSetAPIRecs(t, db, map[uint64]*Rec{
+		1: {Name: "a", Age: 18},
+		2: {Name: "b", Age: 25},
+		3: {Name: "c", Age: 30},
+		4: {Name: "d", Age: 35},
+	})
+
+	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("age", qx.ASC).Offset(2).Limit(1).Filter)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("expected full match count=3, got %d", got)
+	}
+}
+
+func TestAPI_Count_IgnoresInvalidOrderField(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	mustSetAPIRecs(t, db, map[uint64]*Rec{
+		1: {Name: "a", Age: 25},
+		2: {Name: "b", Age: 30},
+	})
+
+	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("does_not_exist", qx.ASC).Offset(1).Limit(1).Filter)
+	if err != nil {
+		t.Fatalf("Count should ignore order fields entirely, got err=%v", err)
+	}
+	if got != 2 {
+		t.Fatalf("expected count=2, got %d", got)
+	}
+}
+
+func TestQuery_MissingBucket_EmptyIndexResultStillRequiresSequenceTx(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+		if tx.Bucket(db.BucketName()) == nil {
+			return nil
+		}
+		return tx.DeleteBucket(db.BucketName())
+	}); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+
+	items, err := db.Query(qx.Query(qx.EQ("age", 999_999)))
+	if err == nil {
+		t.Fatalf("expected missing bucket error, got items=%#v", items)
+	}
+}
 
 func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
@@ -428,70 +550,6 @@ func TestQuerySetEquivalence_StringKeys(t *testing.T) {
 	for k := range wantSet {
 		if _, ok := gotSet[k]; !ok {
 			t.Fatalf("missing id %q in result set", k)
-		}
-	}
-}
-
-func TestScanKeysUint64_SeekOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	for i := 1; i <= 5; i++ {
-		r := &Rec{Name: fmt.Sprintf("n%d", i), Age: i}
-		if err := db.Set(uint64(i), r); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	var got []uint64
-	err := db.ScanKeys(3, func(id uint64) (bool, error) {
-		got = append(got, id)
-		return true, nil
-	})
-	if err != nil {
-		t.Fatalf("ScanKeys: %v", err)
-	}
-
-	want := []uint64{3, 4, 5}
-	if !slices.Equal(want, got) {
-		t.Fatalf("expected %v, got %v", want, got)
-	}
-}
-
-func TestScanKeys_String_SeekLowerBound(t *testing.T) {
-	db, _ := openTempDBString(t)
-
-	for i := 1; i <= 5; i++ {
-		id := fmt.Sprintf("id-%02d", i)
-		r := &Rec{Name: "x", Age: i}
-		if err := db.Set(id, r); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	seek := "id-03"
-	got := make(map[string]struct{})
-	err := db.ScanKeys(seek, func(id string) (bool, error) {
-		if id < seek {
-			t.Fatalf("unexpected id below seek: %v", id)
-		}
-		got[id] = struct{}{}
-		return true, nil
-	})
-	if err != nil {
-		t.Fatalf("ScanKeys: %v", err)
-	}
-
-	want := map[string]struct{}{
-		"id-03": {},
-		"id-04": {},
-		"id-05": {},
-	}
-	if len(got) != len(want) {
-		t.Fatalf("expected %d keys, got %d: %v", len(want), len(got), got)
-	}
-	for id := range want {
-		if _, ok := got[id]; !ok {
-			t.Fatalf("missing key: %v (got=%v)", id, got)
 		}
 	}
 }
@@ -1135,5 +1193,787 @@ func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
 
 	if !slices.Equal(gotWrapped, gotDirect) {
 		t.Fatalf("results mismatch:\n wrapped=%v\n direct=%v", gotWrapped, gotDirect)
+	}
+}
+
+type queryMetamorphicTransform struct {
+	name  string
+	apply func(*qx.QX) (*qx.QX, bool)
+}
+
+type queryMetamorphicCase struct {
+	name string
+	q    *qx.QX
+}
+
+type queryMetamorphicSource struct {
+	name  string
+	open  func(*testing.T) *DB[uint64, Rec]
+	cases func() []queryMetamorphicCase
+}
+
+type queryMetamorphicBaseline[K ~uint64 | ~string] struct {
+	q        *qx.QX
+	exact    bool
+	keys     []K
+	fullKeys []K
+}
+
+func newQueryMetamorphicBaseline[K ~uint64 | ~string](
+	c queryContract[K],
+	q *qx.QX,
+) queryMetamorphicBaseline[K] {
+	c.t.Helper()
+	ref := c.assertAllReadPathsMatchReference(q)
+
+	base := queryMetamorphicBaseline[K]{
+		q:     cloneQuery(q),
+		exact: !queryContractNoOrderWindow(q),
+	}
+	if base.exact {
+		base.keys = ref.page(c, q)
+		return base
+	}
+
+	base.fullKeys = ref.full(c, q)
+	return base
+}
+
+func (c queryContract[K]) AssertMetamorphicEquivalent(
+	base queryMetamorphicBaseline[K],
+	label string,
+	q *qx.QX,
+) {
+	c.t.Helper()
+	ref := c.assertAllReadPathsMatchReference(q)
+
+	if base.exact {
+		got := ref.page(c, q)
+		if !c.equal(base.q, base.keys, got) {
+			c.t.Fatalf(
+				"%s exact equivalence mismatch:\nbase=%+v\nq=%+v\nbaseKeys=%v\ngot=%v",
+				label, base.q, q, base.keys, got,
+			)
+		}
+		return
+	}
+
+	got := ref.full(c, q)
+	fullQ := cloneQuery(base.q)
+	clearQueryOrderWindowForTest(fullQ)
+	if !c.equal(fullQ, base.fullKeys, got) {
+		c.t.Fatalf(
+			"%s full-set equivalence mismatch:\nbase=%+v\nq=%+v\nbaseFull=%v\ngotFull=%v",
+			label, base.q, q, base.fullKeys, got,
+		)
+	}
+}
+
+func queryMetamorphicTransforms() []queryMetamorphicTransform {
+	return []queryMetamorphicTransform{
+		{
+			name: "Normalize",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				return normalizeQueryForTest(q), true
+			},
+		},
+		{
+			name: "AndTrue",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				return withNoisyEquivalentQuery(q, 0), true
+			},
+		},
+		{
+			name: "OrFalse",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				return withNoisyEquivalentQuery(q, 1), true
+			},
+		},
+		{
+			name: "DuplicateAND",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				out := cloneQuery(q)
+				left := cloneMetamorphicExpr(q.Filter)
+				right := cloneMetamorphicExpr(q.Filter)
+				out.Filter = qx.AND(left, right)
+				return out, true
+			},
+		},
+		{
+			name: "DuplicateOR",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				out := cloneQuery(q)
+				left := cloneMetamorphicExpr(q.Filter)
+				right := cloneMetamorphicExpr(q.Filter)
+				out.Filter = qx.OR(left, right)
+				return out, true
+			},
+		},
+		{
+			name: "DoubleNegation",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				out := cloneQuery(q)
+				out.Filter = qx.NOT(qx.NOT(cloneMetamorphicExpr(q.Filter)))
+				return out, true
+			},
+		},
+		{
+			name: "PermuteAND",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				filter, ok := metamorphicReverseBoolArgs(q.Filter, qx.OpAND)
+				if !ok {
+					return nil, false
+				}
+				out := cloneQuery(q)
+				out.Filter = filter
+				return out, true
+			},
+		},
+		{
+			name: "PermuteOR",
+			apply: func(q *qx.QX) (*qx.QX, bool) {
+				filter, ok := metamorphicReverseBoolArgs(q.Filter, qx.OpOR)
+				if !ok {
+					return nil, false
+				}
+				out := cloneQuery(q)
+				out.Filter = filter
+				return out, true
+			},
+		},
+		{
+			name:  "DeMorgan",
+			apply: metamorphicApplyDeMorgan,
+		},
+	}
+}
+
+func cloneMetamorphicExpr(expr qx.Expr) qx.Expr {
+	out := expr
+	if len(expr.Args) == 0 {
+		return out
+	}
+
+	out.Args = make([]qx.Expr, len(expr.Args))
+	for i := range expr.Args {
+		out.Args[i] = cloneMetamorphicExpr(expr.Args[i])
+	}
+	return out
+}
+
+func metamorphicReverseBoolArgs(expr qx.Expr, op string) (qx.Expr, bool) {
+	out := expr
+	if len(expr.Args) == 0 {
+		return out, false
+	}
+
+	reverse := expr.Kind == qx.KindOP && expr.Name == op && len(expr.Args) > 1
+	out.Args = make([]qx.Expr, len(expr.Args))
+	changed := reverse
+	for i := range out.Args {
+		src := i
+		if reverse {
+			src = len(expr.Args) - 1 - i
+		}
+		child, childChanged := metamorphicReverseBoolArgs(expr.Args[src], op)
+		out.Args[i] = child
+		if childChanged {
+			changed = true
+		}
+	}
+	return out, changed
+}
+
+func metamorphicApplyDeMorgan(q *qx.QX) (*qx.QX, bool) {
+	if q == nil {
+		return nil, false
+	}
+	if q.Filter.Kind != qx.KindOP || len(q.Filter.Args) < 2 {
+		return nil, false
+	}
+
+	var inner qx.Expr
+	switch q.Filter.Name {
+	case qx.OpAND:
+		args := make([]qx.Expr, len(q.Filter.Args))
+		for i := range q.Filter.Args {
+			args[i] = qx.NOT(cloneMetamorphicExpr(q.Filter.Args[i]))
+		}
+		inner = qx.OR(args...)
+	case qx.OpOR:
+		args := make([]qx.Expr, len(q.Filter.Args))
+		for i := range q.Filter.Args {
+			args[i] = qx.NOT(cloneMetamorphicExpr(q.Filter.Args[i]))
+		}
+		inner = qx.AND(args...)
+	default:
+		return nil, false
+	}
+
+	out := cloneQuery(q)
+	out.Filter = qx.NOT(inner)
+	return out, true
+}
+
+func queryMetamorphicSmallWorldCases() []queryMetamorphicCase {
+	exprs := smallWorldExprCases()
+	orders := smallWorldOrderCases()
+	windows := smallWorldWindowCases()
+	cases := make([]queryMetamorphicCase, 0, len(exprs)*len(orders)*len(windows))
+	for _, exprCase := range exprs {
+		for _, orderCase := range orders {
+			for _, windowCase := range windows {
+				cases = append(cases, queryMetamorphicCase{
+					name: fmt.Sprintf("%s/%s/%s", exprCase.name, orderCase.name, windowCase.name),
+					q:    buildSmallWorldQuery(exprCase, orderCase, windowCase),
+				})
+			}
+		}
+	}
+	return cases
+}
+
+func queryMetamorphicSeededCases() []queryMetamorphicCase {
+	return []queryMetamorphicCase{
+		{
+			name: "OR_Order_Offset",
+			q: qx.Query(
+				qx.OR(
+					qx.AND(
+						qx.EQ("active", true),
+						qx.IN("country", []string{"NL", "DE", "PL"}),
+						qx.GTE("score", 30.0),
+					),
+					qx.AND(
+						qx.PREFIX("full_name", "FN-1"),
+						qx.NOTIN("country", []string{"Thailand"}),
+						qx.GTE("age", 20),
+					),
+					qx.AND(
+						qx.HASANY("tags", []string{"go", "db"}),
+						qx.NE("name", "alice"),
+					),
+				),
+			).Sort("score", qx.DESC).Offset(300).Limit(120),
+		},
+		{
+			name: "AND_NoOrder_Complex",
+			q: qx.Query(
+				qx.EQ("active", true),
+				qx.NOTIN("country", []string{"NL", "PL"}),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("age", 22),
+			),
+		},
+		{
+			name: "AutocompleteLike",
+			q: qx.Query(
+				qx.PREFIX("full_name", "FN-1"),
+				qx.EQ("active", true),
+				qx.NOTIN("country", []string{"NL"}),
+			).Sort("score", qx.DESC).Limit(80),
+		},
+		{
+			name: "OrderRange",
+			q: qx.Query(
+				qx.GTE("age", 25),
+				qx.LTE("age", 40),
+				qx.GT("score", 20.0),
+			).Sort("score", qx.DESC).Offset(100).Limit(90),
+		},
+	}
+}
+
+func queryMetamorphicSkewedNotInCases() []queryMetamorphicCase {
+	return []queryMetamorphicCase{
+		{
+			name: "CapturedShape",
+			q:    capturedNotInOrderOffsetQuery(),
+		},
+		{
+			name: "DifferentValues",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"DE", "PL"}),
+				qx.NOTIN("country", []string{"Thailand", "US"}),
+			).Sort("score", qx.ASC).Offset(210).Limit(90),
+		},
+		{
+			name: "DescOrder",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).Sort("score", qx.DESC).Offset(446).Limit(70),
+		},
+		{
+			name: "WithoutOffset",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).Sort("score", qx.ASC).Limit(70),
+		},
+	}
+}
+
+func queryMetamorphicUniformProfileCases() []queryMetamorphicCase {
+	return []queryMetamorphicCase{
+		{
+			name: "NoOrderLimit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Limit(120),
+		},
+		{
+			name: "NoOrderOffsetLimit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Offset(40).Limit(80),
+		},
+		{
+			name: "OrderedOffsetLimit",
+			q: qx.Query(
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
+				qx.HASANY("tags", []string{"infra", "rust"}),
+			).Sort("age", qx.ASC).Offset(20).Limit(90),
+		},
+	}
+}
+
+func queryMetamorphicCuratedSources() []queryMetamorphicSource {
+	return []queryMetamorphicSource{
+		{
+			name: "Seeded",
+			open: func(t *testing.T) *DB[uint64, Rec] {
+				db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+				_ = seedData(t, db, 8_000)
+				return db
+			},
+			cases: queryMetamorphicSeededCases,
+		},
+		{
+			name:  "SkewedNotIn",
+			open:  openSkewedNotInRegressionDB,
+			cases: queryMetamorphicSkewedNotInCases,
+		},
+		{
+			name: "UniformProfile",
+			open: func(t *testing.T) *DB[uint64, Rec] {
+				db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+				seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
+					name:        "Uniform",
+					scoreLevels: 50_000,
+					activeTrue:  0.50,
+					hotCountryP: 0.15,
+					hotTagP:     0.30,
+				})
+				return db
+			},
+			cases: queryMetamorphicUniformProfileCases,
+		},
+	}
+}
+
+func runQueryMetamorphicTransforms(
+	t *testing.T,
+	db *DB[uint64, Rec],
+	tc queryMetamorphicCase,
+) {
+	t.Helper()
+	baseQ := cloneQuery(tc.q)
+	contract := newUint64QueryContract(t, db)
+	baseline := newQueryMetamorphicBaseline(contract, baseQ)
+	for _, transform := range queryMetamorphicTransforms() {
+		derived, ok := transform.apply(baseQ)
+		if !ok {
+			continue
+		}
+		contract.AssertMetamorphicEquivalent(
+			baseline,
+			fmt.Sprintf("%s/%s", tc.name, transform.name),
+			derived,
+		)
+	}
+}
+
+func runQueryMetamorphicExecutionRounds(
+	t *testing.T,
+	db *DB[uint64, Rec],
+	tc queryMetamorphicCase,
+) {
+	t.Helper()
+	baseQ := cloneQuery(tc.q)
+	contract := newUint64QueryContract(t, db)
+	baseline := newQueryMetamorphicBaseline(contract, baseQ)
+
+	contract.AssertMetamorphicEquivalent(baseline, tc.name+"/WarmCacheRoundTrip", baseQ)
+
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("RefreshPlannerStats(%s): %v", tc.name, err)
+	}
+	contract.AssertMetamorphicEquivalent(baseline, tc.name+"/RefreshPlannerStatsRoundTrip", baseQ)
+}
+
+func TestQueryMetamorphic_SmallWorldTransforms(t *testing.T) {
+	for _, world := range smallWorldCases() {
+		t.Run(world.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openSmallWorldDB(t, world)
+			for _, tc := range queryMetamorphicSmallWorldCases() {
+				t.Run(tc.name, func(t *testing.T) {
+					runQueryMetamorphicTransforms(t, db, tc)
+				})
+			}
+		})
+	}
+}
+
+func TestQueryMetamorphic_CuratedCorpusTransforms(t *testing.T) {
+	for _, source := range queryMetamorphicCuratedSources() {
+		t.Run(source.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := source.open(t)
+			for _, tc := range source.cases() {
+				t.Run(tc.name, func(t *testing.T) {
+					runQueryMetamorphicTransforms(t, db, tc)
+				})
+			}
+		})
+	}
+}
+
+func TestQueryMetamorphic_CuratedExecutionRounds(t *testing.T) {
+	for _, source := range queryMetamorphicCuratedSources() {
+		t.Run(source.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := source.open(t)
+			for _, tc := range source.cases() {
+				t.Run(tc.name, func(t *testing.T) {
+					runQueryMetamorphicExecutionRounds(t, db, tc)
+				})
+			}
+		})
+	}
+}
+
+type smallWorldRow struct {
+	id  uint64
+	rec *Rec
+}
+
+type smallWorldCase struct {
+	name string
+	rows []smallWorldRow
+}
+
+type smallWorldExprCase struct {
+	name     string
+	noFilter bool
+	expr     qx.Expr
+}
+
+type smallWorldOrderCase struct {
+	name  string
+	apply func(*qx.QX)
+}
+
+type smallWorldWindowCase struct {
+	name  string
+	apply func(*qx.QX)
+}
+
+func smallWorldCases() []smallWorldCase {
+	return []smallWorldCase{
+		{
+			name: "Empty",
+		},
+		{
+			name: "SingleNil",
+			rows: []smallWorldRow{
+				{
+					id: 1,
+					rec: &Rec{
+						Meta:     Meta{Country: ""},
+						Name:     "solo",
+						Email:    "solo@example.test",
+						Age:      0,
+						Score:    0,
+						Active:   false,
+						Tags:     nil,
+						FullName: "FN-000",
+						Opt:      nil,
+					},
+				},
+			},
+		},
+		{
+			name: "Overlap",
+			rows: []smallWorldRow{
+				{
+					id: 1,
+					rec: &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     "alice",
+						Email:    "alice-1@example.test",
+						Age:      20,
+						Score:    10,
+						Active:   true,
+						Tags:     []string{"go", "db"},
+						FullName: "FN-001",
+					},
+				},
+				{
+					id: 2,
+					rec: &Rec{
+						Meta:     Meta{Country: "DE"},
+						Name:     "bob",
+						Email:    "bob@example.test",
+						Age:      30,
+						Score:    20,
+						Active:   false,
+						Tags:     []string{"go"},
+						FullName: "FN-002",
+						Opt:      strPtr("opt-a"),
+					},
+				},
+				{
+					id: 3,
+					rec: &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     "carol",
+						Email:    "carol@example.test",
+						Age:      30,
+						Score:    20,
+						Active:   true,
+						Tags:     []string{"db", "ops"},
+						FullName: "FN-003",
+						Opt:      strPtr(""),
+					},
+				},
+				{
+					id: 4,
+					rec: &Rec{
+						Meta:     Meta{Country: "PL"},
+						Name:     "dave",
+						Email:    "dave@example.test",
+						Age:      40,
+						Score:    20,
+						Active:   false,
+						Tags:     nil,
+						FullName: "ZZ-004",
+						Opt:      strPtr("opt-b"),
+					},
+				},
+				{
+					id: 5,
+					rec: &Rec{
+						Meta:     Meta{Country: "Finland"},
+						Name:     "eve",
+						Email:    "eve@example.test",
+						Age:      25,
+						Score:    15,
+						Active:   true,
+						Tags:     []string{"go", "go", "db"},
+						FullName: "FN-005",
+					},
+				},
+				{
+					id: 6,
+					rec: &Rec{
+						Meta:     Meta{Country: "Thailand"},
+						Name:     "alice",
+						Email:    "alice-2@example.test",
+						Age:      18,
+						Score:    30,
+						Active:   false,
+						Tags:     []string{},
+						FullName: "AA-006",
+						Opt:      strPtr("opt-a"),
+					},
+				},
+			},
+		},
+		{
+			name: "TiesAndDuplicates",
+			rows: []smallWorldRow{
+				{
+					id: 10,
+					rec: &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     "tie",
+						Email:    "tie-1@example.test",
+						Age:      10,
+						Score:    1,
+						Active:   true,
+						Tags:     []string{"go"},
+						FullName: "FN-tie",
+					},
+				},
+				{
+					id: 11,
+					rec: &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     "tie",
+						Email:    "tie-2@example.test",
+						Age:      10,
+						Score:    1,
+						Active:   true,
+						Tags:     []string{"go", "db"},
+						FullName: "FN-tie",
+						Opt:      strPtr("opt-a"),
+					},
+				},
+				{
+					id: 12,
+					rec: &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     "tie",
+						Email:    "tie-3@example.test",
+						Age:      10,
+						Score:    1,
+						Active:   false,
+						Tags:     []string{"db"},
+						FullName: "FN-tie",
+					},
+				},
+				{
+					id: 20,
+					rec: &Rec{
+						Meta:     Meta{Country: "Iceland"},
+						Name:     "cold",
+						Email:    "cold@example.test",
+						Age:      99,
+						Score:    100,
+						Active:   false,
+						Tags:     []string{"ops"},
+						FullName: "ZZ-cold",
+						Opt:      strPtr("opt-z"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func smallWorldExprCases() []smallWorldExprCase {
+	return []smallWorldExprCase{
+		{name: "NoFilter", noFilter: true},
+		{name: "ActiveTrue", expr: qx.EQ("active", true)},
+		{name: "ActiveFalse", expr: qx.EQ("active", false)},
+		{name: "NotActiveTrue", expr: qx.NOT(qx.EQ("active", true))},
+		{name: "CountryEqNL", expr: qx.EQ("country", "NL")},
+		{name: "CountryIN", expr: qx.IN("country", []string{"NL", "DE"})},
+		{name: "CountryNOTIN", expr: qx.NOTIN("country", []string{"Thailand", "Iceland"})},
+		{name: "CountrySuffixLand", expr: qx.SUFFIX("country", "land")},
+		{name: "CountryContainsLand", expr: qx.CONTAINS("country", "land")},
+		{name: "NameEqAlice", expr: qx.EQ("name", "alice")},
+		{name: "NameNotBob", expr: qx.NE("name", "bob")},
+		{name: "AgeGTE30", expr: qx.GTE("age", 30)},
+		{name: "AgeRange", expr: qx.AND(qx.GTE("age", 20), qx.LTE("age", 30))},
+		{name: "ScoreGT15", expr: qx.GT("score", 15.0)},
+		{name: "ScoreLTE20", expr: qx.LTE("score", 20.0)},
+		{name: "FullNamePrefixFN", expr: qx.PREFIX("full_name", "FN-")},
+		{name: "OptEqNil", expr: qx.EQ("opt", nil)},
+		{name: "OptEqValue", expr: qx.EQ("opt", "opt-a")},
+		{name: "OptPrefix", expr: qx.PREFIX("opt", "opt-")},
+		{name: "TagsHasGo", expr: qx.HASALL("tags", []string{"go"})},
+		{name: "TagsHasAny", expr: qx.HASANY("tags", []string{"db", "ops"})},
+		{name: "TagsHasAll", expr: qx.HASALL("tags", []string{"go", "db"})},
+		{name: "TagsHasNone", expr: qx.HASNONE("tags", []string{"go", "ops"})},
+		{name: "AndSelective", expr: qx.AND(qx.EQ("active", true), qx.EQ("country", "NL"))},
+		{name: "AndRange", expr: qx.AND(qx.GTE("age", 20), qx.LTE("age", 30), qx.LTE("score", 20.0))},
+		{name: "OrOverlap", expr: qx.OR(qx.EQ("country", "NL"), qx.HASALL("tags", []string{"go"}))},
+		{
+			name: "OrResidualBranches",
+			expr: qx.OR(
+				qx.AND(qx.EQ("active", true), qx.HASALL("tags", []string{"db"})),
+				qx.AND(qx.EQ("active", false), qx.GTE("score", 20.0)),
+			),
+		},
+		{name: "OrDuplicateBranch", expr: qx.OR(qx.EQ("country", "NL"), qx.EQ("country", "NL"))},
+		{name: "NotGroup", expr: qx.NOT(qx.OR(qx.EQ("country", "Thailand"), qx.EQ("active", false)))},
+	}
+}
+
+func smallWorldOrderCases() []smallWorldOrderCase {
+	return []smallWorldOrderCase{
+		{name: "NoOrder"},
+		{name: "AgeAsc", apply: func(q *qx.QX) { q.Sort("age", qx.ASC) }},
+		{name: "ScoreDesc", apply: func(q *qx.QX) { q.Sort("score", qx.DESC) }},
+		{name: "FullNameAsc", apply: func(q *qx.QX) { q.Sort("full_name", qx.ASC) }},
+		{name: "OptAsc", apply: func(q *qx.QX) { q.Sort("opt", qx.ASC) }},
+		{name: "TagsPosAsc", apply: func(q *qx.QX) { queryOrderSortByArrayPos(q, "tags", []string{"go", "db", "ops"}, qx.ASC) }},
+		{name: "TagsCountDesc", apply: func(q *qx.QX) { queryOrderSortByArrayCount(q, "tags", qx.DESC) }},
+	}
+}
+
+func smallWorldWindowCases() []smallWorldWindowCase {
+	return []smallWorldWindowCase{
+		{name: "Full"},
+		{name: "Limit1", apply: func(q *qx.QX) { q.Limit(1) }},
+		{name: "Offset1Limit2", apply: func(q *qx.QX) { q.Offset(1).Limit(2) }},
+		{name: "OffsetPastLimit3", apply: func(q *qx.QX) { q.Offset(10).Limit(3) }},
+	}
+}
+
+func openSmallWorldDB(t *testing.T, world smallWorldCase) *DB[uint64, Rec] {
+	t.Helper()
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	for _, row := range world.rows {
+		if err := db.Set(row.id, row.rec); err != nil {
+			t.Fatalf("Set(%d): %v", row.id, err)
+		}
+	}
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("RefreshPlannerStats: %v", err)
+	}
+	return db
+}
+
+func buildSmallWorldQuery(exprCase smallWorldExprCase, orderCase smallWorldOrderCase, windowCase smallWorldWindowCase) *qx.QX {
+	var q *qx.QX
+	if exprCase.noFilter {
+		q = qx.Query()
+	} else {
+		q = qx.Query(exprCase.expr)
+	}
+	if orderCase.apply != nil {
+		orderCase.apply(q)
+	}
+	if windowCase.apply != nil {
+		windowCase.apply(q)
+	}
+	return q
+}
+
+func TestQuerySmallWorld_BoundedExhaustiveContract(t *testing.T) {
+	exprs := smallWorldExprCases()
+	orders := smallWorldOrderCases()
+	windows := smallWorldWindowCases()
+
+	for _, world := range smallWorldCases() {
+		t.Run(world.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openSmallWorldDB(t, world)
+
+			for _, exprCase := range exprs {
+				t.Run(exprCase.name, func(t *testing.T) {
+					for _, orderCase := range orders {
+						for _, windowCase := range windows {
+							q := buildSmallWorldQuery(exprCase, orderCase, windowCase)
+							contract := newUint64QueryContract(t, db)
+							contract.assertAllReadPathsMatchReference(q)
+						}
+					}
+				})
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1227,4 +1228,23 @@ func TestUnique_OptNilReleasesAndReuseAllowed(t *testing.T) {
 	if err = db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s}); err != nil {
 		t.Fatalf("Set(2) after releasing opt should be allowed: %v", err)
 	}
+}
+
+type UniqueTestRec struct {
+	Email string   `db:"email" rbi:"unique"`
+	Code  int      `db:"code"  rbi:"unique"`
+	Opt   *string  `db:"opt"   rbi:"unique"`
+	Tags  []string `db:"tags"  rbi:"index"`
+}
+
+func openTempDBUint64Unique(t *testing.T, options ...Options) (*DB[uint64, UniqueTestRec], string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_unique.db")
+	db, raw := openBoltAndNew[uint64, UniqueTestRec](t, path, options...)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db, path
 }
