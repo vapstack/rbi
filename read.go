@@ -109,9 +109,18 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 		return ErrNoIndex
 	}
 
-	return db.index.ScanKeys(keycodec.DataKeyFromUserKey(seek, db.strKey), ErrNoValidKeyIndex, func(key keycodec.DataKey) (bool, error) {
-		return fn(keycodec.UserKeyFromDataKey[K](key, db.strKey))
-	})
+	if db.strKey {
+		return db.index.ScanStringKeys(
+			keycodec.UserKeyString(seek),
+			ErrNoValidKeyIndex,
+			keycodec.UserKeyStringScanFunc(fn),
+		)
+	}
+
+	return db.index.ScanUintKeys(
+		keycodec.UserKeyUint(seek),
+		keycodec.UserKeyUintScanFunc(fn),
+	)
 }
 
 // SeqScan performs a sequential scan over all records starting at the given

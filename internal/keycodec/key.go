@@ -482,6 +482,40 @@ func UserKeyFromDataKey[K ~string | ~uint64](key DataKey, strKey bool) K {
 	return *(*K)(unsafe.Pointer(&u))
 }
 
+// UserKeyString returns id as the canonical string key carrier.
+// It must only be called on paths already known to use string keys.
+func UserKeyString[K ~string | ~uint64](id K) string {
+	return *(*string)(unsafe.Pointer(&id))
+}
+
+// UserKeyUint returns id as the canonical uint64 key carrier.
+// It must only be called on paths already known to use uint64 keys.
+func UserKeyUint[K ~string | ~uint64](id K) uint64 {
+	return *(*uint64)(unsafe.Pointer(&id))
+}
+
+// UserKeyStringScanFunc returns fn reinterpreted as a string-key scan callback.
+//
+// It converts the function value once instead of returning a wrapper that
+// converts every scanned key before calling fn.
+//
+// ScanKeys invokes the callback for every key, so a wrapper would add an extra
+// indirect call per key and put key conversion back into the hot loop.
+//
+// The caller must only use this adapter on paths already known to use string keys.
+func UserKeyStringScanFunc[K ~string | ~uint64](fn func(K) (bool, error)) func(string) (bool, error) {
+	return *(*func(string) (bool, error))(unsafe.Pointer(&fn))
+}
+
+// UserKeyUintScanFunc returns fn reinterpreted as a uint64-key scan callback.
+//
+// See UserKeyStringScanFunc for explanation.
+//
+// The caller must only use this adapter on paths already known to use uint64 keys.
+func UserKeyUintScanFunc[K ~string | ~uint64](fn func(K) (bool, error)) func(uint64) (bool, error) {
+	return *(*func(uint64) (bool, error))(unsafe.Pointer(&fn))
+}
+
 func UserKeyBytesWithBuf[K ~string | ~uint64](id K, strKey bool, buf *[8]byte) []byte {
 	if strKey {
 		s := *(*string)(unsafe.Pointer(&id))

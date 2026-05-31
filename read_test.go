@@ -454,6 +454,68 @@ func TestAPI_ScanKeys_PropagatesCallbackError(t *testing.T) {
 	}
 }
 
+type scanKeysNamedUint64 uint64
+
+func TestAPI_ScanKeys_NamedUint64KeyType(t *testing.T) {
+	db, raw := openBoltAndNew[scanKeysNamedUint64, Rec](t, t.TempDir()+"/named_uint64.db")
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	for i := 1; i <= 3; i++ {
+		if err := db.Set(scanKeysNamedUint64(i), &Rec{Name: "x", Age: i}); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	var got []scanKeysNamedUint64
+	err := db.ScanKeys(scanKeysNamedUint64(2), func(id scanKeysNamedUint64) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+	if !slices.Equal(got, []scanKeysNamedUint64{2, 3}) {
+		t.Fatalf("unexpected keys: %v", got)
+	}
+}
+
+type scanKeysNamedString string
+
+func TestAPI_ScanKeys_NamedStringKeyType(t *testing.T) {
+	db, raw := openBoltAndNew[scanKeysNamedString, Rec](t, t.TempDir()+"/named_string.db")
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	for i, id := range []scanKeysNamedString{"a", "b", "c"} {
+		if err := db.Set(id, &Rec{Name: "x", Age: i}); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	got := make(map[scanKeysNamedString]struct{})
+	err := db.ScanKeys(scanKeysNamedString("b"), func(id scanKeysNamedString) (bool, error) {
+		if id < "b" {
+			t.Fatalf("unexpected id below seek: %v", id)
+		}
+		got[id] = struct{}{}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+	if _, ok := got["b"]; !ok {
+		t.Fatalf("missing b: %v", got)
+	}
+	if _, ok := got["c"]; !ok {
+		t.Fatalf("missing c: %v", got)
+	}
+}
+
 func TestAPI_SeqScan_StopOnFalse(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	for i := 1; i <= 4; i++ {

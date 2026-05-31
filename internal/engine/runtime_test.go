@@ -238,8 +238,8 @@ func TestRuntimeStringQueryKeysAndScanKeysUsePublishedStrMap(t *testing.T) {
 	}
 
 	var scanned []string
-	err := r.ScanKeys(keycodec.DataKeyFromUserKey("b", true), errors.New("invalid key"), func(key keycodec.DataKey) (bool, error) {
-		scanned = append(scanned, key.String())
+	err := r.ScanStringKeys("b", errors.New("invalid key"), func(key string) (bool, error) {
+		scanned = append(scanned, key)
 		return true, nil
 	})
 	if err != nil {

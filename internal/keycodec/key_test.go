@@ -231,6 +231,38 @@ func TestDBKeyBytesAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUserKeyTypedCarriersAndScanFuncs(t *testing.T) {
+	type namedUint uint64
+	type namedString string
+
+	if got := UserKeyUint(namedUint(42)); got != 42 {
+		t.Fatalf("UserKeyUint: got=%d", got)
+	}
+	if got := UserKeyString(namedString("user-42")); got != "user-42" {
+		t.Fatalf("UserKeyString: got=%q", got)
+	}
+
+	var gotUint namedUint
+	uintFn := UserKeyUintScanFunc(func(id namedUint) (bool, error) {
+		gotUint = id
+		return id < 100, nil
+	})
+	cont, err := uintFn(42)
+	if err != nil || !cont || gotUint != 42 {
+		t.Fatalf("UserKeyUintScanFunc: cont=%v err=%v got=%d", cont, err, gotUint)
+	}
+
+	var gotString namedString
+	stringFn := UserKeyStringScanFunc(func(id namedString) (bool, error) {
+		gotString = id
+		return id != "stop", nil
+	})
+	cont, err = stringFn("user-42")
+	if err != nil || !cont || gotString != "user-42" {
+		t.Fatalf("UserKeyStringScanFunc: cont=%v err=%v got=%q", cont, err, gotString)
+	}
+}
+
 func TestOrderedNumericByteStrings(t *testing.T) {
 	neg := Int64ByteString(-1)
 	pos := Int64ByteString(1)

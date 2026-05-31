@@ -10,7 +10,6 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
@@ -351,7 +350,7 @@ func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape) (KeyS
 	return KeySet{IDs: ids, lookup: snap.StrMap.Lookup()}, nil
 }
 
-func (index *Index) ScanKeys(seek keycodec.DataKey, invalidKeyErr error, fn func(keycodec.DataKey) (bool, error)) error {
+func (index *Index) ScanUintKeys(seek uint64, fn func(uint64) (bool, error)) error {
 	snap, seq, ref := index.snapshot.PinCurrent()
 	defer index.snapshot.Unpin(seq, ref)
 
@@ -359,17 +358,12 @@ func (index *Index) ScanKeys(seek keycodec.DataKey, invalidKeyErr error, fn func
 	iter := universe.Iter()
 	defer iter.Release()
 
-	if index.strKey {
-		return scanStringKeys(snap.StrMap, universe, iter, seek.String(), invalidKeyErr, fn)
-	}
-
-	min := seek.Uint()
 	for iter.HasNext() {
 		idx := iter.Next()
-		if idx < min {
+		if idx < seek {
 			continue
 		}
-		cont, err := fn(keycodec.DataKeyFromUserKey(idx, false))
+		cont, err := fn(idx)
 		if err != nil {
 			return err
 		}
@@ -380,11 +374,22 @@ func (index *Index) ScanKeys(seek keycodec.DataKey, invalidKeyErr error, fn func
 	return nil
 }
 
-func scanStringKeys(snap *strmap.Snapshot, universe posting.List, iter posting.Iterator, seek string, invalidKeyErr error, fn func(keycodec.DataKey) (bool, error)) error {
-	if snap == nil || universe.IsEmpty() {
+func (index *Index) ScanStringKeys(seek string, invalidKeyErr error, fn func(string) (bool, error)) error {
+	snap, seq, ref := index.snapshot.PinCurrent()
+	defer index.snapshot.Unpin(seq, ref)
+
+	universe := snap.Universe
+	if universe.IsEmpty() {
 		return nil
 	}
 
+	iter := universe.Iter()
+	defer iter.Release()
+
+	return scanStringKeys(snap.StrMap, universe, iter, seek, invalidKeyErr, fn)
+}
+
+func scanStringKeys(snap *strmap.Snapshot, universe posting.List, iter posting.Iterator, seek string, invalidKeyErr error, fn func(string) (bool, error)) error {
 	next := snap.Next()
 	card := universe.Cardinality()
 	minIdx, hasMin := universe.Minimum()
@@ -425,11 +430,11 @@ func scanStringKeys(snap *strmap.Snapshot, universe posting.List, iter posting.I
 	return nil
 }
 
-func emitScannedStringKey(seek string, s string, fn func(keycodec.DataKey) (bool, error)) (bool, error) {
+func emitScannedStringKey(seek string, s string, fn func(string) (bool, error)) (bool, error) {
 	if s < seek {
 		return true, nil
 	}
-	return fn(keycodec.DataKeyFromUserKey(s, true))
+	return fn(s)
 }
 
 func (index *Index) BuildIndex(bolt *bbolt.DB, bucket []byte, skipFields map[string]struct{}, skipMeasureFields map[string]struct{}, decode DecodeFunc, release ReleaseFunc) (BuildResult, error) {
