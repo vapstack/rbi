@@ -265,7 +265,7 @@ func (index *Index) QueryKeys(q *qx.QX, fn func(KeySet) error) error {
 	snap, seq, ref := index.snapshot.PinCurrent()
 	defer index.snapshot.Unpin(seq, ref)
 
-	keys, err := index.queryKeysOnSnapshot(snap, &shape)
+	keys, err := index.queryKeysOnSnapshot(snap, &shape, false)
 	if err != nil {
 		return err
 	}
@@ -309,9 +309,12 @@ func (index *Index) Query(q *qx.QX, bolt *bbolt.DB, bucketName []byte, unavailab
 	defer index.snapshot.Unpin(seq, ref)
 	defer func() { _ = tx.Rollback() }()
 
-	keys, err := index.queryKeysOnSnapshot(snap, &shape)
+	keys, err := index.queryKeysOnSnapshot(snap, &shape, true)
 	if err != nil {
 		return err
+	}
+	if len(keys.IDs) == 0 {
+		return nil
 	}
 	return fn(tx, keys)
 }
@@ -327,11 +330,11 @@ func (index *Index) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
 	return prepared, qir.NewShape(prepared), nil
 }
 
-func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape) (KeySet, error) {
+func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape, tryEmpty bool) (KeySet, error) {
 	view := index.exec.AcquireView(snap)
 	defer index.exec.ReleaseView(view)
 
-	if !index.exec.TraceSamplingEnabled() {
+	if tryEmpty && !index.exec.TraceSamplingEnabled() {
 		if empty, err := view.TryQueryEmptyOnSnapshot(q); empty || err != nil {
 			return KeySet{}, err
 		}
