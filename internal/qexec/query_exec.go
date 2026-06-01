@@ -610,6 +610,31 @@ func orderBasicContainsReader(preds predicateReader, active []int, baseBM postin
 	return orderBasicResidualMatchesReader(preds, active, idx)
 }
 
+func (qv *View) orderBasicMaterializedBaseFallback(q *qir.Shape, order qir.Order, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, base posting.List, baseCard uint64, preds predicateReader, active []int) ([]uint64, error) {
+	result := postingResult{ids: base}
+	if len(active) == 0 {
+		return qv.queryOrderBasicRange(result, ov, br, order, q.Offset, q.Limit, false, false)
+	}
+
+	builder := newPostingUnionBuilder(postingBatchSinglesEnabled(baseCard))
+	it := base.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		if orderBasicResidualMatchesReader(preds, active, idx) {
+			builder.addSingle(idx)
+		}
+	}
+	it.Release()
+
+	result.ids = builder.finish(false)
+	if result.ids.IsEmpty() {
+		return nil, nil
+	}
+	out, err := qv.queryOrderBasicRange(result, ov, br, order, q.Offset, q.Limit, false, false)
+	result.ids.Release()
+	return out, err
+}
+
 func orderBasicEmitFilteredPostingReader(
 	cursor *queryCursor,
 	preds predicateReader,
@@ -723,7 +748,8 @@ func (qv *View) runOrderBasicBaseQuery(
 					if guard.enabled {
 						out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, baseBM, need, guard)
 						if !ok {
-							return nil, false, nil
+							out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
+							return out, true, err
 						}
 						return out, true, nil
 					}
@@ -736,7 +762,9 @@ func (qv *View) runOrderBasicBaseQuery(
 		if baseCard > 0 && baseCard <= 4096 {
 			out, examined, ok, fallback := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				return nil, false, nil
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
+				return out, true, err
 			}
 			if ok {
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
@@ -746,7 +774,9 @@ func (qv *View) runOrderBasicBaseQuery(
 		if baseCard > 0 && baseCard <= 128 {
 			out, examined, fallback := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				return nil, false, nil
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
+				return out, true, err
 			}
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
@@ -754,7 +784,9 @@ func (qv *View) runOrderBasicBaseQuery(
 		if baseCard <= 4096 {
 			out, examined, fallback := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				return nil, false, nil
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
+				return out, true, err
 			}
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
@@ -2750,8 +2782,18 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
-	if remaining := baseCard - skip; need > remaining {
+	remaining := baseCard - skip
+	if need > remaining {
 		need = remaining
+	}
+	guardEnabled := false
+	guardFullWindowRows := uint64(0)
+	if guard.enabled {
+		if need < remaining {
+			guardEnabled = true
+		} else {
+			_, guardFullWindowRows = ov.RangeStats(br)
+		}
 	}
 	out := make([]uint64, 0, need)
 
@@ -2777,7 +2819,8 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 						}
 					}
 				}
-				if guard.enabled && guard.shouldFallback(examined, len(out)) {
+				if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+					(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 					return nil, examined, true, true
 				}
 				continue
@@ -2801,7 +2844,8 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 				}
 			}
 			it.Release()
-			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+				(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 				return nil, examined, true, true
 			}
 		}
@@ -2840,7 +2884,8 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 					}
 				}
 			}
-			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+				(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 				return nil, examined, true, true
 			}
 			continue
@@ -2867,7 +2912,8 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			}
 		}
 		it.Release()
-		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+		if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+			(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 			return nil, examined, true, true
 		}
 	}
@@ -2901,8 +2947,18 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
-	if remaining := baseCard - skip; need > remaining {
+	remaining := baseCard - skip
+	if need > remaining {
 		need = remaining
+	}
+	guardEnabled := false
+	guardFullWindowRows := uint64(0)
+	if guard.enabled {
+		if need < remaining {
+			guardEnabled = true
+		} else {
+			_, guardFullWindowRows = ov.RangeStats(br)
+		}
 	}
 	out := make([]uint64, 0, need)
 	keyCur := ov.NewCursor(br, desc)
@@ -2931,7 +2987,8 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 				}
 				slot = (slot + 1) & mask
 			}
-			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+				(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 				return nil, examined, true
 			}
 			continue
@@ -2960,7 +3017,8 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			}
 		}
 		it.Release()
-		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+		if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+			(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 			return nil, examined, true
 		}
 	}
@@ -3002,8 +3060,18 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
-	if remaining := baseCard - skip; need > remaining {
+	remaining := baseCard - skip
+	if need > remaining {
 		need = remaining
+	}
+	guardEnabled := false
+	guardFullWindowRows := uint64(0)
+	if guard.enabled {
+		if need < remaining {
+			guardEnabled = true
+		} else {
+			_, guardFullWindowRows = ov.RangeStats(br)
+		}
 	}
 	out := make([]uint64, 0, need)
 	keyCur := ov.NewCursor(br, desc)
@@ -3032,7 +3100,8 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 				}
 				slot = (slot + 1) & mask
 			}
-			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+				(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 				return nil, examined, true
 			}
 			continue
@@ -3061,7 +3130,8 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 			}
 		}
 		it.Release()
-		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+		if (guardEnabled && guard.shouldFallback(examined, len(out))) ||
+			(guardFullWindowRows != 0 && guard.shouldFallbackFullWindow(examined, len(out), guardFullWindowRows, need)) {
 			return nil, examined, true
 		}
 	}

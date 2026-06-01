@@ -277,7 +277,7 @@ func emitOrderBasicSingletonChunk(cursor *queryCursor, result postingResult, sin
 	return false
 }
 
-func (qv *View) queryOrderBasicSingletonChunks(result postingResult, ov indexdata.FieldIndexView, o qir.Order, resultCard, skip, need uint64) []uint64 {
+func (qv *View) queryOrderBasicSingletonChunks(result postingResult, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, o qir.Order, resultCard, skip, need uint64) []uint64 {
 	out := makeOutSlice(resultCard, need)
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
@@ -292,7 +292,6 @@ func (qv *View) queryOrderBasicSingletonChunks(result postingResult, ov indexdat
 	dec := true
 
 	var tmp posting.List
-	br := ov.RangeForBounds(indexdata.Bounds{Has: true})
 	cur := ov.NewCursor(br, o.Desc)
 	for {
 		ids, idx, single, ok := cur.NextPostingOrSingle()
@@ -464,16 +463,29 @@ func (qv *View) emitArrayCountZeroBucketResult(cursor *queryCursor, result posti
 }
 
 func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexView, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
+	br := ov.RangeForBounds(indexdata.Bounds{Has: true})
+	return qv.queryOrderBasicRange(result, ov, br, o, skip, need, all, true)
+}
+
+func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, o qir.Order, skip, need uint64, all bool, includeNilTail bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
+	}
+	if skip >= resultCard {
+		return nil, nil
+	}
+	if !all {
+		if remaining := resultCard - skip; need > remaining {
+			need = remaining
+		}
 	}
 
 	fm := qv.fieldMetaByOrder(o)
 	isSliceOrderField := fm != nil && fm.Slice
 	if !result.neg && !isSliceOrderField && !all && need > 0 && resultCard <= 4096 {
 		if (fm == nil || !fm.Ptr) && uint64(ov.KeyCount()) >= resultCard*8 {
-			return qv.queryOrderBasicSingletonChunks(result, ov, o, resultCard, skip, need), nil
+			return qv.queryOrderBasicSingletonChunks(result, ov, br, o, resultCard, skip, need), nil
 		}
 	}
 
@@ -481,7 +493,6 @@ func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexVie
 
 	out := makeOutSlice(resultCard, need)
 	if !isSliceOrderField && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
-		br := ov.RangeForBounds(indexdata.Bounds{Has: true})
 		cur := ov.NewCursor(br, o.Desc)
 		for {
 			_, ids, ok := cur.Next()
@@ -490,7 +501,7 @@ func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexVie
 			}
 			out = appendMaterializedNumericPostingResultKeys(out, ids, result)
 		}
-		if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
+		if includeNilTail && fm != nil && fm.Ptr {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
 				qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, o).LookupPostingRetained(indexdata.NilIndexEntryKey),
@@ -508,7 +519,6 @@ func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexVie
 	cursor := newQueryCursor(out, skip, need, all, dedupeCap)
 	defer cursor.release()
 
-	br := ov.RangeForBounds(indexdata.Bounds{Has: true})
 	cur := ov.NewCursor(br, o.Desc)
 	for {
 		_, ids, ok := cur.Next()
@@ -523,7 +533,7 @@ func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexVie
 		}
 	}
 
-	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
+	if includeNilTail && fm != nil && fm.Ptr {
 		nilIDs := qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, o).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool

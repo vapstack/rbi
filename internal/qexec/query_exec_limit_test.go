@@ -1774,7 +1774,7 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceKeepsSmallBasePath(t *
 	}
 }
 
-func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceSparseWarmFallback(t *testing.T) {
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceSparseWarmMaterializedBaseFallback(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	const rows = 20_000
@@ -1840,8 +1840,8 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceSparseWarmFallback(t *
 	if !ok {
 		t.Fatalf("executeOrderedLimit: ok=false")
 	}
-	if plan != PlanMaterialized {
-		t.Fatalf("plan=%s want %s", plan, PlanMaterialized)
+	if plan != PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", plan, PlanLimitOrderBasic)
 	}
 	want := []uint64{10_256, 10_255, 10_254, 10_253, 10_252, 10_251, 10_250, 10_249, 10_248, 10_247}
 	if !reflect.DeepEqual(got, want) {

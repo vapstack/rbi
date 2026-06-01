@@ -107,6 +107,7 @@ type plannerOrderedLimitRuntimeGuard struct {
 	minExamined  uint64
 	needWindow   uint64
 	fallbackCost float64
+	uncappedCost float64
 	rowCost      float64
 	reason       string
 }
@@ -344,6 +345,7 @@ func plannerOrderedLimitRuntimeGuardForCandidate(
 	if rowCost < 1 {
 		rowCost = 1
 	}
+	uncappedCost := fallbackCost
 	if capFallback {
 		placementFallbackCap := float64(need) * (48.0 + float64(selected.checks)*8.0)
 		if placementFallbackCap > 0 && fallbackCost > placementFallbackCap {
@@ -355,6 +357,7 @@ func plannerOrderedLimitRuntimeGuardForCandidate(
 		minExamined:  minExamined,
 		needWindow:   uint64(need),
 		fallbackCost: fallbackCost,
+		uncappedCost: uncappedCost,
 		rowCost:      rowCost,
 		reason:       reason,
 	}
@@ -368,6 +371,18 @@ func (g plannerOrderedLimitRuntimeGuard) shouldFallback(examined uint64, emitted
 		return false
 	}
 	return float64(examined)*g.rowCost > g.fallbackCost*1.25
+}
+
+func (g plannerOrderedLimitRuntimeGuard) shouldFallbackFullWindow(examined uint64, emitted int, scanRows uint64, need int) bool {
+	if !g.enabled || examined < g.minExamined || examined >= scanRows || g.uncappedCost <= 0 {
+		return false
+	}
+	if emitted > 0 && uint64(emitted)*4 >= uint64(need) {
+		return false
+	}
+	fallbackCost := g.uncappedCost * 1.25
+	return float64(examined)*g.rowCost > fallbackCost &&
+		float64(scanRows-examined)*g.rowCost > fallbackCost
 }
 
 type plannerOrderedLimitBaseCoreStats struct {
