@@ -459,6 +459,21 @@ func newFlatFieldStorage(entries []Entry, stringData []byte) FieldStorage {
 		pooled.ReleaseByteSlice(stringData)
 		return FieldStorage{}
 	}
+	if stringData == nil && !entries[0].Key.IsNumeric() {
+		totalBytes := 0
+		for i := range entries {
+			totalBytes += entries[i].Key.ByteLen()
+		}
+		if totalBytes > 0 {
+			stringData = fieldByteSlice(totalBytes)
+			off := 0
+			for i := range entries {
+				n := copy(stringData[off:], entries[i].Key.UnsafeString())
+				entries[i].Key = keycodec.FromBytes(stringData[off : off+n])
+				off += n
+			}
+		}
+	}
 	root := fieldIndexFlatRootPool.Get()
 	root.entries = entries
 	root.stringData = stringData

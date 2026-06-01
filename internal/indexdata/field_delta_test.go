@@ -412,6 +412,42 @@ func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *t
 	}
 }
 
+func TestFieldStorageApplyPostingDiff_FlatStringKeysSurviveBaseRelease(t *testing.T) {
+	entries := []Entry{
+		{Key: keycodec.FromStoredString("hot", false), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromStoredString("shared", false), IDs: fieldStorageSingleton(2)},
+		{Key: keycodec.FromStoredString("tag-076", false), IDs: fieldStorageSingleton(3)},
+	}
+	base := newRegularFieldStorage(entries)
+	if base.flat == nil || base.flat.stringData == nil {
+		t.Fatalf("expected flat string storage with owned key data")
+	}
+
+	next := base.applyPostingDiff([]PostingDelta{{
+		Key: keycodec.FromStoredString("tag-076", false),
+		Delta: BatchPostingDelta{
+			Remove: fieldStorageSingleton(3),
+		},
+	}}, true)
+	if next == base {
+		next.Release()
+		t.Fatalf("expected remove to create new flat storage")
+	}
+
+	oldData := base.flat.stringData
+	base.Release()
+	for i := range oldData {
+		oldData[i] = 'x'
+	}
+	defer next.Release()
+
+	fieldStorageAssertPostingContains(t, next, "hot", 1)
+	fieldStorageAssertPostingContains(t, next, "shared", 2)
+	if got := NewFieldIndexViewFromStorage(next).LookupCardinality("tag-076"); got != 0 {
+		t.Fatalf("removed key still has cardinality %d", got)
+	}
+}
+
 func TestFieldStorageApplyPostingDiffBufOwned_ChunkedMatchesUnbuffered(t *testing.T) {
 	entries := fieldStorageEntriesForTest(fieldIndexChunkThreshold+37, true)
 	base := newRegularFieldStorage(entries)
