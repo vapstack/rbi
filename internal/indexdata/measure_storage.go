@@ -151,6 +151,85 @@ func NewMeasureStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorage {
 	return newMeasureChunkedStorageFromEntriesOwned(entries)
 }
 
+// NewMeasureStorageFromSortedRunsOwned consumes runs that are already sorted by ID.
+func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage {
+	total := 0
+	for i := range runs {
+		total += len(runs[i])
+	}
+	if total == 0 {
+		ReleaseMeasureEntrySlots(runs)
+		return MeasureStorage{}
+	}
+
+	pos := pooled.GetIntSlice(len(runs))[:len(runs)]
+	clear(pos)
+	if total <= MeasureChunkThreshold {
+		root := measureFlatRootPool.Get()
+		root.ids = pooled.GetUint64Slice(total)[:total]
+		root.values = pooled.GetUint64Slice(total)[:total]
+		for i := 0; i < total; i++ {
+			entry := popMeasureEntryRun(runs, pos)
+			root.ids[i] = entry.ID
+			root.values[i] = entry.Value
+		}
+		root.refs.Store(1)
+		releaseMeasureEntryRunsOwned(runs)
+		pooled.ReleaseIntSlice(pos)
+		return MeasureStorage{flat: root}
+	}
+
+	root := measureChunkedRootPool.Get()
+	root.refsByID = measureChunkRefSlicePool.Get((total + MeasureChunkTargetRows - 1) / MeasureChunkTargetRows)
+	for remaining := total; remaining > 0; {
+		size := min(MeasureChunkTargetRows, remaining)
+		chunk := measureChunkPool.Get()
+		chunk.ids = pooled.GetUint64Slice(size)[:size]
+		chunk.values = pooled.GetUint64Slice(size)[:size]
+		for i := 0; i < size; i++ {
+			entry := popMeasureEntryRun(runs, pos)
+			chunk.ids[i] = entry.ID
+			chunk.values[i] = entry.Value
+		}
+		chunk.refs.Store(1)
+		root.appendChunkRef(chunk)
+		remaining -= size
+	}
+	root.refs.Store(1)
+	releaseMeasureEntryRunsOwned(runs)
+	pooled.ReleaseIntSlice(pos)
+	return MeasureStorage{chunked: root}
+}
+
+func popMeasureEntryRun(runs [][]MeasureEntry, pos []int) MeasureEntry {
+	best := -1
+	bestID := uint64(0)
+	for i := range runs {
+		p := pos[i]
+		if p == len(runs[i]) {
+			continue
+		}
+		id := runs[i][p].ID
+		if best < 0 || id < bestID {
+			best = i
+			bestID = id
+		}
+	}
+	entry := runs[best][pos[best]]
+	pos[best]++
+	return entry
+}
+
+func releaseMeasureEntryRunsOwned(runs [][]MeasureEntry) {
+	for i := range runs {
+		if runs[i] != nil {
+			ReleaseMeasureEntrySlice(runs[i])
+			runs[i] = nil
+		}
+	}
+	ReleaseMeasureEntrySlots(runs)
+}
+
 func newMeasureFlatStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorage {
 	root := measureFlatRootPool.Get()
 	root.ids = pooled.GetUint64Slice(len(entries))[:len(entries)]

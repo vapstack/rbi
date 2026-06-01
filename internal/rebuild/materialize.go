@@ -1,6 +1,8 @@
 package rebuild
 
 import (
+	"cmp"
+	"slices"
 	"time"
 
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -143,7 +145,7 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 	if len(activeMeasures) > 0 {
 		for _, acc := range activeMeasures {
 			i := acc.Ordinal
-			entries := indexdata.GetMeasureEntrySlice(0)
+			runs := indexdata.GetMeasureEntrySlots(0)
 			for worker := range build.localMeasureStates {
 				if i >= len(build.localMeasureStates[worker]) {
 					continue
@@ -152,14 +154,16 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 				if buf == nil {
 					continue
 				}
-				for entryPos := 0; entryPos < len(buf); entryPos++ {
-					entries = append(entries, buf[entryPos])
+				if cfg.StrKey && len(buf) > 1 {
+					// Bolt scans string keys lexicographically; StrMap IDs can follow an older assignment order.
+					slices.SortFunc(buf, func(a, b indexdata.MeasureEntry) int {
+						return cmp.Compare(a.ID, b.ID)
+					})
 				}
-				indexdata.ReleaseMeasureEntrySlice(buf)
+				runs = append(runs, buf)
 				build.localMeasureStates[worker][i] = nil
 			}
-			storage := indexdata.NewMeasureStorageFromEntriesOwned(entries)
-			nextMeasure[i] = storage
+			nextMeasure[i] = indexdata.NewMeasureStorageFromSortedRunsOwned(runs)
 		}
 	}
 

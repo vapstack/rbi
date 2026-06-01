@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -473,6 +474,37 @@ func TestBuildStringKeysUseLiveMapper(t *testing.T) {
 	}
 	if idx, ok := cfg.StrMap.Create("user-1"); idx != 1 || ok {
 		t.Fatalf("live mapper mapping after rebuild: idx=%d created=%v want=1/false", idx, ok)
+	}
+}
+
+func TestMaterializeStringKeyMeasureRunsSortByNumericID(t *testing.T) {
+	rt := compileRebuildTestSchema(t)
+	score := rt.MeasuresByName["score"]
+	buf := indexdata.GetMeasureEntrySlice(0)
+	buf = append(buf,
+		indexdata.MeasureEntry{ID: 2, Value: 20},
+		indexdata.MeasureEntry{ID: 1, Value: 10},
+	)
+
+	localMeasures := make([][][]indexdata.MeasureEntry, 1)
+	localMeasures[0] = make([][]indexdata.MeasureEntry, len(rt.Measures))
+	localMeasures[0][score.Ordinal] = buf
+
+	result := materialize(
+		Config{Schema: rt, StrKey: true},
+		newRebuildTestState(rt),
+		nil,
+		[]schema.MeasureFieldAccessor{score},
+		&buildData{localMeasureStates: localMeasures},
+		time.Now(),
+	)
+	defer result.Storage.Release()
+
+	if got, ok := result.Storage.Measure[score.Ordinal].Lookup(1); !ok || got != 10 {
+		t.Fatalf("score measure for id=1 got=%d ok=%v want=10/true", got, ok)
+	}
+	if got, ok := result.Storage.Measure[score.Ordinal].Lookup(2); !ok || got != 20 {
+		t.Fatalf("score measure for id=2 got=%d ok=%v want=20/true", got, ok)
 	}
 }
 

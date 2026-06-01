@@ -51,6 +51,40 @@ func TestMeasureStorageApplyDeltasFlatAndChunked(t *testing.T) {
 	chunkedOut.Release()
 }
 
+func TestMeasureStorageFromSortedRunsOwned(t *testing.T) {
+	tests := []struct {
+		name string
+		rows int
+	}{
+		{name: "Flat", rows: MeasureChunkThreshold},
+		{name: "Chunked", rows: MeasureChunkThreshold + MeasureChunkTargetRows + 17},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const runCount = 4
+			runs := GetMeasureEntrySlots(runCount)
+			for i := 0; i < runCount; i++ {
+				run := GetMeasureEntrySlice(0)
+				for id := i + 1; id <= tc.rows; id += runCount {
+					run = append(run, MeasureEntry{ID: uint64(id), Value: uint64(id * 10)})
+				}
+				runs[i] = run
+			}
+
+			storage := NewMeasureStorageFromSortedRunsOwned(runs)
+			defer storage.Release()
+
+			if got := storage.Rows(); got != tc.rows {
+				t.Fatalf("rows: got %d want %d", got, tc.rows)
+			}
+			measureStorageAssertValue(t, storage, 1, 10)
+			measureStorageAssertValue(t, storage, uint64(tc.rows/2), uint64((tc.rows/2)*10))
+			measureStorageAssertValue(t, storage, uint64(tc.rows), uint64(tc.rows*10))
+		})
+	}
+}
+
 func TestMeasureDeltaBatchApplyToMeasureStorageSlotsOwned(t *testing.T) {
 	prev := GetMeasureStorageSlice(3)[:3]
 	prev[0] = measureStorageForTest(4)
