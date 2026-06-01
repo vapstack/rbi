@@ -741,6 +741,28 @@ func BenchmarkQueryPreparedShapeNoOrderBroadRangeLead(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryPreparedShapeScalarEQ3NoOrder(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	expr := qx.AND(
+		qx.EQ("country", "US"),
+		qx.EQ("name", "alice"),
+		qx.EQ("active", true),
+	)
+
+	b.Run("EvalExpr_Materialized", func(b *testing.B) {
+		benchmarkEvalPreparedExpr(b, db, expr, false)
+	})
+	b.Run("Query_All_Materialized", func(b *testing.B) {
+		benchmarkPreparedQueryShape(b, db, qx.Query(expr))
+	})
+	b.Run("Query_Limit128_CandidateNoOrder", func(b *testing.B) {
+		benchmarkPreparedQueryShape(b, db, qx.Query(expr).Limit(128))
+	})
+	b.Run("Dispatch_Limit128_CandidateNoOrder", func(b *testing.B) {
+		benchmarkNoOrderLimitDispatch(b, db, qx.Query(expr).Limit(128))
+	})
+}
+
 func BenchmarkQueryPreparedShapeLowCardOrderBucket(b *testing.B) {
 	db := newTestDB(b, qexecBenchOptions())
 	earlyTags := []string{"bucket_early", "mix"}
@@ -3077,6 +3099,8 @@ type qexecBenchRoute uint8
 
 const (
 	qexecBenchRouteNoFilterNoOrder qexecBenchRoute = iota
+	qexecBenchRouteQuery
+	qexecBenchRouteMaterialized
 	qexecBenchRouteLimit
 	qexecBenchRouteOrderBasicLimit
 	qexecBenchRouteOrderPrefixLimit
@@ -3089,6 +3113,12 @@ func runQexecBenchRoute(view *View, shape *qir.Shape, route qexecBenchRoute) ([]
 	switch route {
 	case qexecBenchRouteNoFilterNoOrder:
 		return view.execSelectedNoOrderNoFilter(shape, nil)
+	case qexecBenchRouteQuery:
+		out, err := view.Query(shape, false)
+		return out, true, err
+	case qexecBenchRouteMaterialized:
+		out, err := view.queryMaterialized(shape)
+		return out, true, err
 	case qexecBenchRouteLimit:
 		if !shape.HasOrder {
 			out, ok, _, err := view.executeNoOrderLimit(shape, nil)
@@ -3111,6 +3141,64 @@ func runQexecBenchRoute(view *View, shape *qir.Shape, route qexecBenchRoute) ([]
 	default:
 		return nil, false, nil
 	}
+}
+
+func qexecBenchReportPlannerCosts(b *testing.B, view *View, shape *qir.Shape) {
+	b.Helper()
+
+	if !shape.HasOrder {
+		if shape.Expr.Op == qir.OpOR && !shape.Expr.Not {
+			var facts plannerORFacts
+			ok := view.collectORFacts(shape, &facts)
+			defer facts.Release()
+			if !ok {
+				return
+			}
+			decision := view.selectOR(shape, &facts)
+			switch decision.kind {
+			case plannerORDecisionNoOrder:
+				b.ReportMetric(decision.noOrder.kWayCost, "planner-selected-cost")
+				b.ReportMetric(decision.noOrder.fallbackCost, "planner-materialized-cost")
+				b.ReportMetric(float64(decision.noOrder.expectedRows), "planner-expected-rows")
+			case plannerORDecisionOrder:
+				b.ReportMetric(decision.order.bestCost, "planner-selected-cost")
+				b.ReportMetric(decision.order.fallbackCost, "planner-materialized-cost")
+				b.ReportMetric(float64(decision.order.expectedRows), "planner-expected-rows")
+			}
+			return
+		}
+
+		facts := noOrderLimitFactsPool.Get()
+		ok, err := view.collectNoOrderLimitFacts(shape, facts)
+		if err == nil && ok {
+			decision := view.selectNoOrderLimit(shape, facts)
+			b.ReportMetric(decision.selected.cost, "planner-selected-cost")
+			b.ReportMetric(decision.materializedFallback.cost, "planner-materialized-cost")
+			b.ReportMetric(decision.rejected.cost, "planner-rejected-cost")
+			b.ReportMetric(float64(decision.selected.expectedRows), "planner-expected-rows")
+			b.ReportMetric(float64(decision.selected.leadRows), "planner-lead-rows")
+			b.ReportMetric(float64(decision.selected.checks), "planner-checks")
+			b.ReportMetric(float64(decision.selected.buildWork), "planner-build-work")
+		}
+		facts.Release()
+		return
+	}
+
+	if shape.Order.Kind != qir.OrderKindBasic || shape.Limit == 0 {
+		return
+	}
+	facts := orderedLimitFactsPool.Get()
+	ok, err := view.collectOrderedLimitFacts(shape, facts)
+	if err == nil && ok {
+		decision, decisionOK, decisionErr := view.selectOrderedLimit(shape, facts)
+		if decisionErr == nil && decisionOK {
+			b.ReportMetric(decision.selected.cost, "planner-selected-cost")
+			b.ReportMetric(decision.materializedFallback.cost, "planner-materialized-cost")
+			b.ReportMetric(decision.rejected.cost, "planner-rejected-cost")
+			b.ReportMetric(float64(decision.selected.expectedRows), "planner-expected-rows")
+		}
+	}
+	facts.Release()
 }
 
 func benchmarkQueryRoute(b *testing.B, db *testDB, q *qx.QX, route qexecBenchRoute) {
@@ -3145,7 +3233,93 @@ func benchmarkQueryRoute(b *testing.B, db *testDB, q *qx.QX, route qexecBenchRou
 		}
 		qexecBenchIDs = out
 	}
+	b.StopTimer()
+	qexecBenchReportPlannerCosts(b, view, &shape)
 	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func benchmarkQueryRouteMatrix(b *testing.B, db *testDB, q *qx.QX, routes []struct {
+	name  string
+	route qexecBenchRoute
+}) {
+	b.Helper()
+
+	for i := range routes {
+		route := routes[i]
+		b.Run(route.name, func(b *testing.B) {
+			benchmarkQueryRoute(b, db, q, route.route)
+		})
+	}
+}
+
+func BenchmarkQueryForcedPlanMatrix(b *testing.B) {
+	routes := []struct {
+		name  string
+		route qexecBenchRoute
+	}{
+		{name: "SelectedQuery", route: qexecBenchRouteQuery},
+		{name: "Materialized", route: qexecBenchRouteMaterialized},
+		{name: "LimitSelector", route: qexecBenchRouteLimit},
+	}
+	orRoutes := []struct {
+		name  string
+		route qexecBenchRoute
+	}{
+		{name: "SelectedQuery", route: qexecBenchRouteQuery},
+		{name: "Materialized", route: qexecBenchRouteMaterialized},
+		{name: "ORSelector", route: qexecBenchRouteOR},
+	}
+
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+		prefix := qexecBenchPrefix(sel)
+
+		scalarEQ3 := qx.Query(
+			qx.EQ("country", "US"),
+			qx.EQ("name", "alice"),
+			qx.EQ("active", true),
+		).Limit(128)
+		mixedAND := qx.Query(
+			qx.EQ("country", "US"),
+			qx.EQ("active", true),
+			qx.HASANY("tags", []string{tag, "missing_tag"}),
+		).Limit(256)
+		rangeAND := qx.Query(
+			ageStart,
+			ageEnd,
+			qx.EQ("active", true),
+			qx.EQ("country", "US"),
+		).Limit(128)
+		prefixAND := qx.Query(
+			qx.PREFIX("full_name", prefix),
+			qx.EQ("active", true),
+			qx.EQ("country", "US"),
+		).Limit(128)
+		orQuery := qx.Query(
+			qx.OR(
+				qx.EQ("country", "US"),
+				qx.AND(qx.EQ("country", "DE"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+				qx.AND(ageStart, ageEnd),
+			),
+		).Limit(256)
+
+		b.Run("ScalarEQ3_Limit128", func(b *testing.B) {
+			benchmarkQueryRouteMatrix(b, db, scalarEQ3, routes)
+		})
+		b.Run("MixedEQ_HASANY_Limit256", func(b *testing.B) {
+			benchmarkQueryRouteMatrix(b, db, mixedAND, routes)
+		})
+		b.Run("RangeEQ_Limit128", func(b *testing.B) {
+			benchmarkQueryRouteMatrix(b, db, rangeAND, routes)
+		})
+		b.Run("PrefixEQ_Limit128", func(b *testing.B) {
+			benchmarkQueryRouteMatrix(b, db, prefixAND, routes)
+		})
+		b.Run("OR_NoOrder_Limit256", func(b *testing.B) {
+			benchmarkQueryRouteMatrix(b, db, orQuery, orRoutes)
+		})
+	})
 }
 
 func BenchmarkQueryRoutes(b *testing.B) {

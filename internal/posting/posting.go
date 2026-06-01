@@ -2076,10 +2076,12 @@ func (p List) BuildAnd(other List) List {
 		}
 		if sp := other.small(); sp != nil {
 			var matched [SmallCap]uint64
+			var cursor ContainsCursor
+			cursor.Reset(p)
 			n := 0
 			for i := 0; i < int(sp.n); i++ {
 				id := sp.ids[i]
-				if !lp.contains(id) {
+				if !cursor.Contains(id) {
 					continue
 				}
 				matched[n] = id
@@ -2090,10 +2092,12 @@ func (p List) BuildAnd(other List) List {
 		}
 		if mp := other.mid(); mp != nil {
 			var matched [MidCap]uint64
+			var cursor ContainsCursor
+			cursor.Reset(p)
 			n := 0
 			for i := 0; i < int(mp.n); i++ {
 				id := mp.ids[i]
-				if !lp.contains(id) {
+				if !cursor.Contains(id) {
 					continue
 				}
 				matched[n] = id
