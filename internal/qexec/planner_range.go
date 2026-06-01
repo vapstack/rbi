@@ -1069,6 +1069,9 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	if buildWork == 0 {
 		return false
 	}
+	if !qv.materializedPredObservationCandidate(op.cacheKey, est, buildWork) {
+		return false
+	}
 	probeBuckets := buckets
 	probeEst := est
 	if useComplementProbe {
@@ -1083,13 +1086,7 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 		}
 	}
 	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, probeBuckets, probeEst)
-	if op.cacheKey.IsZero() {
-		return probeWork >= buildWork
-	}
-	if probeWork >= buildWork {
-		return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, buildWork)
-	}
-	if satAddUint64(probeWork, probeWork) < buildWork {
+	if probeWork == 0 {
 		return false
 	}
 	return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, buildWork)

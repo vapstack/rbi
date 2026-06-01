@@ -1071,8 +1071,14 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 		}
 		return nil, true
 	}
-	out := make([]uint64, 0, clampUint64ToInt(capHint))
+	var out []uint64
+	if !guard.enabled {
+		out = make([]uint64, 0, clampUint64ToInt(capHint))
+	}
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	if guard.enabled {
+		cursor.allocCap = capHint
+	}
 	trackScanWidth := q.HasOrder
 
 	var (
@@ -1408,11 +1414,7 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 	return cursor.out, true
 }
 
-func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, filter posting.List, guard plannerOrderedLimitRuntimeGuard) ([]uint64, bool) {
-	capHint, exhausted := boundedWindowCap(filter.Cardinality(), q.Offset, q.Limit)
-	if exhausted {
-		return nil, true
-	}
+func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, filter posting.List, need uint64, guard plannerOrderedLimitRuntimeGuard) ([]uint64, bool) {
 	emitKeep := uint64(0)
 	if guard.enabled {
 		emitKeep = guard.needWindow >> 2
@@ -1420,8 +1422,8 @@ func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.
 			emitKeep++
 		}
 	}
-	out := make([]uint64, 0, clampUint64ToInt(capHint))
-	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	out := make([]uint64, 0, clampUint64ToInt(need))
+	cursor := newQueryCursor(out, q.Offset, need, false, 0)
 	keyCur := ov.NewCursor(br, desc)
 	examined := uint64(0)
 	var filterCur posting.ContainsCursor

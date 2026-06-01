@@ -297,7 +297,38 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 	if !ok || need <= 0 {
 		return plannerOrderedLimitRuntimeGuard{}
 	}
-	expected := d.selected.expectedRows
+	return plannerOrderedLimitRuntimeGuardForCandidate(d.selected, d.runtimeFallback.cost, need, "bounds_scan_guard", true)
+}
+
+func (d plannerOrderedLimitDecision) baseCoreRuntimeGuard(q *qir.Shape, baseOpCount int) plannerOrderedLimitRuntimeGuard {
+	if !d.selected.kind.usesBaseCore() || baseOpCount == 0 {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	if d.materializedFallback.kind != plannerOrderedLimitCandidateMaterializedFallback || d.materializedFallback.cost <= 0 {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	if q.Offset > 0 {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	need, ok := orderWindow(q)
+	if !ok || need <= 0 {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	// The placement cap is only valid when the selected base scan is expected
+	// to stay near the requested window; broad scans must keep materialized
+	// build cost visible or sparse result ranges fall back to a slower plan.
+	capFallback := d.selected.expectedRows <= uint64(need)*128
+	return plannerOrderedLimitRuntimeGuardForCandidate(d.selected, d.materializedFallback.cost, need, "base_core_scan_guard", capFallback)
+}
+
+func plannerOrderedLimitRuntimeGuardForCandidate(
+	selected plannerOrderedLimitCandidate,
+	fallbackCost float64,
+	need int,
+	reason string,
+	capFallback bool,
+) plannerOrderedLimitRuntimeGuard {
+	expected := selected.expectedRows
 	if expected < uint64(need) {
 		expected = uint64(need)
 	}
@@ -309,14 +340,15 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 	if minExamined < 512 {
 		minExamined = 512
 	}
-	rowCost := 1.0 + float64(d.selected.checks)*0.75
+	rowCost := 1.0 + float64(selected.checks)*0.75
 	if rowCost < 1 {
 		rowCost = 1
 	}
-	fallbackCost := d.runtimeFallback.cost
-	placementFallbackCap := float64(need) * (48.0 + float64(d.selected.checks)*8.0)
-	if placementFallbackCap > 0 && fallbackCost > placementFallbackCap {
-		fallbackCost = placementFallbackCap
+	if capFallback {
+		placementFallbackCap := float64(need) * (48.0 + float64(selected.checks)*8.0)
+		if placementFallbackCap > 0 && fallbackCost > placementFallbackCap {
+			fallbackCost = placementFallbackCap
+		}
 	}
 	return plannerOrderedLimitRuntimeGuard{
 		enabled:      true,
@@ -324,7 +356,7 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 		needWindow:   uint64(need),
 		fallbackCost: fallbackCost,
 		rowCost:      rowCost,
-		reason:       "bounds_scan_guard",
+		reason:       reason,
 	}
 }
 

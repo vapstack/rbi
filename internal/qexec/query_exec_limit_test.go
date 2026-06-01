@@ -49,6 +49,22 @@ func filterQIRLeavesByField[K ~string | ~uint64, V any](db *DB[K, V], leaves []q
 	return out
 }
 
+func warmMaterializedPredForLimitTest[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) qcache.MaterializedPredKey {
+	t.Helper()
+	op := mustLimitQIRExpr(t, db, expr)
+	view := db.engine.currentQueryViewForTests()
+	key := view.materializedPredKey(op)
+	if key.IsZero() {
+		t.Fatalf("expected materialized predicate key for %+v", expr)
+	}
+	ids := view.evalLazyMaterializedPredicateWithKey(op, key)
+	ids.Release()
+	if !view.snap.HasMaterializedPredKey(key) {
+		t.Fatalf("expected warmed materialized predicate for key %s", key.String())
+	}
+	return key
+}
+
 func hideLenIndexForTest[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], field string) {
 	t.Helper()
 	snap := db.engine.snapshot.Current()
@@ -736,7 +752,7 @@ func TestQuery_OrderBasicBaseFastPathCapsLargeLimitByBaseCard(t *testing.T) {
 			ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, shape.Order)
 			br := ov.RangeForBounds(indexdata.Bounds{Has: true})
 
-			got, used, err := view.runOrderBasicBaseQuery(&shape, "score", nil, 0, shape.Order, ov, br, "", base, nil, nil, nil)
+			got, used, err := view.runOrderBasicBaseQuery(&shape, "score", nil, 0, shape.Order, ov, br, "", base, nil, nil, plannerOrderedLimitRuntimeGuard{}, nil)
 			if err != nil {
 				t.Fatalf("runOrderBasicBaseQuery: %v", err)
 			}
@@ -1517,6 +1533,391 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToPostingFilterScanNoTrace(t *
 	}
 	if plan != PlanMaterialized {
 		t.Fatalf("plan=%s want %s", plan, PlanMaterialized)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardFallsBackToMaterialized(t *testing.T) {
+	var events []TraceEvent
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSampleEvery: 1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+	})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		return &Rec{
+			Email: fmt.Sprintf("user%05d@example.com", i),
+			Score: float64(i),
+		}
+	})
+	warmMaterializedPredForLimitTest(t, db, qx.PREFIX("email", "user10"))
+
+	got, err := db.QueryKeys(qx.Query(qx.PREFIX("email", "user10")).Sort("score", qx.DESC).Limit(10))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want := []uint64{10_999, 10_998, 10_997, 10_996, 10_995, 10_994, 10_993, 10_992, 10_991, 10_990}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.OrderedLimitRoute.Selected != plannerOrderedLimitCandidateWarmBaseCore.String() {
+		t.Fatalf("selected=%q want %q route=%+v", ev.OrderedLimitRoute.Selected, plannerOrderedLimitCandidateWarmBaseCore.String(), ev.OrderedLimitRoute)
+	}
+	if !ev.OrderedLimitRoute.RuntimeGuardEnabled || ev.OrderedLimitRoute.RuntimeGuardReason != "base_core_scan_guard" {
+		t.Fatalf("expected base-core runtime guard, route=%+v", ev.OrderedLimitRoute)
+	}
+	if !ev.OrderedLimitRoute.RuntimeFallbackTriggered || ev.OrderedLimitRoute.RuntimeFallbackReason != "base_core_scan_guard" {
+		t.Fatalf("expected base-core runtime fallback, route=%+v", ev.OrderedLimitRoute)
+	}
+	if ev.Plan != string(PlanMaterialized) {
+		t.Fatalf("plan=%s want %s", ev.Plan, PlanMaterialized)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsGoodPlacement(t *testing.T) {
+	var events []TraceEvent
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSampleEvery: 1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+	})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		return &Rec{
+			Email: fmt.Sprintf("user%05d@example.com", i),
+			Score: float64(i),
+		}
+	})
+	warmMaterializedPredForLimitTest(t, db, qx.PREFIX("email", "user19"))
+
+	got, err := db.QueryKeys(qx.Query(qx.PREFIX("email", "user19")).Sort("score", qx.DESC).Limit(10))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want := []uint64{19_999, 19_998, 19_997, 19_996, 19_995, 19_994, 19_993, 19_992, 19_991, 19_990}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.OrderedLimitRoute.Selected != plannerOrderedLimitCandidateWarmBaseCore.String() {
+		t.Fatalf("selected=%q want %q route=%+v", ev.OrderedLimitRoute.Selected, plannerOrderedLimitCandidateWarmBaseCore.String(), ev.OrderedLimitRoute)
+	}
+	if !ev.OrderedLimitRoute.RuntimeGuardEnabled || ev.OrderedLimitRoute.RuntimeGuardReason != "base_core_scan_guard" {
+		t.Fatalf("expected base-core runtime guard, route=%+v", ev.OrderedLimitRoute)
+	}
+	if ev.OrderedLimitRoute.RuntimeFallbackTriggered {
+		t.Fatalf("unexpected base-core runtime fallback, route=%+v", ev.OrderedLimitRoute)
+	}
+	if ev.Plan != string(PlanLimitOrderBasic) {
+		t.Fatalf("plan=%s want %s", ev.Plan, PlanLimitOrderBasic)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsExpensiveMaterializedFallback(t *testing.T) {
+	var events []TraceEvent
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSampleEvery: 1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+	})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		id := uint64(i)
+		return &Rec{
+			Age:   int(id),
+			Score: float64((id*7919)%rows) + float64(id&15)/16,
+		}
+	})
+
+	q := qx.Query(
+		qx.GTE("age", 8_192),
+		qx.LT("age", 8_256),
+	).Sort("score", qx.DESC).Limit(128)
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("warm QueryKeys: %v", err)
+	}
+	if len(got) != 64 {
+		t.Fatalf("warm rows=%d want 64", len(got))
+	}
+
+	events = events[:0]
+	got, err = db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(got) != 64 {
+		t.Fatalf("rows=%d want 64", len(got))
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	route := ev.OrderedLimitRoute
+	if route.Selected != plannerOrderedLimitCandidateWarmBaseCore.String() {
+		t.Fatalf("selected=%q want %q route=%+v", route.Selected, plannerOrderedLimitCandidateWarmBaseCore.String(), route)
+	}
+	if route.Rejected != plannerOrderedLimitCandidateMaterializedFallback.String() || route.RejectedCost <= route.SelectedCost {
+		t.Fatalf("fixture no longer has an expensive materialized fallback: route=%+v", route)
+	}
+	if !route.RuntimeGuardEnabled || route.RuntimeGuardReason != "base_core_scan_guard" {
+		t.Fatalf("expected base-core runtime guard, route=%+v", route)
+	}
+	if route.RuntimeFallbackTriggered {
+		t.Fatalf("unexpected base-core runtime fallback, route=%+v", route)
+	}
+	if ev.Plan != string(PlanLimitOrderBasic) {
+		t.Fatalf("plan=%s want %s", ev.Plan, PlanLimitOrderBasic)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceKeepsSmallBasePath(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		email := fmt.Sprintf("miss%05d@example.com", i)
+		if i%200 == 0 {
+			email = fmt.Sprintf("target%03d@example.com", i/200)
+		}
+		return &Rec{
+			Email: email,
+			Score: float64(i),
+		}
+	})
+	warmMaterializedPredForLimitTest(t, db, qx.PREFIX("email", "target"))
+
+	q := qx.Query(qx.PREFIX("email", "target")).Sort("score", qx.DESC).Limit(10)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.currentQueryViewForTests()
+	facts := orderedLimitFactsPool.Get()
+	defer facts.Release()
+	ok, err := view.collectOrderedLimitFacts(&viewQ, facts)
+	if err != nil {
+		t.Fatalf("collectOrderedLimitFacts: %v", err)
+	}
+	if !ok {
+		t.Fatalf("collectOrderedLimitFacts: ok=false")
+	}
+	decision, ok, err := view.selectOrderedLimit(&viewQ, facts)
+	if err != nil {
+		t.Fatalf("selectOrderedLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("selectOrderedLimit: ok=false")
+	}
+	if decision.selected.kind != plannerOrderedLimitCandidateWarmBaseCore {
+		t.Fatalf("selected=%v want %v", decision.selected.kind, plannerOrderedLimitCandidateWarmBaseCore)
+	}
+	guard := decision.baseCoreRuntimeGuard(&viewQ, len(facts.baseOps))
+	if !guard.enabled {
+		t.Fatalf("expected base-core guard")
+	}
+
+	base, err := view.evalExpr(viewQ.Expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	baseCard := int(base.ids.Cardinality())
+	if baseCard != 100 {
+		base.ids.Release()
+		t.Fatalf("baseCard=%d want 100", baseCard)
+	}
+	if _, _, denseOK, fallback := scanOrderLimitDenseBaseNoTrace(&viewQ, facts.ov, facts.br, viewQ.Order.Desc, base.ids, baseCard, nil, nil, guard); denseOK || fallback {
+		base.ids.Release()
+		t.Fatalf("dense path ok=%v fallback=%v, want small-path fixture", denseOK, fallback)
+	}
+	gotFast, _, fallback := scanOrderLimitSmallBaseNoTrace(&viewQ, facts.ov, facts.br, viewQ.Order.Desc, base.ids, baseCard, nil, nil, guard)
+	base.ids.Release()
+	if fallback {
+		t.Fatalf("small no-trace path unexpectedly fell back")
+	}
+
+	want := []uint64{20_000, 19_800, 19_600, 19_400, 19_200, 19_000, 18_800, 18_600, 18_400, 18_200}
+	if !reflect.DeepEqual(gotFast, want) {
+		t.Fatalf("small fast path keys=%v want=%v", gotFast, want)
+	}
+
+	got, ok, plan, err := view.executeOrderedLimit(&viewQ, nil)
+	if err != nil {
+		t.Fatalf("executeOrderedLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("executeOrderedLimit: ok=false")
+	}
+	if plan != PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", plan, PlanLimitOrderBasic)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceSparseWarmFallback(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		email := fmt.Sprintf("miss%05d@example.com", i)
+		if i >= 10_001 && i <= 10_256 {
+			email = fmt.Sprintf("target%03d@example.com", i-10_000)
+		}
+		return &Rec{
+			Email: email,
+			Score: float64(i),
+		}
+	})
+	warmMaterializedPredForLimitTest(t, db, qx.PREFIX("email", "target"))
+
+	q := qx.Query(qx.PREFIX("email", "target")).Sort("score", qx.DESC).Limit(10)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.currentQueryViewForTests()
+	facts := orderedLimitFactsPool.Get()
+	defer facts.Release()
+	ok, err := view.collectOrderedLimitFacts(&viewQ, facts)
+	if err != nil {
+		t.Fatalf("collectOrderedLimitFacts: %v", err)
+	}
+	if !ok {
+		t.Fatalf("collectOrderedLimitFacts: ok=false")
+	}
+	decision, ok, err := view.selectOrderedLimit(&viewQ, facts)
+	if err != nil {
+		t.Fatalf("selectOrderedLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("selectOrderedLimit: ok=false")
+	}
+	if decision.selected.kind != plannerOrderedLimitCandidateWarmBaseCore {
+		t.Fatalf("selected=%v want %v", decision.selected.kind, plannerOrderedLimitCandidateWarmBaseCore)
+	}
+	guard := decision.baseCoreRuntimeGuard(&viewQ, len(facts.baseOps))
+	if !guard.enabled {
+		t.Fatalf("expected base-core guard")
+	}
+
+	base, err := view.evalExpr(viewQ.Expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	baseCard := base.ids.Cardinality()
+	base.ids.Release()
+	keyCount := uint64(facts.ov.KeyCount())
+	if baseCard != 256 || baseCard > 512 || baseCard <= 128 || keyCount < baseCard*8 {
+		t.Fatalf("fixture is not sparseWarm: baseCard=%d keyCount=%d", baseCard, keyCount)
+	}
+
+	got, ok, plan, err := view.executeOrderedLimit(&viewQ, nil)
+	if err != nil {
+		t.Fatalf("executeOrderedLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("executeOrderedLimit: ok=false")
+	}
+	if plan != PlanMaterialized {
+		t.Fatalf("plan=%s want %s", plan, PlanMaterialized)
+	}
+	want := []uint64{10_256, 10_255, 10_254, 10_253, 10_252, 10_251, 10_250, 10_249, 10_248, 10_247}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+}
+
+func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceStopsAtCappedBaseNeed(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const rows = 2_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		return &Rec{
+			Age:   i,
+			Score: float64(rows - i),
+		}
+	})
+
+	q := qx.Query(qx.LTE("age", 200)).Sort("score", qx.DESC).Limit(1_000)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.currentQueryViewForTests()
+	facts := orderedLimitFactsPool.Get()
+	defer facts.Release()
+	ok, err := view.collectOrderedLimitFacts(&viewQ, facts)
+	if err != nil {
+		t.Fatalf("collectOrderedLimitFacts: %v", err)
+	}
+	if !ok {
+		t.Fatalf("collectOrderedLimitFacts: ok=false")
+	}
+
+	base, err := view.evalExpr(viewQ.Expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	defer base.ids.Release()
+	baseCard := base.ids.Cardinality()
+	if baseCard != 200 {
+		t.Fatalf("baseCard=%d want 200", baseCard)
+	}
+	need, exhausted := boundedWindowCap(baseCard, viewQ.Offset, viewQ.Limit)
+	if exhausted || need != baseCard {
+		t.Fatalf("need=%d exhausted=%v want need=%d", need, exhausted, baseCard)
+	}
+
+	guard := plannerOrderedLimitRuntimeGuard{
+		enabled:      true,
+		minExamined:  512,
+		needWindow:   viewQ.Limit,
+		fallbackCost: 1,
+		rowCost:      1,
+		reason:       "test_base_need_guard",
+	}
+	out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(&viewQ, facts.ov, facts.br, viewQ.Order.Desc, base.ids, need, guard)
+	if !ok {
+		t.Fatalf("posting-filter scan fell back after capped base need")
+	}
+	if len(out) != int(need) {
+		t.Fatalf("posting-filter rows=%d want %d", len(out), need)
+	}
+
+	guard.minExamined = need
+	out, examined, denseOK, fallback := scanOrderLimitDenseBaseNoTrace(&viewQ, facts.ov, facts.br, viewQ.Order.Desc, base.ids, int(baseCard), nil, nil, guard)
+	if fallback {
+		t.Fatalf("dense base scan fell back after completing result: examined=%d rows=%d", examined, len(out))
+	}
+	if !denseOK {
+		t.Fatalf("dense base scan did not use dense path")
+	}
+	if len(out) != int(need) {
+		t.Fatalf("dense base rows=%d want %d", len(out), need)
 	}
 }
 
@@ -2945,6 +3346,93 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	}
 	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), exactKey); !ok {
 		t.Fatalf("expected warm ordered query to promote collapsed exact numeric range cache entry")
+	}
+}
+
+func TestQuery_OrderBasic_BaseCoreObservedWorkAccumulatesBeforePromotion(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		age := 2
+		if i <= rows/2 {
+			age = 1
+		}
+		return &Rec{
+			Age:   age,
+			Score: float64(i),
+		}
+	})
+
+	view := db.engine.currentQueryViewForTests()
+	leaves := mustLimitQIRLeaves(t, db, qx.LTE("age", 1))
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
+	if len(baseOps) != 1 {
+		t.Fatalf("baseOps=%d want 1", len(baseOps))
+	}
+	stats, ok := view.orderBasicRawBaseOpStats(baseOps[0], view.snap.Universe.Cardinality())
+	if !ok || stats.cacheKey.IsZero() {
+		t.Fatalf("orderBasicRawBaseOpStats: ok=%v key=%v", ok, stats.cacheKey)
+	}
+	buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+	observedRows := uint64(100)
+	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, stats.probeBuckets, stats.probeEst)
+	if probeWork == 0 || satAddUint64(probeWork, probeWork) >= buildWork {
+		t.Fatalf("fixture no longer exercises sub-half build work: probe=%d build=%d", probeWork, buildWork)
+	}
+
+	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
+	if view.snap.HasMaterializedPredKey(stats.cacheKey) {
+		t.Fatalf("first observed base-core scan unexpectedly promoted materialized predicate")
+	}
+
+	tries := int((buildWork + probeWork - 1) / probeWork)
+	for i := 1; i < tries; i++ {
+		view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
+	}
+	if !view.snap.HasMaterializedPredKey(stats.cacheKey) {
+		t.Fatalf("repeated observed base-core work did not promote materialized predicate: probe=%d build=%d tries=%d observed=%d", probeWork, buildWork, tries, view.snap.ObservedMaterializedPredWork(stats.cacheKey))
+	}
+}
+
+func TestQuery_OrderBasic_BaseCoreOversizedPromotionStaysBounded(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                             -1,
+		SnapshotMaterializedPredCacheMaxEntries:     4,
+		SnapshotMaterializedPredCacheMaxCardinality: 64,
+	})
+
+	const rows = 2_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("user%04d", i),
+			Email:  fmt.Sprintf("user%04d@example.com", i),
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+
+	view := db.engine.currentQueryViewForTests()
+	leaves := mustLimitQIRLeaves(t, db, qx.AND(
+		qx.PREFIX("name", "user0"),
+		qx.PREFIX("email", "user0"),
+	))
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
+	if len(baseOps) != 2 {
+		t.Fatalf("baseOps=%d want 2", len(baseOps))
+	}
+	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, uint64(rows), 10)
+
+	cache := view.snap.MaterializedPredCache()
+	limit := qcache.MaterializedPredOversizedLimit(cache.Limit())
+	if got := cache.OversizedCount(); got > limit {
+		t.Fatalf("oversized materialized predicates=%d want <=%d", got, limit)
+	}
+	if cache.EntryCount() == 0 {
+		t.Fatalf("expected at least one bounded oversized materialized predicate")
 	}
 }
 

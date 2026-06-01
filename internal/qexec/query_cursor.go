@@ -5,9 +5,10 @@ import "github.com/vapstack/rbi/internal/posting"
 type queryCursor struct {
 	out []uint64
 
-	skip uint64
-	need uint64
-	all  bool
+	skip     uint64
+	need     uint64
+	all      bool
+	allocCap uint64
 
 	seen   u64set
 	dedupe bool
@@ -83,6 +84,10 @@ func (c *queryCursor) emit(idx uint64) bool {
 	if c.skip > 0 {
 		c.skip--
 		return false
+	}
+	if c.allocCap != 0 {
+		c.out = make([]uint64, 0, clampUint64ToInt(c.allocCap))
+		c.allocCap = 0
 	}
 	c.out = append(c.out, idx)
 	if !c.all {

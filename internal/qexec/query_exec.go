@@ -692,6 +692,7 @@ func (qv *View) runOrderBasicBaseQuery(
 	base postingResult,
 	residualPreds predicateReader,
 	residualActive []int,
+	guard plannerOrderedLimitRuntimeGuard,
 	trace *Trace,
 ) ([]uint64, bool, error) {
 
@@ -719,6 +720,13 @@ func (qv *View) runOrderBasicBaseQuery(
 					if remaining := baseCard - q.Offset; need > remaining {
 						need = remaining
 					}
+					if guard.enabled {
+						out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, baseBM, need, guard)
+						if !ok {
+							return nil, false, nil
+						}
+						return out, true, nil
+					}
 					out := make([]uint64, 0, need)
 					out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, baseBM, q.Offset, need)
 					return out, true, nil
@@ -726,19 +734,28 @@ func (qv *View) runOrderBasicBaseQuery(
 			}
 		}
 		if baseCard > 0 && baseCard <= 4096 {
-			out, examined, ok := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
+			out, examined, ok, fallback := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
+			if fallback {
+				return nil, false, nil
+			}
 			if ok {
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				return out, true, nil
 			}
 		}
 		if baseCard > 0 && baseCard <= 128 {
-			out, examined := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
+			out, examined, fallback := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
+			if fallback {
+				return nil, false, nil
+			}
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
 		if baseCard <= 4096 {
-			out, examined := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
+			out, examined, fallback := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
+			if fallback {
+				return nil, false, nil
+			}
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
@@ -746,8 +763,14 @@ func (qv *View) runOrderBasicBaseQuery(
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]uint64, 0, need)
+	var out []uint64
+	if !guard.enabled {
+		out = make([]uint64, 0, need)
+	}
 	cursor := newQueryCursor(out, skip, need, false, 0)
+	if guard.enabled {
+		cursor.allocCap = need
+	}
 
 	var tmp posting.List
 
@@ -820,6 +843,17 @@ func (qv *View) runOrderBasicBaseQuery(
 			tmp.Release()
 			return cursor.out, true, nil
 		}
+		if guard.enabled && guard.shouldFallback(examined, len(cursor.out)) {
+			if trace != nil {
+				trace.AddMatched(uint64(len(cursor.out)))
+				trace.AddExamined(examined)
+				trace.AddOrderScanWidth(scanWidth)
+				trace.SetOrderedLimitRuntimeFallback(guard.reason)
+				trace.SetEarlyStopReason(guard.reason)
+			}
+			tmp.Release()
+			return nil, false, nil
+		}
 	}
 
 	if nilTailField != "" {
@@ -873,6 +907,17 @@ func (qv *View) runOrderBasicBaseQuery(
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				tmp.Release()
 				return cursor.out, true, nil
+			}
+			if guard.enabled && guard.shouldFallback(examined, len(cursor.out)) {
+				if trace != nil {
+					trace.AddMatched(uint64(len(cursor.out)))
+					trace.AddExamined(examined)
+					trace.AddOrderScanWidth(scanWidth)
+					trace.SetOrderedLimitRuntimeFallback(guard.reason)
+					trace.SetEarlyStopReason(guard.reason)
+				}
+				tmp.Release()
+				return nil, false, nil
 			}
 		}
 	}
@@ -1476,14 +1521,16 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 	if buildWork == 0 {
 		return false
 	}
+	if !qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork) {
+		return false
+	}
 
 	if observedRows > universe {
 		observedRows = universe
 	}
 
 	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, stats.probeBuckets, stats.probeEst)
-
-	if satAddUint64(probeWork, probeWork) < buildWork {
+	if probeWork == 0 {
 		return false
 	}
 	return qv.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, probeWork, buildWork)
@@ -1755,6 +1802,9 @@ func (qv *View) executeOrderedLimit(q *qir.Shape, trace *Trace) ([]uint64, bool,
 	}
 
 	guard := decision.runtimeGuard(q)
+	if !guard.enabled {
+		guard = decision.baseCoreRuntimeGuard(q, len(facts.baseOps))
+	}
 	if trace != nil {
 		trace.SetOrderedLimitRoute(qv.traceOrderedLimitRoute(q, facts, decision))
 		fallbackCost := decision.materializedFallback.cost
@@ -1854,8 +1904,12 @@ dispatch:
 						if filter.IsEmpty() {
 							return nil, true, plan, nil
 						}
+						need, exhausted := boundedWindowCap(filter.Cardinality(), q.Offset, q.Limit)
+						if exhausted {
+							return nil, true, plan, nil
+						}
 						if guard.enabled {
-							out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, filter, guard)
+							out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, filter, need, guard)
 							if !ok {
 								if decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
 									selected = decision.runtimeFallback.kind
@@ -1864,16 +1918,12 @@ dispatch:
 								}
 								return qv.dispatchOrderedLimitFallback(q, decision)
 							}
-							if uint64(len(out)) < q.Limit {
+							if uint64(len(out)) < need {
 								if nilTailField != "" {
 									goto orderScanPostingFilterDone
 								}
 							}
 							return out, true, plan, nil
-						}
-						need, exhausted := boundedWindowCap(filter.Cardinality(), q.Offset, q.Limit)
-						if exhausted {
-							return nil, true, plan, nil
 						}
 						out := make([]uint64, 0, clampUint64ToInt(need))
 						out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, filter, q.Offset, need)
@@ -2175,12 +2225,19 @@ dispatch:
 		used bool
 	)
 	if residualActiveBuf != nil {
-		out, used, err = qv.runOrderBasicBaseQuery(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet.owner, residualActiveBuf, trace)
+		out, used, err = qv.runOrderBasicBaseQuery(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet.owner, residualActiveBuf, guard, trace)
 	} else {
-		out, used, err = qv.runOrderBasicBaseQuery(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet.owner, residualActive, trace)
+		out, used, err = qv.runOrderBasicBaseQuery(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet.owner, residualActive, guard, trace)
 	}
 
 	releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
+
+	if err != nil {
+		return out, used, PlanLimitOrderBasic, err
+	}
+	if !used {
+		return qv.dispatchOrderedLimitFallback(q, decision)
+	}
 
 	return out, used, PlanLimitOrderBasic, err
 }
@@ -2668,9 +2725,9 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 	return cursor.out, true
 }
 
-func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64, bool) {
+func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int, guard plannerOrderedLimitRuntimeGuard) ([]uint64, uint64, bool, bool) {
 	if q.Offset >= uint64(baseCard) {
-		return nil, 0, true
+		return nil, 0, true, false
 	}
 	it := base.Iter()
 	minID := it.Next()
@@ -2687,7 +2744,7 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 
 	span := maxID - minID + 1
 	if span == 0 || span > 4096 {
-		return nil, 0, false
+		return nil, 0, false, false
 	}
 
 	limit := clampUint64ToInt(q.Limit)
@@ -2714,8 +2771,14 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 							skip--
 						} else {
 							out = append(out, idx)
+							if len(out) >= need {
+								return out, examined, true, false
+							}
 						}
 					}
+				}
+				if guard.enabled && guard.shouldFallback(examined, len(out)) {
+					return nil, examined, true, true
 				}
 				continue
 			}
@@ -2732,14 +2795,17 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 						}
 						if len(out) >= need {
 							it.Release()
-							return out, examined, true
+							return out, examined, true, false
 						}
 					}
 				}
 			}
 			it.Release()
+			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+				return nil, examined, true, true
+			}
 		}
-		return out, examined, true
+		return out, examined, true, false
 	}
 
 	var bits [64]uint64
@@ -2767,9 +2833,15 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 							skip--
 						} else {
 							out = append(out, idx)
+							if len(out) >= need {
+								return out, examined, true, false
+							}
 						}
 					}
 				}
+			}
+			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+				return nil, examined, true, true
 			}
 			continue
 		}
@@ -2788,20 +2860,23 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 						}
 						if len(out) >= need {
 							it.Release()
-							return out, examined, true
+							return out, examined, true, false
 						}
 					}
 				}
 			}
 		}
 		it.Release()
+		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			return nil, examined, true, true
+		}
 	}
-	return out, examined, true
+	return out, examined, true, false
 }
 
-func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64) {
+func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int, guard plannerOrderedLimitRuntimeGuard) ([]uint64, uint64, bool) {
 	if q.Offset >= uint64(baseCard) {
-		return nil, 0
+		return nil, 0, false
 	}
 	size := 1
 	for size < baseCard*2 {
@@ -2847,11 +2922,17 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 							skip--
 						} else {
 							out = append(out, idx)
+							if len(out) >= need {
+								return out, examined, false
+							}
 						}
 					}
 					break
 				}
 				slot = (slot + 1) & mask
+			}
+			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+				return nil, examined, true
 			}
 			continue
 		}
@@ -2875,15 +2956,18 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			}
 			if len(out) >= need {
 				it.Release()
-				return out, examined
+				return out, examined, false
 			}
 		}
 		it.Release()
+		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			return nil, examined, true
+		}
 	}
-	return out, examined
+	return out, examined, false
 }
 
-func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64) {
+func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int, guard plannerOrderedLimitRuntimeGuard) ([]uint64, uint64, bool) {
 	size := 1
 	for size < baseCard*2 {
 		size <<= 1
@@ -2891,15 +2975,15 @@ func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, 
 	keys := pooled.GetUint64Slice(size)[:size]
 	used := pooled.GetBoolSlice(size)[:size]
 	clear(used)
-	out, examined := scanOrderLimitBaseHashNoTrace(q, ov, br, desc, base, baseCard, keys, used, preds, active)
+	out, examined, fallback := scanOrderLimitBaseHashNoTrace(q, ov, br, desc, base, baseCard, keys, used, preds, active, guard)
 	pooled.ReleaseBoolSlice(used)
 	pooled.ReleaseUint64Slice(keys)
-	return out, examined
+	return out, examined, fallback
 }
 
-func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, keys []uint64, used []bool, preds predicateReader, active []int) ([]uint64, uint64) {
+func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, keys []uint64, used []bool, preds predicateReader, active []int, guard plannerOrderedLimitRuntimeGuard) ([]uint64, uint64, bool) {
 	if q.Offset >= uint64(baseCard) {
-		return nil, 0
+		return nil, 0, false
 	}
 	mask := uint64(len(keys) - 1)
 
@@ -2939,11 +3023,17 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 							skip--
 						} else {
 							out = append(out, idx)
+							if len(out) >= need {
+								return out, examined, false
+							}
 						}
 					}
 					break
 				}
 				slot = (slot + 1) & mask
+			}
+			if guard.enabled && guard.shouldFallback(examined, len(out)) {
+				return nil, examined, true
 			}
 			continue
 		}
@@ -2967,12 +3057,15 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 			}
 			if len(out) >= need {
 				it.Release()
-				return out, examined
+				return out, examined, false
 			}
 		}
 		it.Release()
+		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			return nil, examined, true
+		}
 	}
-	return out, examined
+	return out, examined, false
 }
 
 func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {

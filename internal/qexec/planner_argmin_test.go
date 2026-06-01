@@ -890,6 +890,55 @@ func TestPlannerArgmin_OrderedLimitRuntimeGuard(t *testing.T) {
 	}
 }
 
+func TestPlannerArgmin_OrderedLimitBaseCoreRuntimeGuard(t *testing.T) {
+	q := &qir.Shape{Limit: 10}
+	decision := plannerOrderedLimitDecision{
+		selected: plannerOrderedLimitCandidate{
+			kind:         plannerOrderedLimitCandidateWarmBaseCore,
+			expectedRows: 10,
+			checks:       1,
+		},
+		materializedFallback: plannerOrderedLimitCandidate{
+			kind: plannerOrderedLimitCandidateMaterializedFallback,
+			cost: 100,
+		},
+		runtimeFallback: plannerOrderedLimitCandidate{
+			kind: plannerOrderedLimitCandidateOrderScan,
+			cost: 1,
+		},
+	}
+
+	guard := decision.baseCoreRuntimeGuard(q, 1)
+	if !guard.enabled {
+		t.Fatalf("expected base-core runtime guard")
+	}
+	if guard.reason != "base_core_scan_guard" {
+		t.Fatalf("reason=%q want base_core_scan_guard", guard.reason)
+	}
+	if guard.shouldFallback(guard.minExamined-1, 0) {
+		t.Fatalf("guard fired before minExamined")
+	}
+	if !guard.shouldFallback(guard.minExamined, 0) {
+		t.Fatalf("guard did not fire after underestimated base-core scan work")
+	}
+	if guard.shouldFallback(guard.minExamined, 3) {
+		t.Fatalf("guard fired after enough early output")
+	}
+
+	if guard = decision.baseCoreRuntimeGuard(q, 0); guard.enabled {
+		t.Fatalf("base-core guard enabled without base predicates")
+	}
+	q.Offset = 1
+	if guard = decision.baseCoreRuntimeGuard(q, 1); guard.enabled {
+		t.Fatalf("base-core guard enabled for offset")
+	}
+	q.Offset = 0
+	decision.materializedFallback = plannerOrderedLimitCandidate{}
+	if guard = decision.baseCoreRuntimeGuard(q, 1); guard.enabled {
+		t.Fatalf("base-core guard enabled without materialized fallback")
+	}
+}
+
 func TestPlannerArgmin_NoOrderLimitRuntimeGuard(t *testing.T) {
 	q := &qir.Shape{Limit: 10}
 	decision := plannerNoOrderLimitDecision{
