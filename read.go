@@ -162,7 +162,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		return fmt.Errorf("decode: %w", err)
 	}
 
-	more, err := fn(db.userKeyFromBytes(key), val)
+	more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), val)
 	if err != nil {
 		return err
 	}
@@ -174,7 +174,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		if val, err = db.decode(value); err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
-		if more, err = fn(db.userKeyFromBytes(key), val); err != nil {
+		if more, err = fn(keycodec.UserKeyFromBytes[K](key, db.strKey), val); err != nil {
 			return err
 		}
 	}
@@ -217,7 +217,7 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 		return nil
 	}
 
-	more, err := fn(db.userKeyFromBytes(key), value)
+	more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value)
 	if err != nil {
 		return err
 	}
@@ -226,7 +226,7 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 		if key == nil {
 			return nil
 		}
-		if more, err = fn(db.userKeyFromBytes(key), value); err != nil {
+		if more, err = fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value); err != nil {
 			return err
 		}
 	}

@@ -7,7 +7,6 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/pooled"
-	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
@@ -163,10 +162,6 @@ func patchItemsForWrite(fields []Field) []schema.PatchItem {
 	// Field and schema.PatchItem are layout-identical; wexec copies this view
 	// into request-owned storage immediately.
 	return unsafe.Slice((*schema.PatchItem)(unsafe.SliceData(fields)), len(fields))
-}
-
-func (db *DB[K, V]) userKeyFromBytes(b []byte) K {
-	return keycodec.UserKeyFromBytes[K](b, db.strKey)
 }
 
 func (db *DB[K, V]) forEachModifiedAccessor(accessors []schema.IndexedFieldAccessor, v1 *V, v2 *V, fn func(schema.IndexedFieldAccessor) bool) {
