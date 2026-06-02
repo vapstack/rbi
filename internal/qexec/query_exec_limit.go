@@ -795,12 +795,12 @@ func (qv *View) execSelectedNoOrderDirectUniqueEq(q *qir.Shape, trace *Trace) ([
 	return cursor.out, true, nil
 }
 
-func (qv *View) hasPrefixBoundForField(leaves []qir.Expr, field string) bool {
+func hasPrefixBoundForFieldOrdinal(leaves []qir.Expr, fieldOrdinal int) bool {
 	for _, e := range leaves {
 		if e.Not {
 			continue
 		}
-		if qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field && e.Op == qir.OpPREFIX {
+		if e.FieldOrdinal == fieldOrdinal && e.Op == qir.OpPREFIX {
 			return true
 		}
 	}
@@ -808,21 +808,21 @@ func (qv *View) hasPrefixBoundForField(leaves []qir.Expr, field string) bool {
 }
 
 func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, trace *Trace) ([]uint64, bool, error) {
-	out, used, _, err := qv.execNoOrderBounds(q, field, bounds, leaves, plannerNoOrderLimitRuntimeGuard{}, trace)
+	out, used, _, err := qv.execNoOrderBounds(q, field, qv.fieldOrdinalByName(field), bounds, leaves, plannerNoOrderLimitRuntimeGuard{}, trace)
 	return out, used, err
 }
 
-func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, guard plannerNoOrderLimitRuntimeGuard, trace *Trace) ([]uint64, bool, bool, error) {
-	fm := qv.exec.Schema.Fields[field]
+func (qv *View) execNoOrderBounds(q *qir.Shape, field string, fieldOrdinal int, bounds indexdata.Bounds, leaves []qir.Expr, guard plannerNoOrderLimitRuntimeGuard, trace *Trace) ([]uint64, bool, bool, error) {
+	if fieldOrdinal < 0 || fieldOrdinal >= len(qv.exec.Schema.Indexed) {
+		return nil, false, false, nil
+	}
+	fm := qv.exec.Schema.Indexed[fieldOrdinal].Field
 	if fm == nil || fm.Slice {
 		return nil, false, false, nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, fieldOrdinal)
 	if !ov.HasData() {
-		if !qv.hasIndexedField(field) {
-			return nil, false, false, nil
-		}
 		return nil, true, false, nil
 	}
 
@@ -830,7 +830,7 @@ func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.B
 	hasResidual := false
 	for i := 0; i < len(leaves); i++ {
 		e := leaves[i]
-		if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
+		if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == fieldOrdinal {
 			continue
 		}
 		hasResidual = true
@@ -840,7 +840,7 @@ func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.B
 	if br.Empty() {
 		if hasResidual {
 			for _, e := range leaves {
-				if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
+				if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == fieldOrdinal {
 					continue
 				}
 				if err := qv.validateOrderBasicExpr(e); err != nil {
@@ -855,7 +855,7 @@ func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.B
 	if hasResidual {
 		var ok bool
 		var err error
-		predsBuf, ok, err = qv.buildLeafPredsExcludingBounds(leaves, field, 0)
+		predsBuf, ok, err = qv.buildLeafPredsExcludingBounds(leaves, field, fieldOrdinal, 0)
 		if err != nil {
 			return nil, true, false, err
 		}
@@ -889,7 +889,7 @@ func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.B
 	return out, true, false, nil
 }
 
-func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) ([]leafPred, bool, error) {
+func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, fieldOrdinal int, orderedWindow int) ([]leafPred, bool, error) {
 	predsBuf := leafPredSlicePool.Get(len(leaves))
 
 	orderedUniverse := uint64(0)
@@ -943,7 +943,7 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 	}
 
 	for i, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
+		if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == fieldOrdinal {
 			continue
 		}
 		if mergedRangesBuf != nil && qv.isPositiveOrderedMergedScalarRangeLeaf(e, field) {
@@ -1793,9 +1793,10 @@ func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, or
 		baseCore: orderBasicBaseCore{
 			kind: orderBasicBaseCoreCollapsedRange,
 			collapsed: preparedScalarExactRange{
-				field:    fieldName,
-				bounds:   bounds,
-				cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, bounds),
+				field:        fieldName,
+				fieldOrdinal: e.FieldOrdinal,
+				bounds:       bounds,
+				cacheKey:     qv.materializedPredKeyForExactScalarRange(fieldName, bounds),
 			},
 		},
 		estCard: p.estCard,

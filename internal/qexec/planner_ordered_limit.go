@@ -531,7 +531,7 @@ func (set *plannerMaterializedCacheRouteSet) pressurePenalty() float64 {
 }
 
 func (qv *View) orderedLimitCollapsedRangeStats(op preparedScalarExactRange) (scalarMaterializationStats, bool) {
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, op.field)
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, op.fieldOrdinal)
 	if !ov.HasData() {
 		return scalarMaterializationStats{}, false
 	}
@@ -1153,9 +1153,10 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 					core = orderBasicBaseCore{
 						kind: orderBasicBaseCoreCollapsedRange,
 						collapsed: preparedScalarExactRange{
-							field:    fieldName,
-							bounds:   rb,
-							cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, rb),
+							field:        fieldName,
+							fieldOrdinal: op.FieldOrdinal,
+							bounds:       rb,
+							cacheKey:     qv.materializedPredKeyForExactScalarRange(fieldName, rb),
 						},
 					}
 				}

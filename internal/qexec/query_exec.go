@@ -1281,9 +1281,10 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 		coresBuf = append(coresBuf, orderBasicBaseCore{
 			kind: orderBasicBaseCoreCollapsedRange,
 			collapsed: preparedScalarExactRange{
-				field:    fieldName,
-				bounds:   rb,
-				cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, rb),
+				field:        fieldName,
+				fieldOrdinal: op.FieldOrdinal,
+				bounds:       rb,
+				cacheKey:     qv.materializedPredKeyForExactScalarRange(fieldName, rb),
 			},
 		})
 		for j := i; j < len(baseOps); j++ {
@@ -1903,7 +1904,7 @@ DISPATCH:
 		if len(baseOps) == 0 {
 			out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
 			plan := PlanLimitOrderBasic
-			if qv.hasPrefixBoundForField(ops, f) {
+			if hasPrefixBoundForFieldOrdinal(ops, order.FieldOrdinal) {
 				plan = PlanLimitOrderPrefix
 			}
 			return out, true, plan, nil
@@ -1970,7 +1971,7 @@ DISPATCH:
 
 	DONE:
 		if q.Offset == 0 || !fm.Ptr || nilTailField != "" {
-			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
+			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, order.FieldOrdinal, needWindow)
 			if err != nil {
 				return nil, true, "", err
 			}
@@ -2035,7 +2036,7 @@ DISPATCH:
 					leafPredSlicePool.Put(predsBuf)
 				}
 				plan := PlanLimitOrderBasic
-				if qv.hasPrefixBoundForField(ops, f) {
+				if hasPrefixBoundForFieldOrdinal(ops, order.FieldOrdinal) {
 					plan = PlanLimitOrderPrefix
 				}
 				return out, true, plan, nil

@@ -50,9 +50,10 @@ type scalarComplementMaterializationPlan struct {
 }
 
 type preparedScalarExactRange struct {
-	field    string
-	bounds   indexdata.Bounds
-	cacheKey qcache.MaterializedPredKey
+	field        string
+	fieldOrdinal int
+	bounds       indexdata.Bounds
+	cacheKey     qcache.MaterializedPredKey
 }
 
 type orderFieldScalarLeafKind uint8
@@ -792,13 +793,13 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 	if allowMaterialize && core.expr.Op.IsNumericRange() && (allowPositiveMaterialize || core.qv.snap.MaterializedPredCacheLimit() <= 0) {
 		fieldName := core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal)
 		if coldMaterializeAllowed {
-			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.br); ok {
+			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.br); ok {
 				if allowPositiveMaterialize {
 					out.ids = core.sharedReuse.share(out.ids)
 				}
 				return materializedRangePredicateWithMode(core.expr, out.ids), true
 			}
-		} else if out, ok := core.qv.tryLoadNumericRangeBuckets(fieldName, core.fm, ov, plan.br); ok {
+		} else if out, ok := core.qv.tryLoadNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.br); ok {
 			if allowPositiveMaterialize {
 				out.ids = core.sharedReuse.share(out.ids)
 			}
@@ -878,7 +879,7 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov index
 	}
 
 	if core.expr.Op != qir.OpPREFIX {
-		if out, ok := core.qv.tryEvalNumericRangeBuckets(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
+		if out, ok := core.qv.tryEvalNumericRangeBuckets(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, br); ok {
 			out.ids = core.sharedReuse.share(out.ids)
 			if out.ids.IsEmpty() {
 				return postingResult{}
@@ -966,7 +967,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 	if done {
 		return postingResult{}, false
 	}
-	if out, ok := core.qv.tryLoadNumericRangeBuckets(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, plan.br); ok {
+	if out, ok := core.qv.tryLoadNumericRangeBuckets(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, plan.br); ok {
 		return out, true
 	}
 	return postingResult{}, false
@@ -979,12 +980,12 @@ func (qv *View) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (p
 		}
 	}
 
-	fm := qv.exec.Schema.Fields[op.field]
+	fm := qv.exec.Schema.Indexed[op.fieldOrdinal].Field
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, op.field)
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, op.fieldOrdinal)
 	if !ov.HasData() {
 		return postingResult{}, false
 	}
@@ -994,7 +995,7 @@ func (qv *View) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (p
 		return postingResult{}, false
 	}
 
-	return qv.tryLoadNumericRangeBuckets(op.field, fm, ov, br)
+	return qv.tryLoadNumericRangeBuckets(op.field, op.fieldOrdinal, fm, ov, br)
 }
 
 func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, error) {
@@ -1004,8 +1005,8 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 		}
 	}
 
-	fm := qv.exec.Schema.Fields[op.field]
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, op.field)
+	fm := qv.exec.Schema.Indexed[op.fieldOrdinal].Field
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, op.fieldOrdinal)
 	if !ov.HasData() {
 		return postingResult{}, nil
 	}
@@ -1016,7 +1017,7 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 	}
 
 	if schema.FieldUsesOrderedNumericKeys(fm) {
-		if out, ok := qv.tryEvalNumericRangeBuckets(op.field, fm, ov, br); ok {
+		if out, ok := qv.tryEvalNumericRangeBuckets(op.field, op.fieldOrdinal, fm, ov, br); ok {
 			if !op.cacheKey.IsZero() {
 				out.ids = qv.tryShareMaterializedPred(op.cacheKey, out.ids)
 			}
@@ -1042,7 +1043,7 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	if observedRows <= needWindow {
 		return false
 	}
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, op.field)
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, op.fieldOrdinal)
 	if !ov.HasData() {
 		return false
 	}
@@ -1054,10 +1055,10 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	if buckets == 0 || est == 0 {
 		return false
 	}
-	fm := qv.exec.Schema.Fields[op.field]
+	fm := qv.exec.Schema.Indexed[op.fieldOrdinal].Field
 	universe := qv.snap.Universe.Cardinality()
 	nilTail := fm != nil && fm.Ptr &&
-		qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, op.field).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+		qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.NilIndex, op.fieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 	totalBuckets := ov.KeyCount()
 	useComplementProbe := !nilTail && totalBuckets > buckets && totalBuckets-buckets < buckets
 	if schema.FieldUsesOrderedNumericKeys(fm) && useComplementProbe {
@@ -1157,7 +1158,7 @@ func (core *preparedScalarRangePredicate) materializeComplement(plan scalarCompl
 		pendingAfter  indexdata.FieldIndexRange
 	)
 	if !plan.before.Empty() {
-		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.before); ok {
+		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.before); ok {
 			if ids.IsEmpty() {
 				ids = out.ids
 			} else {
@@ -1169,7 +1170,7 @@ func (core *preparedScalarRangePredicate) materializeComplement(plan scalarCompl
 	}
 
 	if !plan.after.Empty() {
-		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.after); ok {
+		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.after); ok {
 			if ids.IsEmpty() {
 				ids = out.ids
 			} else {

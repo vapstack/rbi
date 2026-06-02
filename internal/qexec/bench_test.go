@@ -3935,13 +3935,14 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 		if fm == nil {
 			b.Fatal("missing age field metadata")
 		}
+		ageOrdinal := db.rt.IndexedByName["age"].Ordinal
 		ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 		if !ov.HasData() {
 			b.Fatal("missing age index")
 		}
 		start, end := qexecBenchRange(scale.rows, sel)
 		br := ov.RangeByRanks(start, end)
-		probe, ok := view.tryEvalNumericRangeBuckets("age", fm, ov, br)
+		probe, ok := view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 		if !ok {
 			b.Skip("numeric range bucket path is not used for this selectivity")
 		}
@@ -3957,7 +3958,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 				b.StopTimer()
 				db.clearCurrentSnapshotCaches()
 				b.StartTimer()
-				res, ok = view.tryEvalNumericRangeBuckets("age", fm, ov, br)
+				res, ok = view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 				if !ok {
 					b.Fatal("expected numeric range bucket eval path")
 				}
@@ -3967,14 +3968,14 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 			b.ReportMetric(float64(qexecBenchCount), "rows/op")
 		})
 
-		warm, ok := view.tryEvalNumericRangeBuckets("age", fm, ov, br)
+		warm, ok := view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 		if !ok {
 			b.Fatal("expected numeric range bucket warmup path")
 		}
 		warm.ids.Release()
 
 		loadable := false
-		loaded, ok := view.tryLoadNumericRangeBuckets("age", fm, ov, br)
+		loaded, ok := view.tryLoadNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 		if ok {
 			loaded.ids.Release()
 			loadable = true
@@ -3985,7 +3986,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				res, ok = view.tryEvalNumericRangeBuckets("age", fm, ov, br)
+				res, ok = view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 				if !ok {
 					b.Fatal("expected numeric range bucket eval path")
 				}
@@ -4003,7 +4004,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				res, ok = view.tryLoadNumericRangeBuckets("age", fm, ov, br)
+				res, ok = view.tryLoadNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 				if !ok {
 					b.Fatal("expected numeric range bucket load path")
 				}
@@ -4022,7 +4023,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 				b.Skip("range cannot be extended")
 			}
 			reuseBR := ov.RangeByRanks(start, reuseEnd)
-			res, ok := view.tryEvalNumericRangeBuckets("age", fm, ov, reuseBR)
+			res, ok := view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, reuseBR)
 			if !ok {
 				b.Skip("numeric range bucket reuse path is not used for this span")
 			}
@@ -4032,7 +4033,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				res, ok = view.tryEvalNumericRangeBuckets("age", fm, ov, reuseBR)
+				res, ok = view.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, reuseBR)
 				if !ok {
 					b.Fatal("expected numeric range bucket extended eval path")
 				}
@@ -4047,7 +4048,7 @@ func BenchmarkNumericRangeBuckets(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				qexecBenchCount, ok = view.trySnapshotNumericRangeCardinality("age", fm, ov, start, end)
+				qexecBenchCount, ok = view.trySnapshotNumericRangeCardinality("age", ageOrdinal, fm, ov, start, end)
 				if !ok {
 					b.Fatal("expected numeric range cardinality path")
 				}

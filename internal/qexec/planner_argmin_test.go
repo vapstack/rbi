@@ -1028,7 +1028,7 @@ func TestPlannerNoOrderLimitRuntimeGuard_DirectRangeFallback(t *testing.T) {
 		rowCost:      1,
 		reason:       "direct_range_guard",
 	}
-	_, used, runtimeFallback, err := view.execNoOrderBounds(&shape, "age", bounds, leaves, guard, trace)
+	_, used, runtimeFallback, err := view.execNoOrderBounds(&shape, "age", view.fieldOrdinalByName("age"), bounds, leaves, guard, trace)
 	if err != nil {
 		t.Fatalf("execNoOrderBounds: %v", err)
 	}

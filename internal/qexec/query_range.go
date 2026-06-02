@@ -8,23 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 )
 
-func (qv *View) numericRangeFieldOrdinal(field string) (int, bool) {
-	acc, ok := qv.exec.Schema.IndexedByName[field]
-	if !ok {
-		return 0, false
-	}
-	return acc.Ordinal, true
-}
-
-func (qv *View) numericRangeBucketCacheEntry(field string, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *qcache.NumericRangeBucketEntry {
-	ordinal, ok := qv.numericRangeFieldOrdinal(field)
-	if !ok {
-		return nil
-	}
-	return qv.snap.NumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
-}
-
-func (qv *View) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
+func (qv *View) tryEvalNumericRangeBuckets(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -46,12 +30,8 @@ func (qv *View) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov in
 		return postingResult{}, false
 	}
 
-	storage, ok := qv.snap.FieldIndexStorage(field)
-	if !ok || storage.KeyCount() == 0 {
-		return postingResult{}, false
-	}
-
-	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	storage := qv.snap.Index[fieldOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -125,7 +105,7 @@ func (qv *View) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov in
 	return postingResult{ids: res}, true
 }
 
-func (qv *View) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
+func (qv *View) tryLoadNumericRangeBuckets(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -147,12 +127,8 @@ func (qv *View) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov in
 		return postingResult{}, false
 	}
 
-	storage, ok := qv.snap.FieldIndexStorage(field)
-	if !ok || storage.KeyCount() == 0 {
-		return postingResult{}, false
-	}
-
-	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	storage := qv.snap.Index[fieldOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -203,7 +179,7 @@ func (qv *View) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov in
 	return postingResult{ids: res}, true
 }
 
-func (qv *View) trySnapshotNumericRangeCardinality(field string, fm *schema.Field, ov indexdata.FieldIndexView, start, end int) (uint64, bool) {
+func (qv *View) trySnapshotNumericRangeCardinality(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, start, end int) (uint64, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}
@@ -211,11 +187,9 @@ func (qv *View) trySnapshotNumericRangeCardinality(field string, fm *schema.Fiel
 		return 0, false
 	}
 
-	storage, ok := qv.snap.FieldIndexStorage(field)
-	if !ok || storage.KeyCount() == 0 {
-		return 0, false
-	}
-	if storage.KeyCount() != ov.KeyCount() {
+	storage := qv.snap.Index[fieldOrdinal]
+	keyCount := storage.KeyCount()
+	if keyCount == 0 || keyCount != ov.KeyCount() {
 		return 0, false
 	}
 	return indexdata.NewFieldIndexViewFromStorage(storage).RangeRows(start, end), true

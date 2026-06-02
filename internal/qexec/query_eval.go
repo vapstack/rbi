@@ -176,9 +176,10 @@ func (qv *View) evalAndOperandsWithMergedNumericRanges(ops []qir.Expr, negate bo
 					}
 					merged = true
 					b, err = qv.evalPreparedScalarExactRange(preparedScalarExactRange{
-						field:    group.field,
-						bounds:   group.bounds,
-						cacheKey: qv.materializedPredKeyForExactScalarRange(group.field, group.bounds),
+						field:        group.field,
+						fieldOrdinal: group.expr.FieldOrdinal,
+						bounds:       group.bounds,
+						cacheKey:     qv.materializedPredKeyForExactScalarRange(group.field, group.bounds),
 					})
 				}
 			}

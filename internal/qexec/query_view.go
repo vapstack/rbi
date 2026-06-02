@@ -283,11 +283,6 @@ func (qv *View) hasIndexedFieldForOrder(order qir.Order) bool {
 	return ok
 }
 
-func (qv *View) hasIndexedField(field string) bool {
-	_, ok := qv.exec.Schema.Fields[field]
-	return ok
-}
-
 func (qv *View) isLenZeroComplementOrdinal(ordinal int) bool {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
 	if !ok || acc.Ordinal >= len(qv.lenZeroComplement) {

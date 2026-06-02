@@ -838,7 +838,7 @@ func (qv *View) evalMergedExactRangePostingResult(e qir.Expr, bounds indexdata.B
 	}
 
 	if core.expr.Op != qir.OpPREFIX {
-		if out, ok := qv.tryEvalNumericRangeBuckets(qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
+		if out, ok := qv.tryEvalNumericRangeBuckets(qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, br); ok {
 			if out.ids.IsEmpty() {
 				return postingResult{}, true
 			}
@@ -2840,6 +2840,7 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBucketPosting(
 	ov indexdata.FieldIndexView,
 	br indexdata.FieldIndexRange,
 	field string,
+	fieldOrdinal int,
 	fm *schema.Field,
 	active []int,
 ) (uint64, uint64, bool) {
@@ -2872,7 +2873,7 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBucketPosting(
 		work.Release()
 		return cnt, examined, true
 	}
-	res, ok := qv.tryEvalNumericRangeBuckets(field, fm, ov, br)
+	res, ok := qv.tryEvalNumericRangeBuckets(field, fieldOrdinal, fm, ov, br)
 	if !ok {
 		return 0, 0, false
 	}
@@ -2914,6 +2915,7 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBuckets(
 	ov indexdata.FieldIndexView,
 	br indexdata.FieldIndexRange,
 	field string,
+	fieldOrdinal int,
 	fm *schema.Field,
 	active []int,
 ) (uint64, uint64, bool) {
@@ -2937,12 +2939,8 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBuckets(
 		return 0, 0, false
 	}
 
-	storage, ok := qv.snap.FieldIndexStorage(field)
-	if !ok || storage.KeyCount() == 0 {
-		return 0, 0, false
-	}
-
-	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	storage := qv.snap.Index[fieldOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return 0, 0, false
 	}
@@ -2963,7 +2961,7 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBuckets(
 	}
 
 	if qv.snap.AllowsMaterializedPredCard(rows) {
-		res, ok := qv.tryEvalNumericRangeBuckets(field, fm, ov, br)
+		res, ok := qv.tryEvalNumericRangeBuckets(field, fieldOrdinal, fm, ov, br)
 		if ok {
 			examined := res.ids.Cardinality()
 			var work posting.List
@@ -3056,10 +3054,10 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 		}
 		pooled.ReleaseBoolSlice(covered)
 
-		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, fm, activeChecks); ok {
+		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, e.FieldOrdinal, fm, activeChecks); ok {
 			return cnt, examined, true
 		}
-		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, fm, activeChecks); ok {
+		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, e.FieldOrdinal, fm, activeChecks); ok {
 			return cnt, examined, true
 		}
 
@@ -3225,10 +3223,10 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 	}
 	pooled.ReleaseBoolSlice(covered)
 
-	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, fm, activeChecks); ok {
+	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, e.FieldOrdinal, fm, activeChecks); ok {
 		return cnt, examined, true
 	}
-	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, fm, activeChecks); ok {
+	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, e.FieldOrdinal, fm, activeChecks); ok {
 		return cnt, examined, true
 	}
 
@@ -4714,7 +4712,7 @@ func (qv *View) tryFilterCardinalityPreparedAndReordered(expr qir.Expr) (uint64,
 				}
 
 				if len(filtered) == 0 {
-					cnt, ok := qv.trySnapshotNumericRangeCardinality(merged.field, fm, ov, br.BaseStart, br.BaseEnd)
+					cnt, ok := qv.trySnapshotNumericRangeCardinality(merged.field, merged.expr.FieldOrdinal, fm, ov, br.BaseStart, br.BaseEnd)
 					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
 					if ok {
 						return cnt, true, nil

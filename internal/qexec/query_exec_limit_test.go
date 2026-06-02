@@ -1036,7 +1036,7 @@ func TestQuery_OrderBasicLimit_MergedStringPrefixPreservesTightenedBounds(t *tes
 
 	view := db.engine.currentQueryViewForTests()
 	leaves := mustLimitQIRLeaves(t, db, q.Filter)
-	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 10)
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", view.fieldOrdinalByName("score"), 10)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -2358,7 +2358,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 		t.Fatalf("expected order bounds to be recognized")
 	}
 
-	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(qirLeaves, "age", 0)
+	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(qirLeaves, "age", view.fieldOrdinalByName("age"), 0)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -2702,7 +2702,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
-	preds1, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	preds1, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", view.fieldOrdinalByName("score"), 4096)
 	if err != nil {
 		t.Fatalf("first buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -2726,7 +2726,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 		t.Fatalf("expected shared complement cache entry after first ordered leaf build")
 	}
 
-	preds2, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	preds2, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", view.fieldOrdinalByName("score"), 4096)
 	if err != nil {
 		t.Fatalf("second buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -2794,7 +2794,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
-	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", view.fieldOrdinalByName("score"), 4096)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -2890,7 +2890,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_ForceMaterializesNonBroa
 		t.Fatalf("expected nullable ordered route to stay non-broad by row cardinality")
 	}
 
-	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "name", window)
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "name", view.fieldOrdinalByName("name"), window)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}

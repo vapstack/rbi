@@ -138,7 +138,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 	br := ov.RangeForBounds(rb)
-	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, fm, ov, br)
+	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, compiled.FieldOrdinal, fm, ov, br)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for %s", f)
 	}
@@ -474,6 +474,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -495,7 +496,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	}
 
 	br1 := makeRange(2500)
-	out1, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br1)
+	out1, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br1)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for first bound")
 	}
@@ -521,7 +522,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	if start1 != start2 || end1 != end2 {
 		t.Fatalf("expected nearby bounds to share full bucket span: first=%d..%d second=%d..%d", start1, end1, start2, end2)
 	}
-	out2, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br2)
+	out2, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br2)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for second bound")
 	}
@@ -549,6 +550,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -570,7 +572,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	}
 
 	br1 := makeRange(2500)
-	out1, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br1)
+	out1, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br1)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for first bound")
 	}
@@ -596,7 +598,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	if start1 != start2 || end1 != end2 {
 		t.Fatalf("expected nearby bounds to share full bucket span: first=%d..%d second=%d..%d", start1, end1, start2, end2)
 	}
-	out2, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br2)
+	out2, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br2)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for second bound")
 	}
@@ -643,6 +645,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -664,7 +667,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 	}
 
 	brNarrow := makeRange(2500)
-	outNarrow, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, brNarrow)
+	outNarrow, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, brNarrow)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for narrow bound")
 	}
@@ -685,7 +688,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 		t.Fatalf("expected wider same-end full span: narrow=%d..%d wide=%d..%d", startNarrow, endNarrow, startWide, endWide)
 	}
 
-	outWide, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, brWide)
+	outWide, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, brWide)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for wide bound")
 	}
@@ -833,6 +836,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -850,7 +854,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	rb.ApplyLo(key, true)
 	br := ov.RangeForBounds(rb)
 
-	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br)
+	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 	if !ok {
 		t.Fatal("expected numeric range bucket path")
 	}
@@ -889,6 +893,7 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -897,14 +902,14 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	qv := db.engine.currentQueryViewForTests()
 
 	br := ov.RangeByRanks(2501, 3001)
-	warm, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br)
+	warm, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 	if !ok {
 		t.Fatal("expected numeric range bucket warmup path")
 	}
 	warm.ids.Release()
 
 	allocs := testing.AllocsPerRun(20, func() {
-		out, ok := qv.tryLoadNumericRangeBuckets("age", fm, ov, br)
+		out, ok := qv.tryLoadNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 		if !ok {
 			t.Fatal("expected warmed numeric range bucket load path")
 		}
@@ -938,6 +943,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -946,7 +952,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 	qv := db.engine.currentQueryViewForTests()
 	br := ov.RangeByRanks(2501, 3001)
 
-	warm, ok := qv.tryEvalNumericRangeBuckets("age", fm, ov, br)
+	warm, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 	if !ok {
 		t.Fatal("expected numeric range bucket warmup path")
 	}
@@ -955,7 +961,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 
 	allocs := testing.AllocsPerRun(100, func() {
 		db.clearCurrentSnapshotCachesForTesting()
-		out, ok := qv.tryEvalNumericRangeBuckets("age", fm, ov, br)
+		out, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
 		if !ok {
 			t.Fatal("expected numeric range bucket cold build path")
 		}
@@ -1027,6 +1033,7 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
 	view := db.engine.currentQueryViewForTests()
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	if !ov.HasData() {
@@ -1044,7 +1051,7 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 		{start: 1_777, end: 2_000},
 	}
 	for _, tc := range cases {
-		got, ok := db.engine.currentQueryViewForTests().trySnapshotNumericRangeCardinality("age", fm, ov, tc.start, tc.end)
+		got, ok := db.engine.currentQueryViewForTests().trySnapshotNumericRangeCardinality("age", ageOrdinal, fm, ov, tc.start, tc.end)
 		if !ok {
 			t.Fatalf("trySnapshotNumericRangeCardinality(%d,%d) failed", tc.start, tc.end)
 		}

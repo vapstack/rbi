@@ -81,6 +81,7 @@ type noOrderLimitFacts struct {
 	leafEst      [plannerPredicateFastPathMaxLeaves]uint64
 
 	directField              string
+	directOrdinal            int
 	directBounds             indexdata.Bounds
 	directBoundsOK           bool
 	directBoundLeaves        int
@@ -187,7 +188,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 	if needWindow < q.Offset {
 		return c.traceWork()
 	}
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, facts.directField)
+	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, facts.directOrdinal)
 	if !ov.HasData() {
 		return c.traceWork()
 	}
@@ -209,7 +210,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 		bestDelta = -bestDelta
 	}
 
-	if qv.hasPrefixBoundForField(facts.leaves, facts.directField) && qv.shouldPreferExecutionNoOrderPrefix(q, facts.leaves) {
+	if hasPrefixBoundForFieldOrdinal(facts.leaves, facts.directOrdinal) && qv.shouldPreferExecutionNoOrderPrefix(q, facts.leaves) {
 		work := TraceRouteWork{
 			CandidateScan:   float64(needWindow) * 0.70,
 			PostingContains: float64(needWindow) * residuals * 0.15,
@@ -457,6 +458,7 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 		}
 		if ok {
 			facts.directField = field
+			facts.directOrdinal = fieldOrdinal
 			facts.directBounds = bounds
 			facts.directBoundsOK = true
 			facts.directBoundLeaves = boundLeaves
@@ -482,13 +484,13 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 			}
 			if ok {
 				facts.directField = field
+				facts.directOrdinal = e.FieldOrdinal
 				facts.directBounds = bounds
 				facts.directBoundsOK = true
 				facts.directBoundLeaves = 0
 				for j := 0; j < len(leaves); j++ {
 					other := leaves[j]
-					if isBoundOp(other.Op) && !other.Not && other.FieldOrdinal >= 0 &&
-						qv.exec.FieldNameByOrdinal(other.FieldOrdinal) == field {
+					if isBoundOp(other.Op) && !other.Not && other.FieldOrdinal == facts.directOrdinal {
 						facts.directBoundLeaves++
 					}
 				}
@@ -502,8 +504,7 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 		facts.directResidualsSupported = true
 		for i := 0; i < len(leaves); i++ {
 			e := leaves[i]
-			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
-				qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == facts.directOrdinal {
 				continue
 			}
 			if !qv.supportsLimitLeafPredExpr(e) {
@@ -627,13 +628,13 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	directRangeOK := false
 	directRangeEmpty := false
 	if facts.directBoundsOK {
-		fm := qv.exec.Schema.Fields[facts.directField]
-		ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, facts.directField)
+		fm := qv.exec.Schema.Indexed[facts.directOrdinal].Field
+		ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, facts.directOrdinal)
 		if fm != nil && !fm.Slice && ov.HasData() {
 			directBR = ov.RangeForBounds(facts.directBounds)
 			directBucketTotal = ov.KeyCount()
 			directHasNilTail = fm.Ptr &&
-				qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, facts.directField).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+				qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.NilIndex, facts.directOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 			directRangeOK = true
 			if directBR.Empty() {
 				directRangeEmpty = true
@@ -661,8 +662,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	}
 
 	for i, e := range leaves {
-		if directRangeOK && isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
-			qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+		if directRangeOK && isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == facts.directOrdinal {
 			continue
 		}
 		leafSupported := qv.supportsLimitLeafPredExpr(e)
@@ -805,8 +805,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 				hasResidualPrefix := false
 				for i := 0; i < len(leaves); i++ {
 					e := leaves[i]
-					if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
-						qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+					if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == facts.directOrdinal {
 						continue
 					}
 					if e.Not {
@@ -823,7 +822,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 					}
 				}
 			}
-			if qv.hasPrefixBoundForField(leaves, facts.directField) && qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
+			if hasPrefixBoundForFieldOrdinal(leaves, facts.directOrdinal) && qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
 				cost = float64(needWindow)*(0.70+float64(residuals)*0.15) + float64(directBR.BaseEnd-directBR.BaseStart)*0.0001
 			}
 			candidates[n] = plannerNoOrderLimitCandidate{
@@ -1006,7 +1005,7 @@ DISPATCH:
 		if !facts.directBoundsOK {
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		out, used, runtimeFallback, err := qv.execNoOrderBounds(q, facts.directField, facts.directBounds, leaves, guard, trace)
+		out, used, runtimeFallback, err := qv.execNoOrderBounds(q, facts.directField, facts.directOrdinal, facts.directBounds, leaves, guard, trace)
 		if !used {
 			if err != nil {
 				return nil, true, "", err
@@ -1024,7 +1023,7 @@ DISPATCH:
 		if !facts.directBoundsOK {
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		out, used, runtimeFallback, err := qv.execNoOrderBounds(q, facts.directField, facts.directBounds, leaves, guard, trace)
+		out, used, runtimeFallback, err := qv.execNoOrderBounds(q, facts.directField, facts.directOrdinal, facts.directBounds, leaves, guard, trace)
 		if !used {
 			if err != nil {
 				return nil, true, "", err
@@ -1075,8 +1074,7 @@ func (qv *View) execSelectedNoOrderLeadScan(q *qir.Shape, facts *noOrderLimitFac
 		rangePredBuilt := false
 
 		for i, e := range leaves {
-			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
-				qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == facts.directOrdinal {
 				if rangePredBuilt {
 					continue
 				}
