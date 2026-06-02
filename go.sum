@@ -4,6 +4,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/vapstack/pooled v0.1.1 h1:8boazSqrcx/FRbYJp3tYNfH8SLUGIOlRZqU2yK0xUck=
+github.com/vapstack/pooled v0.1.1/go.mod h1:G7pwbAJBtWqC0ttLzcBekN1zku/ssk4kgGYNBYp37jI=
 github.com/vapstack/qx v0.4.0 h1:6yi0NOexi/cvi9c6/5mfwTIWdkcBJowZ8wQRYaQvTsI=
 github.com/vapstack/qx v0.4.0/go.mod h1:GdIItKR2RMt+ej9uCHHREqkAXcO5zkPny2GVw5izc3s=
 github.com/vmihailenco/msgpack/v5 v5.4.1 h1:cQriyiUvjTwOHg8QZaPihLWeRAAVoCpE00IUPn0Bjt8=

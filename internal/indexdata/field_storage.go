@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -1073,7 +1073,7 @@ func RebuildLenFieldStorageFromIndexView(universe posting.List, fieldOV FieldInd
 	}
 
 	var nonEmpty posting.List
-	counts := lenCountMapPool.Get(1024)
+	counts := lenCountMapPool.Get()
 
 	br := fieldOV.RangeForBounds(Bounds{Has: true})
 	if !br.Empty() {
@@ -1099,7 +1099,7 @@ func RebuildLenFieldStorageFromIndexView(universe posting.List, fieldOV FieldInd
 		}
 	}
 
-	lengths := lenPostingMapPool.Get(len(counts) + 1)
+	lengths := lenPostingMapPool.Get()
 	for idx, ln := range counts {
 		if ln == 0 {
 			continue

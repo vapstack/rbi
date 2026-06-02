@@ -1,15 +1,15 @@
 package wexec
 
 import (
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 const requestScratchPoolCap = 4 << 10
 
 var encodePool pooled.Buffers
 
-var requestScratchPool = pooled.NewSlicePool[*request](requestScratchPoolCap, pooled.ClearCap)
+var requestScratchPool = pooled.Slices[*request]{MaxCap: requestScratchPoolCap, Clear: pooled.ClearCap}
 
 var requestPool = pooled.Pointers[request]{
 	Init: func(req *request) {
@@ -83,9 +83,9 @@ var attemptStatePool = pooled.Pointers[attemptState]{
 }
 
 var repeatUintIDPool = pooled.Maps[uint64, int]{
-	NewCap: 8,
+	NewCap: 256,
 }
 
 var repeatStringIDPool = pooled.Maps[string, int]{
-	NewCap: 8,
+	NewCap: 256,
 }

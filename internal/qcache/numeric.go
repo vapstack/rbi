@@ -171,7 +171,7 @@ func (c *NumericRangeBucketCache) LoadField(field string) (*NumericRangeBucketEn
 		return entry, ok
 	}
 	if c.fieldIndex == nil {
-		c.fieldIndex = numericRangeBucketFieldIndexPool.Get(len(c.slots))
+		c.fieldIndex = numericRangeBucketFieldIndexPool.Get()
 	} else {
 		clear(c.fieldIndex)
 	}

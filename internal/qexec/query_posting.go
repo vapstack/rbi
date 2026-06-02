@@ -1,7 +1,7 @@
 package qexec
 
 import (
-	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 

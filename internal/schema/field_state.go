@@ -4,8 +4,8 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -42,17 +42,17 @@ type batchLenDiff struct {
 	newLen    int
 }
 
-var snapshotFieldInsertStateSlicePool = pooled.NewSlicePool[InsertState](
-	snapshotFieldStateSlicePoolMaxCap,
-	pooled.NoClear,
-	cleanupSnapshotFieldInsertStateSlice,
-)
+var snapshotFieldInsertStateSlicePool = pooled.Slices[InsertState]{
+	MaxCap:  snapshotFieldStateSlicePoolMaxCap,
+	Clear:   pooled.NoClear,
+	Cleanup: cleanupSnapshotFieldInsertStateSlice,
+}
 
-var snapshotFieldIndexStateSlicePool = pooled.NewSlicePool[IndexState](
-	snapshotFieldStateSlicePoolMaxCap,
-	pooled.ClearCap,
-	cleanupSnapshotFieldIndexStateSlice,
-)
+var snapshotFieldIndexStateSlicePool = pooled.Slices[IndexState]{
+	MaxCap:  snapshotFieldStateSlicePoolMaxCap,
+	Clear:   pooled.ClearCap,
+	Cleanup: cleanupSnapshotFieldIndexStateSlice,
+}
 
 type WriteScratch struct {
 	strings []string
@@ -73,11 +73,11 @@ type BatchState struct {
 	new     WriteScratch
 }
 
-var snapshotFieldBatchStateSlicePool = pooled.NewSlicePool[BatchState](
-	snapshotFieldStateSlicePoolMaxCap,
-	pooled.NoClear,
-	cleanupSnapshotFieldBatchStateSlice,
-)
+var snapshotFieldBatchStateSlicePool = pooled.Slices[BatchState]{
+	MaxCap:  snapshotFieldStateSlicePoolMaxCap,
+	Clear:   pooled.NoClear,
+	Cleanup: cleanupSnapshotFieldBatchStateSlice,
+}
 
 func GetInsertStates(n int) []InsertState {
 	states := snapshotFieldInsertStateSlicePool.Get(n)
@@ -270,7 +270,7 @@ func (s IndexSink) setNil() {
 
 func (s IndexSink) setLen(length int) {
 	if s.state.lengths == nil {
-		s.state.lengths = indexdata.GetLenPostingMap(8)
+		s.state.lengths = indexdata.GetLenPostingMap()
 	}
 	ln := uint32(length)
 	ids := s.state.lengths[ln]

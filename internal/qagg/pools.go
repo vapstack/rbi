@@ -1,6 +1,6 @@
 package qagg
 
-import "github.com/vapstack/rbi/internal/pooled"
+import "github.com/vapstack/pooled"
 
 const (
 	aggregateMetricStateSlicePoolMaxCap = 1 << 20
@@ -12,28 +12,28 @@ const (
 	aggregateGroupOrdinalMapPoolMaxCap  = 1 << 20
 )
 
-var aggregateMetricStateSlicePool = pooled.NewSlicePool[aggregateMetricState](
-	aggregateMetricStateSlicePoolMaxCap,
-	pooled.ClearCap,
-)
+var aggregateMetricStateSlicePool = pooled.Slices[aggregateMetricState]{
+	MaxCap: aggregateMetricStateSlicePoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
-var aggregateMetricSlicePool = pooled.NewSlicePool[aggregateMetric](
-	aggregateMetricSlicePoolMaxCap,
-	pooled.ClearCap,
-)
+var aggregateMetricSlicePool = pooled.Slices[aggregateMetric]{
+	MaxCap: aggregateMetricSlicePoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
-var aggregateFieldRefSlicePool = pooled.NewSlicePool[aggregateFieldRef](
-	aggregateFieldRefSlicePoolMaxCap,
-	pooled.ClearCap,
-)
+var aggregateFieldRefSlicePool = pooled.Slices[aggregateFieldRef]{
+	MaxCap: aggregateFieldRefSlicePoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
-var aggregateOrderSlicePool = pooled.NewSlicePool[aggregateOrder](
-	aggregateOrderSlicePoolMaxCap,
-	pooled.ClearCap,
-)
+var aggregateOrderSlicePool = pooled.Slices[aggregateOrder]{
+	MaxCap: aggregateOrderSlicePoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
 var aggregateOutputPositionMapPool = pooled.Maps[string, int]{
-	NewCap: 8,
+	NewCap: 32,
 	MaxLen: aggregateOutputPositionMapMaxLen,
 }
 

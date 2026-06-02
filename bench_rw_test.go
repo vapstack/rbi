@@ -12,9 +12,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"

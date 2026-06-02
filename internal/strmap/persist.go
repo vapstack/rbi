@@ -8,8 +8,8 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 const (
@@ -764,7 +764,7 @@ type sparseEntry struct {
 	value string
 }
 
-var sparseEntryPool = pooled.NewSlicePool[sparseEntry](4096, pooled.ClearCap)
+var sparseEntryPool = pooled.Slices[sparseEntry]{MaxCap: 4096, Clear: pooled.ClearCap}
 
 func snapshotShouldPersistSparse(sm *Snapshot, usedCount int) bool {
 	if sm.next > maxIntUint64 {

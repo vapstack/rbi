@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
@@ -554,7 +554,7 @@ func orderedDistinctStrings(vals []string, desc bool) []string {
 		return vals
 	}
 
-	seen := stringSetPool.Get(len(vals))
+	seen := stringSetPool.Get()
 	defer stringSetPool.Put(seen)
 
 	if desc {
@@ -632,7 +632,7 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 		}
 
 		if !setBuilt {
-			set = stringSetPool.Get(len(vals))
+			set = stringSetPool.Get()
 			for _, v := range vals {
 				set[v] = struct{}{}
 			}

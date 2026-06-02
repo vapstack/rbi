@@ -3,8 +3,8 @@ package indexdata
 import (
 	"slices"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -110,7 +110,7 @@ func AddStringPostingDiff(
 	capHint int,
 ) map[string]uint32 {
 	if fieldDelta == nil {
-		fieldDelta = stringPostingDiffMapPool.Get(min(capHint, postingAccumMapMaxLen))
+		fieldDelta = stringPostingDiffMapPool.Get()
 	}
 	return addStringPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
 }
@@ -162,7 +162,7 @@ func AddFixedPostingDiff(
 	capHint int,
 ) map[uint64]uint32 {
 	if fieldDelta == nil {
-		fieldDelta = fixedPostingDiffMapPool.Get(min(capHint, postingAccumMapMaxLen))
+		fieldDelta = fixedPostingDiffMapPool.Get()
 	}
 	return addFixedPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
 }
@@ -318,7 +318,7 @@ func AddStringPostingAdd(
 	capHint int,
 ) map[string]uint32 {
 	if fieldMap == nil {
-		fieldMap = stringPostingAddMapPool.Get(min(capHint, postingAccumMapMaxLen))
+		fieldMap = stringPostingAddMapPool.Get()
 	}
 	return addStringPostingAdd(fieldMap, arena, key, idx, capHint, true)
 }
@@ -368,7 +368,7 @@ func AddFixedPostingAdd(
 	capHint int,
 ) map[uint64]uint32 {
 	if fieldMap == nil {
-		fieldMap = fixedPostingAddMapPool.Get(min(capHint, postingAccumMapMaxLen))
+		fieldMap = fixedPostingAddMapPool.Get()
 	}
 	return addFixedPostingAdd(fieldMap, arena, key, idx, capHint, true)
 }

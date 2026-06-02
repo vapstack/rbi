@@ -1,6 +1,6 @@
 package qcache
 
-import "github.com/vapstack/rbi/internal/pooled"
+import "github.com/vapstack/pooled"
 
 const (
 	materializedPredKeySlicePoolMaxCap     = 512
@@ -13,21 +13,23 @@ const (
 	numericRangeBucketFieldIndexPoolMaxLen = 512
 )
 
-var materializedPredKeySlicePool = pooled.NewSlicePool[MaterializedPredKey](
-	materializedPredKeySlicePoolMaxCap,
-	pooled.ClearCap,
-)
+var materializedPredKeySlicePool = pooled.Slices[MaterializedPredKey]{
+	MaxCap: materializedPredKeySlicePoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
-var recentKeyCacheSlotPool = pooled.NewSlicePool[recentKeyCacheSlot](
-	recentKeyCacheSlotPoolMaxCap,
-	pooled.ClearCap,
-)
+var recentKeyCacheSlotPool = pooled.Slices[recentKeyCacheSlot]{
+	MaxCap: recentKeyCacheSlotPoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
 var materializedPredCacheIndexPool = pooled.Maps[uint64, int]{
+	NewCap: 128,
 	MaxLen: materializedPredCacheIndexPoolMaxLen,
 }
 
 var recentKeyCacheIndexPool = pooled.Maps[uint64, int]{
+	NewCap: 128,
 	MaxLen: recentKeyCacheIndexPoolMaxLen,
 }
 
@@ -37,10 +39,10 @@ var materializedPredCachePool = pooled.Pointers[MaterializedPredCache]{
 	},
 }
 
-var materializedPredCacheRetiredPool = pooled.NewSlicePool[*materializedPredCacheEntry](
-	materializedPredCacheRetiredPoolMaxCap,
-	pooled.ClearCap,
-)
+var materializedPredCacheRetiredPool = pooled.Slices[*materializedPredCacheEntry]{
+	MaxCap: materializedPredCacheRetiredPoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
 
 var materializedPredCacheEntryPool = pooled.Pointers[materializedPredCacheEntry]{
 	Clear: true,
@@ -53,6 +55,7 @@ var numericRangeBucketCachePool = pooled.Pointers[NumericRangeBucketCache]{
 }
 
 var numericRangeBucketFieldIndexPool = pooled.Maps[string, *NumericRangeBucketEntry]{
+	NewCap: 64,
 	MaxLen: numericRangeBucketFieldIndexPoolMaxLen,
 }
 

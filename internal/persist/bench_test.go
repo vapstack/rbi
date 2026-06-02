@@ -747,7 +747,7 @@ func benchPersistNilStorage(rows int) indexdata.FieldStorage {
 }
 
 func benchPersistLenStorage(rows int, universe posting.List) indexdata.FieldStorage {
-	lengths := indexdata.GetLenPostingMap(4)
+	lengths := indexdata.GetLenPostingMap()
 	var buckets [4][]uint64
 	for i := 0; i < len(buckets); i++ {
 		buckets[i] = make([]uint64, 0, rows/4+1)

@@ -5,8 +5,8 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
@@ -20,11 +20,8 @@ const (
 )
 
 var uniqueUint64IntMapPool = pooled.Maps[uint64, int]{
-	NewCap: 8,
+	NewCap: 256,
 	MaxLen: uniqueUint64IntMapPoolMaxLen,
-	Cleanup: func(m map[uint64]int) {
-		clear(m)
-	},
 }
 
 type UniqueContext struct {
@@ -335,7 +332,7 @@ func (ctx UniqueContext) checkOnWriteMulti(state *uniqueBatchCheckState, idxs []
 		}
 	}
 	if !ordered {
-		pos := uniqueUint64IntMapPool.Get(len(idxs))
+		pos := uniqueUint64IntMapPool.Get()
 		idxs, oldVals, newVals = collapseUniqueWriteMulti(idxs, oldVals, newVals, pos)
 		uniqueUint64IntMapPool.Put(pos)
 	}

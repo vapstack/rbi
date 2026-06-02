@@ -8,10 +8,10 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/persist"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qagg"
 	"github.com/vapstack/rbi/internal/qcache"

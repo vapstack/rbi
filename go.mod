@@ -3,6 +3,7 @@ module github.com/vapstack/rbi
 go 1.25.0
 
 require (
+	github.com/vapstack/pooled v0.1.1
 	github.com/vapstack/qx v0.4.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.etcd.io/bbolt v1.4.3

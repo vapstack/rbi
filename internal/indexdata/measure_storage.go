@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync/atomic"
 
-	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/pooled"
 )
 
 const (

@@ -1,6 +1,6 @@
 package keycodec
 
-import "github.com/vapstack/rbi/internal/pooled"
+import "github.com/vapstack/pooled"
 
 const (
 	dataKeyPoolMaxCap  = 64 << 10
@@ -8,8 +8,8 @@ const (
 )
 
 var (
-	dataKeyPool  = pooled.NewSlicePool[DataKey](dataKeyPoolMaxCap, pooled.ClearCap)
-	indexKeyPool = pooled.NewSlicePool[IndexKey](indexKeyPoolMaxCap, pooled.ClearCap)
+	dataKeyPool  = pooled.Slices[DataKey]{MaxCap: dataKeyPoolMaxCap, Clear: pooled.ClearCap}
+	indexKeyPool = pooled.Slices[IndexKey]{MaxCap: indexKeyPoolMaxCap, Clear: pooled.ClearCap}
 )
 
 func GetDataKeySlice(capHint int) []DataKey { return dataKeyPool.Get(capHint) }

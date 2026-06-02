@@ -336,7 +336,7 @@ func (s *scheduler) repeatedIDLimitLocked(limit int, strKey bool) int {
 	}
 
 	if strKey {
-		lastByID := repeatStringIDPool.Get(limit)
+		lastByID := repeatStringIDPool.Get()
 		for i := 0; i < limit; i++ {
 			req := s.queueAt(i).reqs[0]
 			id := req.id.String()
@@ -355,7 +355,7 @@ func (s *scheduler) repeatedIDLimitLocked(limit int, strKey bool) int {
 		return limit
 	}
 
-	lastByID := repeatUintIDPool.Get(limit)
+	lastByID := repeatUintIDPool.Get()
 	for i := 0; i < limit; i++ {
 		req := s.queueAt(i).reqs[0]
 		id := req.id.Uint()
@@ -413,7 +413,7 @@ func (s *scheduler) markSupersededSetDeleteJobs(batch []*writeJob, strKey bool) 
 	stats := s.stats.Enabled
 
 	if strKey {
-		lastByID := repeatStringIDPool.Get(len(batch))
+		lastByID := repeatStringIDPool.Get()
 		for i := range batch {
 			req := batch[i].reqs[0]
 			req.replacedBy = nil
@@ -435,7 +435,7 @@ func (s *scheduler) markSupersededSetDeleteJobs(batch []*writeJob, strKey bool) 
 		return
 	}
 
-	lastByID := repeatUintIDPool.Get(len(batch))
+	lastByID := repeatUintIDPool.Get()
 	for i := range batch {
 		req := batch[i].reqs[0]
 		req.replacedBy = nil

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/snapshot"

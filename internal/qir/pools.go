@@ -1,8 +1,8 @@
 package qir
 
-import "github.com/vapstack/rbi/internal/pooled"
+import "github.com/vapstack/pooled"
 
-var exprPool = pooled.NewSlicePool[Expr](256, pooled.ClearCap)
+var exprPool = pooled.Slices[Expr]{MaxCap: 256, Clear: pooled.ClearCap}
 
 func GetExprSlice(capHint int) []Expr { return exprPool.Get(capHint) }
 func ReleaseExprSlice(buf []Expr)     { exprPool.Put(buf) }

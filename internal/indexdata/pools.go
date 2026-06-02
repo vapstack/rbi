@@ -1,7 +1,7 @@
 package indexdata
 
 import (
-	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -17,7 +17,7 @@ var (
 		MaxLen: 4 << 10,
 	}
 	lenPostingMapPool = pooled.Maps[uint32, posting.List]{
-		NewCap: 8,
+		NewCap: 128,
 		MaxLen: 4 << 10,
 	}
 	lenCountMapPool = pooled.Maps[uint64, uint32]{
@@ -42,19 +42,19 @@ var (
 		Clear: true,
 	}
 	stringPostingDiffMapPool = pooled.Maps[string, uint32]{
-		NewCap: 8,
+		NewCap: 256,
 		MaxLen: postingAccumMapMaxLen,
 	}
 	fixedPostingDiffMapPool = pooled.Maps[uint64, uint32]{
-		NewCap: 8,
+		NewCap: 256,
 		MaxLen: postingAccumMapMaxLen,
 	}
 	stringPostingAddMapPool = pooled.Maps[string, uint32]{
-		NewCap: 8,
+		NewCap: 256,
 		MaxLen: postingAccumMapMaxLen,
 	}
 	fixedPostingAddMapPool = pooled.Maps[uint64, uint32]{
-		NewCap: 8,
+		NewCap: 256,
 		MaxLen: postingAccumMapMaxLen,
 	}
 
@@ -153,23 +153,61 @@ var (
 		},
 	}
 
-	postingDeltaSlicePool = pooled.NewSlicePool[PostingDelta](4<<10, pooled.ClearCap, func(buf []PostingDelta) {
-		for i := range buf {
-			buf[i].Delta.Add.Release()
-			buf[i].Delta.Remove.Release()
-		}
-	})
-	fieldEntrySlicePool             = pooled.NewSlicePool[Entry](4<<10, pooled.ClearCap)
-	fieldStorageSlicePool           = pooled.NewSlicePool[FieldStorage](4<<10, pooled.ClearCap)
-	fieldStorageRunCursorSlicePool  = pooled.NewSlicePool[fieldStorageRunCursor](4<<10, pooled.ClearCap)
-	fieldIndexChunkRefSlicePool     = pooled.NewSlicePool[fieldIndexChunkRef](1<<8, pooled.ClearCap)
-	fieldIndexChunkDirPageSlicePool = pooled.NewSlicePool[*fieldIndexChunkDirPage](16<<10, pooled.ClearCap)
-	measureEntrySlicePool           = pooled.NewSlicePool[MeasureEntry](16<<10, pooled.NoClear)
-	measureEntrySlotSlicePool       = pooled.NewSlicePool[[]MeasureEntry](4<<10, pooled.ClearCap, ReleaseMeasureEntryBufs)
-	measureBatchDeltaSlicePool      = pooled.NewSlicePool[MeasureDelta](8<<10, pooled.NoClear)
-	measureDeltaSlotSlicePool       = pooled.NewSlicePool[[]MeasureDelta](4<<10, pooled.ClearCap)
-	measureStorageSlicePool         = pooled.NewSlicePool[MeasureStorage](4<<10, pooled.ClearCap)
-	measureChunkRefSlicePool        = pooled.NewSlicePool[measureChunkRef](64<<10, pooled.ClearLen)
+	postingDeltaSlicePool = pooled.Slices[PostingDelta]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+		Cleanup: func(buf []PostingDelta) {
+			for i := range buf {
+				buf[i].Delta.Add.Release()
+				buf[i].Delta.Remove.Release()
+			}
+		},
+	}
+	fieldEntrySlicePool = pooled.Slices[Entry]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	fieldStorageSlicePool = pooled.Slices[FieldStorage]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	fieldStorageRunCursorSlicePool = pooled.Slices[fieldStorageRunCursor]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	fieldIndexChunkRefSlicePool = pooled.Slices[fieldIndexChunkRef]{
+		MaxCap: 1 << 8,
+		Clear:  pooled.ClearCap,
+	}
+	fieldIndexChunkDirPageSlicePool = pooled.Slices[*fieldIndexChunkDirPage]{
+		MaxCap: 16 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	measureEntrySlicePool = pooled.Slices[MeasureEntry]{
+		MaxCap: 16 << 10,
+		Clear:  pooled.NoClear,
+	}
+	measureEntrySlotSlicePool = pooled.Slices[[]MeasureEntry]{
+		MaxCap:  4 << 10,
+		Clear:   pooled.ClearCap,
+		Cleanup: ReleaseMeasureEntryBufs,
+	}
+	measureBatchDeltaSlicePool = pooled.Slices[MeasureDelta]{
+		MaxCap: 8 << 10,
+		Clear:  pooled.NoClear,
+	}
+	measureDeltaSlotSlicePool = pooled.Slices[[]MeasureDelta]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	measureStorageSlicePool = pooled.Slices[MeasureStorage]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.ClearCap,
+	}
+	measureChunkRefSlicePool = pooled.Slices[measureChunkRef]{
+		MaxCap: 64 << 10,
+		Clear:  pooled.ClearLen,
+	}
 )
 
 // ---
@@ -189,8 +227,8 @@ func ReleaseFieldEntrySlice(buf []Entry)     { fieldEntrySlicePool.Put(buf) }
 func GetBatchPostingDeltaMap() map[uint64]BatchPostingDelta      { return batchPostingDeltaMapPool.Get() }
 func ReleaseBatchPostingDeltaMap(m map[uint64]BatchPostingDelta) { batchPostingDeltaMapPool.Put(m) }
 
-func GetLenPostingMap(capHint int) map[uint32]posting.List { return lenPostingMapPool.Get(capHint) }
-func ReleaseLenPostingMap(m map[uint32]posting.List)       { lenPostingMapPool.Put(m) }
+func GetLenPostingMap() map[uint32]posting.List      { return lenPostingMapPool.Get() }
+func ReleaseLenPostingMap(m map[uint32]posting.List) { lenPostingMapPool.Put(m) }
 
 // todo: rework this >>
 

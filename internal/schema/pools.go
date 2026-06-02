@@ -3,7 +3,7 @@ package schema
 import (
 	"math/bits"
 
-	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/pooled"
 )
 
 const (
@@ -12,11 +12,8 @@ const (
 )
 
 var stringSetPool = pooled.Maps[string, struct{}]{
-	NewCap: 8,
+	NewCap: 64,
 	MaxLen: stringSetPoolMaxLen,
-	Cleanup: func(m map[string]struct{}) {
-		clear(m)
-	},
 }
 
 type u64setPoolBuf struct {

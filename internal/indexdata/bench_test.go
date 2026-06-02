@@ -1285,7 +1285,7 @@ func BenchmarkNewLenFieldStorageFromMapOwned(b *testing.B) {
 	var used bool
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		lengths := lenPostingMapPool.Get(len(base))
+		lengths := lenPostingMapPool.Get()
 		for ln := range base {
 			lengths[uint32(ln)] = base[ln].Clone()
 		}

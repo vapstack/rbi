@@ -122,13 +122,13 @@ func (c *MaterializedPredCache) Init(maxEntries int, maxCardinality uint64) {
 	if cap(c.slots) < maxEntries {
 		c.slots = make([]materializedPredCacheSlot, maxEntries)
 		if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
-			c.index = materializedPredCacheIndexPool.Get(maxEntries)
+			c.index = materializedPredCacheIndexPool.Get()
 		}
 		return
 	}
 	c.slots = c.slots[:maxEntries]
 	if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
-		c.index = materializedPredCacheIndexPool.Get(maxEntries)
+		c.index = materializedPredCacheIndexPool.Get()
 	}
 }
 
@@ -621,7 +621,7 @@ func (c *MaterializedPredCache) insertLocked(key MaterializedPredKey, entry *mat
 	hash := uint64(0)
 	if len(c.slots) > materializedPredCacheLinearMaxEntries {
 		if c.index == nil {
-			c.index = materializedPredCacheIndexPool.Get(len(c.slots))
+			c.index = materializedPredCacheIndexPool.Get()
 		}
 		hash = key.hash()
 		c.index[hash] = idx
@@ -892,7 +892,7 @@ func (c *RecentKeyCache) initSlots(limit int) {
 	c.slots = c.slots[:limit]
 	if limit > materializedPredCacheLinearMaxEntries {
 		if c.index == nil {
-			c.index = recentKeyCacheIndexPool.Get(limit)
+			c.index = recentKeyCacheIndexPool.Get()
 		}
 		if c.indexLen != limit {
 			clear(c.index)

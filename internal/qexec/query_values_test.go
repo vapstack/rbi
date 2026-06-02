@@ -4,8 +4,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 func TestExprValueToDistinctIdxBufClonesStringSlice(t *testing.T) {

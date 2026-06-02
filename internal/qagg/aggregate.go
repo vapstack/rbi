@@ -7,10 +7,10 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/qir"
@@ -259,7 +259,7 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	if len(src.Reduction.Metrics) != 0 {
 		out.metrics = aggregateMetricSlicePool.Get(len(src.Reduction.Metrics))
 	}
-	outputPositions := aggregateOutputPositionMapPool.Get(len(src.Reduction.Group) + len(src.Reduction.Metrics))
+	outputPositions := aggregateOutputPositionMapPool.Get()
 	defer aggregateOutputPositionMapPool.Put(outputPositions)
 
 	for i := range src.Reduction.Group {

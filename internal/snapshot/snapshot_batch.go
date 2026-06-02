@@ -3,8 +3,8 @@ package snapshot
 import (
 	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -102,7 +102,7 @@ func normalizePreparedBatchForSnapshot(entries []BatchEntry) []BatchEntry {
 		return entries[:write]
 	}
 
-	pos := uint64IntMapPool.Get(len(entries))
+	pos := uint64IntMapPool.Get()
 
 	n := 0
 	for i := range entries {
@@ -233,7 +233,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema
 
 	var lastByIdx map[uint64]int
 	if hasRepeated {
-		lastByIdx = uint64IntMapPool.Get(len(entries))
+		lastByIdx = uint64IntMapPool.Get()
 		for i := range entries {
 			lastByIdx[entries[i].ID] = i
 		}

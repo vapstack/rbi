@@ -543,7 +543,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	universe := (posting.List{}).BuildAdded(1)
 	universe = universe.BuildAdded(2)
 	defer universe.Release()
-	lengths := indexdata.GetLenPostingMap(2)
+	lengths := indexdata.GetLenPostingMap()
 	lengths[0] = (posting.List{}).BuildAdded(2)
 	lengths[1] = (posting.List{}).BuildAdded(1)
 	lenStorage, _ := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
