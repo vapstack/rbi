@@ -455,6 +455,43 @@ func TestSnapshotKeepsOriginalMappingAfterMapperMutation(t *testing.T) {
 	}
 }
 
+func TestSnapshotSurvivesMapperTruncateAndIDReuse(t *testing.T) {
+	m := New(0, 256)
+	for i, key := range []string{"seed-a", "seed-b", "seed-c"} {
+		idx, created := m.Create(key)
+		if idx != uint64(i+1) || !created {
+			t.Fatalf("Create(%q) = %d/%v, want %d/true", key, idx, created, i+1)
+		}
+	}
+	snap := m.Snapshot()
+	if idx, ok := snap.Index("seed-a"); !ok || idx != 1 {
+		t.Fatalf("snapshot Index(seed-a) before truncate = %d/%v, want 1/true", idx, ok)
+	}
+
+	m.Truncate()
+	if idx, created := m.Create("new-a"); idx != 1 || !created {
+		t.Fatalf("Create(new-a) after truncate = %d/%v, want 1/true", idx, created)
+	}
+
+	if idx, ok := snap.Index("seed-a"); !ok || idx != 1 {
+		t.Fatalf("old snapshot Index(seed-a) after truncate = %d/%v, want 1/true", idx, ok)
+	}
+	if got, ok := snap.String(1); !ok || got != "seed-a" {
+		t.Fatalf("old snapshot String(1) after id reuse = %q/%v, want seed-a/true", got, ok)
+	}
+	if idx, ok := snap.Index("new-a"); ok {
+		t.Fatalf("old snapshot saw key created after truncate: idx=%d", idx)
+	}
+
+	latest := m.Snapshot()
+	if got, ok := latest.String(1); !ok || got != "new-a" {
+		t.Fatalf("latest String(1) = %q/%v, want new-a/true", got, ok)
+	}
+	if _, ok := latest.Index("seed-a"); ok {
+		t.Fatalf("latest snapshot retained old key after truncate")
+	}
+}
+
 func TestPublishedSnapshotsSurviveCompactionAndLiveStoragePoison(t *testing.T) {
 	m := New(0, 2)
 	for i, key := range []string{"seed-a", "seed-b"} {

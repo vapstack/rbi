@@ -141,6 +141,27 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 			{Name: "opt", Value: nil},
 		}
 	}
+	poisonRec := func(rec *Rec) {
+		rec.Country = "poison-country"
+		rec.Name = "poison-name"
+		rec.Email = "poison-email"
+		rec.Age = -1
+		rec.Score = -1
+		rec.Active = false
+		for i := range rec.Tags {
+			rec.Tags[i] = "poison-tag"
+		}
+		rec.FullName = "poison-full-name"
+	}
+	poisonPatch := func(patch []Field) {
+		for i := range patch {
+			if tags, ok := patch[i].Value.([]string); ok {
+				for j := range tags {
+					tags[j] = "poison-patch-tag"
+				}
+			}
+		}
+	}
 
 	model := make(map[uint64]Rec, 48)
 	for i := 1; i <= 24; i++ {
@@ -207,8 +228,14 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 			case 0:
 				rec := op.rec
 				err = db.Set(op.id, &rec, BeforeCommit(recordCommit))
+				if err == nil {
+					poisonRec(&rec)
+				}
 			case 1:
 				err = db.Patch(op.id, op.patch, BeforeCommit(recordCommit))
+				if err == nil {
+					poisonPatch(op.patch)
+				}
 			default:
 				err = db.Delete(op.id, BeforeCommit(recordCommit))
 			}

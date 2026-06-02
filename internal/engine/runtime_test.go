@@ -297,6 +297,60 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 	}
 }
 
+func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
+	bucket := []byte("runtime_pinned_current_truncate")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob"})
+	setRuntimeTestSequence(t, db, bucket, 2)
+
+	r := newRuntimeTestRuntime(t, false, true)
+	buildRuntimeTestIndex(t, r, db, bucket)
+
+	prepared, shape, err := r.prepareQuery(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	old, seq, ref := r.snapshot.PinCurrent()
+	if old == nil || seq != 2 || ref == nil {
+		t.Fatalf("PinCurrent old snap=%v seq=%d ref=%v", old, seq, ref)
+	}
+	defer r.snapshot.Unpin(seq, ref)
+
+	staged := r.StageTruncate(4)
+	if staged.view == nil {
+		t.Fatal("StageTruncate returned empty staged snapshot")
+	}
+	var broken atomic.Bool
+	if err = r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), errors.New("broken"), 4, "truncate", staged); err != nil {
+		t.Fatalf("PublishCommittedStaged: %v", err)
+	}
+	if got := r.snapshot.Current(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
+		t.Fatalf("current snapshot after truncate=%v", got)
+	}
+
+	keys, err := r.queryKeysOnSnapshot(old, &shape, false)
+	if err != nil {
+		t.Fatalf("query old snapshot: %v", err)
+	}
+	if !slices.Equal(keys.IDs, []uint64{1}) {
+		t.Fatalf("old snapshot query IDs=%v want [1]", keys.IDs)
+	}
+
+	var currentKeys KeySet
+	if err = r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+		currentKeys = k
+		return nil
+	}); err != nil {
+		t.Fatalf("QueryKeys current after truncate: %v", err)
+	}
+	if len(currentKeys.IDs) != 0 {
+		t.Fatalf("current snapshot query IDs=%v want empty", currentKeys.IDs)
+	}
+}
+
 func TestRuntimeDropStagedKeepsCurrentSnapshotQueryable(t *testing.T) {
 	bucket := []byte("runtime_drop_staged")
 	db := openRuntimeTestBolt(t, bucket)
