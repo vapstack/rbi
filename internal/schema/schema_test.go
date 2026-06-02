@@ -713,11 +713,17 @@ func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
 }
 
 func schemaTestIndexViewContains(storage indexdata.FieldStorage, key string, id uint64) bool {
-	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key).Contains(id)
+	ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
+	ok := ids.Contains(id)
+	ids.Release()
+	return ok
 }
 
 func schemaTestIndexViewContainsKey(storage indexdata.FieldStorage, key uint64, id uint64) bool {
-	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(keycodec.FromU64(key)).Contains(id)
+	ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(keycodec.FromU64(key))
+	ok := ids.Contains(id)
+	ids.Release()
+	return ok
 }
 
 func TestRuntimeLookupHelpers(t *testing.T) {
@@ -859,6 +865,53 @@ func TestIndexStateCollectAndMaterialize(t *testing.T) {
 	}
 }
 
+func TestIndexStateMaterializedStorageSurvivesStateRelease(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	rec := schemaTestAccessorRec{
+		Name:   "alice",
+		Tags:   []string{"go", "db"},
+		Scores: []int64{5, 7},
+	}
+	ptr := unsafe.Pointer(&rec)
+	states := GetIndexStates(len(rt.Indexed))
+
+	nameOrdinal := rt.IndexedByName["name"].Ordinal
+	tagsOrdinal := rt.IndexedByName["tags"].Ordinal
+	maybeOrdinal := rt.IndexedByName["maybe"].Ordinal
+	rt.IndexedByName["name"].CollectIndexValue(ptr, 1, &states[nameOrdinal])
+	rt.IndexedByName["tags"].CollectIndexValue(ptr, 1, &states[tagsOrdinal])
+	rt.IndexedByName["maybe"].CollectIndexValue(ptr, 1, &states[maybeOrdinal])
+
+	nameStorage := states[nameOrdinal].MaterializeStorage(false)
+	defer nameStorage.Release()
+	tagStorage := states[tagsOrdinal].MaterializeStorage(false)
+	defer tagStorage.Release()
+	nilStorage := states[maybeOrdinal].MaterializeNilStorage()
+	defer nilStorage.Release()
+	universe := (posting.List{}).BuildAdded(1)
+	lenStorage, _ := states[tagsOrdinal].MaterializeLenStorage(universe)
+	defer lenStorage.Release()
+	defer universe.Release()
+
+	ReleaseIndexStates(states)
+
+	if !schemaTestIndexViewContains(nameStorage, "alice", 1) {
+		t.Fatal("materialized scalar storage did not survive index state release")
+	}
+	if !schemaTestIndexViewContains(tagStorage, "go", 1) || !schemaTestIndexViewContains(tagStorage, "db", 1) {
+		t.Fatal("materialized slice storage did not survive index state release")
+	}
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 1) {
+		t.Fatal("materialized nil storage did not survive index state release")
+	}
+	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 1) {
+		t.Fatal("materialized len storage did not survive index state release")
+	}
+}
+
 func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
 	if err != nil {
@@ -922,6 +975,40 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 		t.Fatal("insert merge lost nil posting")
 	}
 	nilState.discard()
+}
+
+func TestInsertStateResetDropsPreviousLogicalEntries(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	oldRec := schemaTestAccessorRec{Tags: []string{"old"}}
+	newRec := schemaTestAccessorRec{Tags: []string{"new", "next"}}
+
+	var state InsertState
+	rt.IndexedByName["tags"].CollectInsertValue(unsafe.Pointer(&oldRec), 1, false, &state)
+	state.Reset()
+	rt.IndexedByName["tags"].CollectInsertValue(unsafe.Pointer(&newRec), 2, false, &state)
+
+	storage := rt.IndexedByName["tags"].MergeInsertStorageOwned(indexdata.FieldStorage{}, &state, false)
+	defer storage.Release()
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(state.LenDiff())
+	defer lenStorage.Release()
+	state.Reset()
+
+	if schemaTestIndexViewContains(storage, "old", 1) {
+		t.Fatal("insert state reset kept old string posting")
+	}
+	if !schemaTestIndexViewContains(storage, "new", 2) || !schemaTestIndexViewContains(storage, "next", 2) {
+		t.Fatal("insert state reset lost new string postings")
+	}
+	if schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(1), 1) {
+		t.Fatal("insert state reset kept old len posting")
+	}
+	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
+		t.Fatal("insert state reset lost new len posting")
+	}
+	state.discard()
 }
 
 func TestBatchStateCollectApplyReset(t *testing.T) {
@@ -1014,6 +1101,61 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 		t.Fatal("batch nil apply lost nil posting")
 	}
 	nilDiff.discard()
+}
+
+func TestBatchStateResetDropsPreviousLogicalEntries(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	oldRec := schemaTestAccessorRec{Tags: []string{"old"}}
+	newRec := schemaTestAccessorRec{Tags: []string{"old", "stale"}}
+	resetOld := schemaTestAccessorRec{Tags: []string{"drop", "other"}}
+	resetNew := schemaTestAccessorRec{Tags: []string{"fresh"}}
+
+	var state BatchState
+	rt.IndexedByName["tags"].CollectBatchDiff(1, unsafe.Pointer(&oldRec), unsafe.Pointer(&newRec), false, &state)
+	state.Reset()
+	rt.IndexedByName["tags"].CollectBatchDiff(2, unsafe.Pointer(&resetOld), unsafe.Pointer(&resetNew), false, &state)
+
+	storage := rt.IndexedByName["tags"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &state, false)
+	defer storage.Release()
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(state.LenDiff())
+	defer lenStorage.Release()
+	state.Reset()
+
+	if schemaTestIndexViewContains(storage, "stale", 1) {
+		t.Fatal("batch state reset kept old string diff")
+	}
+	if !schemaTestIndexViewContains(storage, "fresh", 2) {
+		t.Fatal("batch state reset lost new string diff")
+	}
+	if schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 1) {
+		t.Fatal("batch state reset kept old len diff")
+	}
+	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(1), 2) {
+		t.Fatal("batch state reset lost new len diff")
+	}
+	state.discard()
+}
+
+func TestWriteScratchResetAndDiscardClearLogicalState(t *testing.T) {
+	var scratch WriteScratch
+	scratch.addString("old")
+	scratch.addFixed(7)
+	scratch.setLen(3)
+	scratch.setNil()
+	scratch.reset()
+	if scratch.ok || scratch.isNil || scratch.length != 0 || len(scratch.strings) != 0 || len(scratch.fixed) != 0 {
+		t.Fatalf("reset scratch kept logical state: %+v", scratch)
+	}
+	scratch.addString("next")
+	scratch.addFixed(9)
+	scratch.setLen(2)
+	scratch.discard()
+	if scratch.ok || scratch.isNil || scratch.length != 0 || scratch.strings != nil || scratch.fixed != nil {
+		t.Fatalf("discard scratch kept owned buffers: %+v", scratch)
+	}
 }
 
 func TestBatchStateReorderedSliceValuesProduceNoDeltas(t *testing.T) {

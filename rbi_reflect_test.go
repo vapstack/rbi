@@ -38,8 +38,21 @@ func (b reflectHexBytes) IndexingValue() string {
 	return hex.EncodeToString([]byte(b))
 }
 
+type reflectPtrHexBytes []byte
+
+func (b *reflectPtrHexBytes) IndexingValue() string {
+	if b == nil {
+		return ""
+	}
+	return hex.EncodeToString([]byte(*b))
+}
+
 type reflectBytesVIRec struct {
 	Key reflectHexBytes `db:"key" rbi:"index"`
+}
+
+type reflectPtrBytesVIRec struct {
+	Key *reflectPtrHexBytes `db:"key" rbi:"index"`
 }
 
 type reflectMapVI map[string]string
@@ -414,6 +427,22 @@ func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_RemainsScalar(t *test
 	if cnt != 1 {
 		t.Fatalf("Count mismatch: got=%d want=1", cnt)
 	}
+}
+
+func TestReflectExt_QueryValueIndexerPointerUnderlyingSlice_PreservesPointerLiteral(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectPtrBytesVIRec](t, "reflect_ptr_bytes_vi.db")
+
+	key := reflectPtrHexBytes{0xab, 0xcd}
+	if err := db.Set(1, &reflectPtrBytesVIRec{Key: &key}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	queryKey := reflectPtrHexBytes{0xab, 0xcd}
+	got, err := db.QueryKeys(qx.Query(qx.EQ("key", &queryKey)))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1})
 }
 
 func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_AllowsCanonicalString(t *testing.T) {

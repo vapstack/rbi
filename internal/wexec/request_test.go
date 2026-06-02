@@ -63,6 +63,32 @@ func TestBuildPatchRequestRepeatIDPolicy(t *testing.T) {
 	requestPool.Put(req)
 }
 
+func TestBuildPatchRequestCopiesCallerPatchItemsShallow(t *testing.T) {
+	ex := NewBatcher(Config{
+		MaxOps:      8,
+		Unavailable: func() error { return nil },
+	})
+
+	tags := []string{"go", "db"}
+	patch := []schema.PatchItem{
+		{Name: "tags", Value: tags},
+	}
+	req := ex.buildPatchRequest(keycodec.DataKeyFromUserKey(uint64(1), false), patch, true, nil, nil, nil)
+	defer requestPool.Put(req)
+
+	patch[0].Name = "name"
+	patch[0].Value = []string{"other"}
+	tags[0] = "mutated"
+
+	if req.patch[0].Name != "tags" {
+		t.Fatalf("request patch item name aliases caller slice: %q", req.patch[0].Name)
+	}
+	gotTags := req.patch[0].Value.([]string)
+	if !reflect.DeepEqual(gotTags, []string{"mutated", "db"}) {
+		t.Fatalf("request patch value was not used directly: %v", gotTags)
+	}
+}
+
 func TestBuildSetRequestHookSuppressesCoalescingPolicy(t *testing.T) {
 	ex := NewBatcher(Config{
 		MaxOps:      8,

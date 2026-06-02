@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -383,6 +384,83 @@ func TestQueryCorrectness_PreparedQueryConcurrentReadOnlyViews(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestQueryFilterReleaseReuseKeepsPostingResultsOwned(t *testing.T) {
+	db := newCorrectnessDB(t)
+	cases := []struct {
+		name string
+		q    *qx.QX
+		want []uint64
+	}{
+		{
+			name: "scalar_and_range",
+			q:    qx.Query(qx.EQ("country", "US"), qx.GTE("age", 30)),
+			want: []uint64{4, 7, 10},
+		},
+		{
+			name: "or_scalar_slice",
+			q:    qx.Query(qx.OR(qx.EQ("country", "DE"), qx.HASANY("tags", []string{"ops"}))),
+			want: []uint64{2, 4, 10, 11},
+		},
+		{
+			name: "slice_all",
+			q:    qx.Query(qx.HASALL("tags", []string{"go", "db"})),
+			want: []uint64{1},
+		},
+		{
+			name: "negative_and_range",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"DE", "PL"}),
+				qx.GTE("age", 20),
+				qx.LT("age", 60),
+			),
+			want: []uint64{1, 4, 6, 7, 8, 9, 10, 12},
+		},
+		{
+			name: "prefix_and_bool",
+			q:    qx.Query(qx.PREFIX("full_name", "FN-0"), qx.EQ("active", true)),
+			want: []uint64{1, 3, 4, 6, 8, 9},
+		},
+	}
+	type retainedResult struct {
+		ids  posting.List
+		want []uint64
+	}
+	retained := make([]retainedResult, 0, len(cases)*8)
+	defer func() {
+		for i := range retained {
+			retained[i].ids.Release()
+		}
+	}()
+
+	snap := db.engine.snapshot.Current()
+	for iter := 0; iter < 8; iter++ {
+		for i := range cases {
+			tc := cases[i]
+			prepared, _, err := prepareTestQuery(db.engine, tc.q)
+			if err != nil {
+				t.Fatalf("%s prepareTestQuery: %v", tc.name, err)
+			}
+			view := db.engine.exec.AcquireView(snap)
+			ids, err := view.Filter(prepared)
+			db.engine.exec.ReleaseView(view)
+			prepared.Release()
+			if err != nil {
+				t.Fatalf("%s Filter: %v", tc.name, err)
+			}
+
+			if got := ids.ToArray(); !slices.Equal(got, tc.want) {
+				t.Fatalf("%s ids=%v want=%v", tc.name, got, tc.want)
+			}
+			retained = append(retained, retainedResult{ids: ids, want: tc.want})
+			for j := range retained {
+				if got := retained[j].ids.ToArray(); !slices.Equal(got, retained[j].want) {
+					t.Fatalf("retained[%d] ids=%v want=%v", j, got, retained[j].want)
+				}
+			}
+		}
 	}
 }
 

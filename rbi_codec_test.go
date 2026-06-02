@@ -363,6 +363,21 @@ func TestCodec_RecordPool_ReusedDecodeLeaksAbsentFields(t *testing.T) {
 	t.Fatalf("failed to observe record pool reuse after %d attempts", attempts)
 }
 
+func TestCodec_RecordPoolReleaseZeroesCustomCodecRecord(t *testing.T) {
+	db, _ := openTempDBUint64CodecSparseRec(t)
+
+	opt := "sticky"
+	rec := db.recPool.Get()
+	rec.Name = "dirty"
+	rec.Tags = []string{"go", "db"}
+	rec.Opt = &opt
+
+	db.ReleaseRecords(rec)
+	if rec.Name != "" || rec.Tags != nil || rec.Opt != nil {
+		t.Fatalf("released custom codec record was not zeroed: %#v", rec)
+	}
+}
+
 /**/
 
 // guard to deny *posting.List
@@ -639,4 +654,19 @@ func TestRecordPool_ReusedDecodeLeaksAbsentFields(t *testing.T) {
 		t.Skipf("sync.Pool reuse is not guaranteed under -race after %d attempts", attempts)
 	}
 	t.Fatalf("failed to observe record pool reuse after %d attempts", attempts)
+}
+
+func TestRecordPoolReleaseZeroesMsgpackRecord(t *testing.T) {
+	db, _ := openTempDBUint64PooledSparseRec(t)
+
+	opt := "sticky"
+	rec := db.recPool.Get()
+	rec.Name = "dirty"
+	rec.Tags = []string{"go", "db"}
+	rec.Opt = &opt
+
+	db.ReleaseRecords(rec)
+	if rec.Name != "" || rec.Tags != nil || rec.Opt != nil {
+		t.Fatalf("released msgpack record was not zeroed: %#v", rec)
+	}
 }

@@ -2,6 +2,59 @@ package indexdata
 
 import "testing"
 
+// Measure storage ownership matrix:
+// - NewMeasureStorageFromEntriesOwned consumes entry buffers and copies ID/value data into storage-owned slices.
+// - NewMeasureStorageFromSortedRunsOwned consumes run buffers and copies ID/value data into storage-owned chunks.
+// - ApplyDeltasOwned retains untouched chunks and rebuilds touched flat/chunk data into new owned storage.
+func poisonMeasureEntries(entries []MeasureEntry) {
+	for i := range entries {
+		entries[i] = MeasureEntry{ID: ^uint64(0), Value: ^uint64(0)}
+	}
+}
+
+func poisonUint64s(bufs ...[]uint64) {
+	for i := range bufs {
+		buf := bufs[i]
+		for j := range buf {
+			buf[j] = ^uint64(0)
+		}
+	}
+}
+
+func TestMeasureStorageFromEntriesOwnedCopiesEntryBuffer(t *testing.T) {
+	tests := []struct {
+		name string
+		rows int
+	}{
+		{name: "Flat", rows: 8},
+		{name: "Chunked", rows: MeasureChunkThreshold + 17},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := GetMeasureEntrySlice(tc.rows)
+			for i := 0; i < tc.rows; i++ {
+				id := uint64(i*2 + 1)
+				entries = append(entries, MeasureEntry{ID: id, Value: id * 10})
+			}
+
+			storage := NewMeasureStorageFromEntriesOwned(entries)
+			defer storage.Release()
+			if storage.IsChunked() != (tc.rows > MeasureChunkThreshold) {
+				t.Fatalf("unexpected storage shape")
+			}
+
+			poisonMeasureEntries(entries)
+
+			measureStorageAssertValue(t, storage, 1, 10)
+			mid := uint64((tc.rows/2)*2 + 1)
+			measureStorageAssertValue(t, storage, mid, mid*10)
+			last := uint64((tc.rows-1)*2 + 1)
+			measureStorageAssertValue(t, storage, last, last*10)
+		})
+	}
+}
+
 func TestMeasureStorageApplyDeltasFlatAndChunked(t *testing.T) {
 	flat := measureStorageForTest(8)
 	if flat.IsChunked() {
@@ -51,6 +104,54 @@ func TestMeasureStorageApplyDeltasFlatAndChunked(t *testing.T) {
 	chunkedOut.Release()
 }
 
+func TestMeasureStorageApplyDeltasOwnedSurvivesBaseReleaseAndPoison(t *testing.T) {
+	flat := measureStorageForTest(8)
+	if flat.IsChunked() {
+		flat.Release()
+		t.Fatalf("expected flat measure storage")
+	}
+	oldFlatIDs := flat.flat.ids
+	oldFlatValues := flat.flat.values
+	flatDeltas := GetMeasureDeltaSlice(2)
+	flatDeltas = append(flatDeltas, MeasureDelta{ID: 1, NewOK: true, New: 111})
+	flatDeltas = append(flatDeltas, MeasureDelta{ID: 3})
+	flatOut := flat.ApplyDeltasOwned(flatDeltas)
+	flat.Release()
+	poisonUint64s(oldFlatIDs, oldFlatValues)
+	defer flatOut.Release()
+
+	measureStorageAssertValue(t, flatOut, 1, 111)
+	measureStorageAssertMissing(t, flatOut, 3)
+	measureStorageAssertValue(t, flatOut, 5, 20)
+
+	chunked := measureStorageForTest(MeasureChunkThreshold + 19)
+	if !chunked.IsChunked() {
+		chunked.Release()
+		t.Fatalf("expected chunked measure storage")
+	}
+	touched := chunked.chunked.refsByID[0].chunk
+	oldChunkIDs := touched.ids
+	oldChunkValues := touched.values
+	chunkedDeltas := GetMeasureDeltaSlice(2)
+	chunkedDeltas = append(chunkedDeltas, MeasureDelta{ID: 1, NewOK: true, New: 111})
+	chunkedDeltas = append(chunkedDeltas, MeasureDelta{ID: 3})
+	chunkedOut := chunked.ApplyDeltasOwned(chunkedDeltas)
+	if !chunkedOut.IsChunked() {
+		chunkedOut.Release()
+		chunked.Release()
+		t.Fatalf("expected chunked output")
+	}
+	chunked.Release()
+	poisonUint64s(oldChunkIDs, oldChunkValues)
+	defer chunkedOut.Release()
+
+	measureStorageAssertValue(t, chunkedOut, 1, 111)
+	measureStorageAssertMissing(t, chunkedOut, 3)
+	measureStorageAssertValue(t, chunkedOut, 5, 20)
+	probe := uint64(MeasureChunkTargetRows*2 + 1)
+	measureStorageAssertValue(t, chunkedOut, probe, uint64(MeasureChunkTargetRows*10))
+}
+
 func TestMeasureStorageFromSortedRunsOwned(t *testing.T) {
 	tests := []struct {
 		name string
@@ -80,6 +181,47 @@ func TestMeasureStorageFromSortedRunsOwned(t *testing.T) {
 			}
 			measureStorageAssertValue(t, storage, 1, 10)
 			measureStorageAssertValue(t, storage, uint64(tc.rows/2), uint64((tc.rows/2)*10))
+			measureStorageAssertValue(t, storage, uint64(tc.rows), uint64(tc.rows*10))
+		})
+	}
+}
+
+func TestMeasureStorageFromSortedRunsOwnedCopiesRunBuffers(t *testing.T) {
+	const runCount = 3
+	tests := []struct {
+		name string
+		rows int
+	}{
+		{name: "Flat", rows: 9},
+		{name: "Chunked", rows: MeasureChunkThreshold + 9},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runs := GetMeasureEntrySlots(runCount)
+			runCopies := make([][]MeasureEntry, runCount)
+			for i := 0; i < runCount; i++ {
+				run := GetMeasureEntrySlice(0)
+				for id := i + 1; id <= tc.rows; id += runCount {
+					run = append(run, MeasureEntry{ID: uint64(id), Value: uint64(id * 10)})
+				}
+				runs[i] = run
+				runCopies[i] = run
+			}
+
+			storage := NewMeasureStorageFromSortedRunsOwned(runs)
+			defer storage.Release()
+			if storage.IsChunked() != (tc.rows > MeasureChunkThreshold) {
+				t.Fatalf("unexpected storage shape")
+			}
+
+			for i := range runCopies {
+				poisonMeasureEntries(runCopies[i])
+			}
+
+			measureStorageAssertValue(t, storage, 1, 10)
+			mid := uint64(tc.rows/2 + 1)
+			measureStorageAssertValue(t, storage, mid, mid*10)
 			measureStorageAssertValue(t, storage, uint64(tc.rows), uint64(tc.rows*10))
 		})
 	}

@@ -178,6 +178,72 @@ func TestBuildDecodeReleaseCallbackContract(t *testing.T) {
 	}
 }
 
+func TestBuildStorageSurvivesDecodedRecordReleaseAndPoison(t *testing.T) {
+	bucket := []byte("rebuild_decode_release_poison")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildTestSchema(t)
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		var key [8]byte
+		return tx.Bucket(bucket).Put(keycodec.U64BytesWithBuf(1, &key), []byte{1})
+	}); err != nil {
+		t.Fatalf("put raw record: %v", err)
+	}
+
+	var bufs [][]byte
+	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg.Decode = func([]byte) (unsafe.Pointer, error) {
+		name := []byte("release-owned-name")
+		tag := []byte("release-owned-tag")
+		bufs = [][]byte{name, tag}
+		rec := &rebuildTestRec{
+			Name:  unsafe.String(unsafe.SliceData(name), len(name)),
+			Tags:  []string{unsafe.String(unsafe.SliceData(tag), len(tag))},
+			Score: 99,
+		}
+		return unsafe.Pointer(rec), nil
+	}
+	cfg.Release = func(ptr unsafe.Pointer) {
+		*(*rebuildTestRec)(ptr) = rebuildTestRec{}
+		for _, buf := range bufs {
+			for i := range buf {
+				buf[i] = 0xa5
+			}
+		}
+	}
+
+	result, err := Build(cfg, newRebuildTestState(rt))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer result.Storage.Release()
+
+	nameOrd := rt.IndexedByName["name"].Ordinal
+	ids := indexdata.NewFieldIndexViewFromStorage(result.Storage.Index[nameOrd]).LookupPostingRetained("release-owned-name")
+	if !ids.Contains(1) {
+		t.Fatalf("name index lost decoded string after release")
+	}
+	ids.Release()
+
+	tagsOrd := rt.IndexedByName["tags"].Ordinal
+	ids = indexdata.NewFieldIndexViewFromStorage(result.Storage.Index[tagsOrd]).LookupPostingRetained("release-owned-tag")
+	if !ids.Contains(1) {
+		t.Fatalf("tags index lost decoded string after release")
+	}
+	ids.Release()
+
+	ids = indexdata.NewFieldIndexViewFromStorage(result.Storage.LenIndex[tagsOrd]).LookupPostingRetainedKey(keycodec.FromU64(1))
+	if !ids.Contains(1) {
+		t.Fatalf("tags len index lost decoded string record after release")
+	}
+	ids.Release()
+
+	scoreOrd := rt.MeasuresByName["score"].Ordinal
+	if got, ok := result.Storage.Measure[scoreOrd].Lookup(1); !ok || got != 99 {
+		t.Fatalf("score measure got=%d ok=%v want=99/true", got, ok)
+	}
+}
+
 func TestBuildPartialPreservesSkippedFieldAndMeasureSlots(t *testing.T) {
 	bucket := []byte("rebuild_partial")
 	db := openRebuildTestBolt(t, bucket)

@@ -2,11 +2,13 @@ package snapshot
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
@@ -237,4 +239,551 @@ func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpd
 	if snapshotBatchLenContains(next, "Tags", 1, 1) {
 		t.Fatal("next snapshot kept stale len=1 posting")
 	}
+}
+
+// BuildPrepared views must own or retain all storage they expose before the
+// caller can retire the predecessor view.
+func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	cfg := CacheConfig{}
+
+	opt2 := "opt2"
+	rec1 := snapshotBatchStorageRec{Name: "alice", Tags: []string{"red"}}
+	rec2 := snapshotBatchStorageRec{Name: "bob", Tags: []string{"green", "yellow"}, Opt: &opt2}
+	current := BuildPrepared(1, nil, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&rec1)},
+		{ID: 2, New: unsafe.Pointer(&rec2)},
+	})
+	if current.Universe.Cardinality() != 2 || !current.Universe.Contains(1) || !current.Universe.Contains(2) {
+		t.Fatal("initial snapshot universe is inconsistent")
+	}
+
+	opt3 := "opt3"
+	rec3 := snapshotBatchStorageRec{Name: "cara", Tags: []string{"blue"}, Opt: &opt3}
+	next := BuildPrepared(2, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 3, New: unsafe.Pointer(&rec3)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if !snapshotBatchFieldContains(current, "Name", "alice", 1) {
+		t.Fatal("insert-only snapshot lost retained predecessor field storage")
+	}
+	if !snapshotBatchFieldContains(current, "Name", "cara", 3) {
+		t.Fatal("insert-only snapshot is missing inserted field storage")
+	}
+	if !snapshotBatchLenContains(current, "Tags", 2, 2) || !snapshotBatchLenContains(current, "Tags", 1, 3) {
+		t.Fatal("insert-only snapshot len index is inconsistent")
+	}
+	if current.Universe.Cardinality() != 3 || !current.Universe.Contains(3) {
+		t.Fatal("insert-only snapshot universe is inconsistent")
+	}
+
+	rec1Patch := snapshotBatchStorageRec{Name: "alicia", Tags: rec1.Tags}
+	next = BuildPrepared(3, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{
+			ID:        1,
+			Old:       unsafe.Pointer(&rec1),
+			New:       unsafe.Pointer(&rec1Patch),
+			Patch:     []schema.PatchItem{{Name: "Name", Value: rec1Patch.Name}},
+			PatchOnly: true,
+		},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if snapshotBatchFieldContains(current, "Name", "alice", 1) {
+		t.Fatal("patch-only snapshot kept stale scalar posting")
+	}
+	if !snapshotBatchFieldContains(current, "Name", "alicia", 1) {
+		t.Fatal("patch-only snapshot is missing updated scalar posting")
+	}
+	if !snapshotBatchFieldContains(current, "Tags", "red", 1) {
+		t.Fatal("patch-only snapshot lost untouched retained field storage")
+	}
+
+	rec2Mid := snapshotBatchStorageRec{Name: "bob", Tags: []string{"green"}, Opt: &opt2}
+	rec2Patch := snapshotBatchStorageRec{Name: "bobby", Tags: []string{"green", "blue"}, Opt: &opt2}
+	next = BuildPrepared(4, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{
+			ID:        2,
+			Old:       unsafe.Pointer(&rec2),
+			New:       unsafe.Pointer(&rec2Mid),
+			Patch:     []schema.PatchItem{{Name: "Tags", Value: rec2Mid.Tags}},
+			PatchOnly: true,
+		},
+		{
+			ID:        2,
+			Old:       unsafe.Pointer(&rec2Mid),
+			New:       unsafe.Pointer(&rec2Patch),
+			Patch:     []schema.PatchItem{{Name: "Name", Value: rec2Patch.Name}, {Name: "Tags", Value: rec2Patch.Tags}},
+			PatchOnly: true,
+		},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if snapshotBatchFieldContains(current, "Name", "bob", 2) {
+		t.Fatal("aggregated patch snapshot kept stale repeated-id scalar posting")
+	}
+	if !snapshotBatchFieldContains(current, "Name", "bobby", 2) {
+		t.Fatal("aggregated patch snapshot is missing repeated-id scalar posting")
+	}
+	if snapshotBatchFieldContains(current, "Tags", "yellow", 2) {
+		t.Fatal("aggregated patch snapshot kept stale repeated-id slice posting")
+	}
+	if !snapshotBatchFieldContains(current, "Tags", "blue", 2) {
+		t.Fatal("aggregated patch snapshot is missing repeated-id slice posting")
+	}
+
+	rec3Replace := snapshotBatchStorageRec{Name: "dana", Tags: []string{"orange"}}
+	next = BuildPrepared(5, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 3, Old: unsafe.Pointer(&rec3), New: unsafe.Pointer(&rec3Replace)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if snapshotBatchFieldContains(current, "Name", "cara", 3) {
+		t.Fatal("set-replace snapshot kept stale scalar posting")
+	}
+	if !snapshotBatchFieldContains(current, "Name", "dana", 3) {
+		t.Fatal("set-replace snapshot is missing new scalar posting")
+	}
+	if !snapshotBatchNilContains(current, "Opt", 3) {
+		t.Fatal("set-replace snapshot is missing nil opt membership")
+	}
+
+	next = BuildPrepared(6, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&rec1Patch)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if current.Universe.Contains(1) || current.Universe.Cardinality() != 2 {
+		t.Fatal("delete snapshot universe is inconsistent")
+	}
+	if snapshotBatchFieldContains(current, "Name", "alicia", 1) {
+		t.Fatal("delete snapshot kept deleted scalar posting")
+	}
+	if snapshotBatchFieldContains(current, "Tags", "red", 1) {
+		t.Fatal("delete snapshot kept deleted slice posting")
+	}
+
+	next = BuildPrepared(7, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 2, Old: unsafe.Pointer(&rec2Patch)},
+		{ID: 3, Old: unsafe.Pointer(&rec3Replace)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if !current.Universe.IsEmpty() {
+		t.Fatal("delete-all snapshot universe is not empty")
+	}
+	if snapshotBatchFieldContains(current, "Name", "bobby", 2) || snapshotBatchFieldContains(current, "Name", "dana", 3) {
+		t.Fatal("delete-all snapshot kept deleted field postings")
+	}
+
+	opt5 := "opt5"
+	rec4 := snapshotBatchStorageRec{Name: "erin", Tags: []string{"silver"}}
+	rec5 := snapshotBatchStorageRec{Name: "frank", Tags: []string{"gold", "white"}, Opt: &opt5}
+	next = BuildPrepared(8, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 4, New: unsafe.Pointer(&rec4)},
+		{ID: 5, New: unsafe.Pointer(&rec5)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	if current.Universe.Cardinality() != 2 || !current.Universe.Contains(4) || !current.Universe.Contains(5) {
+		t.Fatal("post-empty insert snapshot universe is inconsistent")
+	}
+
+	opt4Replace := "opt4"
+	rec4Replace := snapshotBatchStorageRec{Name: "erin2", Tags: []string{"black"}, Opt: &opt4Replace}
+	rec5Replace := snapshotBatchStorageRec{Name: "frank2"}
+	next = BuildPrepared(9, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 4, Old: unsafe.Pointer(&rec4), New: unsafe.Pointer(&rec4Replace)},
+		{ID: 5, Old: unsafe.Pointer(&rec5), New: unsafe.Pointer(&rec5Replace)},
+	})
+	current.releaseRuntimeCaches()
+	current.releaseStorage()
+	current = next
+	defer current.releaseRuntimeCaches()
+	defer current.releaseStorage()
+
+	if snapshotBatchFieldContains(current, "Name", "erin", 4) || snapshotBatchFieldContains(current, "Name", "frank", 5) {
+		t.Fatal("full-replace snapshot kept stale scalar postings")
+	}
+	if !snapshotBatchFieldContains(current, "Name", "erin2", 4) || !snapshotBatchFieldContains(current, "Name", "frank2", 5) {
+		t.Fatal("full-replace snapshot is missing new scalar postings")
+	}
+	if !snapshotBatchFieldContains(current, "Opt", opt4Replace, 4) {
+		t.Fatal("full-replace snapshot is missing new opt posting")
+	}
+	if !snapshotBatchNilContains(current, "Opt", 5) {
+		t.Fatal("full-replace snapshot is missing nil opt membership")
+	}
+	if current.Universe.Cardinality() != 2 || !current.Universe.Contains(4) || !current.Universe.Contains(5) {
+		t.Fatal("full-replace snapshot universe is inconsistent")
+	}
+}
+
+func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	cfg := CacheConfig{}
+
+	type modelRec struct {
+		name   string
+		tags   []string
+		opt    string
+		hasOpt bool
+	}
+
+	model := make(map[uint64]modelRec, 8)
+	knownNames := make(map[string]struct{}, 16)
+	knownTags := make(map[string]struct{}, 16)
+	knownOpts := make(map[string]struct{}, 16)
+	knownLens := make(map[uint64]struct{}, 4)
+
+	record := func(name string, tags []string, opt string, hasOpt bool) modelRec {
+		out := modelRec{name: name, opt: opt, hasOpt: hasOpt}
+		if len(tags) > 0 {
+			out.tags = append([]string(nil), tags...)
+		}
+		knownNames[name] = struct{}{}
+		knownLens[uint64(len(tags))] = struct{}{}
+		for i := range tags {
+			knownTags[tags[i]] = struct{}{}
+		}
+		if hasOpt {
+			knownOpts[opt] = struct{}{}
+		}
+		return out
+	}
+
+	borrowString := func(s string, bufs *[][]byte) string {
+		buf := []byte(s)
+		*bufs = append(*bufs, buf)
+		return unsafe.String(unsafe.SliceData(buf), len(buf))
+	}
+
+	makeInput := func(src modelRec, bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) *snapshotBatchStorageRec {
+		rec := &snapshotBatchStorageRec{Name: borrowString(src.name, bufs)}
+		if len(src.tags) > 0 {
+			rec.Tags = make([]string, len(src.tags))
+			for i := range src.tags {
+				rec.Tags[i] = borrowString(src.tags[i], bufs)
+			}
+		}
+		if src.hasOpt {
+			opt := borrowString(src.opt, bufs)
+			rec.Opt = &opt
+		}
+		*inputs = append(*inputs, rec)
+		return rec
+	}
+
+	poisonInputs := func(bufs [][]byte, inputs []*snapshotBatchStorageRec) {
+		for i := range bufs {
+			buf := bufs[i]
+			for j := range buf {
+				buf[j] = 0x7f
+			}
+		}
+		for i := range inputs {
+			input := inputs[i]
+			input.Name = "poison"
+			for j := range input.Tags {
+				input.Tags[j] = "poison"
+			}
+			if input.Opt != nil {
+				*input.Opt = "poison"
+			}
+		}
+	}
+
+	assertPosting := func(label string, ids posting.List, want map[uint64]struct{}) {
+		t.Helper()
+		if ids.Cardinality() != uint64(len(want)) {
+			got := ids.ToArray()
+			ids.Release()
+			t.Fatalf("%s: cardinality got %d ids=%v want %d", label, len(got), got, len(want))
+		}
+		for id := range want {
+			if !ids.Contains(id) {
+				got := ids.ToArray()
+				ids.Release()
+				t.Fatalf("%s: missing id %d in %v", label, id, got)
+			}
+		}
+		ids.Release()
+	}
+
+	assertStoragePosting := func(label string, storage indexdata.FieldStorage, key string, want map[uint64]struct{}) {
+		t.Helper()
+		ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
+		assertPosting(label, ids, want)
+	}
+
+	assertModel := func(label string, snap *View) {
+		t.Helper()
+		if snap.Universe.Cardinality() != uint64(len(model)) {
+			t.Fatalf("%s: universe cardinality got %d want %d", label, snap.Universe.Cardinality(), len(model))
+		}
+		for id := range model {
+			if !snap.Universe.Contains(id) {
+				t.Fatalf("%s: universe missing id %d", label, id)
+			}
+		}
+
+		nameWant := make(map[string]map[uint64]struct{}, len(knownNames))
+		tagWant := make(map[string]map[uint64]struct{}, len(knownTags))
+		optWant := make(map[string]map[uint64]struct{}, len(knownOpts))
+		lenWant := make(map[uint64]map[uint64]struct{}, len(knownLens))
+		nilWant := make(map[uint64]struct{})
+		nonEmptyWant := make(map[uint64]struct{})
+
+		addStringID := func(dst map[string]map[uint64]struct{}, key string, id uint64) {
+			set := dst[key]
+			if set == nil {
+				set = make(map[uint64]struct{}, 1)
+				dst[key] = set
+			}
+			set[id] = struct{}{}
+		}
+		addLenID := func(key uint64, id uint64) {
+			set := lenWant[key]
+			if set == nil {
+				set = make(map[uint64]struct{}, 1)
+				lenWant[key] = set
+			}
+			set[id] = struct{}{}
+		}
+
+		for id, rec := range model {
+			addStringID(nameWant, rec.name, id)
+			for i := range rec.tags {
+				addStringID(tagWant, rec.tags[i], id)
+			}
+			addLenID(uint64(len(rec.tags)), id)
+			if len(rec.tags) > 0 {
+				nonEmptyWant[id] = struct{}{}
+			}
+			if rec.hasOpt {
+				addStringID(optWant, rec.opt, id)
+			} else {
+				nilWant[id] = struct{}{}
+			}
+		}
+
+		names := make([]string, 0, len(knownNames))
+		for key := range knownNames {
+			names = append(names, key)
+		}
+		slices.Sort(names)
+		for _, key := range names {
+			ids := snap.FieldLookupPostingRetained("Name", key)
+			assertPosting(label+": Name "+key, ids, nameWant[key])
+		}
+
+		tags := make([]string, 0, len(knownTags))
+		for key := range knownTags {
+			tags = append(tags, key)
+		}
+		slices.Sort(tags)
+		for _, key := range tags {
+			ids := snap.FieldLookupPostingRetained("Tags", key)
+			assertPosting(label+": Tags "+key, ids, tagWant[key])
+		}
+
+		opts := make([]string, 0, len(knownOpts))
+		for key := range knownOpts {
+			opts = append(opts, key)
+		}
+		slices.Sort(opts)
+		for _, key := range opts {
+			ids := snap.FieldLookupPostingRetained("Opt", key)
+			assertPosting(label+": Opt "+key, ids, optWant[key])
+		}
+
+		optAcc := snap.IndexedFieldByName["Opt"]
+		var nilStorage indexdata.FieldStorage
+		if optAcc.Ordinal < len(snap.NilIndex) {
+			nilStorage = snap.NilIndex[optAcc.Ordinal]
+		}
+		assertStoragePosting(label+": Opt nil", nilStorage, indexdata.NilIndexEntryKey, nilWant)
+
+		tagsAcc := snap.IndexedFieldByName["Tags"]
+		var lenStorage indexdata.FieldStorage
+		if tagsAcc.Ordinal < len(snap.LenIndex) {
+			lenStorage = snap.LenIndex[tagsAcc.Ordinal]
+		}
+		useZeroComplement := tagsAcc.Ordinal < len(snap.LenZeroComplement) && snap.LenZeroComplement[tagsAcc.Ordinal]
+		lens := make([]uint64, 0, len(knownLens))
+		for ln := range knownLens {
+			lens = append(lens, ln)
+		}
+		slices.Sort(lens)
+		for _, ln := range lens {
+			want := lenWant[ln]
+			if useZeroComplement && ln == 0 {
+				want = nil
+			}
+			assertStoragePosting(label+": Tags len", lenStorage, keycodec.U64ByteString(ln), want)
+		}
+		if useZeroComplement {
+			assertStoragePosting(label+": Tags non-empty", lenStorage, indexdata.LenIndexNonEmptyKey, nonEmptyWant)
+		} else {
+			assertStoragePosting(label+": Tags non-empty", lenStorage, indexdata.LenIndexNonEmptyKey, nil)
+		}
+	}
+
+	var current *View
+	defer func() {
+		if current != nil {
+			current.releaseRuntimeCaches()
+			current.releaseStorage()
+		}
+	}()
+
+	var seq uint64
+	run := func(label string, build func(*[][]byte, *[]*snapshotBatchStorageRec) []BatchEntry, update func()) {
+		t.Helper()
+		var bufs [][]byte
+		var inputs []*snapshotBatchStorageRec
+		entries := build(&bufs, &inputs)
+		seq++
+		next := BuildPrepared(seq, current, rt, cfg, nil, rt.Patch.Fields, entries)
+		if current != nil {
+			current.releaseRuntimeCaches()
+			current.releaseStorage()
+		}
+		current = next
+		poisonInputs(bufs, inputs)
+		update()
+		assertModel(label, current)
+	}
+
+	rec1 := record("alice", []string{"red"}, "", false)
+	rec2 := record("bob", []string{"green", "yellow"}, "opt2", true)
+	rec3 := record("cara", nil, "opt3", true)
+	run("insert", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{
+			{ID: 1, New: unsafe.Pointer(makeInput(rec1, bufs, inputs))},
+			{ID: 2, New: unsafe.Pointer(makeInput(rec2, bufs, inputs))},
+			{ID: 3, New: unsafe.Pointer(makeInput(rec3, bufs, inputs))},
+		}
+	}, func() {
+		model[1] = rec1
+		model[2] = rec2
+		model[3] = rec3
+	})
+
+	rec1Patch := record("alicia", []string{"red"}, "", false)
+	run("patch-name", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		oldPtr := makeInput(model[1], bufs, inputs)
+		newPtr := makeInput(rec1Patch, bufs, inputs)
+		return []BatchEntry{{
+			ID:        1,
+			Old:       unsafe.Pointer(oldPtr),
+			New:       unsafe.Pointer(newPtr),
+			Patch:     []schema.PatchItem{{Name: "Name", Value: newPtr.Name}},
+			PatchOnly: true,
+		}}
+	}, func() {
+		model[1] = rec1Patch
+	})
+
+	rec2Mid := record("bob", []string{"green"}, "opt2", true)
+	rec2Patch := record("bobby", []string{"green", "blue"}, "opt2b", true)
+	run("repeated-patch", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		oldPtr := makeInput(model[2], bufs, inputs)
+		midPtr := makeInput(rec2Mid, bufs, inputs)
+		newPtr := makeInput(rec2Patch, bufs, inputs)
+		return []BatchEntry{
+			{
+				ID:        2,
+				Old:       unsafe.Pointer(oldPtr),
+				New:       unsafe.Pointer(midPtr),
+				Patch:     []schema.PatchItem{{Name: "Tags", Value: midPtr.Tags}},
+				PatchOnly: true,
+			},
+			{
+				ID:  2,
+				Old: unsafe.Pointer(midPtr),
+				New: unsafe.Pointer(newPtr),
+				Patch: []schema.PatchItem{
+					{Name: "Name", Value: newPtr.Name},
+					{Name: "Tags", Value: newPtr.Tags},
+					{Name: "Opt", Value: rec2Patch.opt},
+				},
+				PatchOnly: true,
+			},
+		}
+	}, func() {
+		model[2] = rec2Patch
+	})
+
+	rec3Replace := record("dana", []string{"orange", "violet"}, "", false)
+	run("replace", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{{
+			ID:  3,
+			Old: unsafe.Pointer(makeInput(model[3], bufs, inputs)),
+			New: unsafe.Pointer(makeInput(rec3Replace, bufs, inputs)),
+		}}
+	}, func() {
+		model[3] = rec3Replace
+	})
+
+	run("delete", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{{
+			ID:  1,
+			Old: unsafe.Pointer(makeInput(model[1], bufs, inputs)),
+		}}
+	}, func() {
+		delete(model, 1)
+	})
+
+	rec4 := record("erin", nil, "opt4", true)
+	rec5 := record("frank", []string{"gold", "white"}, "", false)
+	run("insert-more", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{
+			{ID: 4, New: unsafe.Pointer(makeInput(rec4, bufs, inputs))},
+			{ID: 5, New: unsafe.Pointer(makeInput(rec5, bufs, inputs))},
+		}
+	}, func() {
+		model[4] = rec4
+		model[5] = rec5
+	})
+
+	rec2Replace := record("bruno", []string{"cyan"}, "", false)
+	rec3Replace2 := record("daria", nil, "opt3r", true)
+	rec4Replace := record("ella", []string{"black"}, "opt4r", true)
+	rec5Replace := record("felix", []string{"white", "silver"}, "", false)
+	run("full-replace", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{
+			{ID: 2, Old: unsafe.Pointer(makeInput(model[2], bufs, inputs)), New: unsafe.Pointer(makeInput(rec2Replace, bufs, inputs))},
+			{ID: 3, Old: unsafe.Pointer(makeInput(model[3], bufs, inputs)), New: unsafe.Pointer(makeInput(rec3Replace2, bufs, inputs))},
+			{ID: 4, Old: unsafe.Pointer(makeInput(model[4], bufs, inputs)), New: unsafe.Pointer(makeInput(rec4Replace, bufs, inputs))},
+			{ID: 5, Old: unsafe.Pointer(makeInput(model[5], bufs, inputs)), New: unsafe.Pointer(makeInput(rec5Replace, bufs, inputs))},
+		}
+	}, func() {
+		model[2] = rec2Replace
+		model[3] = rec3Replace2
+		model[4] = rec4Replace
+		model[5] = rec5Replace
+	})
+
+	run("delete-all", func(bufs *[][]byte, inputs *[]*snapshotBatchStorageRec) []BatchEntry {
+		return []BatchEntry{
+			{ID: 2, Old: unsafe.Pointer(makeInput(model[2], bufs, inputs))},
+			{ID: 3, Old: unsafe.Pointer(makeInput(model[3], bufs, inputs))},
+			{ID: 4, Old: unsafe.Pointer(makeInput(model[4], bufs, inputs))},
+			{ID: 5, Old: unsafe.Pointer(makeInput(model[5], bufs, inputs))},
+		}
+	}, func() {
+		delete(model, 2)
+		delete(model, 3)
+		delete(model, 4)
+		delete(model, 5)
+	})
 }

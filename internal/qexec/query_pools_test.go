@@ -153,3 +153,104 @@ func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
 		}
 	}
 }
+
+func TestPostsAnyFilterStatePoolClearsOwnedIDsOnly(t *testing.T) {
+	post := poolsSmall(11, 13)
+	posts := posting.GetSlice(1)
+	posts = append(posts, post)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = posts
+	state.ids = poolsSmall(3, 5, 7)
+	state.containsCalls = 9
+	state.containsMaterializeAt = 4
+	state.applyObservedSavings = 123
+	state.neg = true
+
+	postsAnyFilterStatePool.Put(state)
+	defer func() {
+		posts[0].Release()
+		posting.ReleaseSlice(posts)
+	}()
+
+	if state.postsBuf != nil ||
+		!state.ids.IsEmpty() ||
+		state.containsCalls != 0 ||
+		state.containsMaterializeAt != 0 ||
+		state.applyObservedSavings != 0 ||
+		state.neg {
+		t.Fatalf("pooled postsAnyFilterState retained stale state: %+v", state)
+	}
+	if !posts[0].Contains(11) || !posts[0].Contains(13) {
+		t.Fatalf("postsAnyFilterState pool released caller-owned postsBuf")
+	}
+}
+
+func TestLazyMaterializedPredicateStatePoolClearsOwnedIDs(t *testing.T) {
+	state := lazyMaterializedPredicateStatePool.Get()
+	state.ids = poolsSmall(21, 34, 55)
+	state.loaded = true
+
+	lazyMaterializedPredicateStatePool.Put(state)
+
+	if !state.ids.IsEmpty() || state.loaded {
+		t.Fatalf("pooled lazy materialized state retained stale state: %+v", state)
+	}
+}
+
+func TestFieldIndexRangePredicateStatePoolClearsOwnedPostings(t *testing.T) {
+	linear := posting.GetSlice(2)
+	linear = append(linear, poolsSmall(1, 3), poolsSmall(5, 7))
+
+	state := fieldIndexRangePredicateStatePool.Get()
+	state.bucketCount = 2
+	state.keepProbeHits = true
+	state.rangeMaterialized = true
+	state.probeMaterialized = true
+	state.linearPostsBuf = linear
+	state.rangeIDs = poolsSmall(1, 3, 5, 7)
+	state.probeIDs = poolsSmall(3, 7)
+
+	fieldIndexRangePredicateStatePool.Put(state)
+
+	if state.linearPostsBuf != nil ||
+		!state.rangeIDs.IsEmpty() ||
+		!state.probeIDs.IsEmpty() ||
+		state.bucketCount != 0 ||
+		state.keepProbeHits ||
+		state.rangeMaterialized ||
+		state.probeMaterialized {
+		t.Fatalf("pooled fieldIndexRangePredicateState retained stale state: %+v", state)
+	}
+	full := linear[:cap(linear)]
+	for i := range full {
+		if !full[i].IsEmpty() {
+			t.Fatalf("released linearPostsBuf retained posting at slot %d", i)
+		}
+	}
+}
+
+func TestU64SetReleaseClearsUsedBitmap(t *testing.T) {
+	set := getU64Set(4)
+	if set.pooled == nil {
+		t.Fatalf("expected pooled u64set")
+	}
+	if !set.Add(17) || !set.Add(33) || !set.Add(65) {
+		t.Fatalf("unexpected duplicate in fresh set")
+	}
+	if !set.Has(17) || !set.Has(33) || !set.Has(65) {
+		t.Fatalf("fresh set lookup failed")
+	}
+
+	used := set.used
+	releaseU64Set(&set)
+
+	if set.keys != nil || set.used != nil || set.n != 0 || set.pooled != nil {
+		t.Fatalf("released u64set handle retained state: %+v", set)
+	}
+	for i := range used {
+		if used[i] != 0 {
+			t.Fatalf("released u64set used bitmap retained slot %d", i)
+		}
+	}
+}

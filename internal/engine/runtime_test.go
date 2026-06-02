@@ -297,6 +297,77 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 	}
 }
 
+func TestRuntimeDropStagedKeepsCurrentSnapshotQueryable(t *testing.T) {
+	bucket := []byte("runtime_drop_staged")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	setRuntimeTestSequence(t, db, bucket, 1)
+
+	r := newRuntimeTestRuntime(t, false, true)
+	buildRuntimeTestIndex(t, r, db, bucket)
+
+	staged := r.StageTruncate(2)
+	if staged.view == nil {
+		t.Fatal("StageTruncate returned empty staged snapshot")
+	}
+	r.DropStaged(2)
+
+	if snap, ref, ok := r.snapshot.PinBySeq(2); ok {
+		r.snapshot.Unpin(2, ref)
+		t.Fatalf("staged snapshot survived DropStaged: %v", snap)
+	}
+	if got := r.snapshot.Current(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
+		t.Fatalf("current snapshot after DropStaged=%v", got)
+	}
+
+	var keys KeySet
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+		keys = k
+		return nil
+	}); err != nil {
+		t.Fatalf("QueryKeys after DropStaged: %v", err)
+	}
+	if !slices.Equal(keys.IDs, []uint64{1}) {
+		t.Fatalf("QueryKeys after DropStaged IDs=%v want [1]", keys.IDs)
+	}
+}
+
+func TestRuntimeFailedBuildIndexKeepsCurrentSnapshotQueryable(t *testing.T) {
+	bucket := []byte("runtime_failed_rebuild_keeps_current")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	setRuntimeTestSequence(t, db, bucket, 1)
+
+	r := newRuntimeTestRuntime(t, false, true)
+	buildRuntimeTestIndex(t, r, db, bucket)
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		var key [8]byte
+		return tx.Bucket(bucket).Put(keycodec.U64BytesWithBuf(2, &key), []byte{0xff})
+	}); err != nil {
+		t.Fatalf("put corrupt record: %v", err)
+	}
+	setRuntimeTestSequence(t, db, bucket, 2)
+
+	if _, err := r.BuildIndex(db, bucket, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec); err == nil {
+		t.Fatal("BuildIndex succeeded with corrupt record")
+	}
+	if got := r.snapshot.Current(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
+		t.Fatalf("current snapshot after failed BuildIndex=%v", got)
+	}
+
+	var keys KeySet
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+		keys = k
+		return nil
+	}); err != nil {
+		t.Fatalf("QueryKeys after failed BuildIndex: %v", err)
+	}
+	if !slices.Equal(keys.IDs, []uint64{1}) {
+		t.Fatalf("QueryKeys after failed BuildIndex IDs=%v want [1]", keys.IDs)
+	}
+}
+
 func TestRuntimeConfigureWriteWiresSnapshotPublish(t *testing.T) {
 	r := newRuntimeTestRuntime(t, false, true)
 	var cfg wexec.Config

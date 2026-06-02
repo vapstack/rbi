@@ -11,6 +11,25 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
+// String-key storage ownership matrix:
+// - keycodec.IndexKey built from []byte/string is borrowed input.
+// - fieldIndexFlatRoot owns copied stringData for persisted string keys.
+// - fieldIndexChunk owns copied stringData for persisted string keys.
+// - fieldIndexChunkStreamBuilder may borrow keys while building, but finish publishes owned chunks.
+// - posting payloads are owned or retained through posting.List Clone/Borrow contracts.
+func fieldStorageMutableString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+func poisonBytes(bufs ...[]byte) {
+	for i := range bufs {
+		buf := bufs[i]
+		for j := range buf {
+			buf[j] = 0x7f
+		}
+	}
+}
+
 func TestFieldIndexStringRefSize(t *testing.T) {
 	if got := unsafe.Sizeof(fieldIndexStringRef(0)); got != 4 {
 		t.Fatalf("unexpected fieldIndexStringRef size: got %d want 4", got)
@@ -217,6 +236,130 @@ func TestBuildFieldWriteSinkAddStringRejectsTooLongValue(t *testing.T) {
 	if !strings.Contains(err.Error(), "exceeds limit") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestRegularFieldStorageFlatCopiesBorrowedStringKeyBytes(t *testing.T) {
+	keys := [][]byte{
+		[]byte("flat/alpha"),
+		[]byte("flat/bravo"),
+		[]byte("flat/charlie"),
+	}
+	entries := GetFieldEntrySlice(len(keys))[:len(keys)]
+	for i := range keys {
+		id := uint64(i + 1)
+		entries[i] = Entry{
+			Key: keycodec.FromBytes(keys[i]),
+			IDs: fieldStoragePosting(id, id+1000),
+		}
+	}
+
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContains(t, storage, "flat/alpha", 1, 1001)
+	fieldStorageAssertPostingContains(t, storage, "flat/bravo", 2, 1002)
+	fieldStorageAssertPostingContains(t, storage, "flat/charlie", 3, 1003)
+}
+
+func TestFlatFieldStorageFromPostingMapOwnedCopiesCallerStringKeyBytes(t *testing.T) {
+	keys := [][]byte{
+		[]byte("map-flat/alpha"),
+		[]byte("map-flat/bravo"),
+		[]byte("map-flat/charlie"),
+	}
+	m := GetPostingMap()
+	for i := range keys {
+		id := uint64(i + 11)
+		m[fieldStorageMutableString(keys[i])] = fieldStoragePosting(id, id+1000)
+	}
+
+	storage := NewFlatFieldStorageFromPostingMapOwned(m, false)
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContains(t, storage, "map-flat/alpha", 11, 1011)
+	fieldStorageAssertPostingContains(t, storage, "map-flat/bravo", 12, 1012)
+	fieldStorageAssertPostingContains(t, storage, "map-flat/charlie", 13, 1013)
+}
+
+func TestRegularFieldStorageChunkedCopiesBorrowedStringKeyBytes(t *testing.T) {
+	const total = fieldIndexChunkThreshold
+	keys := make([][]byte, total)
+	entries := make([]Entry, total)
+	for i := range entries {
+		key := fmt.Sprintf("chunk/%04d", i)
+		keys[i] = []byte(key)
+		entries[i] = Entry{
+			Key: keycodec.FromBytes(keys[i]),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContains(t, storage, "chunk/0000", 1)
+	fieldStorageAssertPostingContains(t, storage, "chunk/0192", 193)
+	fieldStorageAssertPostingContains(t, storage, "chunk/0383", 384)
+}
+
+func TestRegularFieldStorageFromPostingMapOwnedChunkedCopiesCallerStringKeyBytes(t *testing.T) {
+	const total = fieldIndexChunkThreshold
+	keys := make([][]byte, total)
+	m := GetPostingMap()
+	for i := 0; i < total; i++ {
+		keys[i] = []byte(fmt.Sprintf("map-chunk/%04d", i))
+		m[fieldStorageMutableString(keys[i])] = fieldStorageSingleton(uint64(i + 1))
+	}
+
+	storage := NewRegularFieldStorageFromPostingMapOwned(m, false)
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContains(t, storage, "map-chunk/0000", 1)
+	fieldStorageAssertPostingContains(t, storage, "map-chunk/0192", 193)
+	fieldStorageAssertPostingContains(t, storage, "map-chunk/0383", 384)
+}
+
+func TestFieldStorageBuilderCopiesBorrowedStringKeyBytes(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 17
+	keys := make([][]byte, total)
+	var builder fieldStorageBuilder
+	builder.init(total, false)
+	for i := 0; i < total; i++ {
+		keys[i] = []byte(fmt.Sprintf("builder/%04d", i))
+		builder.append(keycodec.FromBytes(keys[i]), fieldStorageSingleton(uint64(i+1)))
+	}
+
+	storage := builder.finish()
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContains(t, storage, "builder/0000", 1)
+	fieldStorageAssertPostingContains(t, storage, "builder/0192", 193)
+	fieldStorageAssertPostingContains(t, storage, "builder/0400", 401)
 }
 
 func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
@@ -731,6 +874,99 @@ func TestRebuildLenFieldStorageFromIndexView_UsesZeroComplement(t *testing.T) {
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(1), 7, 9, 10)
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 8)
 	fieldStorageAssertPostingContains(t, storage, LenIndexNonEmptyKey, 7, 8, 9, 10)
+}
+
+func TestRebuildLenFieldStorageFromIndexViewSurvivesSourceRelease(t *testing.T) {
+	universe := fieldStoragePosting(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+	entries := []Entry{
+		{Key: keycodec.FromStoredString("a", false), IDs: fieldStoragePosting(7, 8)},
+		{Key: keycodec.FromStoredString("b", false), IDs: fieldStoragePosting(8, 9)},
+		{Key: keycodec.FromStoredString("c", false), IDs: fieldStoragePosting(10)},
+	}
+	base := newRegularFieldStorage(entries)
+	if base.flat == nil || base.flat.stringData == nil {
+		base.Release()
+		t.Fatalf("expected flat string source storage")
+	}
+
+	storage, useZeroComplement := RebuildLenFieldStorageFromIndexView(universe, NewFieldIndexViewFromStorage(base))
+	if !useZeroComplement {
+		storage.Release()
+		base.Release()
+		universe.Release()
+		t.Fatalf("expected zero complement")
+	}
+
+	oldData := base.flat.stringData
+	base.Release()
+	poisonBytes(oldData)
+	universe.Release()
+	defer storage.Release()
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	if ov.LookupCardinality(keycodec.U64ByteString(0)) != 0 {
+		t.Fatalf("zero posting must be omitted when zero complement is used")
+	}
+	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(1), 7, 9, 10)
+	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 8)
+	fieldStorageAssertPostingContains(t, storage, LenIndexNonEmptyKey, 7, 8, 9, 10)
+}
+
+func TestRebuildLenFieldStorageFromChunkedIndexViewSurvivesSourceRelease(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 7
+	entries := make([]Entry, total)
+	var universe posting.List
+	for i := 0; i < total; i++ {
+		id := uint64(i + 1)
+		entries[i] = Entry{
+			Key: keycodec.FromStoredString(fmt.Sprintf("len-chunk/%04d", i), false),
+			IDs: fieldStorageSingleton(id),
+		}
+		universe = universe.BuildAdded(id)
+	}
+	universe = universe.BuildAdded(total + 1)
+	universe = universe.BuildAdded(total + 2)
+	universe = universe.BuildAdded(total + 3)
+
+	base := newRegularFieldStorage(entries)
+	if !base.IsChunked() {
+		base.Release()
+		universe.Release()
+		t.Fatalf("expected chunked source storage")
+	}
+
+	oldData := make([][]byte, 0, base.chunked.chunkCount)
+	for i := range base.chunked.pages {
+		page := base.chunked.pages[i]
+		for j := range page.refs {
+			oldData = append(oldData, page.refs[j].chunk.stringData)
+		}
+	}
+
+	storage, useZeroComplement := RebuildLenFieldStorageFromIndexView(universe, NewFieldIndexViewFromStorage(base))
+	if useZeroComplement {
+		storage.Release()
+		base.Release()
+		universe.Release()
+		t.Fatalf("zero complement is not expected")
+	}
+
+	base.Release()
+	for i := range oldData {
+		poisonBytes(oldData[i])
+	}
+	universe.Release()
+	defer storage.Release()
+
+	ids := NewFieldIndexViewFromStorage(storage).LookupPostingRetained(keycodec.U64ByteString(1))
+	defer ids.Release()
+	if ids.Cardinality() != total || !ids.Contains(1) || !ids.Contains(fieldIndexChunkThreshold) || !ids.Contains(total) {
+		t.Fatalf("len=1 bucket mismatch: cardinality=%d ids=%v", ids.Cardinality(), ids)
+	}
+	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(0), total+1, total+2, total+3)
+	if NewFieldIndexViewFromStorage(storage).LookupCardinality(LenIndexNonEmptyKey) != 0 {
+		t.Fatalf("unexpected non-empty marker")
+	}
 }
 
 func TestFieldStorageSlotsRetainSharedStorage(t *testing.T) {

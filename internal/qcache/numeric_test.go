@@ -56,6 +56,57 @@ func TestNumericRangeBucketCache_SlotLifecycleAndClear(t *testing.T) {
 	}
 }
 
+func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	cache := GetNumericRangeBucketCache(2, 99)
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+	cached, ok := entry.TryStoreFullSpan(0, 1, qcacheTestPosting(1, 2, 3))
+	if !ok {
+		ReleaseNumericRangeBucketCache(cache)
+		t.Fatal("expected full-span store to succeed")
+	}
+	cached.Release()
+
+	cache.StoreSlot("age", 0, entry)
+	if got, ok := cache.LoadField("age"); !ok || got != entry {
+		ReleaseNumericRangeBucketCache(cache)
+		t.Fatal("expected field index load to return stored entry")
+	}
+
+	slots := cache.slots
+	fieldIndex := cache.fieldIndex
+	ReleaseNumericRangeBucketCache(cache)
+
+	if len(cache.slots) != 0 ||
+		cache.count != 0 ||
+		cache.maxCard != 0 ||
+		cache.fieldIndex != nil ||
+		cache.fieldIndexLen != 0 {
+		t.Fatalf("released numeric range cache retained state: %+v", cache)
+	}
+	if slots[0].field != "" || slots[0].entry != nil {
+		t.Fatalf("released numeric range cache slot retained entry: %+v", slots[0])
+	}
+	if len(fieldIndex) != 0 {
+		t.Fatalf("released numeric range cache field index retained entries: %+v", fieldIndex)
+	}
+	if entry.refs.Load() != 0 ||
+		entry.storage.KeyCount() != 0 ||
+		entry.idx.keyCount != 0 ||
+		entry.maxCard != 0 ||
+		entry.fullSpanClock != 0 ||
+		entry.retired != nil {
+		t.Fatalf("released numeric range entry retained state: %+v", entry)
+	}
+	for i := range entry.fullSpanCache {
+		if entry.fullSpanCache[i].used || !entry.fullSpanCache[i].ids.IsEmpty() {
+			t.Fatalf("released numeric full-span slot %d retained state: %+v", i, entry.fullSpanCache[i])
+		}
+	}
+}
+
 func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 	shared := qcacheTestFieldStorage(32, 100)
 	changed := qcacheTestFieldStorage(32, 200)

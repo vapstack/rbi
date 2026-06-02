@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 	"testing"
+	"unsafe"
 )
 
 var (
@@ -17,6 +18,14 @@ var (
 	benchBool      bool
 	benchUint64    uint64
 )
+
+// IndexKey ownership boundary:
+// - FromBytes/FromString are borrowed views.
+// - UserKeyFromBytes[string] copies bytes into a stable string.
+// - IndexLookupKey keeps its query string valid for IndexKey() while the lookup key is alive.
+func keycodecMutableString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
 
 func TestIndexKeyNumericAndRaw8(t *testing.T) {
 	raw := "\x01\x02\x03\x04\x05\x06\x07\x08"
@@ -119,6 +128,47 @@ func TestIndexKeyStoredStringConstructors(t *testing.T) {
 	empty := FromStoredString("", true)
 	if empty.IsNumeric() || empty.ByteLen() != 0 || empty.UnsafeString() != "" {
 		t.Fatalf("empty stored key mismatch: numeric=%v len=%d raw=%q", empty.IsNumeric(), empty.ByteLen(), empty.UnsafeString())
+	}
+}
+
+func TestIndexKeyFromBytesBorrowsSourceBytes(t *testing.T) {
+	raw := []byte("borrowed")
+	key := FromBytes(raw)
+	if key.UnsafeString() != "borrowed" {
+		t.Fatalf("unexpected initial key: %q", key.UnsafeString())
+	}
+
+	raw[0] = 'B'
+	raw[7] = 'D'
+	if key.UnsafeString() != "BorroweD" {
+		t.Fatalf("FromBytes must expose borrowed source bytes, got %q", key.UnsafeString())
+	}
+}
+
+func TestIndexKeyFromStringBorrowsStringData(t *testing.T) {
+	raw := []byte("borrowed-string")
+	key := FromString(keycodecMutableString(raw))
+	if key.UnsafeString() != "borrowed-string" {
+		t.Fatalf("unexpected initial key: %q", key.UnsafeString())
+	}
+
+	raw[0] = 'B'
+	raw[9] = 'S'
+	if key.UnsafeString() != "Borrowed-String" {
+		t.Fatalf("FromString must expose borrowed string data, got %q", key.UnsafeString())
+	}
+}
+
+func TestIndexKeyFixedStoredStringDoesNotBorrowSourceBytes(t *testing.T) {
+	raw := []byte("\x01\x02\x03\x04\x05\x06\x07\x08")
+	key := FromStoredString(keycodecMutableString(raw), true)
+	if !key.IsNumeric() {
+		t.Fatalf("fixed8 stored string must become numeric")
+	}
+
+	raw[0] = 0xff
+	if key.UnsafeString() != "\x01\x02\x03\x04\x05\x06\x07\x08" {
+		t.Fatalf("numeric fixed8 key must not borrow source bytes: %x", []byte(key.UnsafeString()))
 	}
 }
 
@@ -296,6 +346,14 @@ func TestIndexLookupKey(t *testing.T) {
 	}
 	if seen[IndexLookupString("alpha")] != 1 || seen[IndexLookupU64(42)] != 2 {
 		t.Fatalf("lookup key must be comparable by value")
+	}
+
+	raw := []byte("lookup-owned")
+	lookup := IndexLookupString(string(raw))
+	indexKey := lookup.IndexKey()
+	raw[0] = 'X'
+	if lookup.StringKey() != "lookup-owned" || indexKey.UnsafeString() != "lookup-owned" {
+		t.Fatalf("lookup key must keep query string independent from caller bytes: lookup=%q index=%q", lookup.StringKey(), indexKey.UnsafeString())
 	}
 }
 

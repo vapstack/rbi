@@ -108,6 +108,52 @@ func TestReadRoundTripSparseWithHoles(t *testing.T) {
 	}
 }
 
+func TestReadSnapshotCopiesInputBufferStringBytes(t *testing.T) {
+	sm := &Snapshot{
+		next:      5,
+		keys:      map[string]uint64{"alpha": 1, "charlie": 3, "echo": 5},
+		denseStrs: []string{"", "alpha", "", "charlie", "", "echo"},
+		denseUsed: []bool{false, true, false, true, false, true},
+	}
+
+	var payload bytes.Buffer
+	writer := bufio.NewWriter(&payload)
+	if err := WriteSnapshot(writer, sm); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	input := payload.Bytes()
+	got, err := Read(bufio.NewReader(bytes.NewReader(input)), 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	for i := range input {
+		input[i] = 0xa5
+	}
+
+	snap := got.snapshotNoLock()
+	for _, tc := range []struct {
+		key string
+		idx uint64
+	}{
+		{key: "alpha", idx: 1},
+		{key: "charlie", idx: 3},
+		{key: "echo", idx: 5},
+	} {
+		gotIdx, ok := snap.Index(tc.key)
+		if !ok || gotIdx != tc.idx {
+			t.Fatalf("forward mapping aliases input buffer for %q: got=%d ok=%v want=%d", tc.key, gotIdx, ok, tc.idx)
+		}
+		gotKey, ok := snap.String(tc.idx)
+		if !ok || gotKey != tc.key {
+			t.Fatalf("reverse mapping aliases input buffer at %d: got=%q ok=%v want=%q", tc.idx, gotKey, ok, tc.key)
+		}
+	}
+}
+
 func TestSnapshotStringJumpsToAnchor(t *testing.T) {
 	base := &Snapshot{
 		next:      100,
@@ -406,6 +452,92 @@ func TestSnapshotKeepsOriginalMappingAfterMapperMutation(t *testing.T) {
 	latest := m.Snapshot()
 	if got, ok := latest.String(2); !ok || got != "live-key" {
 		t.Fatalf("latest reverse mismatch: got=%q ok=%v want live-key", got, ok)
+	}
+}
+
+func TestPublishedSnapshotsSurviveCompactionAndLiveStoragePoison(t *testing.T) {
+	m := New(0, 2)
+	for i, key := range []string{"seed-a", "seed-b"} {
+		idx, created := m.Create(key)
+		if idx != uint64(i+1) || !created {
+			t.Fatalf("Create(%q) = %d/%v, want %d/true", key, idx, created, i+1)
+		}
+	}
+	pinned := m.Snapshot()
+
+	if idx, created := m.Create("delta-c"); idx != 3 || !created {
+		t.Fatalf("Create(delta-c) = %d/%v, want 3/true", idx, created)
+	}
+	mid := m.Snapshot()
+
+	if idx, created := m.Create("compact-d"); idx != 4 || !created {
+		t.Fatalf("Create(compact-d) = %d/%v, want 4/true", idx, created)
+	}
+	latest := m.Snapshot()
+
+	m.Lock()
+	if m.snap == nil || m.snap.base != nil || m.snap.depth != 1 || m.snap.next != 4 {
+		t.Fatalf("expected compacted full snapshot, got snap=%#v", m.snap)
+	}
+	for key := range m.keys {
+		delete(m.keys, key)
+	}
+	for i := range m.strs {
+		m.strs[i] = "poison"
+	}
+	m.Unlock()
+
+	type mapping struct {
+		key string
+		idx uint64
+	}
+	for _, tc := range []struct {
+		name       string
+		snap       *Snapshot
+		present    []mapping
+		absentKeys []string
+		absentIdxs []uint64
+	}{
+		{
+			name:       "pinned",
+			snap:       pinned,
+			present:    []mapping{{key: "seed-a", idx: 1}, {key: "seed-b", idx: 2}},
+			absentKeys: []string{"delta-c", "compact-d"},
+			absentIdxs: []uint64{3, 4},
+		},
+		{
+			name:       "mid",
+			snap:       mid,
+			present:    []mapping{{key: "seed-a", idx: 1}, {key: "seed-b", idx: 2}, {key: "delta-c", idx: 3}},
+			absentKeys: []string{"compact-d"},
+			absentIdxs: []uint64{4},
+		},
+		{
+			name:    "latest",
+			snap:    latest,
+			present: []mapping{{key: "seed-a", idx: 1}, {key: "seed-b", idx: 2}, {key: "delta-c", idx: 3}, {key: "compact-d", idx: 4}},
+		},
+	} {
+		for _, want := range tc.present {
+			gotIdx, ok := tc.snap.Index(want.key)
+			if !ok || gotIdx != want.idx {
+				t.Fatalf("%s Index(%q) = %d/%v, want %d/true", tc.name, want.key, gotIdx, ok, want.idx)
+			}
+			gotKey, ok := tc.snap.String(want.idx)
+			if !ok || gotKey != want.key {
+				t.Fatalf("%s String(%d) = %q/%v, want %q/true", tc.name, want.idx, gotKey, ok, want.key)
+			}
+		}
+		for _, key := range tc.absentKeys {
+			if idx, ok := tc.snap.Index(key); ok {
+				t.Fatalf("%s Index(%q) = %d/true, want absent", tc.name, key, idx)
+			}
+		}
+		for _, idx := range tc.absentIdxs {
+			if key, ok := tc.snap.String(idx); ok {
+				t.Fatalf("%s String(%d) = %q/true, want absent", tc.name, idx, key)
+			}
+		}
 	}
 }
 

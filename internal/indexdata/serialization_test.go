@@ -218,6 +218,70 @@ func TestFieldStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 	numericRound.Release()
 }
 
+func TestFieldStorageReadCopiesInputBufferStringKeys(t *testing.T) {
+	flatMap := GetPostingMap()
+	flatMap["ser-flat/a"] = fieldStorageSingleton(1)
+	flatMap["ser-flat/b"] = fieldStorageSingleton(2)
+	flat := NewRegularFieldStorageFromPostingMapOwned(flatMap, false)
+	if flat.IsChunked() {
+		flat.Release()
+		t.Fatalf("expected flat string storage")
+	}
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := flat.WriteInto(writer); err != nil {
+		flat.Release()
+		t.Fatalf("write flat storage: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		flat.Release()
+		t.Fatalf("flush flat storage: %v", err)
+	}
+	flatRound, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if err != nil {
+		flat.Release()
+		t.Fatalf("read flat storage: %v", err)
+	}
+	flat.Release()
+	poisonBytes(raw.Bytes())
+	fieldStorageAssertPostingContains(t, flatRound, "ser-flat/a", 1)
+	fieldStorageAssertPostingContains(t, flatRound, "ser-flat/b", 2)
+	flatRound.Release()
+
+	chunkedMap := GetPostingMap()
+	for i := 0; i < FieldChunkThreshold+5; i++ {
+		chunkedMap[fmt.Sprintf("ser-chunk/%04d", i)] = fieldStorageSingleton(uint64(i + 1))
+	}
+	chunked := NewRegularFieldStorageFromPostingMapOwned(chunkedMap, false)
+	if !chunked.IsChunked() {
+		chunked.Release()
+		t.Fatalf("expected chunked string storage")
+	}
+
+	raw.Reset()
+	writer.Reset(&raw)
+	if err := chunked.WriteInto(writer); err != nil {
+		chunked.Release()
+		t.Fatalf("write chunked storage: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		chunked.Release()
+		t.Fatalf("flush chunked storage: %v", err)
+	}
+	chunkedRound, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if err != nil {
+		chunked.Release()
+		t.Fatalf("read chunked storage: %v", err)
+	}
+	chunked.Release()
+	poisonBytes(raw.Bytes())
+	fieldStorageAssertPostingContains(t, chunkedRound, "ser-chunk/0000", 1)
+	fieldStorageAssertPostingContains(t, chunkedRound, "ser-chunk/0192", 193)
+	fieldStorageAssertPostingContains(t, chunkedRound, "ser-chunk/0388", 389)
+	chunkedRound.Release()
+}
+
 func TestSerializationSkipEntryAndKey(t *testing.T) {
 	first := Entry{
 		Key: keycodec.FromStoredString("skip", false),

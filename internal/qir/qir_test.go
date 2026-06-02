@@ -137,6 +137,71 @@ func TestQueryReleaseOwned_ClearsInlineOrderStorage(t *testing.T) {
 	}
 }
 
+func TestQueryReleaseOwnedClearsExprOwnerStorage(t *testing.T) {
+	q := queryPool.Get()
+	owned := q.newOwnedExprSlice(2)
+	owned[0] = Expr{Op: OpEQ, FieldOrdinal: 1, Value: "active"}
+	owned[1] = Expr{Op: OpPREFIX, FieldOrdinal: 2, Value: "go"}
+	q.Expr = Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: owned}
+
+	q.releaseOwned()
+	if q.exprOwnersUsed != 0 || q.Expr.Op != 0 || q.Expr.Operands != nil {
+		t.Fatalf("releaseOwned left query state: exprOwnersUsed=%d expr=%+v", q.exprOwnersUsed, q.Expr)
+	}
+	if len(q.exprOwners) == 0 {
+		t.Fatalf("expected reusable expr owner storage")
+	}
+	reusable := q.exprOwners[0]
+	for i, expr := range reusable[:cap(reusable)] {
+		if expr.Op != 0 || expr.FieldOrdinal != 0 || expr.Value != nil || expr.Operands != nil {
+			t.Fatalf("expr owner slot %d was not cleared: %+v", i, expr)
+		}
+	}
+
+	next := q.newOwnedExprSlice(1)
+	if next[0].Op != 0 || next[0].FieldOrdinal != 0 || next[0].Value != nil || next[0].Operands != nil {
+		t.Fatalf("reused expr owner exposed stale predicate: %+v", next[0])
+	}
+	queryPool.Put(q)
+}
+
+func TestQueryReleaseOwnedDropsOversizedExprOwnerStorage(t *testing.T) {
+	q := queryPool.Get()
+	owned := q.newOwnedExprSlice(queryExprOwnerMaxCap + 1)
+	owned[0] = Expr{Op: OpEQ, FieldOrdinal: 1, Value: "oversized"}
+
+	q.releaseOwned()
+	if len(q.exprOwners) == 0 || q.exprOwners[0] != nil {
+		t.Fatalf("oversized expr owner storage was retained")
+	}
+	queryPool.Put(q)
+}
+
+func TestBuildQueryOwnsCallerOperandSlices(t *testing.T) {
+	operands := []Expr{
+		{Op: OpEQ, FieldOrdinal: 1, Value: "active"},
+		{Op: OpPREFIX, FieldOrdinal: 2, Value: "go"},
+	}
+	source := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: operands}
+	prepared := BuildQuery(source)
+	defer prepared.Release()
+
+	operands[0] = Expr{Op: OpEQ, FieldOrdinal: 9, Value: "mutated"}
+	source.Operands[1] = Expr{Op: OpSUFFIX, FieldOrdinal: 8, Value: "poison"}
+
+	if prepared.Expr.Op != OpAND || len(prepared.Expr.Operands) != 2 {
+		t.Fatalf("expected AND with two owned operands, got %+v", prepared.Expr)
+	}
+	left := prepared.Expr.Operands[0]
+	right := prepared.Expr.Operands[1]
+	if left.Op != OpEQ || left.FieldOrdinal != 1 || left.Value != "active" {
+		t.Fatalf("left operand aliases caller slice: %+v", left)
+	}
+	if right.Op != OpPREFIX || right.FieldOrdinal != 2 || right.Value != "go" {
+		t.Fatalf("right operand aliases caller slice: %+v", right)
+	}
+}
+
 func TestPrepareCountExprs_NilResolverPreservesDistinctFieldIdentity(t *testing.T) {
 	prepared, err := PrepareCountExprsNoResolve(
 		qx.EQ("status", "active"),
@@ -173,6 +238,38 @@ func TestPrepareCountExprs_NilResolverKeepsSameFieldComplementFold(t *testing.T)
 
 	if !IsFalseConst(prepared.Expr) {
 		t.Fatalf("expected same-field complement to normalize to false, got %+v", prepared.Expr)
+	}
+}
+
+func TestPrepareCompilerReleaseClearsNilFieldOrdinals(t *testing.T) {
+	compiler := newPrepareCompilerNoResolve()
+	status, ok := compiler.fieldOrdinal("status")
+	if !ok {
+		t.Fatal("status field ordinal was not assigned")
+	}
+	country, ok := compiler.fieldOrdinal("country")
+	if !ok {
+		t.Fatal("country field ordinal was not assigned")
+	}
+	again, ok := compiler.fieldOrdinal("status")
+	if !ok || again != status {
+		t.Fatalf("same field ordinal changed: got=%d want=%d ok=%v", again, status, ok)
+	}
+	if country == status {
+		t.Fatalf("distinct no-resolve fields share ordinal %d", status)
+	}
+
+	owned := compiler.nilFieldOrdinals
+	if len(owned) != 2 {
+		t.Fatalf("nil ordinal map len=%d want 2", len(owned))
+	}
+	compiler.release()
+
+	if compiler.nilFieldOrdinals != nil {
+		t.Fatalf("compiler retained nil ordinal map after release")
+	}
+	if len(owned) != 0 {
+		t.Fatalf("released nil ordinal map retained entries: %+v", owned)
 	}
 }
 

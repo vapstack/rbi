@@ -171,6 +171,35 @@ func TestRecentKeyCache_LimitAndEntryCount(t *testing.T) {
 	cache.Clear()
 }
 
+func TestRecentKeyCacheClearReleasesAndClearsOwnedState(t *testing.T) {
+	keys := qcacheBenchKeys(materializedPredCacheLinearMaxEntries + 2)
+	var cache RecentKeyCache
+	for i := range keys {
+		if promote, _ := cache.AddWorkAndShouldPromote(keys[i], len(keys), uint64(i+1), ^uint64(0)); promote {
+			t.Fatalf("unexpected promotion for key %d", i)
+		}
+	}
+	if cache.slots == nil || cache.index == nil {
+		t.Fatalf("expected populated slots and index")
+	}
+
+	slots := cache.slots
+	index := cache.index
+	cache.Clear()
+
+	if cache.slots != nil || cache.index != nil || cache.indexLen != 0 || cache.clock != 0 {
+		t.Fatalf("cleared recent-key cache retained state: %+v", cache)
+	}
+	for i := range slots[:cap(slots)] {
+		if slots[:cap(slots)][i].used || !slots[:cap(slots)][i].key.IsZero() || slots[:cap(slots)][i].hash != 0 || slots[:cap(slots)][i].stamp != 0 || slots[:cap(slots)][i].work != 0 {
+			t.Fatalf("cleared recent-key slot %d retained data: %+v", i, slots[:cap(slots)][i])
+		}
+	}
+	if len(index) != 0 {
+		t.Fatalf("cleared recent-key index retained entries: %v", index)
+	}
+}
+
 func TestMaterializedPredCache_StoreBorrowedDetachesFromSourceOwner(t *testing.T) {
 	cache := GetMaterializedPredCache(4, 0)
 	defer cache.ReleaseRef()
@@ -751,6 +780,49 @@ func TestMaterializedPredCache_InheritTypedNilEntry(t *testing.T) {
 	cached, ok := next.Load(key)
 	if !ok || !cached.IsEmpty() {
 		t.Fatalf("expected typed-nil entry to survive as empty negative cache entry")
+	}
+}
+
+func TestMaterializedPredCache_InheritedPostingSurvivesSourceCacheRelease(t *testing.T) {
+	prev := GetMaterializedPredCache(8, 0)
+	next := GetMaterializedPredCache(8, 0)
+	defer next.ReleaseRef()
+
+	key := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user")
+	base := qcacheTestLargePosting()
+	want := base.ToArray()
+	prev.Store(key, base.Borrow())
+	base.Release()
+
+	next.InheritFrom(prev, nil, nil)
+	prev.ReleaseRef()
+
+	cached, ok := next.Load(key)
+	if !ok || cached.IsEmpty() {
+		t.Fatal("expected inherited cached posting")
+	}
+	if !slices.Equal(cached.ToArray(), want) {
+		cached.Release()
+		t.Fatalf("inherited posting mismatch after source cache release: got=%v want=%v", cached.ToArray(), want)
+	}
+	extra := uint64(15<<32 | 33)
+	cached = cached.BuildAdded(extra)
+	if !cached.Contains(extra) {
+		cached.Release()
+		t.Fatalf("mutated inherited view missing id=%d", extra)
+	}
+	cached.Release()
+
+	reloaded, ok := next.Load(key)
+	if !ok || reloaded.IsEmpty() {
+		t.Fatal("expected inherited cached posting after borrowed view mutation")
+	}
+	defer reloaded.Release()
+	if !slices.Equal(reloaded.ToArray(), want) {
+		t.Fatalf("borrowed view mutation changed inherited cache entry: got=%v want=%v", reloaded.ToArray(), want)
+	}
+	if reloaded.Contains(extra) {
+		t.Fatalf("inherited cache entry leaked borrowed view mutation id=%d", extra)
 	}
 }
 

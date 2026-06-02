@@ -119,6 +119,29 @@ func postingFromIDs(ids ...uint64) List {
 	return out
 }
 
+type postingOwnershipCase struct {
+	name  string
+	ids   []uint64
+	repr  string
+	extra uint64
+}
+
+func postingOwnershipCases() []postingOwnershipCase {
+	large := make([]uint64, 0, MidCap+6)
+	for i := uint64(0); i < MidCap+3; i++ {
+		large = append(large, i*2+1)
+	}
+	large = append(large, 1<<32|5, 1<<32|9, 2<<32|11)
+
+	return []postingOwnershipCase{
+		{name: "Empty", repr: "empty", extra: 101},
+		{name: "Singleton", ids: []uint64{7}, repr: "singleton", extra: 101},
+		{name: "Small", ids: []uint64{3, 7, 11, 19}, repr: "small", extra: 101},
+		{name: "Mid", ids: []uint64{2, 4, 6, 8, 10, 12, 14, 16, 18}, repr: "mid", extra: 101},
+		{name: "Large", ids: large, repr: "large", extra: 3 << 32},
+	}
+}
+
 func TestCloneOwnedSmallIsIndependent(t *testing.T) {
 	var base List
 	base = base.BuildAdded(3)
@@ -181,6 +204,136 @@ func TestCloneIntoLargeKeepsSharedContainerClone(t *testing.T) {
 	}
 	if !dst.Contains(513) {
 		t.Fatalf("CloneInto destination lost local mutation")
+	}
+}
+
+func TestCloneReleaseOrderMatrix(t *testing.T) {
+	for _, tc := range postingOwnershipCases() {
+		t.Run(tc.name+"/ReleaseSourceThenUseClone", func(t *testing.T) {
+			base := postingFromIDs(tc.ids...)
+			assertListRepresentation(t, base, tc.repr)
+			clone := base.Clone()
+			base.Release()
+			defer clone.Release()
+
+			assertSameListSet(t, clone, tc.ids)
+			clone = clone.BuildAdded(tc.extra)
+			assertSameListSet(t, clone, append(slices.Clone(tc.ids), tc.extra))
+		})
+
+		t.Run(tc.name+"/ReleaseCloneThenUseSource", func(t *testing.T) {
+			base := postingFromIDs(tc.ids...)
+			assertListRepresentation(t, base, tc.repr)
+			clone := base.Clone()
+			clone.Release()
+			defer base.Release()
+
+			assertSameListSet(t, base, tc.ids)
+			base = base.BuildAdded(tc.extra)
+			assertSameListSet(t, base, append(slices.Clone(tc.ids), tc.extra))
+		})
+	}
+}
+
+func TestCloneIntoReleaseOrderMatrix(t *testing.T) {
+	for _, tc := range postingOwnershipCases() {
+		t.Run(tc.name+"/ReleaseSourceThenUseCloneInto", func(t *testing.T) {
+			base := postingFromIDs(tc.ids...)
+			dst := postingFromIDs(9001, 9003, 9005)
+			out := base.CloneInto(dst)
+			base.Release()
+			defer out.Release()
+
+			assertSameListSet(t, out, tc.ids)
+			out = out.BuildAdded(tc.extra)
+			assertSameListSet(t, out, append(slices.Clone(tc.ids), tc.extra))
+		})
+
+		t.Run(tc.name+"/ReleaseCloneIntoThenUseSource", func(t *testing.T) {
+			base := postingFromIDs(tc.ids...)
+			dst := postingFromIDs(9001, 9003, 9005)
+			out := base.CloneInto(dst)
+			out.Release()
+			defer base.Release()
+
+			assertSameListSet(t, base, tc.ids)
+			base = base.BuildAdded(tc.extra)
+			assertSameListSet(t, base, append(slices.Clone(tc.ids), tc.extra))
+		})
+	}
+}
+
+func TestBorrowReleaseDoesNotReleaseSourceMatrix(t *testing.T) {
+	for _, tc := range postingOwnershipCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			base := postingFromIDs(tc.ids...)
+			assertListRepresentation(t, base, tc.repr)
+			borrowed := base.Borrow()
+			borrowed.Release()
+			defer base.Release()
+
+			assertSameListSet(t, base, tc.ids)
+			base = base.BuildAdded(tc.extra)
+			assertSameListSet(t, base, append(slices.Clone(tc.ids), tc.extra))
+		})
+	}
+}
+
+func TestSetOperationResultsSurviveBorrowedInputOwnerRelease(t *testing.T) {
+	leftLarge := priorityLargeBaseIDs()
+	rightLarge := append(slices.Clone(leftLarge[:MidCap]), 4<<32|1, 4<<32|3, 5<<32|5, 5<<32|7)
+
+	cases := []struct {
+		name  string
+		left  []uint64
+		right []uint64
+		extra uint64
+	}{
+		{
+			name:  "Small",
+			left:  []uint64{1, 3, 5, 7},
+			right: []uint64{5, 7, 9, 11},
+			extra: 101,
+		},
+		{
+			name:  "Large",
+			left:  leftLarge,
+			right: rightLarge,
+			extra: 9 << 32,
+		},
+	}
+
+	ops := []struct {
+		name string
+		run  func(List, List) List
+		want func([]uint64, []uint64) []uint64
+	}{
+		{name: "Or", run: func(a, b List) List { return a.BuildOr(b) }, want: unionUint64},
+		{name: "And", run: func(a, b List) List { return a.BuildAnd(b) }, want: intersectUint64},
+		{name: "AndNot", run: func(a, b List) List { return a.BuildAndNot(b) }, want: differenceUint64},
+	}
+
+	for _, tc := range cases {
+		for _, op := range ops {
+			t.Run(tc.name+"/"+op.name, func(t *testing.T) {
+				leftBase := postingFromIDs(tc.left...)
+				rightBase := postingFromIDs(tc.right...)
+				left := leftBase.Borrow()
+				right := rightBase.Borrow()
+				out := op.run(left, right)
+				left.Release()
+				right.Release()
+
+				leftBase.Release()
+				rightBase.Release()
+
+				want := op.want(tc.left, tc.right)
+				assertSameListSet(t, out, want)
+				out = out.BuildAdded(tc.extra)
+				assertSameListSet(t, out, append(want, tc.extra))
+				out.Release()
+			})
+		}
 	}
 }
 
@@ -736,6 +889,252 @@ func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
 			base.Release()
 		})
 	}
+}
+
+func TestListDeterministicModelReplayReleasePoison(t *testing.T) {
+	type poisonTarget struct {
+		small   *smallPosting
+		mid     *midPosting
+		bitmaps []*bitmap32
+	}
+
+	model := make(map[uint64]struct{}, 64)
+	var current List
+	defer current.Release()
+
+	modelSlice := func() []uint64 {
+		out := make([]uint64, 0, len(model))
+		for id := range model {
+			out = append(out, id)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	addModel := func(ids []uint64) {
+		for _, id := range ids {
+			model[id] = struct{}{}
+		}
+	}
+
+	removeModel := func(ids []uint64) {
+		for _, id := range ids {
+			delete(model, id)
+		}
+	}
+
+	intersectModel := func(ids []uint64) {
+		keep := make(map[uint64]struct{}, len(ids))
+		for _, id := range ids {
+			keep[id] = struct{}{}
+		}
+		for id := range model {
+			if _, ok := keep[id]; !ok {
+				delete(model, id)
+			}
+		}
+	}
+
+	collectPoison := func(ids List, touched []uint64) poisonTarget {
+		if sp := ids.small(); sp != nil {
+			return poisonTarget{small: sp}
+		}
+		if mp := ids.mid(); mp != nil {
+			return poisonTarget{mid: mp}
+		}
+		lp := ids.largeRef()
+		if lp == nil {
+			return poisonTarget{}
+		}
+		if len(touched) == 0 {
+			touched = ids.ToArray()
+		}
+		seen := make(map[uint32]struct{}, len(touched))
+		target := poisonTarget{bitmaps: make([]*bitmap32, 0, len(touched))}
+		for _, id := range touched {
+			high := highbits64(id)
+			if _, ok := seen[high]; ok {
+				continue
+			}
+			seen[high] = struct{}{}
+			if rb := lp.highlowcontainer.getContainer(high); rb != nil {
+				target.bitmaps = append(target.bitmaps, rb)
+			}
+		}
+		return target
+	}
+
+	poison := func(target poisonTarget) {
+		if target.small != nil {
+			target.small.n = SmallCap
+			for i := range target.small.ids {
+				target.small.ids[i] = ^uint64(0) - uint64(i)
+			}
+		}
+		if target.mid != nil {
+			target.mid.n = MidCap
+			for i := range target.mid.ids {
+				target.mid.ids[i] = ^uint64(0) - uint64(i)
+			}
+		}
+		for _, rb := range target.bitmaps {
+			rb.highlowcontainer.clear()
+		}
+	}
+
+	poisonUint64s := func(ids []uint64) {
+		for i := range ids {
+			ids[i] = ^uint64(0) - uint64(i)
+		}
+	}
+
+	run := func(label string, touched []uint64, mutate func(List) List, update func()) {
+		t.Helper()
+		old := current
+		wantOld := modelSlice()
+		target := collectPoison(old, touched)
+		next := mutate(old.Borrow())
+		assertSameListSet(t, old, wantOld)
+		update()
+		old.Release()
+		poison(target)
+		current = next
+		assertSameListSet(t, current, modelSlice())
+	}
+
+	run("add-single", []uint64{10}, func(ids List) List {
+		return ids.BuildAdded(10)
+	}, func() {
+		addModel([]uint64{10})
+	})
+
+	smallAdds := []uint64{2, 4, 6, 8, 12, 14, 16}
+	run("add-many-small", smallAdds, func(ids List) List {
+		batch := slices.Clone(smallAdds)
+		out := ids.BuildAddedMany(batch)
+		poisonUint64s(batch)
+		return out
+	}, func() {
+		addModel(smallAdds)
+	})
+
+	midAdds := []uint64{18, 20, 22, 24, 26}
+	run("add-many-mid", midAdds, func(ids List) List {
+		batch := slices.Clone(midAdds)
+		out := ids.BuildAddedMany(batch)
+		poisonUint64s(batch)
+		return out
+	}, func() {
+		addModel(midAdds)
+	})
+
+	largeAdds := make([]uint64, 0, 32)
+	for id := uint64(100); id < 156; id += 2 {
+		largeAdds = append(largeAdds, id)
+	}
+	largeAdds = append(largeAdds, 1<<32|5, 1<<32|7, 2<<32|9, 3<<32|11)
+	run("grow-large", largeAdds, func(ids List) List {
+		batch := slices.Clone(largeAdds)
+		out := ids.BuildAddedMany(batch)
+		poisonUint64s(batch)
+		return out
+	}, func() {
+		addModel(largeAdds)
+	})
+
+	removeToMid := []uint64{2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26}
+	run("remove-to-mid-card-large", removeToMid, func(ids List) List {
+		mask := postingFromIDs(removeToMid...)
+		out := ids.BuildAndNot(mask)
+		mask.Release()
+		return out
+	}, func() {
+		removeModel(removeToMid)
+	})
+
+	run("optimize-downshift", current.ToArray(), func(ids List) List {
+		out := ids.BuildOptimized()
+		if out.largeRef() != nil {
+			out.Release()
+			t.Fatalf("BuildOptimized kept large representation at cardinality %d", len(model))
+		}
+		return out
+	}, func() {})
+
+	smallKeep := []uint64{100, 104, 108, 1<<32 | 5, 2<<32 | 9, 3<<32 | 11}
+	run("and-small", current.ToArray(), func(ids List) List {
+		mask := postingFromIDs(smallKeep...)
+		out := ids.BuildAnd(mask)
+		mask.Release()
+		return out
+	}, func() {
+		intersectModel(smallKeep)
+	})
+
+	orLarge := make([]uint64, 0, 39)
+	for id := uint64(1000); id < 1070; id += 2 {
+		orLarge = append(orLarge, id)
+	}
+	orLarge = append(orLarge, 104, 1<<32|5, 4<<32|1, 4<<32|3)
+	run("or-large", orLarge, func(ids List) List {
+		right := postingFromIDs(orLarge...)
+		out := ids.BuildOr(right)
+		right.Release()
+		return out
+	}, func() {
+		addModel(orLarge)
+	})
+
+	removeLarge := []uint64{
+		100, 104, 1000, 1002, 1004, 1006, 1008, 1010,
+		1012, 1014, 1016, 1018, 1020, 1022, 1024, 4<<32 | 1,
+	}
+	run("and-not-large", removeLarge, func(ids List) List {
+		maskIDs := append(slices.Clone(removeLarge), 8<<32|1, 8<<32|3, 8<<32|5, 8<<32|7,
+			8<<32|9, 8<<32|11, 8<<32|13, 8<<32|15, 8<<32|17, 8<<32|19,
+			8<<32|21, 8<<32|23, 8<<32|25, 8<<32|27, 8<<32|29, 8<<32|31,
+			8<<32|33, 8<<32|35)
+		mask := postingFromIDs(maskIDs...)
+		out := ids.BuildAndNot(mask)
+		mask.Release()
+		return out
+	}, func() {
+		removeModel(removeLarge)
+	})
+
+	finalKeep := []uint64{1060, 1062, 1<<32 | 5, 3<<32 | 11}
+	run("and-large-shrink", current.ToArray(), func(ids List) List {
+		maskIDs := append(slices.Clone(finalKeep), 9<<32|1, 9<<32|3, 9<<32|5, 9<<32|7,
+			9<<32|9, 9<<32|11, 9<<32|13, 9<<32|15, 9<<32|17, 9<<32|19,
+			9<<32|21, 9<<32|23, 9<<32|25, 9<<32|27, 9<<32|29, 9<<32|31,
+			9<<32|33, 9<<32|35, 9<<32|37, 9<<32|39, 9<<32|41, 9<<32|43,
+			9<<32|45, 9<<32|47, 9<<32|49, 9<<32|51, 9<<32|53, 9<<32|55,
+			9<<32|57, 9<<32|59, 9<<32|61, 9<<32|63, 9<<32|65)
+		mask := postingFromIDs(maskIDs...)
+		out := ids.BuildAnd(mask)
+		mask.Release()
+		return out
+	}, func() {
+		intersectModel(finalKeep)
+	})
+
+	run("final-optimize", current.ToArray(), func(ids List) List {
+		out := ids.BuildOptimized()
+		if out.largeRef() != nil {
+			out.Release()
+			t.Fatalf("final BuildOptimized kept large representation at cardinality %d", len(model))
+		}
+		return out
+	}, func() {})
+
+	run("remove-all", current.ToArray(), func(ids List) List {
+		mask := postingFromIDs(finalKeep...)
+		out := ids.BuildAndNot(mask)
+		mask.Release()
+		return out
+	}, func() {
+		removeModel(finalKeep)
+	})
 }
 
 func TestLargePostingPoolReleaseDoesNotCorruptSharedClone(t *testing.T) {

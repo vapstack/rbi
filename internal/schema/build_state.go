@@ -2,6 +2,7 @@ package schema
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -56,7 +57,11 @@ func (s *BuildFieldLocalState) addValue(key string, idx uint64) {
 	if s.vals == nil {
 		s.vals = indexdata.GetPostingMap()
 	}
-	s.vals[key] = s.vals[key].BuildAdded(idx)
+	ids := s.vals[key]
+	if ids.IsEmpty() {
+		key = strings.Clone(key)
+	}
+	s.vals[key] = ids.BuildAdded(idx)
 }
 
 func (s *BuildFieldLocalState) addFixedValue(key uint64, idx uint64) {

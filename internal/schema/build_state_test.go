@@ -2,6 +2,7 @@ package schema
 
 import (
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
@@ -9,6 +10,29 @@ import (
 
 func buildStateSingleton(id uint64) posting.List {
 	return (posting.List{}).BuildAdded(id)
+}
+
+func TestBuildFieldLocalStateOwnsStringKeyUntilFlush(t *testing.T) {
+	buf := []byte("mutable-name")
+	state := NewBuildFieldLocalState(false, false)
+	state.addValue(unsafe.String(unsafe.SliceData(buf), len(buf)), 11)
+
+	for i := range buf {
+		buf[i] = 0xa5
+	}
+
+	dst := NewBuildFieldState(false)
+	state.FlushAllInto(dst)
+	state.Release()
+
+	storage := dst.MaterializeStorage()
+	defer storage.Release()
+
+	ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained("mutable-name")
+	if !ids.Contains(11) {
+		t.Fatalf("materialized storage lost string key after source buffer poison")
+	}
+	ids.Release()
 }
 
 func TestBuildFieldLocalStateReleaseClearsVals(t *testing.T) {

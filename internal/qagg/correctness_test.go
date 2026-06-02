@@ -312,6 +312,95 @@ func TestGroupedMeasureLookupRoutesMatchRecursive(t *testing.T) {
 	}
 }
 
+func TestAggregateExecuteReleaseReuseKeepsResultsOwned(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+	cases := []struct {
+		name string
+		q    *qx.QX
+		want Result
+	}{
+		{
+			name: "filtered_group_measure",
+			q: qx.Query(qx.GTE("age", 30)).
+				Group("country").
+				Metrics(qx.ROWCOUNT().AS("rows"), qx.SUM("amount").AS("sum")),
+			want: Result{Layout: []string{"country", "rows", "sum"}, Rows: []Row{
+				{valueFromSafeString("DE"), Value{num: 2, any: ValueKindUint}, Value{num: 35, any: ValueKindInt}},
+				{valueFromSafeString("NL"), Value{num: 1, any: ValueKindUint}, Value{num: 0, any: ValueKindInt}},
+				{valueFromSafeString("PL"), Value{num: 1, any: ValueKindUint}, Value{num: 50, any: ValueKindInt}},
+				{valueFromSafeString("US"), Value{num: 1, any: ValueKindUint}, Value{num: 40, any: ValueKindInt}},
+			}},
+		},
+		{
+			name: "hybrid_group",
+			q: qx.Group("country").Metrics(
+				qx.SUM("age").AS("age_sum"),
+				qx.SUM("amount").AS("amount_sum"),
+			),
+			want: qaggReferenceGroupedAgeAmountSums(qaggDefaultRows(), []string{"country", "age_sum", "amount_sum"}),
+		},
+		{
+			name: "filtered_group_string",
+			q: qx.Query(qx.EQ("active", true)).
+				Group("segment").
+				Metrics(qx.ROWCOUNT().AS("rows")),
+			want: Result{Layout: []string{"segment", "rows"}, Rows: []Row{
+				{valueFromSafeString("core"), Value{num: 2, any: ValueKindUint}},
+				{valueFromSafeString("edge"), Value{num: 2, any: ValueKindUint}},
+			}},
+		},
+		{
+			name: "distinct_string",
+			q:    qx.Aggregate(qx.DISTINCT("country").AS("country")),
+			want: Result{Layout: []string{"country"}, Rows: []Row{
+				{valueFromSafeString("DE")},
+				{valueFromSafeString("NL")},
+				{valueFromSafeString("PL")},
+				{valueFromSafeString("US")},
+			}},
+		},
+		{
+			name: "ungrouped_metrics",
+			q: qx.Query(qx.GTE("age", 30)).Metrics(
+				qx.COUNT("age").AS("age_count"),
+				qx.SUM("age").AS("age_sum"),
+				qx.AVG("age").AS("age_avg"),
+				qx.MIN("age").AS("age_min"),
+				qx.MAX("age").AS("age_max"),
+			),
+			want: qaggReferenceUngroupedAge(qaggDefaultRows(), []string{"age_count", "age_sum", "age_avg", "age_min", "age_max"}),
+		},
+	}
+	type retainedResult struct {
+		got  Result
+		want Result
+	}
+	retained := make([]retainedResult, 0, len(cases)*8)
+
+	for iter := 0; iter < 8; iter++ {
+		for i := range cases {
+			tc := cases[i]
+			prepared, err := Prepare(tc.q, db.rt)
+			if err != nil {
+				t.Fatalf("%s Prepare: %v", tc.name, err)
+			}
+			view := db.view()
+			got, err := Execute(view, db.snap, prepared)
+			db.exec.ReleaseView(view)
+			prepared.Release()
+			if err != nil {
+				t.Fatalf("%s Execute: %v", tc.name, err)
+			}
+
+			requireQaggResultsEqualUnordered(t, got, tc.want)
+			retained = append(retained, retainedResult{got: got, want: tc.want})
+			for j := range retained {
+				requireQaggResultsEqualUnordered(t, retained[j].got, retained[j].want)
+			}
+		}
+	}
+}
+
 func TestRowCountAggregateEqualsCountForRepresentativeFilters(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 	tests := []struct {

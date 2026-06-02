@@ -20,13 +20,13 @@ func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	defer releaseUniqueRecords(db, items...)
 	if len(items) != 1 || items[0] == nil {
 		t.Fatalf("unexpected query result: %#v", items)
 	}
 
 	items[0].Name = "mutated"
 	items[0].Tags[0] = "changed"
+	db.ReleaseRecords(items...)
 
 	again, err := db.Get(1)
 	if err != nil {
@@ -35,6 +35,21 @@ func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
 	defer releaseUniqueRecords(db, again)
 	if again == nil || again.Name != "alice" || again.Tags[0] != "go" {
 		t.Fatalf("stored value changed after Query result mutation: %#v", again)
+	}
+
+	keys, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("QueryKeys(alice): %v", err)
+	}
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("query index changed after Query result release: %v", keys)
+	}
+	keys, err = db.QueryKeys(qx.Query(qx.EQ("name", "mutated")))
+	if err != nil {
+		t.Fatalf("QueryKeys(mutated): %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("released Query result leaked into index: %v", keys)
 	}
 }
 

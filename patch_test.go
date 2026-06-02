@@ -1,15 +1,52 @@
 package rbi
 
 import (
+	"io"
 	"math"
 	"reflect"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
+
+type patchQueuedOwnershipRec struct {
+	Name string   `db:"name" rbi:"index"`
+	Tags []string `db:"tags" rbi:"index"`
+}
+
+type patchQueuedOwnershipPayload struct {
+	Name string
+	Tags []string
+}
+
+var (
+	patchQueuedOwnershipDecodeArmed   atomic.Bool
+	patchQueuedOwnershipDecodeStarted chan struct{}
+	patchQueuedOwnershipDecodeResume  chan struct{}
+)
+
+func (r *patchQueuedOwnershipRec) EncodeRBI(w io.Writer) error {
+	return msgpack.NewEncoder(w).Encode(patchQueuedOwnershipPayload{Name: r.Name, Tags: r.Tags})
+}
+
+func (r *patchQueuedOwnershipRec) DecodeRBI(rd io.Reader) error {
+	if patchQueuedOwnershipDecodeArmed.CompareAndSwap(true, false) {
+		close(patchQueuedOwnershipDecodeStarted)
+		<-patchQueuedOwnershipDecodeResume
+	}
+	var payload patchQueuedOwnershipPayload
+	if err := msgpack.NewDecoder(rd).Decode(&payload); err != nil {
+		return err
+	}
+	r.Name = payload.Name
+	r.Tags = payload.Tags
+	return nil
+}
 
 func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
@@ -352,6 +389,59 @@ func TestAPI_MakePatchInto_ResetsDstAndDeepCopiesMutableValues(t *testing.T) {
 	}
 	if got.Opt == nil || *got.Opt != "next" {
 		t.Fatalf("patch aliased mutated pointer value from newVal: %#v", got.Opt)
+	}
+}
+
+func TestPatchQueuedRequestCopiesCallerPatchItemsBeforeApply(t *testing.T) {
+	db := openTempDBUint64Reflect[patchQueuedOwnershipRec](t, "patch_queued_ownership.db")
+
+	if err := db.Set(1, &patchQueuedOwnershipRec{Name: "base", Tags: []string{"base"}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	patchQueuedOwnershipDecodeStarted = make(chan struct{})
+	patchQueuedOwnershipDecodeResume = make(chan struct{})
+	patchQueuedOwnershipDecodeArmed.Store(true)
+	defer func() {
+		patchQueuedOwnershipDecodeArmed.Store(false)
+		patchQueuedOwnershipDecodeStarted = nil
+		patchQueuedOwnershipDecodeResume = nil
+	}()
+
+	tags := []string{"owned", "keep"}
+	patch := []Field{{Name: "tags", Value: tags}}
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Patch(1, patch, PatchStrict)
+	}()
+
+	select {
+	case <-patchQueuedOwnershipDecodeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Patch did not reach blocked decode")
+	}
+
+	patch[0].Name = "name"
+	close(patchQueuedOwnershipDecodeResume)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Get(1): got nil")
+	}
+	defer db.ReleaseRecords(got)
+
+	if got.Name != "base" {
+		t.Fatalf("queued patch item name aliased caller mutation: name=%q", got.Name)
+	}
+	if !slices.Equal(got.Tags, []string{"owned", "keep"}) {
+		t.Fatalf("queued patch value was not applied: tags=%v", got.Tags)
 	}
 }
 
