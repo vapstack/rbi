@@ -375,7 +375,7 @@ func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64)
 				owner, ok = posts[i].TrySingle()
 				if !ok {
 					pooled.ReleaseUint64Slice(keyOwners)
-					goto regular
+					goto REGULAR
 				}
 				base := i << 1
 				keyOwners[base] = keys[i]
@@ -387,7 +387,7 @@ func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64)
 			return newUniqueNumericFieldIndexChunk(keyOwners)
 		}
 	}
-regular:
+REGULAR:
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
@@ -432,7 +432,7 @@ func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, 
 				owner, ok = posts[i].TrySingle()
 				if !ok {
 					pooled.ReleaseUint64Slice(owners)
-					goto regular
+					goto REGULAR
 				}
 				owners[i] = owner
 			}
@@ -441,7 +441,7 @@ func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, 
 			return newUniqueStringFieldIndexChunk(owners, refs, data)
 		}
 	}
-regular:
+REGULAR:
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}

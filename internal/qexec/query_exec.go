@@ -1878,7 +1878,7 @@ func (qv *View) dispatchOrderedLimit(
 
 	selected := decision.selectedKind()
 
-dispatch:
+DISPATCH:
 	switch selected {
 	case plannerOrderedLimitCandidateEmpty:
 		return nil, true, PlanLimitOrderBasic, nil
@@ -1918,7 +1918,7 @@ dispatch:
 					if e.Not {
 						v, ok := e.Value.(bool)
 						if !ok {
-							goto orderScanPostingFilterDone
+							goto DONE
 						}
 						filterExpr.Not = false
 						filterExpr.Value = !v
@@ -1946,13 +1946,13 @@ dispatch:
 								if decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
 									selected = decision.runtimeFallback.kind
 									guard = plannerOrderedLimitRuntimeGuard{}
-									goto dispatch
+									goto DISPATCH
 								}
 								return qv.dispatchOrderedLimitFallback(q, decision)
 							}
 							if uint64(len(out)) < need {
 								if nilTailField != "" {
-									goto orderScanPostingFilterDone
+									goto DONE
 								}
 							}
 							return out, true, plan, nil
@@ -1960,14 +1960,15 @@ dispatch:
 						out := make([]uint64, 0, clampUint64ToInt(need))
 						out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, filter, q.Offset, need)
 						if uint64(len(out)) < need && nilTailField != "" {
-							goto orderScanPostingFilterDone
+							goto DONE
 						}
 						return out, true, plan, nil
 					}
 				}
 			}
 		}
-	orderScanPostingFilterDone:
+
+	DONE:
 		if q.Offset == 0 || !fm.Ptr || nilTailField != "" {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
 			if err != nil {
@@ -2023,7 +2024,7 @@ dispatch:
 					if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
 						selected = decision.runtimeFallback.kind
 						guard = plannerOrderedLimitRuntimeGuard{}
-						goto dispatch
+						goto DISPATCH
 					}
 					return qv.dispatchOrderedLimitFallback(q, decision)
 				}
@@ -2137,7 +2138,7 @@ dispatch:
 			}
 			loadedCoreBuf[i] = true
 			loadedCount++
-			var err error
+
 			base, err = qv.andPostingResult(base, b)
 			if err != nil {
 				if loadedCoreHeap != nil {

@@ -1283,10 +1283,7 @@ func plannerOrderedLimitPick(candidates []plannerOrderedLimitCandidate) plannerO
 	return d
 }
 
-func (qv *View) collectOrderedLimitFacts(
-	q *qir.Shape,
-	facts *orderedLimitFacts,
-) (bool, error) {
+func (qv *View) collectOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts) (bool, error) {
 	if !q.HasOrder || q.Limit == 0 {
 		return false, nil
 	}

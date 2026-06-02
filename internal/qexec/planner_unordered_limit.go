@@ -957,7 +957,7 @@ func (qv *View) dispatchNoOrderLimit(
 
 	selected := decision.selected
 
-dispatch:
+DISPATCH:
 	switch selected.kind {
 	case plannerNoOrderLimitCandidateEmpty:
 		return nil, true, PlanCandidateNoOrder, nil
@@ -1014,7 +1014,7 @@ dispatch:
 			if runtimeFallback && decision.runtimeFallback.kind != plannerNoOrderLimitCandidateNone {
 				selected = decision.runtimeFallback
 				guard = plannerNoOrderLimitRuntimeGuard{}
-				goto dispatch
+				goto DISPATCH
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
@@ -1032,7 +1032,7 @@ dispatch:
 			if runtimeFallback && decision.runtimeFallback.kind != plannerNoOrderLimitCandidateNone {
 				selected = decision.runtimeFallback
 				guard = plannerNoOrderLimitRuntimeGuard{}
-				goto dispatch
+				goto DISPATCH
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
