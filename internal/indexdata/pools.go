@@ -5,6 +5,8 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
+const LenPostingMapMaxRetainedLen = 4 << 10
+
 var (
 	postingMapPool = pooled.Maps[string, posting.List]{
 		NewCap: 64,
@@ -16,7 +18,7 @@ var (
 	}
 	lenPostingMapPool = pooled.Maps[uint32, posting.List]{
 		NewCap: 128,
-		MaxLen: 4 << 10,
+		MaxLen: LenPostingMapMaxRetainedLen,
 	}
 	lenCountMapPool = pooled.Maps[uint64, uint32]{
 		NewCap: 1024,

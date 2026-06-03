@@ -37,7 +37,7 @@ const buildIndexRunTargetEntries = max(4<<10, indexdata.FieldChunkTargetEntries*
 func NewBuildFieldState(slice bool) *BuildFieldState {
 	state := &BuildFieldState{}
 	if slice {
-		state.lenMap = make(map[uint32]posting.List, 8)
+		state.lenMap = indexdata.GetLenPostingMap()
 	}
 	return state
 }
@@ -45,7 +45,7 @@ func NewBuildFieldState(slice bool) *BuildFieldState {
 func NewBuildFieldLocalState(numeric bool, slice bool) BuildFieldLocalState {
 	state := BuildFieldLocalState{numeric: numeric}
 	if slice {
-		state.lenMap = make(map[uint32]posting.List, 8)
+		state.lenMap = indexdata.GetLenPostingMap()
 	}
 	return state
 }
@@ -74,7 +74,7 @@ func (s *BuildFieldLocalState) addNil(idx uint64) {
 
 func (s *BuildFieldLocalState) addLen(length int, idx uint64) {
 	if s.lenMap == nil {
-		s.lenMap = make(map[uint32]posting.List, 8)
+		s.lenMap = indexdata.GetLenPostingMap()
 	}
 	ln := uint32(length)
 	s.lenMap[ln] = s.lenMap[ln].BuildAdded(idx)
@@ -121,6 +121,7 @@ func (s *BuildFieldLocalState) FlushAllInto(dst *BuildFieldState) {
 	}
 
 	if len(s.lenMap) > 0 {
+		lenMapLen := len(s.lenMap)
 		dst.lenMu.Lock()
 		for ln, ids := range s.lenMap {
 			merged := dst.lenMap[ln]
@@ -129,6 +130,9 @@ func (s *BuildFieldLocalState) FlushAllInto(dst *BuildFieldState) {
 		}
 		dst.lenMu.Unlock()
 		clear(s.lenMap)
+		if lenMapLen > indexdata.LenPostingMapMaxRetainedLen {
+			s.lenMap = nil
+		}
 	}
 }
 
@@ -142,6 +146,7 @@ func (s *BuildFieldLocalState) Release() {
 	s.fixed = nil
 
 	posting.ReleaseMapU32(s.lenMap)
+	indexdata.ReleaseLenPostingMap(s.lenMap)
 	s.lenMap = nil
 
 	s.nils.Release()
@@ -165,6 +170,7 @@ func (s *BuildFieldState) Release() {
 	s.nils = posting.List{}
 
 	posting.ReleaseMapU32(s.lenMap)
+	indexdata.ReleaseLenPostingMap(s.lenMap)
 	s.lenMap = nil
 }
 
@@ -177,7 +183,12 @@ func (s *BuildFieldState) MaterializeNilStorage() indexdata.FieldStorage {
 func (s *BuildFieldState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
 	lenMap := s.lenMap
 	s.lenMap = nil
-	return indexdata.NewLenFieldStorageFromMapOwned(universe, lenMap)
+	lenMapLen := len(lenMap)
+	storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lenMap)
+	if lenMapLen <= indexdata.LenPostingMapMaxRetainedLen {
+		indexdata.ReleaseLenPostingMap(lenMap)
+	}
+	return storage, useZeroComplement
 }
 
 func (s BuildSink) setNil() {

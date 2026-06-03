@@ -119,6 +119,21 @@ func TestBuildFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
 	}
 }
 
+func TestBuildFieldLocalStateFlushAllIntoDropsOversizedLenMap(t *testing.T) {
+	state := NewBuildFieldLocalState(false, true)
+	for i := 0; i <= indexdata.LenPostingMapMaxRetainedLen; i++ {
+		state.addLen(i, uint64(i+1))
+	}
+
+	dst := NewBuildFieldState(true)
+	state.FlushAllInto(dst)
+	defer dst.Release()
+
+	if state.lenMap != nil {
+		t.Fatalf("expected oversized source len map to be detached")
+	}
+}
+
 func TestBuildFieldStateMaterializeStorageDetachesRuns(t *testing.T) {
 	state := NewBuildFieldState(false)
 	state.runs = []indexdata.FieldStorageRun{{}}

@@ -130,8 +130,11 @@ func (state *IndexState) MaterializeNilStorage() indexdata.FieldStorage {
 func (state *IndexState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
 	lengths := state.lengths
 	state.lengths = nil
+	lengthsLen := len(lengths)
 	storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
-	indexdata.ReleaseLenPostingMap(lengths)
+	if lengthsLen <= indexdata.LenPostingMapMaxRetainedLen {
+		indexdata.ReleaseLenPostingMap(lengths)
+	}
 	return storage, useZeroComplement
 }
 

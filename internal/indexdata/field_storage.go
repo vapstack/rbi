@@ -1131,8 +1131,11 @@ func RebuildLenFieldStorageFromIndexView(universe posting.List, fieldOV FieldInd
 		lengths[0] = empty
 	}
 
+	lengthsLen := len(lengths)
 	storage, useZeroComplement := newLenFieldStorageFromMapOwned(universe, lengths, nonEmpty)
-	lenPostingMapPool.Put(lengths)
+	if lengthsLen <= LenPostingMapMaxRetainedLen {
+		lenPostingMapPool.Put(lengths)
+	}
 	nonEmpty.Release()
 	return storage, useZeroComplement
 }
