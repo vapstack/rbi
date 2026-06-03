@@ -803,7 +803,7 @@ func (qv *View) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
 }
 
 func (qv *View) buildPredicatesCandidate(leaves []qir.Expr) (predicateSet, bool) {
-	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
+	if len(leaves) == 1 && leaves[0].Op == qir.OpConst && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
 		return preds, true
@@ -825,7 +825,7 @@ func (qv *View) buildPredicatesCandidate(leaves []qir.Expr) (predicateSet, bool)
 }
 
 func (qv *View) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
-	if e.Op == qir.OpNOOP {
+	if e.Op == qir.OpConst {
 		if e.Not {
 			return predicate{expr: e, alwaysFalse: true}, true
 		}
@@ -2799,7 +2799,7 @@ func releasePredicates(preds []predicate) {
 }
 
 func (qv *View) buildPredicatesWithColdMode(leaves []qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicateSet, bool) {
-	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
+	if len(leaves) == 1 && leaves[0].Op == qir.OpConst && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
 		return preds, true
@@ -3225,7 +3225,7 @@ func (qv *View) buildPredicatesOrderedWithMode(
 	coverOrderRange, allowOrderedEagerMaterialize bool,
 ) (predicateSet, bool) {
 
-	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
+	if len(leaves) == 1 && leaves[0].Op == qir.OpConst && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
 		return preds, true
@@ -3449,7 +3449,7 @@ func (qv *View) buildPredicateWithColdModeAndWarmLoad(
 	allowMaterialize, lazyColdMaterialize, allowWarmLoad bool,
 ) (predicate, bool) {
 
-	if e.Op == qir.OpNOOP {
+	if e.Op == qir.OpConst {
 		if e.Not {
 			return predicate{expr: e, alwaysFalse: true}, true
 		}

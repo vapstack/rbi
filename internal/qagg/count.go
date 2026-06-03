@@ -21,7 +21,7 @@ func Count(view *qexec.View, q *qir.Query, emitTrace bool) (uint64, error) {
 	expr := shape.Expr
 	traceEnabled := emitTrace && view.TraceSamplingEnabled()
 	if !traceEnabled {
-		if expr.Op == qir.OpNOOP {
+		if expr.Op == qir.OpConst {
 			if expr.Not {
 				return 0, nil
 			}
@@ -42,7 +42,7 @@ func Count(view *qexec.View, q *qir.Query, emitTrace bool) (uint64, error) {
 		trace = view.BeginTrace(shape.WithExpr(expr))
 	}
 
-	if expr.Op == qir.OpNOOP {
+	if expr.Op == qir.OpConst {
 		out := view.SnapshotUniverseCardinality()
 		if expr.Not {
 			out = 0

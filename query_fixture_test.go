@@ -678,7 +678,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 }
 
 func evalPreparedExprBool(rec *Rec, e qir.Expr) (bool, error) {
-	if e.Op == qir.OpNOOP {
+	if e.Op == qir.OpConst {
 		if e.Not {
 			return false, nil
 		}

@@ -83,6 +83,15 @@ func TestPrepareQuery_POSScalarStringRejected(t *testing.T) {
 	}
 }
 
+func TestPrepareCountExpr_EmptyBoolOpsRejected(t *testing.T) {
+	if _, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.AND()); err == nil {
+		t.Fatal("expected empty AND to be rejected")
+	}
+	if _, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.OR()); err == nil {
+		t.Fatal("expected empty OR to be rejected")
+	}
+}
+
 func TestPrepareCountExpr_ISNULLCompilesAsEqNil(t *testing.T) {
 	got, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.ISNULL("status"))
 	if err != nil {
@@ -119,23 +128,23 @@ func TestPrepareCountExpr_NOTNULLCompilesAsNeNil(t *testing.T) {
 	}
 }
 
-func TestQueryReleaseOwned_ClearsInlineOrderStorage(t *testing.T) {
+func TestQueryReleaseOwned_ClearsOrder(t *testing.T) {
 	q := queryPool.Get()
-	q.orderStorage[0] = Order{
+	q.Order = Order{
 		FieldOrdinal: 2,
 		Kind:         OrderKindArrayPos,
 		Data:         []string{"go", "ops"},
 		Desc:         true,
 	}
-	q.Order = q.orderStorage[:]
+	q.HasOrder = true
 
 	q.releaseOwned()
 
-	if q.Order != nil {
-		t.Fatalf("expected releaseOwned to drop query order slice")
+	if q.HasOrder {
+		t.Fatalf("expected releaseOwned to clear HasOrder")
 	}
-	if q.orderStorage[0].FieldOrdinal != 0 || q.orderStorage[0].Kind != 0 || q.orderStorage[0].Data != nil || q.orderStorage[0].Desc {
-		t.Fatalf("expected releaseOwned to clear inline order storage, got %+v", q.orderStorage[0])
+	if q.Order.FieldOrdinal != 0 || q.Order.Kind != 0 || q.Order.Data != nil || q.Order.Desc {
+		t.Fatalf("expected releaseOwned to clear order, got %+v", q.Order)
 	}
 }
 
@@ -177,31 +186,6 @@ func TestQueryReleaseOwnedDropsOversizedExprOwnerStorage(t *testing.T) {
 		t.Fatalf("oversized expr owner storage was retained")
 	}
 	queryPool.Put(q)
-}
-
-func TestBuildQueryOwnsCallerOperandSlices(t *testing.T) {
-	operands := []Expr{
-		{Op: OpEQ, FieldOrdinal: 1, Value: "active"},
-		{Op: OpPREFIX, FieldOrdinal: 2, Value: "go"},
-	}
-	source := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: operands}
-	prepared := BuildQuery(source)
-	defer prepared.Release()
-
-	operands[0] = Expr{Op: OpEQ, FieldOrdinal: 9, Value: "mutated"}
-	source.Operands[1] = Expr{Op: OpSUFFIX, FieldOrdinal: 8, Value: "poison"}
-
-	if prepared.Expr.Op != OpAND || len(prepared.Expr.Operands) != 2 {
-		t.Fatalf("expected AND with two owned operands, got %+v", prepared.Expr)
-	}
-	left := prepared.Expr.Operands[0]
-	right := prepared.Expr.Operands[1]
-	if left.Op != OpEQ || left.FieldOrdinal != 1 || left.Value != "active" {
-		t.Fatalf("left operand aliases caller slice: %+v", left)
-	}
-	if right.Op != OpPREFIX || right.FieldOrdinal != 2 || right.Value != "go" {
-		t.Fatalf("right operand aliases caller slice: %+v", right)
-	}
 }
 
 func TestPrepareCountExprs_ResolverPreservesDistinctFieldIdentity(t *testing.T) {
@@ -264,29 +248,7 @@ func TestPrepareCountExpr_NormalizedTreeAvoidsExtraOwnedCopy(t *testing.T) {
 	}
 }
 
-func TestCollectAndLeaves_ExtractRejectsNegatedAndGroup(t *testing.T) {
-	e := Expr{
-		Op: OpAND,
-		Operands: []Expr{
-			{
-				Op:  OpAND,
-				Not: true,
-				Operands: []Expr{
-					{Op: OpEQ, FieldOrdinal: 1, Value: "a@example.com"},
-					{Op: OpEQ, FieldOrdinal: 2, Value: 42},
-				},
-			},
-			{Op: OpEQ, FieldOrdinal: 3, Value: true},
-		},
-	}
-
-	leaves, ok := CollectAndLeaves(e, LeafModeExtract)
-	if ok || leaves != nil {
-		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
-	}
-}
-
-func TestCollectAndLeavesFixed_RejectsNegatedAndGroup(t *testing.T) {
+func TestCollectAndLeavesInto_ExtractRejectsNegatedAndGroup(t *testing.T) {
 	e := Expr{
 		Op: OpAND,
 		Operands: []Expr{
@@ -303,7 +265,30 @@ func TestCollectAndLeavesFixed_RejectsNegatedAndGroup(t *testing.T) {
 	}
 
 	var buf [4]Expr
-	leaves, ok := CollectAndLeavesFixed(e, buf[:0])
+	leaves, ok := CollectAndLeavesInto(e, buf[:0], LeafModeExtract)
+	if ok || leaves != nil {
+		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
+	}
+}
+
+func TestCollectAndLeavesInto_RejectsNegatedAndGroup(t *testing.T) {
+	e := Expr{
+		Op: OpAND,
+		Operands: []Expr{
+			{
+				Op:  OpAND,
+				Not: true,
+				Operands: []Expr{
+					{Op: OpEQ, FieldOrdinal: 1, Value: "a@example.com"},
+					{Op: OpEQ, FieldOrdinal: 2, Value: 42},
+				},
+			},
+			{Op: OpEQ, FieldOrdinal: 3, Value: true},
+		},
+	}
+
+	var buf [4]Expr
+	leaves, ok := CollectAndLeavesInto(e, buf[:0], LeafModeCollect)
 	if ok || leaves != nil {
 		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
 	}
@@ -316,16 +301,28 @@ func TestNormalizeExpr_OrFalseCollapsesToLeaf(t *testing.T) {
 		FieldOrdinal: NoFieldOrdinal,
 		Operands: []Expr{
 			leaf,
-			{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal},
+			{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal},
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
 	if !reflect.DeepEqual(out, leaf) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, leaf)
+	}
+}
+
+func TestNormalizeExpr_EmptyBoolNodesBecomeConstants(t *testing.T) {
+	out, changed := normalizeExpr(Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal})
+	if !changed || !IsTrueConst(out) {
+		t.Fatalf("empty AND normalize result=%+v changed=%v", out, changed)
+	}
+
+	out, changed = normalizeExpr(Expr{Op: OpOR, FieldOrdinal: NoFieldOrdinal})
+	if !changed || !IsFalseConst(out) {
+		t.Fatalf("empty OR normalize result=%+v changed=%v", out, changed)
 	}
 }
 
@@ -344,7 +341,7 @@ func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(expr)
+	out, changed := normalizeExpr(expr)
 	if changed {
 		t.Fatalf("expected canonical AND to stay unchanged")
 	}
@@ -353,7 +350,7 @@ func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		_, _ = NormalizeExpr(expr)
+		_, _ = normalizeExpr(expr)
 	})
 	if allocs > 0 {
 		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
@@ -374,7 +371,7 @@ func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(expr)
+	out, changed := normalizeExpr(expr)
 	if changed {
 		t.Fatalf("expected canonical OR to stay unchanged")
 	}
@@ -383,7 +380,7 @@ func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		_, _ = NormalizeExpr(expr)
+		_, _ = normalizeExpr(expr)
 	})
 	if allocs > 0 {
 		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
@@ -401,7 +398,7 @@ func TestNormalizeExpr_DeMorganForNotAnd(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
@@ -428,20 +425,20 @@ func TestNormalizeExpr_FlattensAndNoopNoise(t *testing.T) {
 		Op:           OpAND,
 		FieldOrdinal: NoFieldOrdinal,
 		Operands: []Expr{
-			{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal},
+			{Op: OpConst, FieldOrdinal: NoFieldOrdinal},
 			{
 				Op:           OpAND,
 				FieldOrdinal: NoFieldOrdinal,
 				Operands: []Expr{
 					leafA,
-					{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal},
+					{Op: OpConst, FieldOrdinal: NoFieldOrdinal},
 				},
 			},
 			leafB,
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
@@ -471,7 +468,7 @@ func TestNormalizeExpr_DoubleNotEliminates(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
@@ -491,7 +488,7 @@ func TestNormalizeExpr_ExactDuplicateANDCollapses(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
@@ -511,7 +508,7 @@ func TestNormalizeExpr_ExactDuplicateORCollapses(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
@@ -531,11 +528,11 @@ func TestNormalizeExpr_ExactLeafComplementANDToFalse(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
-	want := Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal}
+	want := Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}
 	if !reflect.DeepEqual(out, want) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
 	}
@@ -552,29 +549,29 @@ func TestNormalizeExpr_ExactLeafComplementORToTrue(t *testing.T) {
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if !changed {
 		t.Fatalf("expected changed=true")
 	}
-	want := Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}
+	want := Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}
 	if !reflect.DeepEqual(out, want) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
 	}
 }
 
-func TestNormalizeExpr_MalformedNoopComplementStaysMalformed(t *testing.T) {
+func TestNormalizeExpr_MalformedConstComplementStaysMalformed(t *testing.T) {
 	in := Expr{
 		Op:           OpAND,
 		FieldOrdinal: NoFieldOrdinal,
 		Operands: []Expr{
-			{Op: OpNOOP, FieldOrdinal: 1},
-			{Op: OpNOOP, FieldOrdinal: 1, Not: true},
+			{Op: OpConst, FieldOrdinal: 1},
+			{Op: OpConst, FieldOrdinal: 1, Not: true},
 		},
 	}
 
-	out, changed := NormalizeExpr(in)
+	out, changed := normalizeExpr(in)
 	if changed {
-		t.Fatalf("expected malformed NOOP pair to stay untouched, got=%+v", out)
+		t.Fatalf("expected malformed CONST pair to stay untouched, got=%+v", out)
 	}
 	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, in)

@@ -15,49 +15,18 @@ const (
 	leafStatusInvalid
 )
 
-func CollectAndLeavesFixed(e Expr, dst []Expr) ([]Expr, bool) {
-	dst, status := appendAndLeaves(dst[:0], e, LeafModeCollect)
-	if status != leafStatusOK || len(dst) == 0 {
+func CollectAndLeavesInto(e Expr, dst []Expr, mode LeafMode) ([]Expr, bool) {
+	dst, status := appendAndLeaves(dst[:0], e, mode)
+	if status != leafStatusOK {
 		return nil, false
+	}
+	if len(dst) == 0 {
+		return nil, true
 	}
 	return dst, true
 }
 
-func CollectAndLeaves(e Expr, mode LeafMode) ([]Expr, bool) {
-	n, ok := AndLeafLen(e, mode)
-	if !ok {
-		return nil, false
-	}
-	if n == 0 {
-		return nil, true
-	}
-	out := make([]Expr, 0, n)
-	out, status := appendAndLeaves(out, e, mode)
-	if status != leafStatusOK {
-		return nil, false
-	}
-	return out, true
-}
-
-func CollectAndLeavesScratch(e Expr, dst []Expr, mode LeafMode) ([]Expr, bool) {
-	dst, status := appendAndLeaves(dst[:0], e, mode)
-	switch status {
-
-	case leafStatusOK:
-		if len(dst) == 0 {
-			return nil, true
-		}
-		return dst, true
-
-	case leafStatusOverflow:
-		return CollectAndLeaves(e, mode)
-
-	default:
-		return nil, false
-	}
-}
-
-func CollectAndLeavesPooled(e Expr, dst []Expr, mode LeafMode) ([]Expr, []Expr, bool) {
+func CollectAndLeavesPooledFallback(e Expr, dst []Expr, mode LeafMode) ([]Expr, []Expr, bool) {
 	dst, status := appendAndLeaves(dst[:0], e, mode)
 	switch status {
 
@@ -92,7 +61,7 @@ func CollectAndLeavesPooled(e Expr, dst []Expr, mode LeafMode) ([]Expr, []Expr, 
 func AndLeafLen(e Expr, mode LeafMode) (int, bool) {
 	switch e.Op {
 
-	case OpNOOP:
+	case OpConst:
 		if mode == LeafModeCollect && e.Not {
 			return 1, true
 		}
@@ -129,14 +98,14 @@ func AndLeafLen(e Expr, mode LeafMode) (int, bool) {
 func appendAndLeaves(dst []Expr, e Expr, mode LeafMode) ([]Expr, leafStatus) {
 	switch e.Op {
 
-	case OpNOOP:
+	case OpConst:
 		if mode != LeafModeCollect {
 			return nil, leafStatusInvalid
 		}
 		if !e.Not {
 			return dst, leafStatusOK
 		}
-		return appendAndLeaf(dst, Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal})
+		return appendAndLeaf(dst, Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal})
 
 	case OpAND:
 		if e.Not || len(e.Operands) == 0 {

@@ -16,8 +16,8 @@ func NewShape(query *Query) Shape {
 		Offset: query.Offset,
 		Limit:  query.Limit,
 	}
-	if len(query.Order) == 1 {
-		shape.Order = query.Order[0]
+	if query.HasOrder {
+		shape.Order = query.Order
 		shape.HasOrder = true
 	}
 	return shape

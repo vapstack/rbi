@@ -104,9 +104,9 @@ func TestExecPlanLeadScanNoOrderMergedRangeLeadUsesEffectiveBounds(t *testing.T)
 	defer prepared.Release()
 
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		t.Fatalf("CollectAndLeavesScratch: ok=false")
+		t.Fatalf("CollectAndLeavesInto: ok=false")
 	}
 
 	view := db.engine.currentQueryViewForTests()

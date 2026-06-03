@@ -155,7 +155,7 @@ func plannerGuardrailRunForcedOrderedPlanner(
 	trace *Trace,
 ) ([]uint64, bool, error) {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
 		return nil, false, nil
 	}
@@ -212,7 +212,7 @@ func plannerGuardrailRunForcedOrderedNoOrderPlanner(
 	trace *Trace,
 ) ([]uint64, bool, error) {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
 		return nil, false, nil
 	}
@@ -253,7 +253,7 @@ func plannerGuardrailRunForcedNoOrderRange(
 	trace *Trace,
 ) ([]uint64, bool, error) {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
 		return nil, false, nil
 	}
@@ -564,9 +564,9 @@ func plannerGuardrailOrderedLimitBaseCandidate(
 
 	view := db.view()
 	var leavesBuf [limitQueryFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || len(leaves) == 0 {
-		t.Fatalf("CollectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
+		t.Fatalf("CollectAndLeavesInto: ok=%v len=%d", ok, len(leaves))
 	}
 
 	orderField := view.exec.FieldNameByOrdinal(viewQ.Order.FieldOrdinal)
@@ -709,9 +709,9 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 
 		view := db.view()
 		var leavesBuf [limitQueryFastPathMaxLeaves]qir.Expr
-		leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+		leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 		if !ok || len(leaves) == 0 {
-			t.Fatalf("CollectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
+			t.Fatalf("CollectAndLeavesInto: ok=%v len=%d", ok, len(leaves))
 		}
 
 		var baseOpsBuf [limitQueryFastPathMaxLeaves]qir.Expr

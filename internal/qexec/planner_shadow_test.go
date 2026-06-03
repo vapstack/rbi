@@ -302,7 +302,7 @@ func TestPlannerShadow_OrderedLimitExecutionVsPlanner(t *testing.T) {
 
 	ordered := h.run("shadow_order_limit_planner", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 		var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+		leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 		if !ok {
 			return nil, false, nil
 		}
@@ -345,7 +345,7 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 		t.Fatalf("prepareQuery: %v", err)
 	}
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("collectAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
@@ -373,7 +373,7 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 
 	ordered := h.run("shadow_candidate_order_alt_planner", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 		var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		l, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+		l, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 		if !ok {
 			return nil, false, nil
 		}

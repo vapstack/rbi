@@ -865,7 +865,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(expr, leavesBuf[:0], qir.LeafModeCollect)
 
 	if !ok || len(leaves) < 2 || len(leaves) > cardinalityPredicateScanMaxLeaves {
 		return 0, false, nil
@@ -999,32 +999,6 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	return cnt, true, nil
 }
 
-func cardinalityLeavesForUniquePath(expr qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
-	if expr.Not {
-		return nil, false
-	}
-
-	if expr.Op == qir.OpAND {
-		leaves, ok := qir.CollectAndLeavesScratch(expr, dst, qir.LeafModeCollect)
-		if !ok || len(leaves) == 0 {
-			return nil, false
-		}
-		return leaves, true
-	}
-
-	if expr.Op == qir.OpOR || expr.Op == qir.OpNOOP || len(expr.Operands) != 0 {
-		return nil, false
-	}
-
-	if cap(dst) == 0 {
-		return []qir.Expr{expr}, true
-	}
-
-	dst = dst[:1]
-	dst[0] = expr
-	return dst, true
-}
-
 func (qv *View) uniqueCardinalityPathPrecheck(expr qir.Expr) (hasUnique bool, ok bool) {
 	if expr.Not {
 		return false, false
@@ -1047,7 +1021,7 @@ func (qv *View) uniqueCardinalityPathPrecheck(expr qir.Expr) (hasUnique bool, ok
 		return found, true
 	}
 
-	if expr.Op == qir.OpOR || expr.Op == qir.OpNOOP || len(expr.Operands) != 0 {
+	if expr.Op == qir.OpOR || expr.Op == qir.OpConst || len(expr.Operands) != 0 {
 		return false, false
 	}
 
@@ -1063,8 +1037,11 @@ func (qv *View) TryFilterCardinalityByUniqueEq(expr qir.Expr, trace *Trace) (uin
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := cardinalityLeavesForUniquePath(expr, leavesBuf[:0])
-	if !ok {
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(expr, leavesBuf[:0], qir.LeafModeCollect)
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
+	}
+	if !ok || len(leaves) == 0 {
 		return 0, false, nil
 	}
 
@@ -1105,6 +1082,11 @@ func (qv *View) TryFilterCardinalityByUniqueEq(expr qir.Expr, trace *Trace) (uin
 
 	var checksBuf [cardinalityPredicateScanMaxLeaves]int
 	checks := checksBuf[:0]
+	if predSet.Len()-1 > cap(checksBuf) {
+		checksHeap := pooled.GetIntSlice(predSet.Len() - 1)
+		defer pooled.ReleaseIntSlice(checksHeap)
+		checks = checksHeap[:0]
+	}
 
 	for i := 0; i < predSet.Len(); i++ {
 		if i == leadIdx {
@@ -1222,7 +1204,7 @@ func shouldTryMaterializedCardinalityAND(expr qir.Expr) bool {
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(expr, leavesBuf[:0], qir.LeafModeCollect)
 
 	if !ok || len(leaves) < 2 || len(leaves) > cardinalityPredicateScanMaxLeaves {
 		return false
@@ -1279,7 +1261,7 @@ func (qv *View) buildCardinalityPredicatesWithMode(leaves []qir.Expr, allowMater
 	owner := predicateSlicePool.Get(len(leaves))
 	preds := predicateSet{owner: owner}
 
-	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
+	if len(leaves) == 1 && leaves[0].Op == qir.OpConst && leaves[0].Not {
 		preds.Append(predicate{alwaysFalse: true})
 		return preds, true
 	}
@@ -2589,7 +2571,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || !shouldTryCardinalityByPredicates(leaves) {
 		return 0, false, nil
 	}
@@ -3581,7 +3563,7 @@ func cardinalityORHasPrefixLikeBranch(expr qir.Expr) bool {
 
 func cardinalityHasPositivePrefixLikeAndLeaf(e qir.Expr) (bool, bool) {
 	switch e.Op {
-	case qir.OpNOOP:
+	case qir.OpConst:
 		return false, false
 
 	case qir.OpAND:
@@ -3622,7 +3604,7 @@ func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesFixed(expr.Operands[0], leavesBuf[:0])
+	leaves, ok := qir.CollectAndLeavesInto(expr.Operands[0], leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
 		return false
 	}
@@ -3647,7 +3629,7 @@ func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
 	var keys [cardinalityORScalarDisjointMaxBranches]string
 	var nils [cardinalityORScalarDisjointMaxBranches]bool
 	for branchIdx, op := range expr.Operands {
-		leaves, ok = qir.CollectAndLeavesFixed(op, leavesBuf[:0])
+		leaves, ok = qir.CollectAndLeavesInto(op, leavesBuf[:0], qir.LeafModeCollect)
 		if !ok {
 			return false
 		}
@@ -3987,7 +3969,7 @@ func (qv *View) TryFilterCardinalityORByPredicates(expr qir.Expr, trace *Trace) 
 	var leafBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
 LOOP:
 	for branchIdx, op := range expr.Operands {
-		leaves, ok := qir.CollectAndLeavesFixed(op, leafBuf[:0])
+		leaves, ok := qir.CollectAndLeavesInto(op, leafBuf[:0], qir.LeafModeCollect)
 		if !ok {
 			cardinalityORBranchSlicePool.Put(branchesBuf)
 			return 0, false, nil
@@ -4373,7 +4355,7 @@ LOOP:
 }
 
 func (qv *View) exactExprCardinality(expr qir.Expr) (uint64, error) {
-	if expr.Op == qir.OpNOOP {
+	if expr.Op == qir.OpConst {
 		if expr.Not {
 			return 0, nil
 		}
@@ -4421,7 +4403,7 @@ type cardinalityLeafPlan struct {
 func cardinalityLeafOpCost(e qir.Expr) int {
 	cost := 5
 	switch e.Op {
-	case qir.OpEQ, qir.OpNOOP:
+	case qir.OpEQ, qir.OpConst:
 		cost = 0
 	case qir.OpIN, qir.OpHASALL, qir.OpHASANY:
 		cost = 1
@@ -4442,7 +4424,7 @@ func cardinalityLeafOpCost(e qir.Expr) int {
 
 func cardinalityPredicateResidualOpWeight(p predicate) uint64 {
 	switch p.expr.Op {
-	case qir.OpEQ, qir.OpNOOP:
+	case qir.OpEQ, qir.OpConst:
 		return 1
 	case qir.OpIN, qir.OpHASALL:
 		return 2
@@ -4662,7 +4644,7 @@ func (qv *View) tryFilterCardinalityPreparedAndReordered(expr qir.Expr) (uint64,
 	}
 
 	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || len(leaves) < 2 || len(leaves) > cardinalityPredicateScanMaxLeaves {
 		return 0, false, nil
 	}

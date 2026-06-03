@@ -1011,7 +1011,7 @@ func (qv *View) validateOrderBasicBaseOps(baseOps []qir.Expr) error {
 func (qv *View) validateOrderBasicExpr(e qir.Expr) error {
 	switch e.Op {
 
-	case qir.OpNOOP:
+	case qir.OpConst:
 		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
 			return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 		}

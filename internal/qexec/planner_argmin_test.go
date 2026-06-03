@@ -562,7 +562,7 @@ func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 	defer preparedQ.Release()
 
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("collectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
 	}
@@ -1005,9 +1005,9 @@ func TestPlannerNoOrderLimitRuntimeGuard_DirectRangeFallback(t *testing.T) {
 	defer prepared.Release()
 
 	var leavesBuf [4]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, ok := qir.CollectAndLeavesInto(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		t.Fatalf("CollectAndLeavesScratch: ok=false")
+		t.Fatalf("CollectAndLeavesInto: ok=false")
 	}
 
 	view := db.view()

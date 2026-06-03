@@ -382,12 +382,12 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 	}
 
 	if n <= len(facts.leavesInline) {
-		facts.leaves, ok = qir.CollectAndLeavesScratch(q.Expr, facts.leavesInline[:0], qir.LeafModeCollect)
+		facts.leaves, ok = qir.CollectAndLeavesInto(q.Expr, facts.leavesInline[:0], qir.LeafModeCollect)
 	} else {
 		if cap(facts.leavesBuf) < n {
 			facts.leavesBuf = make([]qir.Expr, 0, n)
 		}
-		facts.leaves, ok = qir.CollectAndLeavesScratch(q.Expr, facts.leavesBuf[:0], qir.LeafModeCollect)
+		facts.leaves, ok = qir.CollectAndLeavesInto(q.Expr, facts.leavesBuf[:0], qir.LeafModeCollect)
 		facts.leavesBuf = facts.leaves
 	}
 	if !ok || len(facts.leaves) == 0 {

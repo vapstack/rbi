@@ -67,6 +67,34 @@ func TestTracer_EmitsAndSamples(t *testing.T) {
 	}
 }
 
+func TestTracer_BeginTraceCollectsWideANDLeafMetadata(t *testing.T) {
+	ops := make([]qir.Expr, 9)
+	for i := range ops {
+		ops[i] = qir.Expr{Op: qir.OpEQ, FieldOrdinal: i}
+	}
+	ops[1].Not = true
+	ops[2].Op = qir.OpPREFIX
+
+	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{
+		Expr: qir.Expr{
+			Op:           qir.OpAND,
+			FieldOrdinal: qir.NoFieldOrdinal,
+			Operands:     ops,
+		},
+	}, "")
+
+	ev := trace.Event()
+	if ev.LeafCount != len(ops) {
+		t.Fatalf("LeafCount=%d want %d", ev.LeafCount, len(ops))
+	}
+	if !ev.HasNeg {
+		t.Fatalf("expected HasNeg")
+	}
+	if !ev.HasPrefix {
+		t.Fatalf("expected HasPrefix")
+	}
+}
+
 func TestTracer_ORDecisionEstimates(t *testing.T) {
 	var (
 		mu     sync.Mutex

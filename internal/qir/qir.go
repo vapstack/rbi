@@ -11,7 +11,7 @@ import (
 type Op byte
 
 const (
-	OpNOOP Op = iota
+	OpConst Op = iota
 
 	OpAND
 	OpOR
@@ -32,7 +32,7 @@ const (
 )
 
 var opNames = [...]string{
-	OpNOOP:     "NOOP",
+	OpConst:    "CONST",
 	OpAND:      "AND",
 	OpOR:       "OR",
 	OpEQ:       "EQ",
@@ -104,12 +104,12 @@ type Order struct {
 
 type Query struct {
 	Expr           Expr
-	Order          []Order
+	Order          Order
+	HasOrder       bool
 	Offset         uint64
 	Limit          uint64
 	exprOwners     [][]Expr
 	exprOwnersUsed int
-	orderStorage   [1]Order
 }
 
 type FieldResolver interface {
@@ -145,26 +145,14 @@ func (q *Query) releaseOwned() {
 		q.exprOwners = nil
 	}
 	q.Expr = Expr{}
-	q.orderStorage[0] = Order{}
-	q.Order = nil
+	q.Order = Order{}
+	q.HasOrder = false
 	q.Offset = 0
 	q.Limit = 0
 }
 
 func (c *prepareCompiler) fieldOrdinal(name string) (int, bool) {
 	return c.resolve.ResolveField(name)
-}
-
-func (q *Query) ownExprTree(expr Expr) Expr {
-	if len(expr.Operands) == 0 {
-		return expr
-	}
-	dst := q.newOwnedExprSlice(len(expr.Operands))
-	for i := range expr.Operands {
-		dst[i] = q.ownExprTree(expr.Operands[i])
-	}
-	expr.Operands = dst
-	return expr
 }
 
 func (q *Query) newOwnedExprSlice(n int) []Expr {
@@ -219,8 +207,8 @@ func PrepareQuery(src *qx.QX, resolve FieldResolver) (*Query, error) {
 			query.Release()
 			return nil, err
 		}
-		query.orderStorage[0] = order
-		query.Order = query.orderStorage[:]
+		query.Order = order
+		query.HasOrder = true
 	}
 
 	return query, nil
@@ -230,7 +218,7 @@ func PrepareCountExprsResolved(resolve FieldResolver, exprs ...qx.Expr) (*Query,
 	switch len(exprs) {
 	case 0:
 		query := queryPool.Get()
-		query.Expr = Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}
+		query.Expr = Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}
 		return query, nil
 	case 1:
 		return PrepareCountExprResolved(resolve, exprs[0])
@@ -282,7 +270,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 		if src.Name != "" || src.Value != nil || len(src.Args) != 0 {
 			return Expr{}, fmt.Errorf("rbi: invalid empty filter expression")
 		}
-		return Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, nil
+		return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, nil
 	}
 	if src.Kind != qx.KindOP {
 		return Expr{}, fmt.Errorf("rbi does not support filter expression kind %q", src.Kind)
@@ -292,7 +280,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 	case qx.OpAND:
 		out := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal}
 		if len(src.Args) == 0 {
-			return out, nil
+			return Expr{}, fmt.Errorf("rbi: empty AND expression")
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
@@ -307,7 +295,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 	case qx.OpOR:
 		out := Expr{Op: OpOR, FieldOrdinal: NoFieldOrdinal}
 		if len(src.Args) == 0 {
-			return out, nil
+			return Expr{}, fmt.Errorf("rbi: empty OR expression")
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
@@ -476,23 +464,8 @@ func posOrderLiteralIsScalarString(v any) bool {
 	return false
 }
 
-func BuildQuery(exprs ...Expr) *Query {
-	query := queryPool.Get()
-	switch len(exprs) {
-	case 0:
-		query.Expr = Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}
-	case 1:
-		query.Expr = query.ownExprTree(exprs[0])
-	default:
-		root := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: exprs}
-		expr, _ := NormalizeExpr(root)
-		query.Expr = query.ownExprTree(expr)
-	}
-	return query
-}
-
 func IsTrueConst(e Expr) bool {
-	return e.Op == OpNOOP &&
+	return e.Op == OpConst &&
 		!e.Not &&
 		e.FieldOrdinal == NoFieldOrdinal &&
 		e.Value == nil &&
@@ -500,7 +473,7 @@ func IsTrueConst(e Expr) bool {
 }
 
 func IsFalseConst(e Expr) bool {
-	return e.Op == OpNOOP &&
+	return e.Op == OpConst &&
 		e.Not &&
 		e.FieldOrdinal == NoFieldOrdinal &&
 		e.Value == nil &&
@@ -516,7 +489,7 @@ func (q *Query) newOwnedExprBuf(capacity int) []Expr {
 	return q.newOwnedExprSlice(capacity)[:0]
 }
 
-func NormalizeExpr(e Expr) (Expr, bool) {
+func normalizeExpr(e Expr) (Expr, bool) {
 	return normalizeExprWithAlloc(e, func(capacity int) []Expr {
 		if capacity == 0 {
 			return nil
@@ -544,8 +517,8 @@ func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc) (Expr, bool) {
 
 func normalizeExprInverted(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, bool) {
 	switch e.Op {
-	case OpNOOP:
-		out, changed := normalizeNoop(e, invert)
+	case OpConst:
+		out, changed := normalizeConst(e, invert)
 		return out, changed, false
 	case OpAND, OpOR:
 		return normalizeBoolNode(e, invert, alloc)
@@ -559,7 +532,7 @@ func normalizeExprInverted(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool,
 	}
 }
 
-func normalizeNoop(e Expr, invert bool) (Expr, bool) {
+func normalizeConst(e Expr, invert bool) (Expr, bool) {
 	if e.FieldOrdinal != NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
 		if !invert {
 			return e, false
@@ -575,19 +548,24 @@ func normalizeNoop(e Expr, invert bool) (Expr, bool) {
 	}
 
 	if neg {
-		return Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal}, !IsFalseConst(e)
+		return Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, !IsFalseConst(e)
 	}
-	return Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, !IsTrueConst(e)
+	return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, !IsTrueConst(e)
 }
 
 func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, bool) {
 	if len(e.Operands) == 0 {
-		if !invert {
-			return e, false, e.Op == OpAND
+		neg := e.Op == OpOR
+		if e.Not {
+			neg = !neg
 		}
-		out := e
-		out.Not = !out.Not
-		return out, true, false
+		if invert {
+			neg = !neg
+		}
+		if neg {
+			return Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, true, false
+		}
+		return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, true, false
 	}
 
 	neg := e.Not
@@ -623,7 +601,7 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 			}
 		}
 
-		if nc.Op == OpNOOP && (nc.FieldOrdinal != NoFieldOrdinal || nc.Value != nil || len(nc.Operands) != 0) {
+		if nc.Op == OpConst && (nc.FieldOrdinal != NoFieldOrdinal || nc.Value != nil || len(nc.Operands) != 0) {
 			if childPost {
 				postNeeded = true
 			}
@@ -635,7 +613,7 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 
 		if op == OpAND {
 			if IsFalseConst(nc) {
-				return Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal}, true, false
+				return Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, true, false
 			}
 			if IsTrueConst(nc) {
 				if !changed {
@@ -647,7 +625,7 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 			}
 		} else {
 			if IsTrueConst(nc) {
-				return Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, true, false
+				return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, true, false
 			}
 			if IsFalseConst(nc) {
 				if !changed {
@@ -696,9 +674,9 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 
 	if len(out) == 0 {
 		if op == OpAND {
-			return Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, true, false
+			return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, true, false
 		}
-		return Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal}, true, false
+		return Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, true, false
 	}
 
 	if len(out) == 1 {
@@ -782,7 +760,7 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc) (Expr, bool) {
 
 	for i, ch := range expr.Operands {
 		n, c := normalizeExprPost(ch, alloc)
-		drop := n.Op == OpNOOP && !n.Not
+		drop := n.Op == OpConst && !n.Not
 		flatten := n.Op == OpAND && !n.Not
 		if !changed && !c && !drop && !flatten {
 			continue
@@ -812,7 +790,7 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc) (Expr, bool) {
 	}
 
 	if len(out) == 0 {
-		return Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, true
+		return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, true
 	}
 	if len(out) == 1 {
 		return out[0], true
@@ -831,7 +809,7 @@ func normalizeORPost(e Expr, alloc exprBufAlloc) (Expr, bool) {
 
 	for i, ch := range e.Operands {
 		n, c := normalizeExprPost(ch, alloc)
-		drop := n.Op == OpNOOP && !n.Not
+		drop := n.Op == OpConst && !n.Not
 		if !changed && !c && !drop {
 			continue
 		}
@@ -877,12 +855,12 @@ func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bo
 
 	mayMatch := false
 	for i, cur := range terms {
-		if len(cur.Operands) != 0 || cur.Op == OpNOOP {
+		if len(cur.Operands) != 0 || cur.Op == OpConst {
 			continue
 		}
 		for _, prev := range terms[:i] {
 			if len(prev.Operands) == 0 &&
-				prev.Op != OpNOOP &&
+				prev.Op != OpConst &&
 				prev.Op == cur.Op &&
 				prev.FieldOrdinal == cur.FieldOrdinal {
 				mayMatch = true
@@ -916,9 +894,9 @@ func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bo
 				break
 			}
 			if op == OpAND {
-				return nil, true, Expr{Op: OpNOOP, Not: true, FieldOrdinal: NoFieldOrdinal}, true
+				return nil, true, Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, true
 			}
-			return nil, true, Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}, true
+			return nil, true, Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, true
 		}
 
 		if !dup {
@@ -945,7 +923,7 @@ func exprExactLeafMatch(a, b Expr) bool {
 	if len(a.Operands) != 0 || len(b.Operands) != 0 {
 		return false
 	}
-	if a.Op == OpNOOP || b.Op == OpNOOP {
+	if a.Op == OpConst || b.Op == OpConst {
 		return false
 	}
 	if a.Op != b.Op || a.FieldOrdinal != b.FieldOrdinal {

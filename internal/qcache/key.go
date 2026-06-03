@@ -55,7 +55,7 @@ const (
 // encoded keys store qir.Op as its iota byte value; the table avoids
 // strconv.Itoa on common String hot paths.
 var materializedPredKeyOpText = [...]string{
-	qir.OpNOOP:     "0",
+	qir.OpConst:    "0",
 	qir.OpAND:      "1",
 	qir.OpOR:       "2",
 	qir.OpEQ:       "3",

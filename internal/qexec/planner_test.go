@@ -48,6 +48,36 @@ func newPlannerPrecountDB(t *testing.T) *DB[uint64, plannerPrecountRec] {
 	return db
 }
 
+func TestCardinalityUniqueEqWideANDUsesUniquePath(t *testing.T) {
+	db := newPlannerPrecountDB(t)
+
+	exprs := make([]qx.Expr, 0, cardinalityPredicateScanMaxLeaves+2)
+	exprs = append(exprs, qx.EQ("email", "b@example.com"))
+	for i := 0; i <= cardinalityPredicateScanMaxLeaves; i++ {
+		exprs = append(exprs, qx.GTE("score", 2-i))
+	}
+	compiled := mustTestQIRExprForDB(t, db, qx.AND(exprs...))
+	leafCount, leafOK := qir.AndLeafLen(compiled, qir.LeafModeCollect)
+	if !leafOK || leafCount <= cardinalityPredicateScanMaxLeaves {
+		t.Fatalf("compiled leaf count=(%d,%v), want > %d", leafCount, leafOK, cardinalityPredicateScanMaxLeaves)
+	}
+
+	trace := &Trace{}
+	got, ok, err := db.engine.currentQueryViewForTests().TryFilterCardinalityByUniqueEq(compiled, trace)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByUniqueEq: %v", err)
+	}
+	if !ok {
+		t.Fatalf("TryFilterCardinalityByUniqueEq did not use unique path")
+	}
+	if got != 1 {
+		t.Fatalf("TryFilterCardinalityByUniqueEq=%d, want 1", got)
+	}
+	if trace.Event().Plan != string(planFilterCardinalityUniqueEq) {
+		t.Fatalf("plan=%q want %q", trace.Event().Plan, planFilterCardinalityUniqueEq)
+	}
+}
+
 func plannerPrecountBranch(t *testing.T, db *DB[uint64, plannerPrecountRec], q *qx.QX, field string, value any) plannerORBranch {
 	t.Helper()
 	window, ok := orderWindowForTest(q)
@@ -558,9 +588,10 @@ func TestPlannerOrderedProfileCountsNonOrderPrefixResidual(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	leaves, ok := qir.CollectAndLeaves(viewQ.Expr, qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesInto(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		t.Fatalf("CollectAndLeaves: ok=false")
+		t.Fatalf("CollectAndLeavesInto: ok=false")
 	}
 
 	view := db.engine.currentQueryViewForTests()

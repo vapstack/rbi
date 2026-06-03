@@ -22,7 +22,7 @@ import (
 func (qv *View) evalExpr(e qir.Expr) (postingResult, error) {
 	switch e.Op {
 
-	case qir.OpNOOP:
+	case qir.OpConst:
 		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
 			return postingResult{}, fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 		}

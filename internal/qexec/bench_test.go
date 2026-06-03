@@ -1384,9 +1384,13 @@ func benchmarkCardinalityPredicateExecutor(b *testing.B, db *testDB, expr qx.Exp
 	}
 	defer prepared.Release()
 
-	leaves, ok := qir.CollectAndLeaves(prepared.Expr, qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(prepared.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		b.Fatalf("CollectAndLeaves failed")
+		b.Fatalf("CollectAndLeavesPooledFallback failed")
+	}
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
 	}
 
 	view := db.view()
@@ -1710,9 +1714,13 @@ func benchmarkBuildPredicates(b *testing.B, db *testDB, expr qx.Expr, kind strin
 	}
 	defer prepared.Release()
 
-	leaves, ok := qir.CollectAndLeaves(prepared.Expr, qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(prepared.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		b.Fatalf("CollectAndLeaves failed")
+		b.Fatalf("CollectAndLeavesPooledFallback failed")
+	}
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
 	}
 
 	db.clearCurrentSnapshotCaches()
@@ -2609,9 +2617,13 @@ func benchmarkExecPlanOrderedBasicReader(b *testing.B, db *testDB, q *qx.QX) {
 	}
 	defer prepared.Release()
 
-	leaves, ok := qir.CollectAndLeaves(shape.Expr, qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		b.Fatalf("CollectAndLeaves failed")
+		b.Fatalf("CollectAndLeavesPooledFallback failed")
+	}
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
 	}
 	view := db.view()
 	orderField := db.exec.FieldNameByOrdinal(shape.Order.FieldOrdinal)
@@ -2657,9 +2669,13 @@ func benchmarkExecPlanOrderedBasicAnchor(b *testing.B, db *testDB, q *qx.QX) {
 	}
 	defer prepared.Release()
 
-	leaves, ok := qir.CollectAndLeaves(shape.Expr, qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		b.Fatalf("CollectAndLeaves failed")
+		b.Fatalf("CollectAndLeavesPooledFallback failed")
+	}
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
 	}
 	view := db.view()
 	order := shape.Order

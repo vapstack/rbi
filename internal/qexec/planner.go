@@ -1538,7 +1538,7 @@ func (qv *View) collectORBranchFacts(q *qir.Shape, facts *plannerORFacts, snap *
 }
 
 func collectORBranchLeaves(op qir.Expr, leavesBuf []qir.Expr) ([]qir.Expr, []qir.Expr, bool) {
-	return qir.CollectAndLeavesPooled(op, leavesBuf[:0], qir.LeafModeCollect)
+	return qir.CollectAndLeavesPooledFallback(op, leavesBuf[:0], qir.LeafModeCollect)
 }
 
 func (qv *View) collectORBranchFact(

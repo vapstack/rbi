@@ -35,7 +35,7 @@ func (r *Runtime) BeginTrace(q qir.Shape, orderField string) *Trace {
 	}
 
 	var leavesBuf [8]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, leavesHeap, ok := qir.CollectAndLeavesPooledFallback(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if ok {
 		tr.ev.LeafCount = len(leaves)
 		for _, expr := range leaves {
@@ -46,6 +46,9 @@ func (r *Runtime) BeginTrace(q qir.Shape, orderField string) *Trace {
 				tr.ev.HasPrefix = true
 			}
 		}
+	}
+	if leavesHeap != nil {
+		qir.ReleaseExprSlice(leavesHeap)
 	}
 
 	tr.start = tr.ev.Timestamp

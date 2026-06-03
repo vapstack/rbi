@@ -1789,7 +1789,7 @@ func (qv *View) estimateMergedScalarRangeOrderCost(
 
 func (qv *View) executionOrderShapeInfo(orderField string, leaves []qir.Expr) (hasOrderPrefix bool, compatible bool) {
 	for _, e := range leaves {
-		if e.Op == qir.OpNOOP {
+		if e.Op == qir.OpConst {
 			if e.Not {
 				return false, false
 			}
@@ -2066,7 +2066,7 @@ func (qv *View) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Ex
 	restCount := 0
 
 	for _, e := range leaves {
-		if e.Op == qir.OpNOOP || e.Not || e.FieldOrdinal < 0 {
+		if e.Op == qir.OpConst || e.Not || e.FieldOrdinal < 0 {
 			return false
 		}
 
@@ -2343,7 +2343,7 @@ func (qv *View) estimateOrderedAnchorSetupCost(
 
 	for _, e := range leaves {
 		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-		if e.Not || e.FieldOrdinal < 0 || e.Op == qir.OpNOOP {
+		if e.Not || e.FieldOrdinal < 0 || e.Op == qir.OpConst {
 			continue
 		}
 		if fieldName == orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
@@ -2532,7 +2532,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 			orderRangeLeaves++
 		}
 
-		if e.Op == qir.OpNOOP && !e.Not {
+		if e.Op == qir.OpConst && !e.Not {
 			continue
 		}
 		if coveredBuf[i] {
@@ -2663,7 +2663,7 @@ func (qv *View) estimateLeafOrderCost(
 ) (
 	selectivity float64, fallbackWork float64, orderRange bool, hasPrefix bool, ok bool) {
 
-	if e.Op == qir.OpNOOP {
+	if e.Op == qir.OpConst {
 		if e.Not {
 			return 0, 0, false, false, true
 		}

@@ -31,11 +31,12 @@ func mustLimitQIRExpr[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], ex
 
 func mustLimitQIRLeaves[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) []qir.Expr {
 	t.Helper()
-	leaves, ok := qir.CollectAndLeaves(mustLimitQIRExpr(t, db, expr), qir.LeafModeCollect)
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesInto(mustLimitQIRExpr(t, db, expr), leavesBuf[:0], qir.LeafModeCollect)
 	if !ok {
-		t.Fatalf("collectAndLeaves failed")
+		t.Fatalf("CollectAndLeavesInto failed")
 	}
-	return leaves
+	return append([]qir.Expr(nil), leaves...)
 }
 
 func filterQIRLeavesByField[K ~string | ~uint64, V any](db *DB[K, V], leaves []qir.Expr, field string) []qir.Expr {
