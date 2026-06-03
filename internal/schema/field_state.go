@@ -296,7 +296,7 @@ type InsertSink struct {
 }
 
 func (s InsertSink) setNil() {
-	s.state.nils = indexdata.AddStringPostingAddOwned(s.state.nils, &s.state.arena, indexdata.NilIndexEntryKey, s.idx, s.state.nilsHint)
+	s.state.nils = indexdata.AddStringPostingAdd(s.state.nils, &s.state.arena, indexdata.NilIndexEntryKey, s.idx, s.state.nilsHint)
 	s.state.changed = true
 }
 
@@ -312,12 +312,12 @@ func (s InsertSink) setLen(length int) {
 }
 
 func (s InsertSink) addString(key string) {
-	s.state.index = indexdata.AddStringPostingAddOwned(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
+	s.state.index = indexdata.AddStringPostingAdd(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
 	s.state.changed = true
 }
 
 func (s InsertSink) addFixed(key uint64) {
-	s.state.fixed = indexdata.AddFixedPostingAddOwned(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
+	s.state.fixed = indexdata.AddFixedPostingAdd(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
 	s.state.changed = true
 }
 
@@ -379,13 +379,13 @@ func snapshotFieldStorageHint(base indexdata.FieldStorage, batchHint int) int {
 
 func (acc IndexedFieldAccessor) MergeInsertStorageOwned(base indexdata.FieldStorage, state *InsertState, allowChunk bool) indexdata.FieldStorage {
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
-		return base.MergeFixedPostingAddsRetainMapOwned(state.fixed, state.arena, allowChunk)
+		return base.MergeFixedPostingAdds(state.fixed, state.arena, allowChunk)
 	}
-	return base.MergeStringPostingAddsRetainMapOwned(state.index, state.arena, false, allowChunk)
+	return base.MergeStringPostingAdds(state.index, state.arena, false, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) MergeInsertNilStorageOwned(base indexdata.FieldStorage, state *InsertState) indexdata.FieldStorage {
-	return base.MergeStringPostingAddsRetainMapOwned(state.nils, state.arena, false, false)
+	return base.MergeStringPostingAdds(state.nils, state.arena, false, false)
 }
 
 func (state *InsertState) Reset() {
@@ -446,10 +446,10 @@ func (acc IndexedFieldAccessor) CollectBatchDiff(idx uint64, oldPtr, newPtr unsa
 
 	if state.old.isNil != state.new.isNil {
 		if state.old.isNil {
-			state.nils = indexdata.AddStringPostingDiffOwned(state.nils, &state.arena, indexdata.NilIndexEntryKey, idx, false)
+			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, indexdata.NilIndexEntryKey, idx, false)
 		}
 		if state.new.isNil {
-			state.nils = indexdata.AddStringPostingDiffOwned(state.nils, &state.arena, indexdata.NilIndexEntryKey, idx, true)
+			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, indexdata.NilIndexEntryKey, idx, true)
 		}
 		state.changed = true
 	}
@@ -540,13 +540,13 @@ func (acc IndexedFieldAccessor) CollectBatchDiff(idx uint64, oldPtr, newPtr unsa
 
 func (acc IndexedFieldAccessor) ApplyBatchStorageOwned(base indexdata.FieldStorage, state *BatchState, allowChunk bool) indexdata.FieldStorage {
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
-		return base.ApplyFixedPostingDiffRetainMapOwned(state.fixed, state.arena, allowChunk)
+		return base.ApplyFixedPostingDiff(state.fixed, state.arena, allowChunk)
 	}
-	return base.ApplyStringPostingDiffRetainMapOwned(state.index, state.arena, false, allowChunk)
+	return base.ApplyStringPostingDiff(state.index, state.arena, false, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) ApplyBatchNilStorageOwned(base indexdata.FieldStorage, state *BatchState) indexdata.FieldStorage {
-	return base.ApplyStringPostingDiffRetainMapOwned(state.nils, state.arena, false, false)
+	return base.ApplyStringPostingDiff(state.nils, state.arena, false, false)
 }
 
 func (state *BatchState) Reset() {
@@ -624,11 +624,11 @@ func collectFieldBatchPostingDiffBuf(fieldDelta map[string]uint32, arena **index
 		newVal := newVals[j]
 		switch {
 		case oldVal < newVal:
-			fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+			fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false)
 			changed = true
 			i++
 		case oldVal > newVal:
-			fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+			fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true)
 			changed = true
 			j++
 		default:
@@ -638,11 +638,11 @@ func collectFieldBatchPostingDiffBuf(fieldDelta map[string]uint32, arena **index
 	}
 
 	for ; i < oldLen; i++ {
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVals[i], idx, false)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVals[i], idx, false)
 		changed = true
 	}
 	for ; j < newLen; j++ {
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVals[j], idx, true)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVals[j], idx, true)
 		changed = true
 	}
 
@@ -664,11 +664,11 @@ func collectFixedFieldBatchPostingDiffBuf(fieldDelta map[uint64]uint32, arena **
 		newVal := newVals[j]
 		switch {
 		case oldVal < newVal:
-			fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+			fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false)
 			changed = true
 			i++
 		case oldVal > newVal:
-			fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+			fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true)
 			changed = true
 			j++
 		default:
@@ -678,11 +678,11 @@ func collectFixedFieldBatchPostingDiffBuf(fieldDelta map[uint64]uint32, arena **
 	}
 
 	for ; i < oldLen; i++ {
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVals[i], idx, false)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVals[i], idx, false)
 		changed = true
 	}
 	for ; j < newLen; j++ {
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVals[j], idx, true)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVals[j], idx, true)
 		changed = true
 	}
 
@@ -705,16 +705,16 @@ func collectScalarFieldBatchPostingDiff(
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 
 	case oldOK:
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false)
 		return fieldDelta, true
 
 	case newOK:
-		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 
 	default:
@@ -738,16 +738,16 @@ func collectScalarFixedFieldBatchPostingDiff(
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 
 	case oldOK:
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false)
 		return fieldDelta, true
 
 	case newOK:
-		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
+		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 
 	default:

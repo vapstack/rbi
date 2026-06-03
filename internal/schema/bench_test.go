@@ -390,7 +390,7 @@ func BenchmarkInsertStateCollectMergeReset(b *testing.B) {
 				storage.Release()
 				nilStorage.Release()
 				if diff := state.LenDiff(); diff != nil {
-					lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(diff)
+					lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(diff)
 					benchmarkSchemaIntSink += lenStorage.KeyCount()
 					lenStorage.Release()
 				}
@@ -423,7 +423,7 @@ func BenchmarkBatchStateCollectApplyReset(b *testing.B) {
 				storage.Release()
 				nilStorage.Release()
 				if diff := state.LenDiff(); diff != nil {
-					lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(diff)
+					lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(diff)
 					benchmarkSchemaIntSink += lenStorage.KeyCount()
 					lenStorage.Release()
 				}

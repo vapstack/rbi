@@ -5,8 +5,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-const postingAccumMapMaxLen = 4 << 10
-
 var (
 	postingMapPool = pooled.Maps[string, posting.List]{
 		NewCap: 64,
@@ -28,36 +26,6 @@ var (
 		NewCap: 64,
 		MaxLen: 4 << 10,
 	}
-	postingDiffArenaPool = pooled.Pointers[PostingDiffArena]{
-		New: func() *PostingDiffArena {
-			return &PostingDiffArena{values: make([]postingDiffAccum, 0, 8)}
-		},
-	}
-	postingAddArenaPool = pooled.Pointers[PostingAddArena]{
-		New: func() *PostingAddArena {
-			return &PostingAddArena{values: make([]postingAddAccum, 0, 8)}
-		},
-	}
-	lenPostingDiffPool = pooled.Pointers[LenPostingDiff]{
-		Clear: true,
-	}
-	stringPostingDiffMapPool = pooled.Maps[string, uint32]{
-		NewCap: 256,
-		MaxLen: postingAccumMapMaxLen,
-	}
-	fixedPostingDiffMapPool = pooled.Maps[uint64, uint32]{
-		NewCap: 256,
-		MaxLen: postingAccumMapMaxLen,
-	}
-	stringPostingAddMapPool = pooled.Maps[string, uint32]{
-		NewCap: 256,
-		MaxLen: postingAccumMapMaxLen,
-	}
-	fixedPostingAddMapPool = pooled.Maps[uint64, uint32]{
-		NewCap: 256,
-		MaxLen: postingAccumMapMaxLen,
-	}
-
 	fieldIndexFlatRootPool = pooled.Pointers[fieldIndexFlatRoot]{
 		Cleanup: func(r *fieldIndexFlatRoot) {
 			for i := range r.entries {
@@ -229,15 +197,6 @@ func ReleaseBatchPostingDeltaMap(m map[uint64]BatchPostingDelta) { batchPostingD
 
 func GetLenPostingMap() map[uint32]posting.List      { return lenPostingMapPool.Get() }
 func ReleaseLenPostingMap(m map[uint32]posting.List) { lenPostingMapPool.Put(m) }
-
-// todo: rework this >>
-
-func PutStringPostingDiffMap(m map[string]uint32) { stringPostingDiffMapPool.Put(m) }
-func PutFixedPostingDiffMap(m map[uint64]uint32)  { fixedPostingDiffMapPool.Put(m) }
-func PutStringPostingAddMap(m map[string]uint32)  { stringPostingAddMapPool.Put(m) }
-func PutFixedPostingAddMap(m map[uint64]uint32)   { fixedPostingAddMapPool.Put(m) }
-
-// <<
 
 func GetFieldStorageSlice(capHint int) []FieldStorage { return fieldStorageSlicePool.Get(capHint) }
 func ReleaseFieldStorageSlice(slots []FieldStorage)   { fieldStorageSlicePool.Put(slots) }

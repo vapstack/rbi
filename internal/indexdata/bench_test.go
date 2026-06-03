@@ -1548,7 +1548,7 @@ func BenchmarkApplyFieldPostingDiffStorageBufOwnedChunked(b *testing.B) {
 	benchUint64 = uint64(total)
 }
 
-func BenchmarkFieldStorageMergeStringPostingAddsOwned(b *testing.B) {
+func BenchmarkFieldStorageMergeStringPostingAdds(b *testing.B) {
 	const deltaCount = 128
 	keys := make([]string, deltaCount)
 	for i := range keys {
@@ -1558,21 +1558,22 @@ func BenchmarkFieldStorageMergeStringPostingAddsOwned(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
+	var arena *PostingAddArena
+	var adds map[string]uint32
 	for i := 0; i < b.N; i++ {
-		var arena *PostingAddArena
-		var adds map[string]uint32
 		for j := 0; j < deltaCount; j++ {
 			adds = AddStringPostingAdd(adds, &arena, keys[j], uint64(i*deltaCount+j+1), deltaCount)
 		}
-		storage := FieldStorage{}.MergeStringPostingAddsOwned(adds, arena, false, true)
+		storage := FieldStorage{}.MergeStringPostingAdds(adds, arena, false, true)
 		total += storage.KeyCount()
 		storage.Release()
-		arena.Release()
+		clear(adds)
+		arena.Reset()
 	}
 	benchUint64 = uint64(total)
 }
 
-func BenchmarkFieldStorageMergeFixedPostingAddsOwned(b *testing.B) {
+func BenchmarkFieldStorageMergeFixedPostingAdds(b *testing.B) {
 	const deltaCount = 128
 	keys := make([]uint64, deltaCount)
 	for i := range keys {
@@ -1582,21 +1583,22 @@ func BenchmarkFieldStorageMergeFixedPostingAddsOwned(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
+	var arena *PostingAddArena
+	var adds map[uint64]uint32
 	for i := 0; i < b.N; i++ {
-		var arena *PostingAddArena
-		var adds map[uint64]uint32
 		for j := 0; j < deltaCount; j++ {
 			adds = AddFixedPostingAdd(adds, &arena, keys[j], uint64(i*deltaCount+j+1), deltaCount)
 		}
-		storage := FieldStorage{}.MergeFixedPostingAddsOwned(adds, arena, true)
+		storage := FieldStorage{}.MergeFixedPostingAdds(adds, arena, true)
 		total += storage.KeyCount()
 		storage.Release()
-		arena.Release()
+		clear(adds)
+		arena.Reset()
 	}
 	benchUint64 = uint64(total)
 }
 
-func BenchmarkFieldStorageApplyStringPostingDiffOwned(b *testing.B) {
+func BenchmarkFieldStorageApplyStringPostingDiff(b *testing.B) {
 	const rows = FieldChunkThreshold * 4
 	const deltaCount = 64
 
@@ -1612,22 +1614,23 @@ func BenchmarkFieldStorageApplyStringPostingDiffOwned(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
+	var arena *PostingDiffArena
+	var deltas map[string]uint32
 	for i := 0; i < b.N; i++ {
-		var arena *PostingDiffArena
-		var deltas map[string]uint32
 		for j := 0; j < deltaCount; j++ {
-			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(base+j+1), false, deltaCount)
-			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(10_000_000+i*deltaCount+j), true, deltaCount)
+			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(base+j+1), false)
+			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(10_000_000+i*deltaCount+j), true)
 		}
-		next := storage.ApplyStringPostingDiffOwned(deltas, arena, false, true)
+		next := storage.ApplyStringPostingDiff(deltas, arena, false, true)
 		total += next.KeyCount()
 		next.Release()
-		arena.Release()
+		clear(deltas)
+		arena.Reset()
 	}
 	benchUint64 = uint64(total)
 }
 
-func BenchmarkFieldStorageApplyLenPostingDiffOwned(b *testing.B) {
+func BenchmarkFieldStorageApplyLenPostingDiff(b *testing.B) {
 	const rows = 512
 	const deltaCount = 64
 
@@ -1647,15 +1650,15 @@ func BenchmarkFieldStorageApplyLenPostingDiffOwned(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
+	var deltas *LenPostingDiff
 	for i := 0; i < b.N; i++ {
-		var deltas *LenPostingDiff
 		base := uint64(rows + i*deltaCount + 1)
 		for j := 0; j < deltaCount; j++ {
 			id := base + uint64(j)
-			AddLenPostingBucketDiff(&deltas, id, 1, true)
-			AddLenPostingNonEmptyDiff(&deltas, id, true)
+			deltas = AddLenPostingBucket(deltas, id, 1, true)
+			deltas = AddLenPostingNonEmpty(deltas, id, true)
 		}
-		next := storage.ApplyLenPostingDiffOwned(deltas)
+		next := storage.ApplyLenPostingDiff(deltas)
 		total += next.KeyCount()
 		next.Release()
 	}

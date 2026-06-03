@@ -992,7 +992,7 @@ func TestInsertStateResetDropsPreviousLogicalEntries(t *testing.T) {
 
 	storage := rt.IndexedByName["tags"].MergeInsertStorageOwned(indexdata.FieldStorage{}, &state, false)
 	defer storage.Release()
-	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(state.LenDiff())
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(state.LenDiff())
 	defer lenStorage.Release()
 	state.Reset()
 
@@ -1120,7 +1120,7 @@ func TestBatchStateResetDropsPreviousLogicalEntries(t *testing.T) {
 
 	storage := rt.IndexedByName["tags"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &state, false)
 	defer storage.Release()
-	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiffRetainOwned(state.LenDiff())
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(state.LenDiff())
 	defer lenStorage.Release()
 	state.Reset()
 

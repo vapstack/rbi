@@ -424,7 +424,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 		}
 		if lenDiff := state.LenDiff(); lenDiff != nil {
 			baseLen := next.LenIndex[i]
-			if storage := baseLen.ApplyLenPostingDiffRetainOwned(lenDiff); storage != baseLen {
+			if storage := baseLen.ApplyLenPostingDiff(lenDiff); storage != baseLen {
 				next.LenIndex[i] = storage
 			}
 		}
@@ -685,7 +685,7 @@ func buildPreparedSnapshotAggregated(
 		}
 		if lenDiff := state.LenDiff(); lenDiff != nil {
 			baseLen := next.LenIndex[ordinal]
-			if storage := baseLen.ApplyLenPostingDiffRetainOwned(lenDiff); storage != baseLen {
+			if storage := baseLen.ApplyLenPostingDiff(lenDiff); storage != baseLen {
 				next.LenIndex[ordinal] = storage
 			}
 		}

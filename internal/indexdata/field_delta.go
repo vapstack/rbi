@@ -8,7 +8,10 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-const LenIndexNonEmptyKey = "\xFFNONEMPTY"
+const (
+	LenIndexNonEmptyKey   = "\xFFNONEMPTY"
+	postingAccumMapMaxLen = 4 << 10
+)
 
 type BatchPostingDelta struct {
 	Add    posting.List
@@ -39,22 +42,6 @@ type LenPostingDiff struct {
 	lengths     map[uint64]BatchPostingDelta
 	nonEmpty    BatchPostingDelta
 	hasNonEmpty bool
-}
-
-func getPostingDiffArena(capHint int) *PostingDiffArena {
-	arena := postingDiffArenaPool.Get()
-	if cap(arena.values) < capHint {
-		arena.values = slices.Grow(arena.values, capHint)
-	}
-	return arena
-}
-
-func (arena *PostingDiffArena) Release() {
-	if arena == nil {
-		return
-	}
-	arena.Reset()
-	postingDiffArenaPool.Put(arena)
 }
 
 func (arena *PostingDiffArena) Reset() {
@@ -107,44 +94,14 @@ func AddStringPostingDiff(
 	key string,
 	idx uint64,
 	isAdd bool,
-	capHint int,
-) map[string]uint32 {
-	if fieldDelta == nil {
-		fieldDelta = stringPostingDiffMapPool.Get()
-	}
-	return addStringPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
-}
-
-func AddStringPostingDiffOwned(
-	fieldDelta map[string]uint32,
-	arena **PostingDiffArena,
-	key string,
-	idx uint64,
-	isAdd bool,
 ) map[string]uint32 {
 	if fieldDelta == nil {
 		fieldDelta = make(map[string]uint32, 8)
 	}
-	return addStringPostingDiff(fieldDelta, arena, key, idx, isAdd, 0, false)
-}
-
-func addStringPostingDiff(
-	fieldDelta map[string]uint32,
-	arena **PostingDiffArena,
-	key string,
-	idx uint64,
-	isAdd bool,
-	capHint int,
-	pooledArena bool,
-) map[string]uint32 {
 	ref, ok := fieldDelta[key]
 	if !ok {
 		if *arena == nil {
-			if pooledArena {
-				*arena = getPostingDiffArena(capHint)
-			} else {
-				*arena = &PostingDiffArena{}
-			}
+			*arena = &PostingDiffArena{}
 		}
 		ref = (*arena).alloc()
 		fieldDelta[key] = ref
@@ -159,66 +116,20 @@ func AddFixedPostingDiff(
 	key uint64,
 	idx uint64,
 	isAdd bool,
-	capHint int,
-) map[uint64]uint32 {
-	if fieldDelta == nil {
-		fieldDelta = fixedPostingDiffMapPool.Get()
-	}
-	return addFixedPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
-}
-
-func AddFixedPostingDiffOwned(
-	fieldDelta map[uint64]uint32,
-	arena **PostingDiffArena,
-	key uint64,
-	idx uint64,
-	isAdd bool,
 ) map[uint64]uint32 {
 	if fieldDelta == nil {
 		fieldDelta = make(map[uint64]uint32, 8)
 	}
-	return addFixedPostingDiff(fieldDelta, arena, key, idx, isAdd, 0, false)
-}
-
-func addFixedPostingDiff(
-	fieldDelta map[uint64]uint32,
-	arena **PostingDiffArena,
-	key uint64,
-	idx uint64,
-	isAdd bool,
-	capHint int,
-	pooledArena bool,
-) map[uint64]uint32 {
 	ref, ok := fieldDelta[key]
 	if !ok {
 		if *arena == nil {
-			if pooledArena {
-				*arena = getPostingDiffArena(capHint)
-			} else {
-				*arena = &PostingDiffArena{}
-			}
+			*arena = &PostingDiffArena{}
 		}
 		ref = (*arena).alloc()
 		fieldDelta[key] = ref
 	}
 	(*arena).accum(ref).addID(idx, isAdd)
 	return fieldDelta
-}
-
-func getPostingAddArena(capHint int) *PostingAddArena {
-	arena := postingAddArenaPool.Get()
-	if cap(arena.values) < capHint {
-		arena.values = slices.Grow(arena.values, capHint)
-	}
-	return arena
-}
-
-func (arena *PostingAddArena) Release() {
-	if arena == nil {
-		return
-	}
-	arena.Reset()
-	postingAddArenaPool.Put(arena)
 }
 
 func (arena *PostingAddArena) Reset() {
@@ -318,40 +229,12 @@ func AddStringPostingAdd(
 	capHint int,
 ) map[string]uint32 {
 	if fieldMap == nil {
-		fieldMap = stringPostingAddMapPool.Get()
-	}
-	return addStringPostingAdd(fieldMap, arena, key, idx, capHint, true)
-}
-
-func AddStringPostingAddOwned(
-	fieldMap map[string]uint32,
-	arena **PostingAddArena,
-	key string,
-	idx uint64,
-	capHint int,
-) map[string]uint32 {
-	if fieldMap == nil {
 		fieldMap = make(map[string]uint32, max(8, min(capHint, postingAccumMapMaxLen)))
 	}
-	return addStringPostingAdd(fieldMap, arena, key, idx, capHint, false)
-}
-
-func addStringPostingAdd(
-	fieldMap map[string]uint32,
-	arena **PostingAddArena,
-	key string,
-	idx uint64,
-	capHint int,
-	pooledArena bool,
-) map[string]uint32 {
 	ref, ok := fieldMap[key]
 	if !ok {
 		if *arena == nil {
-			if pooledArena {
-				*arena = getPostingAddArena(capHint)
-			} else {
-				*arena = &PostingAddArena{}
-			}
+			*arena = &PostingAddArena{}
 		}
 		ref = (*arena).alloc()
 		fieldMap[key] = ref
@@ -368,78 +251,18 @@ func AddFixedPostingAdd(
 	capHint int,
 ) map[uint64]uint32 {
 	if fieldMap == nil {
-		fieldMap = fixedPostingAddMapPool.Get()
-	}
-	return addFixedPostingAdd(fieldMap, arena, key, idx, capHint, true)
-}
-
-func AddFixedPostingAddOwned(
-	fieldMap map[uint64]uint32,
-	arena **PostingAddArena,
-	key uint64,
-	idx uint64,
-	capHint int,
-) map[uint64]uint32 {
-	if fieldMap == nil {
 		fieldMap = make(map[uint64]uint32, max(8, min(capHint, postingAccumMapMaxLen)))
 	}
-	return addFixedPostingAdd(fieldMap, arena, key, idx, capHint, false)
-}
-
-func addFixedPostingAdd(
-	fieldMap map[uint64]uint32,
-	arena **PostingAddArena,
-	key uint64,
-	idx uint64,
-	capHint int,
-	pooledArena bool,
-) map[uint64]uint32 {
 	ref, ok := fieldMap[key]
 	if !ok {
 		if *arena == nil {
-			if pooledArena {
-				*arena = getPostingAddArena(capHint)
-			} else {
-				*arena = &PostingAddArena{}
-			}
+			*arena = &PostingAddArena{}
 		}
 		ref = (*arena).alloc()
 		fieldMap[key] = ref
 	}
 	(*arena).accum(ref).add(idx)
 	return fieldMap
-}
-
-func (d *LenPostingDiff) putAfterMove() {
-	if d == nil {
-		return
-	}
-	if d.lengths != nil {
-		ReleaseBatchPostingDeltaMap(d.lengths)
-		d.lengths = nil
-	}
-	d.nonEmpty = BatchPostingDelta{}
-	d.hasNonEmpty = false
-	lenPostingDiffPool.Put(d)
-}
-
-func (d *LenPostingDiff) Release() {
-	if d == nil {
-		return
-	}
-	if d.lengths != nil {
-		for _, lengthDelta := range d.lengths {
-			lengthDelta.Add.Release()
-			lengthDelta.Remove.Release()
-		}
-		ReleaseBatchPostingDeltaMap(d.lengths)
-		d.lengths = nil
-	}
-	d.nonEmpty.Add.Release()
-	d.nonEmpty.Remove.Release()
-	d.nonEmpty = BatchPostingDelta{}
-	d.hasNonEmpty = false
-	lenPostingDiffPool.Put(d)
 }
 
 func (d *LenPostingDiff) Reset() {
@@ -478,26 +301,6 @@ func (d *LenPostingDiff) resetAfterMove() {
 	d.hasNonEmpty = false
 }
 
-func ensureLenPostingDiff(delta **LenPostingDiff) *LenPostingDiff {
-	if *delta == nil {
-		*delta = lenPostingDiffPool.Get()
-		if (*delta).lengths == nil {
-			(*delta).lengths = GetBatchPostingDeltaMap()
-		}
-	}
-	return *delta
-}
-
-func AddLenPostingBucketDiff(fieldDelta **LenPostingDiff, idx uint64, length int, isAdd bool) {
-	delta := ensureLenPostingDiff(fieldDelta)
-	delta.lengths = addFixedBatchPostingDelta(delta.lengths, uint64(length), idx, isAdd)
-}
-
-func AddLenPostingNonEmptyDiff(fieldDelta **LenPostingDiff, idx uint64, isAdd bool) {
-	delta := ensureLenPostingDiff(fieldDelta)
-	delta.AddNonEmpty(idx, isAdd)
-}
-
 func AddLenPostingBucket(fieldDelta *LenPostingDiff, idx uint64, length int, isAdd bool) *LenPostingDiff {
 	if fieldDelta == nil {
 		fieldDelta = &LenPostingDiff{}
@@ -534,20 +337,6 @@ func (d *LenPostingDiff) AddNonEmpty(idx uint64, isAdd bool) {
 	} else {
 		d.nonEmpty.Remove = d.nonEmpty.Remove.BuildAdded(idx)
 	}
-}
-
-func addFixedBatchPostingDelta(fieldDelta map[uint64]BatchPostingDelta, key uint64, idx uint64, isAdd bool) map[uint64]BatchPostingDelta {
-	if fieldDelta == nil {
-		fieldDelta = GetBatchPostingDeltaMap()
-	}
-	delta := fieldDelta[key]
-	if isAdd {
-		delta.Add = delta.Add.BuildAdded(idx)
-	} else {
-		delta.Remove = delta.Remove.BuildAdded(idx)
-	}
-	fieldDelta[key] = delta
-	return fieldDelta
 }
 
 func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingDiffArena, fixed8 bool) []PostingDelta {
@@ -612,17 +401,7 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 	return buf
 }
 
-func (s FieldStorage) ApplyStringPostingDiffOwned(
-	deltas map[string]uint32,
-	arena *PostingDiffArena,
-	fixed8 bool,
-	allowChunk bool,
-) FieldStorage {
-	defer PutStringPostingDiffMap(deltas)
-	return s.ApplyStringPostingDiffRetainMapOwned(deltas, arena, fixed8, allowChunk)
-}
-
-func (s FieldStorage) ApplyStringPostingDiffRetainMapOwned(
+func (s FieldStorage) ApplyStringPostingDiff(
 	deltas map[string]uint32,
 	arena *PostingDiffArena,
 	fixed8 bool,
@@ -635,16 +414,7 @@ func (s FieldStorage) ApplyStringPostingDiffRetainMapOwned(
 	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func (s FieldStorage) ApplyFixedPostingDiffOwned(
-	deltas map[uint64]uint32,
-	arena *PostingDiffArena,
-	allowChunk bool,
-) FieldStorage {
-	defer PutFixedPostingDiffMap(deltas)
-	return s.ApplyFixedPostingDiffRetainMapOwned(deltas, arena, allowChunk)
-}
-
-func (s FieldStorage) ApplyFixedPostingDiffRetainMapOwned(
+func (s FieldStorage) ApplyFixedPostingDiff(
 	deltas map[uint64]uint32,
 	arena *PostingDiffArena,
 	allowChunk bool,
@@ -706,17 +476,7 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]uint32, arena *PostingAddAre
 	return buf
 }
 
-func (s FieldStorage) MergeStringPostingAddsOwned(
-	adds map[string]uint32,
-	arena *PostingAddArena,
-	fixed8 bool,
-	allowChunk bool,
-) FieldStorage {
-	defer PutStringPostingAddMap(adds)
-	return s.MergeStringPostingAddsRetainMapOwned(adds, arena, fixed8, allowChunk)
-}
-
-func (s FieldStorage) MergeStringPostingAddsRetainMapOwned(
+func (s FieldStorage) MergeStringPostingAdds(
 	adds map[string]uint32,
 	arena *PostingAddArena,
 	fixed8 bool,
@@ -732,16 +492,7 @@ func (s FieldStorage) MergeStringPostingAddsRetainMapOwned(
 	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func (s FieldStorage) MergeFixedPostingAddsOwned(
-	adds map[uint64]uint32,
-	arena *PostingAddArena,
-	allowChunk bool,
-) FieldStorage {
-	defer PutFixedPostingAddMap(adds)
-	return s.MergeFixedPostingAddsRetainMapOwned(adds, arena, allowChunk)
-}
-
-func (s FieldStorage) MergeFixedPostingAddsRetainMapOwned(
+func (s FieldStorage) MergeFixedPostingAdds(
 	adds map[uint64]uint32,
 	arena *PostingAddArena,
 	allowChunk bool,
@@ -837,23 +588,15 @@ func (d *LenPostingDiff) takeOwned(dst []PostingDelta) int {
 	return n
 }
 
-func (s FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStorage {
-	return s.applyLenPostingDiffOwned(deltas, false)
-}
-
-func (s FieldStorage) ApplyLenPostingDiffRetainOwned(deltas *LenPostingDiff) FieldStorage {
-	return s.applyLenPostingDiffOwned(deltas, true)
-}
-
-func (s FieldStorage) applyLenPostingDiffOwned(deltas *LenPostingDiff, retain bool) FieldStorage {
+func (s FieldStorage) ApplyLenPostingDiff(deltas *LenPostingDiff) FieldStorage {
 	count := deltas.count()
 	if count == 0 {
-		deltas.finishAfterMove(retain)
+		deltas.resetAfterMove()
 		return s
 	}
 	if count == 1 {
 		delta, ok := deltas.takeSingleOwned()
-		deltas.finishAfterMove(retain)
+		deltas.resetAfterMove()
 		if !ok {
 			return s
 		}
@@ -868,14 +611,14 @@ func (s FieldStorage) applyLenPostingDiffOwned(deltas *LenPostingDiff, retain bo
 	var buf []PostingDelta
 	if count <= len(inline) {
 		n := deltas.takeOwned(inline[:count])
-		deltas.finishAfterMove(retain)
+		deltas.resetAfterMove()
 		deltaKeys = inline[:n]
 		if len(deltaKeys) > 1 && keycodec.Compare(deltaKeys[0].Key, deltaKeys[1].Key) > 0 {
 			deltaKeys[0], deltaKeys[1] = deltaKeys[1], deltaKeys[0]
 		}
 	} else {
 		buf = deltas.sortedBufOwned()
-		deltas.finishAfterMove(retain)
+		deltas.resetAfterMove()
 		if buf == nil {
 			return s
 		}
@@ -891,14 +634,6 @@ func (s FieldStorage) applyLenPostingDiffOwned(deltas *LenPostingDiff, retain bo
 		return storage
 	}
 	return FieldStorage{}
-}
-
-func (d *LenPostingDiff) finishAfterMove(retain bool) {
-	if retain {
-		d.resetAfterMove()
-		return
-	}
-	d.putAfterMove()
 }
 
 func (d *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
