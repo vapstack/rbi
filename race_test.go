@@ -991,6 +991,288 @@ func raceExtraRangeKeys(startInclusive, endExclusive, total int) []uint64 {
 	return out
 }
 
+func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
+	if !testRaceEnabled {
+		t.Skip("race-only public DB workload")
+	}
+
+	db := raceExtraOpenTempDBUint64(t, Options{
+		AnalyzeInterval:                             -1,
+		AutoBatchWindow:                             25 * time.Microsecond,
+		AutoBatchMax:                                16,
+		AutoBatchMaxQueue:                           1024,
+		SnapshotMaterializedPredCacheMaxEntries:     4,
+		SnapshotMaterializedPredCacheMaxCardinality: 96,
+		NumericRangeBucketSize:                      64,
+		NumericRangeBucketMinFieldKeys:              1,
+		NumericRangeBucketMinSpanKeys:               1,
+	})
+
+	const total = 4096
+	raceExtraSeedGeneratedUint64Data(t, db, total, func(i int) *raceExtraRec {
+		opt := fmt.Sprintf("opt-%d", i%17)
+		return &raceExtraRec{
+			raceExtraMeta: raceExtraMeta{Country: []string{"NL", "PL", "DE", "US"}[i&3]},
+			Name:          fmt.Sprintf("user-%d", i%257),
+			Email:         fmt.Sprintf("user-%05d@example.test", i),
+			Age:           i,
+			Score:         float64(i%997) + float64(i&7)*0.25,
+			Active:        i&1 == 0,
+			Tags:          []string{[]string{"go", "db", "ops", "rust", "java"}[i%5], []string{"hot", "cold", "blue"}[i%3]},
+			FullName:      fmt.Sprintf("Full Name %04d", i),
+			Opt:           &opt,
+		}
+	})
+
+	queries := []*qx.QX{
+		qx.Query(qx.GTE("age", total-96)),
+		qx.Query(qx.LT("age", 96)),
+		qx.Query(qx.GTE("age", 1024), qx.LT("age", 1120)),
+		qx.Query(qx.GTE("score", 700), qx.LT("score", 760)),
+		qx.Query(qx.PREFIX("email", "user-00")),
+		qx.Query(qx.PREFIX("name", "user-1")),
+		qx.Query(qx.HASANY("tags", []string{"go", "db"})),
+		qx.Query(qx.AND(qx.EQ("active", true), qx.GTE("age", 2048))),
+		qx.Query(qx.OR(qx.LT("age", 32), qx.PREFIX("name", "user-2"))),
+		qx.Query(qx.GTE("age", 1024), qx.LT("age", 3072)).Sort("age", qx.ASC).Limit(128),
+		qx.Query(qx.GTE("score", 200), qx.LT("score", 980)).Sort("score", qx.DESC).Offset(64).Limit(128),
+		qx.Query(qx.PREFIX("full_name", "Full Name")).Sort("full_name", qx.ASC).Offset(32).Limit(96),
+		qx.Query(qx.HASANY("tags", []string{"go", "ops"})).Limit(128),
+		qx.Query(qx.AND(qx.EQ("active", true), qx.GTE("age", 128))).Offset(16).Limit(96),
+		qx.Query(qx.OR(
+			qx.AND(qx.EQ("active", true), qx.GTE("score", 500)),
+			qx.AND(qx.PREFIX("email", "user-01"), qx.LT("age", 2400)),
+			qx.AND(qx.HASANY("tags", []string{"db", "qa"}), qx.GTE("age", 64)),
+		)).Sort("score", qx.ASC).Offset(48).Limit(112),
+		queryOrderSortByArrayCount(
+			qx.Query(qx.HASANY("tags", []string{"go", "db", "qa"})),
+			"tags",
+			qx.DESC,
+		).Offset(8).Limit(80),
+	}
+	for i := range queries {
+		if _, err := db.QueryKeys(queries[i]); err != nil {
+			t.Fatalf("warm QueryKeys(%d): %v", i, err)
+		}
+		if _, err := db.Count(queries[i].Filter); err != nil {
+			t.Fatalf("warm Count(%d): %v", i, err)
+		}
+	}
+
+	record := func(id uint64, salt int) *raceExtraRec {
+		n := int(id) + salt
+		var opt *string
+		if n&3 != 0 {
+			v := fmt.Sprintf("opt-work-%d-%d", id, salt)
+			opt = &v
+		}
+		return &raceExtraRec{
+			raceExtraMeta: raceExtraMeta{Country: []string{"NL", "PL", "DE", "US", "FR"}[n%5]},
+			Name:          fmt.Sprintf("user-%d", n%311),
+			Email:         fmt.Sprintf("user-%05d@example.test", id),
+			Age:           n % (total + 768),
+			Score:         float64(n%1200) + float64(salt&15)*0.125,
+			Active:        n&1 == 0,
+			Tags:          []string{[]string{"go", "db", "ops", "rust", "java", "qa"}[n%6], []string{"hot", "cold", "blue", "green"}[n%4]},
+			FullName:      fmt.Sprintf("Workload %04d %04d", id, salt),
+			Opt:           opt,
+		}
+	}
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
+	}
+	checkErr := func(label string, err error) bool {
+		if err == nil {
+			return true
+		}
+		setFailed(fmt.Sprintf("%s failed: %v", label, err))
+		return false
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	writerN := min(6, max(4, runtime.GOMAXPROCS(0)/2))
+	readerN := min(12, max(8, runtime.GOMAXPROCS(0)))
+	const writerIterations = 1280
+	const readerIterations = 2048
+
+	for w := 0; w < writerN; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					setFailed(fmt.Sprintf("writer panic: %v", r))
+				}
+			}()
+			r := newRand(int64(20260701 + worker))
+			ids := make([]uint64, 0, 8)
+			vals := make([]*raceExtraRec, 0, 8)
+			<-start
+			for i := 0; i < writerIterations; i++ {
+				if failed.Load() != nil {
+					return
+				}
+				id := uint64(1 + r.IntN(total+512))
+				switch r.IntN(6) {
+				case 0:
+					if !checkErr("Set", db.Set(id, record(id, worker*10_000+i))) {
+						return
+					}
+				case 1:
+					patch := []Field{
+						{Name: "age", Value: r.IntN(total + 768)},
+						{Name: "score", Value: float64(r.IntN(1200)) + float64(i&7)*0.25},
+					}
+					if !checkErr("Patch numeric", db.Patch(id, patch)) {
+						return
+					}
+				case 2:
+					patch := []Field{
+						{Name: "active", Value: r.IntN(2) == 0},
+						{Name: "country", Value: []string{"NL", "PL", "DE", "US", "FR"}[r.IntN(5)]},
+						{Name: "tags", Value: []string{[]string{"go", "db", "ops", "rust", "java", "qa"}[r.IntN(6)]}},
+					}
+					if !checkErr("Patch indexed", db.Patch(id, patch)) {
+						return
+					}
+				case 3:
+					ids = ids[:0]
+					vals = vals[:0]
+					n := 2 + r.IntN(5)
+					for j := 0; j < n; j++ {
+						batchID := uint64(1 + r.IntN(total+512))
+						ids = append(ids, batchID)
+						vals = append(vals, record(batchID, worker*20_000+i*16+j))
+					}
+					if !checkErr("BatchSet", db.BatchSet(ids, vals)) {
+						return
+					}
+				case 4:
+					ids = ids[:0]
+					n := 2 + r.IntN(5)
+					for j := 0; j < n; j++ {
+						ids = append(ids, uint64(1+r.IntN(total+512)))
+					}
+					patch := []Field{{Name: "full_name", Value: fmt.Sprintf("batch-%d-%d", worker, i)}}
+					if !checkErr("BatchPatch", db.BatchPatch(ids, patch)) {
+						return
+					}
+				default:
+					if r.IntN(3) == 0 {
+						ids = ids[:0]
+						n := 2 + r.IntN(4)
+						for j := 0; j < n; j++ {
+							ids = append(ids, uint64(1+r.IntN(total+512)))
+						}
+						if !checkErr("BatchDelete", db.BatchDelete(ids)) {
+							return
+						}
+					} else if !checkErr("Delete", db.Delete(id)) {
+						return
+					}
+				}
+			}
+		}(w)
+	}
+
+	for g := 0; g < readerN; g++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					setFailed(fmt.Sprintf("reader panic: %v", r))
+				}
+			}()
+			r := newRand(int64(20260801 + worker))
+			batch := make([]uint64, 8)
+			var scanned []*raceExtraRec
+			<-start
+			for i := 0; i < readerIterations; i++ {
+				if failed.Load() != nil {
+					return
+				}
+				q := queries[r.IntN(len(queries))]
+				switch r.IntN(8) {
+				case 0:
+					if _, err := db.QueryKeys(q); !checkErr("QueryKeys", err) {
+						return
+					}
+				case 1:
+					if _, err := db.Count(q.Filter); !checkErr("Count", err) {
+						return
+					}
+				case 2:
+					items, err := db.Query(q)
+					if !checkErr("Query", err) {
+						return
+					}
+					db.ReleaseRecords(items...)
+				case 3:
+					rec, err := db.Get(uint64(1 + r.IntN(total+512)))
+					if !checkErr("Get", err) {
+						return
+					}
+					db.ReleaseRecords(rec)
+				case 4:
+					for j := range batch {
+						batch[j] = uint64(1 + r.IntN(total+512))
+					}
+					items, err := db.BatchGet(batch...)
+					if !checkErr("BatchGet", err) {
+						return
+					}
+					db.ReleaseRecords(items...)
+				case 5:
+					seen := 0
+					err := db.ScanKeys(uint64(1+r.IntN(total)), func(uint64) (bool, error) {
+						seen++
+						return seen < 24, nil
+					})
+					if !checkErr("ScanKeys", err) {
+						return
+					}
+				case 6:
+					scanned = scanned[:0]
+					err := db.SeqScan(uint64(1+r.IntN(total)), func(_ uint64, rec *raceExtraRec) (bool, error) {
+						scanned = append(scanned, rec)
+						return len(scanned) < 12, nil
+					})
+					if !checkErr("SeqScan", err) {
+						db.ReleaseRecords(scanned...)
+						return
+					}
+					db.ReleaseRecords(scanned...)
+				default:
+					if i&31 == 0 {
+						if !checkErr("RefreshPlannerStats", db.RefreshPlannerStats()) {
+							return
+						}
+					} else {
+						_ = db.Stats()
+						_ = db.IndexStats()
+						_ = db.AutoBatchStats()
+						_ = db.SnapshotStats()
+					}
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+}
+
 func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(t *testing.T) {
 	db := raceExtraOpenTempDBUint64(t, Options{
 		AnalyzeInterval:                             -1,
