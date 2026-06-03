@@ -21,7 +21,7 @@ type InsertState struct {
 	index   map[string]uint32
 	fixed   map[uint64]uint32
 	nils    map[string]uint32
-	arena   *indexdata.PostingAddArena
+	arena   indexdata.PostingAddArena
 	lengths *indexdata.LenPostingDiff
 	changed bool
 
@@ -66,7 +66,7 @@ type BatchState struct {
 	index   map[string]uint32
 	fixed   map[uint64]uint32
 	nils    map[string]uint32
-	arena   *indexdata.PostingDiffArena
+	arena   indexdata.PostingDiffArena
 	lengths *indexdata.LenPostingDiff
 	changed bool
 	old     WriteScratch
@@ -379,13 +379,13 @@ func snapshotFieldStorageHint(base indexdata.FieldStorage, batchHint int) int {
 
 func (acc IndexedFieldAccessor) MergeInsertStorageOwned(base indexdata.FieldStorage, state *InsertState, allowChunk bool) indexdata.FieldStorage {
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
-		return base.MergeFixedPostingAdds(state.fixed, state.arena, allowChunk)
+		return base.MergeFixedPostingAdds(state.fixed, &state.arena, allowChunk)
 	}
-	return base.MergeStringPostingAdds(state.index, state.arena, false, allowChunk)
+	return base.MergeStringPostingAdds(state.index, &state.arena, false, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) MergeInsertNilStorageOwned(base indexdata.FieldStorage, state *InsertState) indexdata.FieldStorage {
-	return base.MergeStringPostingAdds(state.nils, state.arena, false, false)
+	return base.MergeStringPostingAdds(state.nils, &state.arena, false, false)
 }
 
 func (state *InsertState) Reset() {
@@ -419,8 +419,7 @@ func (state *InsertState) discard() {
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	state.arena.Reset()
-	state.arena = nil
+	state.arena = indexdata.PostingAddArena{}
 	if state.lengths != nil {
 		state.lengths.Reset()
 		state.lengths = nil
@@ -540,13 +539,13 @@ func (acc IndexedFieldAccessor) CollectBatchDiff(idx uint64, oldPtr, newPtr unsa
 
 func (acc IndexedFieldAccessor) ApplyBatchStorageOwned(base indexdata.FieldStorage, state *BatchState, allowChunk bool) indexdata.FieldStorage {
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
-		return base.ApplyFixedPostingDiff(state.fixed, state.arena, allowChunk)
+		return base.ApplyFixedPostingDiff(state.fixed, &state.arena, allowChunk)
 	}
-	return base.ApplyStringPostingDiff(state.index, state.arena, false, allowChunk)
+	return base.ApplyStringPostingDiff(state.index, &state.arena, false, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) ApplyBatchNilStorageOwned(base indexdata.FieldStorage, state *BatchState) indexdata.FieldStorage {
-	return base.ApplyStringPostingDiff(state.nils, state.arena, false, false)
+	return base.ApplyStringPostingDiff(state.nils, &state.arena, false, false)
 }
 
 func (state *BatchState) Reset() {
@@ -580,8 +579,7 @@ func (state *BatchState) discard() {
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	state.arena.Reset()
-	state.arena = nil
+	state.arena = indexdata.PostingDiffArena{}
 	if state.lengths != nil {
 		state.lengths.Reset()
 		state.lengths = nil
@@ -609,7 +607,7 @@ func addFixedFieldPostingList(fieldMap map[uint64]posting.List, key uint64, idx 
 	return fieldMap
 }
 
-func collectFieldBatchPostingDiffBuf(fieldDelta map[string]uint32, arena **indexdata.PostingDiffArena, idx uint64, oldVals, newVals []string) (map[string]uint32, bool) {
+func collectFieldBatchPostingDiffBuf(fieldDelta map[string]uint32, arena *indexdata.PostingDiffArena, idx uint64, oldVals, newVals []string) (map[string]uint32, bool) {
 	oldLen := len(oldVals)
 	newLen := len(newVals)
 	if oldLen == 0 && newLen == 0 {
@@ -649,7 +647,7 @@ func collectFieldBatchPostingDiffBuf(fieldDelta map[string]uint32, arena **index
 	return fieldDelta, changed
 }
 
-func collectFixedFieldBatchPostingDiffBuf(fieldDelta map[uint64]uint32, arena **indexdata.PostingDiffArena, idx uint64, oldVals, newVals []uint64) (map[uint64]uint32, bool) {
+func collectFixedFieldBatchPostingDiffBuf(fieldDelta map[uint64]uint32, arena *indexdata.PostingDiffArena, idx uint64, oldVals, newVals []uint64) (map[uint64]uint32, bool) {
 	oldLen := len(oldVals)
 	newLen := len(newVals)
 	if oldLen == 0 && newLen == 0 {
@@ -691,7 +689,7 @@ func collectFixedFieldBatchPostingDiffBuf(fieldDelta map[uint64]uint32, arena **
 
 func collectScalarFieldBatchPostingDiff(
 	fieldDelta map[string]uint32,
-	arena **indexdata.PostingDiffArena,
+	arena *indexdata.PostingDiffArena,
 	idx uint64,
 	oldOK bool,
 	oldVal string,
@@ -724,7 +722,7 @@ func collectScalarFieldBatchPostingDiff(
 
 func collectScalarFixedFieldBatchPostingDiff(
 	fieldDelta map[uint64]uint32,
-	arena **indexdata.PostingDiffArena,
+	arena *indexdata.PostingDiffArena,
 	idx uint64,
 	oldOK bool,
 	oldVal uint64,

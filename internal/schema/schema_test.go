@@ -941,7 +941,7 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 		t.Fatal("insert reset left changed flag set")
 	}
 	state.discard()
-	if state.arena != nil || state.lengths != nil {
+	if state.Changed() || state.lengths != nil {
 		t.Fatal("insert discard kept owned internals")
 	}
 
@@ -1086,7 +1086,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 		t.Fatal("slice batch state missing len diff")
 	}
 	slice.discard()
-	if slice.arena != nil || slice.lengths != nil {
+	if slice.Changed() || slice.lengths != nil {
 		t.Fatal("batch discard kept owned internals")
 	}
 

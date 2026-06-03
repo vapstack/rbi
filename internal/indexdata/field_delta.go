@@ -52,9 +52,6 @@ type LenPostingDiff struct {
 }
 
 func (arena *PostingDiffArena) Reset() {
-	if arena == nil {
-		return
-	}
 	if cap(arena.values) > postingAccumMapMaxLen {
 		arena.values = nil
 		arena.used = 0
@@ -106,7 +103,7 @@ func (acc *postingDiffAccum) materializeOwned() BatchPostingDelta {
 
 func AddStringPostingDiff(
 	fieldDelta map[string]uint32,
-	arena **PostingDiffArena,
+	arena *PostingDiffArena,
 	key string,
 	idx uint64,
 	isAdd bool,
@@ -116,19 +113,16 @@ func AddStringPostingDiff(
 	}
 	ref, ok := fieldDelta[key]
 	if !ok {
-		if *arena == nil {
-			*arena = &PostingDiffArena{}
-		}
-		ref = (*arena).alloc()
+		ref = arena.alloc()
 		fieldDelta[key] = ref
 	}
-	(*arena).accum(ref).addID(idx, isAdd)
+	arena.accum(ref).addID(idx, isAdd)
 	return fieldDelta
 }
 
 func AddFixedPostingDiff(
 	fieldDelta map[uint64]uint32,
-	arena **PostingDiffArena,
+	arena *PostingDiffArena,
 	key uint64,
 	idx uint64,
 	isAdd bool,
@@ -138,20 +132,14 @@ func AddFixedPostingDiff(
 	}
 	ref, ok := fieldDelta[key]
 	if !ok {
-		if *arena == nil {
-			*arena = &PostingDiffArena{}
-		}
-		ref = (*arena).alloc()
+		ref = arena.alloc()
 		fieldDelta[key] = ref
 	}
-	(*arena).accum(ref).addID(idx, isAdd)
+	arena.accum(ref).addID(idx, isAdd)
 	return fieldDelta
 }
 
 func (arena *PostingAddArena) Reset() {
-	if arena == nil {
-		return
-	}
 	if cap(arena.values) > postingAccumMapMaxLen {
 		arena.values = nil
 		arena.used = 0
@@ -253,7 +241,7 @@ func (acc *postingAddAccum) materializeOwned() posting.List {
 
 func AddStringPostingAdd(
 	fieldMap map[string]uint32,
-	arena **PostingAddArena,
+	arena *PostingAddArena,
 	key string,
 	idx uint64,
 	capHint int,
@@ -263,19 +251,16 @@ func AddStringPostingAdd(
 	}
 	ref, ok := fieldMap[key]
 	if !ok {
-		if *arena == nil {
-			*arena = &PostingAddArena{}
-		}
-		ref = (*arena).alloc()
+		ref = arena.alloc()
 		fieldMap[key] = ref
 	}
-	(*arena).accum(ref).add(idx)
+	arena.accum(ref).add(idx)
 	return fieldMap
 }
 
 func AddFixedPostingAdd(
 	fieldMap map[uint64]uint32,
-	arena **PostingAddArena,
+	arena *PostingAddArena,
 	key uint64,
 	idx uint64,
 	capHint int,
@@ -285,13 +270,10 @@ func AddFixedPostingAdd(
 	}
 	ref, ok := fieldMap[key]
 	if !ok {
-		if *arena == nil {
-			*arena = &PostingAddArena{}
-		}
-		ref = (*arena).alloc()
+		ref = arena.alloc()
 		fieldMap[key] = ref
 	}
-	(*arena).accum(ref).add(idx)
+	arena.accum(ref).add(idx)
 	return fieldMap
 }
 

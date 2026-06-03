@@ -705,13 +705,13 @@ func TestFieldStorageApplyPostingDiffBufOwned_ChunkedMatchesUnbuffered(t *testin
 }
 
 func TestFieldStorageMergeStringPostingAdds_SortsAndDeduplicates(t *testing.T) {
-	var arena *PostingAddArena
+	var arena PostingAddArena
 	adds := AddStringPostingAdd(nil, &arena, "b", 3, 8)
 	adds = AddStringPostingAdd(adds, &arena, "a", 2, 8)
 	adds = AddStringPostingAdd(adds, &arena, "a", 2, 8)
 	defer arena.Reset()
 
-	storage := FieldStorage{}.MergeStringPostingAdds(adds, arena, false, false)
+	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -731,11 +731,11 @@ func TestFieldStorageMergeStringPostingAdds_SortsAndDeduplicates(t *testing.T) {
 func TestFieldStorageMergeStringPostingAddsCopiesCallerKeyBytes(t *testing.T) {
 	keyA := []byte("owned-add/a")
 	keyB := []byte("owned-add/b")
-	var arena *PostingAddArena
+	var arena PostingAddArena
 	adds := AddStringPostingAdd(nil, &arena, fieldStorageMutableString(keyB), 20, 8)
 	adds = AddStringPostingAdd(adds, &arena, fieldStorageMutableString(keyA), 10, 8)
 
-	storage := FieldStorage{}.MergeStringPostingAdds(adds, arena, false, false)
+	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, false)
 	arena.Reset()
 	poisonBytes(keyA, keyB)
 	defer storage.Release()
@@ -745,13 +745,13 @@ func TestFieldStorageMergeStringPostingAddsCopiesCallerKeyBytes(t *testing.T) {
 }
 
 func TestFieldStorageMergeFixedPostingAdds_SortsAndDeduplicates(t *testing.T) {
-	var arena *PostingAddArena
+	var arena PostingAddArena
 	adds := AddFixedPostingAdd(nil, &arena, 6, 3, 8)
 	adds = AddFixedPostingAdd(adds, &arena, 2, 1, 8)
 	adds = AddFixedPostingAdd(adds, &arena, 2, 1, 8)
 	defer arena.Reset()
 
-	storage := FieldStorage{}.MergeFixedPostingAdds(adds, arena, false)
+	storage := FieldStorage{}.MergeFixedPostingAdds(adds, &arena, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -776,13 +776,13 @@ func TestFieldStorageApplyStringPostingDiff_UpdatesAndRemoves(t *testing.T) {
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
-	var arena *PostingDiffArena
+	var arena PostingDiffArena
 	deltas := AddStringPostingDiff(nil, &arena, "a", 1, false)
 	deltas = AddStringPostingDiff(deltas, &arena, "b", 9, true)
 	deltas = AddStringPostingDiff(deltas, &arena, "c", 3, true)
 	defer arena.Reset()
 
-	storage := base.ApplyStringPostingDiff(deltas, arena, false, false)
+	storage := base.ApplyStringPostingDiff(deltas, &arena, false, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -801,11 +801,11 @@ func TestFieldStorageApplyStringPostingDiffCopiesCallerKeyBytes(t *testing.T) {
 	base := newRegularFieldStorage(entries)
 
 	key := []byte("owned-diff/b")
-	var arena *PostingDiffArena
+	var arena PostingDiffArena
 	deltas := AddStringPostingDiff(nil, &arena, fieldStorageMutableString(key), 2, true)
 	deltas = AddStringPostingDiff(deltas, &arena, "owned-diff/c", 30, true)
 
-	storage := base.ApplyStringPostingDiff(deltas, arena, false, false)
+	storage := base.ApplyStringPostingDiff(deltas, &arena, false, false)
 	arena.Reset()
 	if storage == base {
 		storage.Release()
@@ -917,7 +917,7 @@ func TestFieldStorageApplyStringPostingDiffModelReplayReleasePoison(t *testing.T
 			}
 		}
 
-		var arena *PostingDiffArena
+		var arena PostingDiffArena
 		var deltas map[string]uint32
 		borrowed := make([][]byte, 0, len(ops))
 		for _, op := range ops {
@@ -950,7 +950,7 @@ func TestFieldStorageApplyStringPostingDiffModelReplayReleasePoison(t *testing.T
 		}
 
 		old := storage
-		next := storage.ApplyStringPostingDiff(deltas, arena, false, allowChunk)
+		next := storage.ApplyStringPostingDiff(deltas, &arena, false, allowChunk)
 		arena.Reset()
 		if next == old {
 			t.Fatalf("%s: diff returned unchanged storage", label)
@@ -1031,13 +1031,13 @@ func TestFieldStorageApplyFixedPostingDiff_UpdatesAndRemoves(t *testing.T) {
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
-	var arena *PostingDiffArena
+	var arena PostingDiffArena
 	deltas := AddFixedPostingDiff(nil, &arena, 2, 1, false)
 	deltas = AddFixedPostingDiff(deltas, &arena, 4, 9, true)
 	deltas = AddFixedPostingDiff(deltas, &arena, 6, 3, true)
 	defer arena.Reset()
 
-	storage := base.ApplyFixedPostingDiff(deltas, arena, false)
+	storage := base.ApplyFixedPostingDiff(deltas, &arena, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -1144,7 +1144,7 @@ func TestFieldStorageApplyFixedPostingDiffModelReplayReleasePoison(t *testing.T)
 			}
 		}
 
-		var arena *PostingDiffArena
+		var arena PostingDiffArena
 		var deltas map[uint64]uint32
 		for _, op := range ops {
 			deltas = AddFixedPostingDiff(deltas, &arena, op.key, op.id, op.add)
@@ -1170,7 +1170,7 @@ func TestFieldStorageApplyFixedPostingDiffModelReplayReleasePoison(t *testing.T)
 		}
 
 		old := storage
-		next := storage.ApplyFixedPostingDiff(deltas, arena, allowChunk)
+		next := storage.ApplyFixedPostingDiff(deltas, &arena, allowChunk)
 		arena.Reset()
 		if next == old {
 			t.Fatalf("%s: diff returned unchanged storage", label)

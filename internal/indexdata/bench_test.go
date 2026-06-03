@@ -1558,13 +1558,13 @@ func BenchmarkFieldStorageMergeStringPostingAdds(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
-	var arena *PostingAddArena
+	var arena PostingAddArena
 	var adds map[string]uint32
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < deltaCount; j++ {
 			adds = AddStringPostingAdd(adds, &arena, keys[j], uint64(i*deltaCount+j+1), deltaCount)
 		}
-		storage := FieldStorage{}.MergeStringPostingAdds(adds, arena, false, true)
+		storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, true)
 		total += storage.KeyCount()
 		storage.Release()
 		clear(adds)
@@ -1583,13 +1583,13 @@ func BenchmarkFieldStorageMergeFixedPostingAdds(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
-	var arena *PostingAddArena
+	var arena PostingAddArena
 	var adds map[uint64]uint32
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < deltaCount; j++ {
 			adds = AddFixedPostingAdd(adds, &arena, keys[j], uint64(i*deltaCount+j+1), deltaCount)
 		}
-		storage := FieldStorage{}.MergeFixedPostingAdds(adds, arena, true)
+		storage := FieldStorage{}.MergeFixedPostingAdds(adds, &arena, true)
 		total += storage.KeyCount()
 		storage.Release()
 		clear(adds)
@@ -1614,14 +1614,14 @@ func BenchmarkFieldStorageApplyStringPostingDiff(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total int
-	var arena *PostingDiffArena
+	var arena PostingDiffArena
 	var deltas map[string]uint32
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < deltaCount; j++ {
 			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(base+j+1), false)
 			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(10_000_000+i*deltaCount+j), true)
 		}
-		next := storage.ApplyStringPostingDiff(deltas, arena, false, true)
+		next := storage.ApplyStringPostingDiff(deltas, &arena, false, true)
 		total += next.KeyCount()
 		next.Release()
 		clear(deltas)
