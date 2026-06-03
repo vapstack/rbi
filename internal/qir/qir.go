@@ -123,10 +123,7 @@ const (
 )
 
 type prepareCompiler struct {
-	resolve             FieldResolver
-	useResolver         bool
-	nilFieldOrdinals    map[string]int
-	nextNilFieldOrdinal int
+	resolve FieldResolver
 }
 
 func (q *Query) Release() {
@@ -154,42 +151,8 @@ func (q *Query) releaseOwned() {
 	q.Limit = 0
 }
 
-func newPrepareCompilerResolved(resolve FieldResolver) prepareCompiler {
-	return prepareCompiler{
-		resolve:             resolve,
-		useResolver:         true,
-		nextNilFieldOrdinal: NoFieldOrdinal - 1,
-	}
-}
-
-func newPrepareCompilerNoResolve() prepareCompiler {
-	return prepareCompiler{
-		useResolver:         false,
-		nextNilFieldOrdinal: NoFieldOrdinal - 1,
-	}
-}
-
-func (c *prepareCompiler) release() {
-	if c.nilFieldOrdinals != nil {
-		nilPrepareFieldOrdinalsPool.Put(c.nilFieldOrdinals)
-		c.nilFieldOrdinals = nil
-	}
-}
-
 func (c *prepareCompiler) fieldOrdinal(name string) (int, bool) {
-	if c.useResolver {
-		return c.resolve.ResolveField(name)
-	}
-	if c.nilFieldOrdinals == nil {
-		c.nilFieldOrdinals = nilPrepareFieldOrdinalsPool.Get()
-	}
-	if fieldOrdinal, ok := c.nilFieldOrdinals[name]; ok {
-		return fieldOrdinal, true
-	}
-	fieldOrdinal := c.nextNilFieldOrdinal
-	c.nilFieldOrdinals[name] = fieldOrdinal
-	c.nextNilFieldOrdinal--
-	return fieldOrdinal, true
+	return c.resolve.ResolveField(name)
 }
 
 func (q *Query) ownExprTree(expr Expr) Expr {
@@ -239,47 +202,7 @@ func PrepareQuery(src *qx.QX, resolve FieldResolver) (*Query, error) {
 	}
 
 	query := queryPool.Get()
-	compiler := newPrepareCompilerResolved(resolve)
-
-	raw, err := compileFilter(query, &src.Filter, &compiler)
-	if err != nil {
-		query.Release()
-		return nil, err
-	}
-	query.setNormalizedExpr(raw)
-	query.Offset = src.Window.Offset
-	query.Limit = src.Window.Limit
-
-	if len(src.Order) == 1 {
-		order, err := compileOrder(&src.Order[0], &compiler)
-		if err != nil {
-			query.Release()
-			return nil, err
-		}
-		query.orderStorage[0] = order
-		query.Order = query.orderStorage[:]
-	}
-
-	return query, nil
-}
-
-func PrepareQueryNoResolve(src *qx.QX) (*Query, error) {
-	if src == nil {
-		return nil, fmt.Errorf("QX is nil")
-	}
-	if src.HasReduction() {
-		return nil, fmt.Errorf("rbi does not support reduction/group/having")
-	}
-	if len(src.Projection) > 0 {
-		return nil, fmt.Errorf("rbi does not support projection/select")
-	}
-	if len(src.Order) > 1 {
-		return nil, fmt.Errorf("rbi does not support multi-column ordering")
-	}
-
-	query := queryPool.Get()
-	compiler := newPrepareCompilerNoResolve()
-	defer compiler.release()
+	compiler := prepareCompiler{resolve: resolve}
 
 	raw, err := compileFilter(query, &src.Filter, &compiler)
 	if err != nil {
@@ -313,33 +236,7 @@ func PrepareCountExprsResolved(resolve FieldResolver, exprs ...qx.Expr) (*Query,
 		return PrepareCountExprResolved(resolve, exprs[0])
 	default:
 		query := queryPool.Get()
-		compiler := newPrepareCompilerResolved(resolve)
-		ops := query.newOwnedExprSlice(len(exprs))
-		for i := range exprs {
-			expr, err := compileFilter(query, &exprs[i], &compiler)
-			if err != nil {
-				query.Release()
-				return nil, err
-			}
-			ops[i] = expr
-		}
-		query.setNormalizedExpr(Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: ops})
-		return query, nil
-	}
-}
-
-func PrepareCountExprsNoResolve(exprs ...qx.Expr) (*Query, error) {
-	switch len(exprs) {
-	case 0:
-		query := queryPool.Get()
-		query.Expr = Expr{Op: OpNOOP, FieldOrdinal: NoFieldOrdinal}
-		return query, nil
-	case 1:
-		return PrepareCountExprNoResolve(exprs[0])
-	default:
-		query := queryPool.Get()
-		compiler := newPrepareCompilerNoResolve()
-		defer compiler.release()
+		compiler := prepareCompiler{resolve: resolve}
 		ops := query.newOwnedExprSlice(len(exprs))
 		for i := range exprs {
 			expr, err := compileFilter(query, &exprs[i], &compiler)
@@ -356,21 +253,7 @@ func PrepareCountExprsNoResolve(exprs ...qx.Expr) (*Query, error) {
 
 func PrepareCountExprResolved(resolve FieldResolver, expr qx.Expr) (*Query, error) {
 	query := queryPool.Get()
-	compiler := newPrepareCompilerResolved(resolve)
-
-	raw, err := compileFilter(query, &expr, &compiler)
-	if err != nil {
-		query.Release()
-		return nil, err
-	}
-	query.setNormalizedExpr(raw)
-	return query, nil
-}
-
-func PrepareCountExprNoResolve(expr qx.Expr) (*Query, error) {
-	query := queryPool.Get()
-	compiler := newPrepareCompilerNoResolve()
-	defer compiler.release()
+	compiler := prepareCompiler{resolve: resolve}
 
 	raw, err := compileFilter(query, &expr, &compiler)
 	if err != nil {

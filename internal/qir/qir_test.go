@@ -15,6 +15,8 @@ func (testPrepareResolver) ResolveField(name string) (int, bool) {
 		return 1, true
 	case "tags":
 		return 2, true
+	case "country":
+		return 3, true
 	default:
 		return 0, false
 	}
@@ -202,13 +204,13 @@ func TestBuildQueryOwnsCallerOperandSlices(t *testing.T) {
 	}
 }
 
-func TestPrepareCountExprs_NilResolverPreservesDistinctFieldIdentity(t *testing.T) {
-	prepared, err := PrepareCountExprsNoResolve(
+func TestPrepareCountExprs_ResolverPreservesDistinctFieldIdentity(t *testing.T) {
+	prepared, err := PrepareCountExprsResolved(testPrepareFieldResolver,
 		qx.EQ("status", "active"),
 		qx.EQ("country", "active"),
 	)
 	if err != nil {
-		t.Fatalf("PrepareCountExprs(nil): %v", err)
+		t.Fatalf("PrepareCountExprsResolved: %v", err)
 	}
 	defer prepared.Release()
 
@@ -219,57 +221,25 @@ func TestPrepareCountExprs_NilResolverPreservesDistinctFieldIdentity(t *testing.
 	left := prepared.Expr.Operands[0]
 	right := prepared.Expr.Operands[1]
 	if left.FieldOrdinal == NoFieldOrdinal || right.FieldOrdinal == NoFieldOrdinal {
-		t.Fatalf("expected synthetic field ordinals, got left=%d right=%d", left.FieldOrdinal, right.FieldOrdinal)
+		t.Fatalf("expected resolved field ordinals, got left=%d right=%d", left.FieldOrdinal, right.FieldOrdinal)
 	}
 	if left.FieldOrdinal == right.FieldOrdinal {
 		t.Fatalf("distinct fields collapsed to one identity: left=%+v right=%+v", left, right)
 	}
 }
 
-func TestPrepareCountExprs_NilResolverKeepsSameFieldComplementFold(t *testing.T) {
-	prepared, err := PrepareCountExprsNoResolve(
+func TestPrepareCountExprs_ResolverKeepsSameFieldComplementFold(t *testing.T) {
+	prepared, err := PrepareCountExprsResolved(testPrepareFieldResolver,
 		qx.EQ("status", "active"),
 		qx.NOT(qx.EQ("status", "active")),
 	)
 	if err != nil {
-		t.Fatalf("PrepareCountExprs(nil): %v", err)
+		t.Fatalf("PrepareCountExprsResolved: %v", err)
 	}
 	defer prepared.Release()
 
 	if !IsFalseConst(prepared.Expr) {
 		t.Fatalf("expected same-field complement to normalize to false, got %+v", prepared.Expr)
-	}
-}
-
-func TestPrepareCompilerReleaseClearsNilFieldOrdinals(t *testing.T) {
-	compiler := newPrepareCompilerNoResolve()
-	status, ok := compiler.fieldOrdinal("status")
-	if !ok {
-		t.Fatal("status field ordinal was not assigned")
-	}
-	country, ok := compiler.fieldOrdinal("country")
-	if !ok {
-		t.Fatal("country field ordinal was not assigned")
-	}
-	again, ok := compiler.fieldOrdinal("status")
-	if !ok || again != status {
-		t.Fatalf("same field ordinal changed: got=%d want=%d ok=%v", again, status, ok)
-	}
-	if country == status {
-		t.Fatalf("distinct no-resolve fields share ordinal %d", status)
-	}
-
-	owned := compiler.nilFieldOrdinals
-	if len(owned) != 2 {
-		t.Fatalf("nil ordinal map len=%d want 2", len(owned))
-	}
-	compiler.release()
-
-	if compiler.nilFieldOrdinals != nil {
-		t.Fatalf("compiler retained nil ordinal map after release")
-	}
-	if len(owned) != 0 {
-		t.Fatalf("released nil ordinal map retained entries: %+v", owned)
 	}
 }
 

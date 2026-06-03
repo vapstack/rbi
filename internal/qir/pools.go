@@ -13,8 +13,3 @@ var queryPool = pooled.Pointers[Query]{
 	},
 	Clear: false,
 }
-
-var nilPrepareFieldOrdinalsPool = pooled.Maps[string, int]{
-	NewCap: 8,
-	MaxLen: 64,
-}

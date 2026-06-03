@@ -759,13 +759,24 @@ func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
 	return qe.exec.FieldNameByOrdinal(ordinal)
 }
 
+type testQIRResolver map[string]int
+
+func (r testQIRResolver) ResolveField(name string) (int, bool) {
+	if ordinal, ok := r[name]; ok {
+		return ordinal, true
+	}
+	ordinal := len(r)
+	r[name] = ordinal
+	return ordinal, true
+}
+
 func prepareTestQuery(qe *queryEngine, q *qx.QX) (*qir.Query, qir.Shape, error) {
 	var (
 		prepared *qir.Query
 		err      error
 	)
 	if qe == nil {
-		prepared, err = qir.PrepareQueryNoResolve(q)
+		prepared, err = qir.PrepareQuery(q, testQIRResolver{})
 	} else {
 		prepared, err = qir.PrepareQuery(q, qe.schema.IndexedByName)
 	}
@@ -781,7 +792,7 @@ func prepareTestExpr(qe *queryEngine, expr qx.Expr) (*qir.Query, qir.Expr, error
 		err      error
 	)
 	if qe == nil {
-		prepared, err = qir.PrepareCountExprsNoResolve(expr)
+		prepared, err = qir.PrepareCountExprsResolved(testQIRResolver{}, expr)
 	} else {
 		prepared, err = qir.PrepareCountExprsResolved(qe.schema.IndexedByName, expr)
 	}
