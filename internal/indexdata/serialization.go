@@ -268,8 +268,7 @@ func ReadMeasureStorage(reader *bufio.Reader, keep bool) (MeasureStorage, error)
 	for start := 0; start < rows; {
 		size := min(MeasureChunkTargetRows, rows-start)
 		chunk := measureChunkPool.Get()
-		chunk.ids = pooled.GetUint64Slice(size)[:size]
-		chunk.values = pooled.GetUint64Slice(size)[:size]
+		chunk.init(size)
 		for i := 0; i < size; i++ {
 			row := start + i
 			id, err := readUvarint(reader)

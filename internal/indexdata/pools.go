@@ -80,13 +80,23 @@ var (
 		Cleanup: func(p *fieldIndexChunkDirPage) {
 			for i := range p.refs {
 				p.refs[i].chunk.release()
+				p.refs[i] = fieldIndexChunkRef{}
 			}
-			fieldIndexChunkRefSlicePool.Put(p.refs)
-			pooled.ReleaseIntSlice(p.prefix)
-			pooled.ReleaseUint64Slice(p.rowPrefix)
-			p.refs = nil
-			p.prefix = nil
-			p.rowPrefix = nil
+			if cap(p.refs) > fieldIndexDirPageTargetRefs {
+				p.refs = nil
+			} else {
+				p.refs = p.refs[:0]
+			}
+			if cap(p.prefix) > fieldIndexDirPageTargetRefs+1 {
+				p.prefix = nil
+			} else {
+				p.prefix = p.prefix[:0]
+			}
+			if cap(p.rowPrefix) > fieldIndexDirPageTargetRefs+1 {
+				p.rowPrefix = nil
+			} else {
+				p.rowPrefix = p.rowPrefix[:0]
+			}
 			p.refsCount.Store(0)
 		},
 	}
@@ -102,10 +112,16 @@ var (
 	}
 	measureChunkPool = pooled.Pointers[measureChunk]{
 		Cleanup: func(c *measureChunk) {
-			pooled.ReleaseUint64Slice(c.ids)
-			pooled.ReleaseUint64Slice(c.values)
-			c.ids = nil
-			c.values = nil
+			if cap(c.ids) > MeasureChunkTargetRows {
+				c.ids = nil
+			} else {
+				c.ids = c.ids[:0]
+			}
+			if cap(c.values) > MeasureChunkTargetRows {
+				c.values = nil
+			} else {
+				c.values = c.values[:0]
+			}
 			c.refs.Store(0)
 		},
 	}

@@ -58,6 +58,19 @@ type MeasureStorage struct {
 	chunked *measureChunkedRoot
 }
 
+func (chunk *measureChunk) init(size int) {
+	if cap(chunk.ids) < size {
+		chunk.ids = make([]uint64, size)
+	} else {
+		chunk.ids = chunk.ids[:size]
+	}
+	if cap(chunk.values) < size {
+		chunk.values = make([]uint64, size)
+	} else {
+		chunk.values = chunk.values[:size]
+	}
+}
+
 func sortMeasureEntryBuf(buf []MeasureEntry) {
 	if len(buf) <= 1 {
 		return
@@ -184,8 +197,7 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 	for remaining := total; remaining > 0; {
 		size := min(MeasureChunkTargetRows, remaining)
 		chunk := measureChunkPool.Get()
-		chunk.ids = pooled.GetUint64Slice(size)[:size]
-		chunk.values = pooled.GetUint64Slice(size)[:size]
+		chunk.init(size)
 		for i := 0; i < size; i++ {
 			entry := popMeasureEntryRun(runs, pos)
 			chunk.ids[i] = entry.ID
@@ -271,8 +283,7 @@ func (r *measureChunkedRoot) appendEntryRangeAsChunk(entries []MeasureEntry, sta
 func newMeasureChunkFromEntryRange(entries []MeasureEntry, start int, end int) *measureChunk {
 	size := end - start
 	chunk := measureChunkPool.Get()
-	chunk.ids = pooled.GetUint64Slice(size)[:size]
-	chunk.values = pooled.GetUint64Slice(size)[:size]
+	chunk.init(size)
 	for i := 0; i < size; i++ {
 		entry := entries[start+i]
 		chunk.ids[i] = entry.ID

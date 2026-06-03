@@ -11,6 +11,7 @@ import (
 const (
 	LenIndexNonEmptyKey   = "\xFFNONEMPTY"
 	postingAccumMapMaxLen = 4 << 10
+	postingAccumSpillCap  = posting.MidCap
 )
 
 type BatchPostingDelta struct {
@@ -28,7 +29,10 @@ type postingDiffAccum struct {
 	remove postingAddAccum
 }
 
-type PostingDiffArena struct{ values []postingDiffAccum }
+type PostingDiffArena struct {
+	values []postingDiffAccum
+	used   int
+}
 
 type postingAddAccum struct {
 	spill     []uint64
@@ -36,7 +40,10 @@ type postingAddAccum struct {
 	inline    [posting.SmallCap]uint64
 }
 
-type PostingAddArena struct{ values []postingAddAccum }
+type PostingAddArena struct {
+	values []postingAddAccum
+	used   int
+}
 
 type LenPostingDiff struct {
 	lengths     map[uint64]BatchPostingDelta
@@ -48,19 +55,28 @@ func (arena *PostingDiffArena) Reset() {
 	if arena == nil {
 		return
 	}
-	for i := range arena.values {
-		arena.values[i].reset()
-	}
 	if cap(arena.values) > postingAccumMapMaxLen {
 		arena.values = nil
-	} else {
-		arena.values = arena.values[:0]
+		arena.used = 0
+		return
 	}
+	used := arena.used
+	for i := 0; i < used; i++ {
+		arena.values[i].reset()
+	}
+	if used < len(arena.values) {
+		clear(arena.values[used:])
+		arena.values = arena.values[:used]
+	}
+	arena.used = 0
 }
 
 func (arena *PostingDiffArena) alloc() uint32 {
-	ref := uint32(len(arena.values))
-	arena.values = append(arena.values, postingDiffAccum{})
+	ref := uint32(arena.used)
+	if arena.used == len(arena.values) {
+		arena.values = append(arena.values, postingDiffAccum{})
+	}
+	arena.used++
 	return ref
 }
 
@@ -136,19 +152,28 @@ func (arena *PostingAddArena) Reset() {
 	if arena == nil {
 		return
 	}
-	for i := range arena.values {
-		arena.values[i].reset()
-	}
 	if cap(arena.values) > postingAccumMapMaxLen {
 		arena.values = nil
-	} else {
-		arena.values = arena.values[:0]
+		arena.used = 0
+		return
 	}
+	used := arena.used
+	for i := 0; i < used; i++ {
+		arena.values[i].reset()
+	}
+	if used < len(arena.values) {
+		clear(arena.values[used:])
+		arena.values = arena.values[:used]
+	}
+	arena.used = 0
 }
 
 func (arena *PostingAddArena) alloc() uint32 {
-	ref := uint32(len(arena.values))
-	arena.values = append(arena.values, postingAddAccum{})
+	ref := uint32(arena.used)
+	if arena.used == len(arena.values) {
+		arena.values = append(arena.values, postingAddAccum{})
+	}
+	arena.used++
 	return ref
 }
 
@@ -157,13 +182,16 @@ func (arena *PostingAddArena) accum(ref uint32) *postingAddAccum {
 }
 
 func (acc *postingAddAccum) reset() {
-	pooled.ReleaseUint64Slice(acc.spill)
-	acc.spill = nil
+	if cap(acc.spill) > postingAccumSpillCap {
+		acc.spill = nil
+	} else {
+		acc.spill = acc.spill[:0]
+	}
 	acc.inlineLen = 0
 }
 
 func (acc *postingAddAccum) add(id uint64) {
-	if acc.spill != nil {
+	if len(acc.spill) > 0 {
 		acc.spill = append(acc.spill, id)
 		return
 	}
@@ -174,7 +202,10 @@ func (acc *postingAddAccum) add(id uint64) {
 		return
 	}
 
-	spill := pooled.GetUint64Slice(posting.MidCap)
+	spill := acc.spill
+	if spill == nil {
+		spill = make([]uint64, 0, posting.MidCap)
+	}
 	spill = append(spill, acc.inline[:]...)
 	spill = append(spill, id)
 	acc.spill = spill
@@ -210,10 +241,9 @@ func materializePostingAddOwned(ids []uint64) posting.List {
 }
 
 func (acc *postingAddAccum) materializeOwned() posting.List {
-	if acc.spill != nil {
+	if len(acc.spill) > 0 {
 		out := materializePostingAddOwned(acc.spill)
-		pooled.ReleaseUint64Slice(acc.spill)
-		acc.spill = nil
+		acc.reset()
 		return out
 	}
 	n := int(acc.inlineLen)
