@@ -559,7 +559,7 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	oldPtr := unsafe.Pointer(&oldRec)
 	newPtr := unsafe.Pointer(&newRec)
 
-	scalar := rt.Patch.Access[rt.Patch.Ordinals["Scalar"]]
+	scalar := schemaTestPatchAccess(t, rt, "Scalar")
 	if scalar.ValueEqual == nil || scalar.ValueEqual(oldPtr, newPtr) {
 		t.Fatal("scalar patch equality failed")
 	}
@@ -567,32 +567,32 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 		t.Fatal("scalar patch copy failed")
 	}
 
-	typed := rt.Patch.Access[rt.Patch.Ordinals["Typed"]]
+	typed := schemaTestPatchAccess(t, rt, "Typed")
 	copiedTyped := typed.CopyValue(newPtr).([]string)
 	copiedTyped[0] = "mutated"
 	if newRec.Typed[0] != "b" {
 		t.Fatal("typed slice copy aliases source")
 	}
 
-	named := rt.Patch.Access[rt.Patch.Ordinals["Named"]]
+	named := schemaTestPatchAccess(t, rt, "Named")
 	copiedNamed := named.CopyValue(newPtr).(schemaTestNamedStrings)
 	copiedNamed[0] = "mutated"
 	if newRec.Named[0] != "n2" {
 		t.Fatal("named immutable slice copy aliases source")
 	}
 
-	nested := rt.Patch.Access[rt.Patch.Ordinals["Nested"]]
+	nested := schemaTestPatchAccess(t, rt, "Nested")
 	if nested.ValueEqual != nil || nested.CopyValue != nil {
 		t.Fatal("mutable nested patch field must use root fallback")
 	}
-	vi := rt.Patch.Access[rt.Patch.Ordinals["VI"]]
+	vi := schemaTestPatchAccess(t, rt, "VI")
 	if vi.ValueEqual == nil || vi.ValueEqual(oldPtr, newPtr) {
 		t.Fatal("ValueIndexer scalar patch equality failed")
 	}
 	if vi.CopyValue != nil {
 		t.Fatal("ValueIndexer copy should use root fallback")
 	}
-	viPtr := rt.Patch.Access[rt.Patch.Ordinals["VIPtr"]]
+	viPtr := schemaTestPatchAccess(t, rt, "VIPtr")
 	if viPtr.ValueEqual == nil || viPtr.ValueEqual(oldPtr, newPtr) {
 		t.Fatal("ValueIndexer pointer patch equality failed")
 	}
@@ -625,6 +625,18 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 			t.Fatalf("Unique PatchOrdinal mismatch for %s", acc.Name)
 		}
 	}
+}
+
+func schemaTestPatchAccess(t *testing.T, rt *Schema, name string) PatchFieldAccessor {
+	t.Helper()
+	for i := range rt.Patch.Access {
+		acc := rt.Patch.Access[i]
+		if acc.Field.Name == name {
+			return acc
+		}
+	}
+	t.Fatalf("missing patch accessor %q", name)
+	return PatchFieldAccessor{}
 }
 
 func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {

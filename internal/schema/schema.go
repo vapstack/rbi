@@ -208,10 +208,9 @@ type PatchItem struct {
 }
 
 type PatchRuntime struct {
-	Fields   map[string]*Field
-	Access   []PatchFieldAccessor
-	Ordinals map[string]int
-	typ      reflect.Type
+	Fields map[string]*Field
+	Access []PatchFieldAccessor
+	typ    reflect.Type
 }
 
 func Compile(vtype reflect.Type, config Config) (*Schema, error) {
@@ -697,18 +696,17 @@ func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
 	if err := populatePatcher(patchMap, vtype, nil, make([]int, vtype.NumField())); err != nil {
 		return PatchRuntime{}, err
 	}
-	access, ordinals := makePatchFieldAccessors(vtype, patchMap)
+	access := makePatchFieldAccessors(vtype, patchMap)
 	return PatchRuntime{
-		Fields:   patchMap,
-		Access:   access,
-		Ordinals: ordinals,
-		typ:      vtype,
+		Fields: patchMap,
+		Access: access,
+		typ:    vtype,
 	}, nil
 }
 
-func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]PatchFieldAccessor, map[string]int) {
+func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) []PatchFieldAccessor {
 	if len(fields) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	patchFields := make([]*Field, 0, len(fields))
@@ -720,7 +718,6 @@ func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]Pa
 	})
 
 	access := make([]PatchFieldAccessor, 0, len(patchFields))
-	ordinals := make(map[string]int, vtype.NumField())
 
 	var prev *Field
 	for _, f := range patchFields {
@@ -734,10 +731,8 @@ func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]Pa
 		acc.ValueEqual = buildPatchValueEqualFn(f, fieldType, offset)
 		acc.CopyValue = buildPatchValueCopyFn(f, fieldType, offset)
 
-		ordinal := len(access)
 		access = append(access, acc)
-		ordinals[f.Name] = ordinal
 	}
 
-	return access, ordinals
+	return access
 }

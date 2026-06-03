@@ -508,7 +508,7 @@ func BenchmarkPatchValueEqual(b *testing.B) {
 	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
 
 	for _, name := range cases {
-		acc := rt.Patch.Access[rt.Patch.Ordinals[name]]
+		acc := benchmarkSchemaPatchAccess(b, rt, name)
 		fieldIndex := acc.Field.Index
 		b.Run(name, func(b *testing.B) {
 			equal := false
@@ -533,7 +533,7 @@ func BenchmarkPatchValueCopy(b *testing.B) {
 	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
 
 	for _, name := range cases {
-		acc := rt.Patch.Access[rt.Patch.Ordinals[name]]
+		acc := benchmarkSchemaPatchAccess(b, rt, name)
 		fieldIndex := acc.Field.Index
 		b.Run(name, func(b *testing.B) {
 			var copied any
@@ -569,6 +569,18 @@ func BenchmarkPatchApply(b *testing.B) {
 		}
 	}
 	benchmarkSchemaAnySink = rec.Tags
+}
+
+func benchmarkSchemaPatchAccess(b *testing.B, rt *Schema, name string) PatchFieldAccessor {
+	b.Helper()
+	for i := range rt.Patch.Access {
+		acc := rt.Patch.Access[i]
+		if acc.Field.Name == name {
+			return acc
+		}
+	}
+	b.Fatalf("missing patch accessor %q", name)
+	return PatchFieldAccessor{}
 }
 
 func benchmarkSchemaDeepCopyValue(src any) any {
