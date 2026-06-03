@@ -1250,3 +1250,71 @@ func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnp
 
 	second.releaseRuntimeCaches()
 }
+
+func TestManagerReDrainsNumericRetiredAfterSharedSnapshotRelease(t *testing.T) {
+	m := NewRegistry(true)
+
+	shared := testStorage("10", "20")
+	defer shared.Release()
+
+	first := testView(map[string]indexdata.FieldStorage{"age": shared})
+	first.Seq = 17
+	first.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{}, 0)
+	first.numericRangeBucketCache.StoreSlot("age", 0, entry)
+	m.Publish(first)
+
+	pinnedOld, oldRef, ok := m.PinBySeq(first.Seq)
+	if !ok || pinnedOld != first {
+		t.Fatal("expected first snapshot to be pinned")
+	}
+
+	second := testView(map[string]indexdata.FieldStorage{"age": shared})
+	second.Seq = 18
+	second.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	inheritNumericRangeBucketCache(second, first)
+	m.Publish(second)
+
+	pinnedCurrent, currentSeq, currentRef := m.PinCurrent()
+	if pinnedCurrent != second || currentRef == nil {
+		t.Fatal("expected second snapshot to be current")
+	}
+
+	evicted := false
+	count := entry.FullSpanEntryCount()
+	for i := 0; !evicted && i < 64; i++ {
+		ids := testPosting(uint64(i+1), 1<<32|uint64(i+1))
+		cached, ok := entry.TryStoreFullSpan(i, i, ids)
+		if !ok {
+			t.Fatalf("expected full-span store %d to succeed", i)
+		}
+		cached.Release()
+		nextCount := entry.FullSpanEntryCount()
+		evicted = nextCount == count
+		count = nextCount
+	}
+	if !evicted {
+		t.Fatal("expected shared numeric entry to have retired full-span postings")
+	}
+
+	m.Unpin(currentSeq, currentRef)
+	retained := second.numericRangeBucketCache.TakeRetired()
+	if !retained.IsEmpty() {
+		retained.Release()
+		t.Fatal("expected current unpin to keep retired postings while entry is shared")
+	}
+	retained.Release()
+	if entry.FullSpanEntryCount() == 0 {
+		t.Fatal("expected current unpin to keep retired postings while entry is shared")
+	}
+
+	m.Unpin(first.Seq, oldRef)
+	redrained := second.numericRangeBucketCache.TakeRetired()
+	if !redrained.IsEmpty() {
+		redrained.Release()
+		t.Fatal("expected old snapshot release to re-drain current numeric retired postings")
+	}
+	redrained.Release()
+
+	second.releaseRuntimeCaches()
+}

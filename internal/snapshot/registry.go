@@ -48,7 +48,7 @@ func appendRetiredSnapshot(buf []*View, snap *View) []*View {
 	return append(buf, snap)
 }
 
-func releaseRetiredSnapshots(buf []*View) {
+func releaseRetiredSnapshotList(buf []*View) {
 	if buf == nil {
 		return
 	}
@@ -58,6 +58,33 @@ func releaseRetiredSnapshots(buf []*View) {
 		retired.releaseRuntimeCaches()
 	}
 	snapshotRetiredListPool.Put(buf)
+}
+
+func (sm *Registry) releaseRetiredSnapshots(buf []*View) {
+	if buf == nil {
+		return
+	}
+	releaseRetiredSnapshotList(buf)
+
+	var (
+		matPredRetired  qcache.MaterializedPredRetired
+		numRangeRetired qcache.NumericRangeBucketRetired
+	)
+
+	sm.mu.Lock()
+	ref := sm.currentRef.Load()
+	if ref != nil && ref.refs.Load() == 0 && ref.snap != nil {
+		if ref.snap.matPredCache != nil {
+			matPredRetired = ref.snap.matPredCache.TakeRetired()
+		}
+		if ref.snap.numericRangeBucketCache != nil {
+			numRangeRetired = ref.snap.numericRangeBucketCache.TakeRetired()
+		}
+	}
+	sm.mu.Unlock()
+
+	matPredRetired.Release()
+	numRangeRetired.Release()
 }
 
 func (sm *Registry) publishRef(s *View) []*View {
@@ -115,7 +142,7 @@ func (sm *Registry) DropStaged(seq uint64) {
 	if ref.refs.Load() <= 0 {
 		retired = sm.releaseRetiredSnapshotRefLocked(seq, ref)
 		sm.mu.Unlock()
-		releaseRetiredSnapshots(retired)
+		sm.releaseRetiredSnapshots(retired)
 		return
 	}
 	ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
@@ -160,8 +187,9 @@ func (sm *Registry) Unpin(seq uint64, ref *Ref) {
 		return
 	}
 	var (
-		cacheRetired qcache.MaterializedPredRetired
-		retired      []*View
+		matPredRetired  qcache.MaterializedPredRetired
+		numRangeRetired qcache.NumericRangeBucketRetired
+		retired         []*View
 	)
 
 	sm.mu.Lock()
@@ -175,13 +203,17 @@ func (sm *Registry) Unpin(seq uint64, ref *Ref) {
 			held.retired = nil
 		}
 		if held.snap.matPredCache != nil {
-			cacheRetired = held.snap.matPredCache.TakeRetired()
+			matPredRetired = held.snap.matPredCache.TakeRetired()
+		}
+		if held.snap.numericRangeBucketCache != nil {
+			numRangeRetired = held.snap.numericRangeBucketCache.TakeRetired()
 		}
 	}
 	sm.mu.Unlock()
 
-	releaseRetiredSnapshots(retired)
-	cacheRetired.Release()
+	sm.releaseRetiredSnapshots(retired)
+	matPredRetired.Release()
+	numRangeRetired.Release()
 }
 
 func (sm *Registry) retireSnapshotLocked(seq uint64) []*View {
@@ -228,7 +260,7 @@ func (sm *Registry) Current() *View {
 
 func (sm *Registry) Publish(s *View) {
 	retired := sm.publishRef(s)
-	releaseRetiredSnapshots(retired)
+	sm.releaseRetiredSnapshots(retired)
 }
 
 func (sm *Registry) PinCurrent() (*View, uint64, *Ref) {

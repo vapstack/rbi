@@ -47,6 +47,12 @@ type NumericRangeBucketEntry struct {
 	retired       []posting.List
 }
 
+// NumericRangeBucketRetired carries detached retired full-span postings past
+// the caller's reader barrier so payload release can run outside cache locks.
+type NumericRangeBucketRetired struct {
+	chunks [][]posting.List
+}
+
 type numericRangeBucketCacheSlot struct {
 	field string
 	entry *NumericRangeBucketEntry
@@ -202,6 +208,37 @@ func (c *NumericRangeBucketCache) MaxCardinality() uint64 {
 	return c.maxCard
 }
 
+func (c *NumericRangeBucketCache) DrainRetired() {
+	c.TakeRetired().Release()
+}
+
+func (c *NumericRangeBucketCache) TakeRetired() NumericRangeBucketRetired {
+	if len(c.slots) == 0 {
+		return NumericRangeBucketRetired{}
+	}
+
+	c.mu.Lock()
+	var chunks [][]posting.List
+	for i := range c.slots {
+		entry := c.slots[i].entry
+		// Shared entries may still protect borrowed views from inherited snapshots.
+		if entry == nil || entry.refs.Load() != 1 {
+			continue
+		}
+		retired := entry.takeRetired()
+		if retired == nil {
+			continue
+		}
+		if chunks == nil {
+			chunks = numericRangeBucketRetiredPool.Get(1)
+		}
+		chunks = append(chunks, retired)
+	}
+	c.mu.Unlock()
+
+	return NumericRangeBucketRetired{chunks: chunks}
+}
+
 func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nextIndex []indexdata.FieldStorage, fields schema.IndexedFieldMap) {
 	if len(c.slots) == 0 || nextIndex == nil || len(fields) == 0 {
 		return
@@ -301,6 +338,29 @@ func (e *NumericRangeBucketEntry) retirePosting(ids posting.List) {
 		e.retired = posting.GetSlice(1)
 	}
 	e.retired = append(e.retired, ids)
+}
+
+func (e *NumericRangeBucketEntry) takeRetired() []posting.List {
+	e.mu.Lock()
+	retired := e.retired
+	e.retired = nil
+	e.mu.Unlock()
+	return retired
+}
+
+func (r NumericRangeBucketRetired) Release() {
+	if r.chunks == nil {
+		return
+	}
+	for i := range r.chunks {
+		posting.ReleaseAll(r.chunks[i])
+		posting.ReleaseSlice(r.chunks[i])
+	}
+	numericRangeBucketRetiredPool.Put(r.chunks)
+}
+
+func (r NumericRangeBucketRetired) IsEmpty() bool {
+	return r.chunks == nil
 }
 
 func (e *NumericRangeBucketEntry) LoadFullSpan(start, end int) (posting.List, bool) {

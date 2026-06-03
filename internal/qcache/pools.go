@@ -1,12 +1,16 @@
 package qcache
 
-import "github.com/vapstack/pooled"
+import (
+	"github.com/vapstack/pooled"
+	"github.com/vapstack/rbi/internal/posting"
+)
 
 const (
 	materializedPredKeySlicePoolMaxCap     = 512
 	recentKeyCacheSlotPoolMaxCap           = 512
 	materializedPredCacheRetiredPoolMaxCap = 512
 	materializedPredCacheIndexPoolMaxLen   = 512
+	numericRangeBucketRetiredPoolMaxCap    = 512
 
 	recentKeyCacheIndexPoolMaxLen = recentKeyCacheSlotPoolMaxCap + materializedPredCacheOversizedMaxEntries
 
@@ -41,6 +45,11 @@ var materializedPredCachePool = pooled.Pointers[MaterializedPredCache]{
 
 var materializedPredCacheRetiredPool = pooled.Slices[*materializedPredCacheEntry]{
 	MaxCap: materializedPredCacheRetiredPoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
+
+var numericRangeBucketRetiredPool = pooled.Slices[[]posting.List]{
+	MaxCap: numericRangeBucketRetiredPoolMaxCap,
 	Clear:  pooled.ClearCap,
 }
 

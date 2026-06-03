@@ -183,6 +183,9 @@ func (v *View) RuntimeMaterializedPredObservedEntryCount() int {
 }
 
 func (v *View) drainRetiredRuntimeCaches() {
+	if v.numericRangeBucketCache != nil {
+		v.numericRangeBucketCache.DrainRetired()
+	}
 	if v.matPredCache != nil {
 		v.matPredCache.DrainRetired()
 	}

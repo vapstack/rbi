@@ -107,6 +107,50 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 	}
 }
 
+func TestNumericRangeBucketCacheDrainRetiredSkipsSharedEntries(t *testing.T) {
+	cache := GetNumericRangeBucketCache(2, 0)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	unshared := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
+	shared := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
+	shared.Retain()
+	defer shared.Release()
+
+	for i := 0; i <= numericRangeFullSpanCacheMaxEntries; i++ {
+		ids := qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1))
+		cached, ok := unshared.TryStoreFullSpan(i, i, ids)
+		if !ok {
+			t.Fatalf("expected unshared full-span store %d to succeed", i)
+		}
+		cached.Release()
+
+		ids = qcacheTestPosting(uint64(i+11), 1<<32|uint64(i+11))
+		cached, ok = shared.TryStoreFullSpan(i, i, ids)
+		if !ok {
+			t.Fatalf("expected shared full-span store %d to succeed", i)
+		}
+		cached.Release()
+	}
+	if len(unshared.retired) == 0 || len(shared.retired) == 0 {
+		t.Fatal("expected both numeric entries to have retired full-span postings")
+	}
+
+	cache.StoreSlot("age", 0, unshared)
+	cache.StoreSlot("score", 1, shared)
+	retired := cache.TakeRetired()
+	if retired.IsEmpty() {
+		t.Fatal("expected unshared numeric retired postings to be detached")
+	}
+	retired.Release()
+
+	if unshared.retired != nil {
+		t.Fatal("expected unshared numeric retired postings to be drained")
+	}
+	if len(shared.retired) == 0 {
+		t.Fatal("expected shared numeric retired postings to remain protected")
+	}
+}
+
 func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 	shared := qcacheTestFieldStorage(32, 100)
 	changed := qcacheTestFieldStorage(32, 200)
