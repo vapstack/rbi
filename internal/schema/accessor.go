@@ -1591,15 +1591,12 @@ func makeIndexedFieldAccessor(vtype reflect.Type, f *Field) (IndexedFieldAccesso
 	return acc, nil
 }
 
-func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]IndexedFieldAccessor, []IndexedFieldAccessor, []IndexedFieldAccessor, IndexedFieldMap, error) {
+func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]IndexedFieldAccessor, error) {
 	if len(fields) == 0 {
-		return nil, nil, nil, nil, nil
+		return nil, nil
 	}
 
 	access := make([]IndexedFieldAccessor, 0, len(fields))
-	validationAccess := make([]IndexedFieldAccessor, 0, len(fields))
-	uniqueAccess := make([]IndexedFieldAccessor, 0, 4)
-	fieldMap := make(IndexedFieldMap, len(fields))
 
 	names := make([]string, 0, len(fields))
 	for name := range fields {
@@ -1611,18 +1608,11 @@ func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]
 		f := fields[name]
 		acc, err := makeIndexedFieldAccessor(vtype, f)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, err
 		}
 		acc.Ordinal = len(access)
 		access = append(access, acc)
-		if acc.Validate != nil {
-			validationAccess = append(validationAccess, acc)
-		}
-		fieldMap[f.DBName] = acc
-		if f.Unique && !f.Slice {
-			uniqueAccess = append(uniqueAccess, acc)
-		}
 	}
 
-	return access, validationAccess, uniqueAccess, fieldMap, nil
+	return access, nil
 }

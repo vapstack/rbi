@@ -226,7 +226,7 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
 
-	access, validationAccess, uniqueAccess, fieldMap, err := makeIndexedFieldAccessors(vtype, collector.indexFields)
+	access, err := makeIndexedFieldAccessors(vtype, collector.indexFields)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
 	}
@@ -240,14 +240,18 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 			}
 		}
 	}
+	fieldMap := make(IndexedFieldMap, len(access))
+	validationAccess := make([]IndexedFieldAccessor, 0, len(access))
+	uniqueAccess := make([]IndexedFieldAccessor, 0, 4)
 	for i := range access {
-		fieldMap[access[i].Name] = access[i]
-	}
-	for i := range validationAccess {
-		validationAccess[i] = fieldMap[validationAccess[i].Name]
-	}
-	for i := range uniqueAccess {
-		uniqueAccess[i] = fieldMap[uniqueAccess[i].Name]
+		acc := access[i]
+		fieldMap[acc.Name] = acc
+		if acc.Validate != nil {
+			validationAccess = append(validationAccess, acc)
+		}
+		if acc.UniqueGetter != nil {
+			uniqueAccess = append(uniqueAccess, acc)
+		}
 	}
 
 	measureAccess, measureMap, err := makeMeasureFieldAccessors(vtype, collector.measureFields)
