@@ -184,9 +184,6 @@ func (c *MaterializedPredCache) Load(key MaterializedPredKey) (posting.List, boo
 	if !ok {
 		return posting.List{}, false
 	}
-	if entry == nil {
-		return posting.List{}, true
-	}
 
 	entry.touch(&c.clock)
 
@@ -295,9 +292,6 @@ func (c *MaterializedPredCache) LoadOrStore(key MaterializedPredKey, ids posting
 	if entry, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		ids.Release()
-		if entry == nil {
-			return posting.List{}, true
-		}
 		entry.touch(&c.clock)
 		return entry.ids.Borrow(), true
 	}
@@ -338,9 +332,6 @@ func (c *MaterializedPredCache) TryLoadOrStoreOversized(key MaterializedPredKey,
 	if entry, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		ids.Release()
-		if entry == nil {
-			return posting.List{}, true
-		}
 		entry.touch(&c.clock)
 		return entry.ids.Borrow(), true
 	}
@@ -399,20 +390,16 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, fields 
 		if _, exists := c.lookupLocked(&key); exists {
 			continue
 		}
-		if slot.entry != nil {
-			slot.entry.retain()
-			stamp := slot.entry.stamp.Load()
-			if stamp > maxStamp {
-				maxStamp = stamp
-			}
-			if slot.entry.oversized {
-				oversized++
-			}
+		slot.entry.retain()
+		stamp := slot.entry.stamp.Load()
+		if stamp > maxStamp {
+			maxStamp = stamp
+		}
+		if slot.entry.oversized {
+			oversized++
 		}
 		if !c.insertLocked(key, slot.entry) {
-			if slot.entry != nil {
-				slot.entry.release()
-			}
+			slot.entry.release()
 			break
 		}
 		c.count.Add(1)
@@ -520,9 +507,6 @@ func (c *MaterializedPredCache) firstFreeSlotLocked() int {
 }
 
 func (c *MaterializedPredCache) retireEntryLocked(entry *materializedPredCacheEntry) {
-	if entry == nil {
-		return
-	}
 	if c.retired == nil {
 		c.retired = materializedPredCacheRetiredPool.Get(1)
 	}
@@ -563,17 +547,7 @@ func (c *MaterializedPredCache) findVictimLocked(mode materializedPredCacheEvict
 		if !slot.used {
 			continue
 		}
-		stamp := uint64(0)
-		if slot.entry != nil {
-			stamp = slot.entry.stamp.Load()
-		}
-		if slot.entry == nil {
-			if mode != matPredCacheEvictOversizedOnly && stamp <= fallbackStamp {
-				fallbackIdx = i
-				fallbackStamp = stamp
-			}
-			continue
-		}
+		stamp := slot.entry.stamp.Load()
 		if slot.entry.oversized {
 			if mode != matPredCacheEvictOversizedOnly && stamp <= fallbackStamp {
 				fallbackIdx = i
@@ -618,7 +592,7 @@ func (c *MaterializedPredCache) evictLocked(mode materializedPredCacheEvictMode)
 		c.freeHint = idx
 	}
 	c.count.Add(-1)
-	if slot.entry != nil && slot.entry.oversized {
+	if slot.entry.oversized {
 		c.oversizedCount.Add(-1)
 	}
 	c.retireEntryLocked(slot.entry)

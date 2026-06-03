@@ -756,7 +756,7 @@ func TestMaterializedPredCacheEntryPool_AllocsPerRunStayZeroAfterWarmup(t *testi
 	requireZeroAllocsAfterWarmupQCache(t, run)
 }
 
-func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+func TestMaterializedPredCache_StoreEmptyEntriesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	cache := GetMaterializedPredCache(8, 0)
 	defer cache.ReleaseRef()
 
@@ -769,14 +769,9 @@ func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t
 
 	run := func() {
 		cache.Clear()
-		cache.mu.Lock()
 		for i := range keys {
-			if !cache.insertLocked(keys[i], nil) {
-				cache.mu.Unlock()
-				t.Fatalf("insertLocked(%v) failed", keys[i])
-			}
+			cache.Store(keys[i], posting.List{})
 		}
-		cache.mu.Unlock()
 	}
 
 	requireZeroAllocsAfterWarmupQCache(t, run)
@@ -817,29 +812,23 @@ func TestMaterializedPredCache_LoadOrStoreAllocsPerRunStayZeroAfterWarmup(t *tes
 	requireZeroAllocsAfterWarmupQCache(t, run)
 }
 
-func TestMaterializedPredCache_InheritTypedNilEntry(t *testing.T) {
+func TestMaterializedPredCache_InheritNegativeEntry(t *testing.T) {
 	prev := GetMaterializedPredCache(8, 0)
 	next := GetMaterializedPredCache(8, 0)
 	defer prev.ReleaseRef()
 	defer next.ReleaseRef()
 
 	key := MaterializedPredKeyForScalar("name", qir.OpPREFIX, "a")
-	prev.mu.Lock()
-	if !prev.insertLocked(key, nil) {
-		prev.mu.Unlock()
-		t.Fatalf("insertLocked(%v) failed", key)
-	}
-	prev.count.Add(1)
-	prev.mu.Unlock()
+	prev.Store(key, posting.List{})
 
 	next.InheritFrom(prev, nil, nil)
 
 	if got := next.EntryCount(); got != 1 {
-		t.Fatalf("expected typed-nil entry to be inherited as negative cache entry, got=%d", got)
+		t.Fatalf("expected negative cache entry to be inherited, got=%d", got)
 	}
 	cached, ok := next.Load(key)
 	if !ok || !cached.IsEmpty() {
-		t.Fatalf("expected typed-nil entry to survive as empty negative cache entry")
+		t.Fatalf("expected negative cache entry to survive as empty posting")
 	}
 }
 
