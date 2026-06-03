@@ -1,7 +1,6 @@
 package schema
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -31,8 +30,6 @@ type BuildFieldLocalState struct {
 type BuildSink struct {
 	State *BuildFieldLocalState
 	Idx   uint64
-	Field string
-	Err   *error
 }
 
 const buildIndexRunTargetEntries = max(4<<10, indexdata.FieldChunkTargetEntries*16)
@@ -184,37 +181,17 @@ func (s *BuildFieldState) MaterializeLenStorage(universe posting.List) (indexdat
 }
 
 func (s BuildSink) setNil() {
-	if s.State == nil {
-		return
-	}
 	s.State.addNil(s.Idx)
 }
 
 func (s BuildSink) setLen(length int) {
-	if s.State == nil {
-		return
-	}
 	s.State.addLen(length, s.Idx)
 }
 
 func (s BuildSink) addString(key string) {
-	if s.Err != nil && *s.Err == nil && len(key) > indexdata.FieldStringRefMax {
-		if s.Field != "" {
-			*s.Err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.Field, len(key), indexdata.FieldStringRefMax)
-		} else {
-			*s.Err = indexdata.ValidateIndexedStringKeyLen(len(key))
-		}
-		return
-	}
-	if s.State == nil {
-		return
-	}
 	s.State.addValue(key, s.Idx)
 }
 
 func (s BuildSink) addFixed(key uint64) {
-	if s.State == nil {
-		return
-	}
 	s.State.addFixedValue(key, s.Idx)
 }

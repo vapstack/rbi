@@ -452,13 +452,33 @@ func TestStringValidationUsesRealStringAccessors(t *testing.T) {
 		t.Fatalf("StringValidation=%+v, want only name", rt.StringValidation)
 	}
 	rec := schemaTestStringValidationRec{Name: strings.Repeat("x", indexdata.FieldStringRefMax+1)}
-	var fieldErr error
-	rt.StringValidation[0].WriteBuild(unsafe.Pointer(&rec), BuildSink{
-		Field: rt.StringValidation[0].Name,
-		Err:   &fieldErr,
-	})
+	fieldErr := rt.StringValidation[0].Validate(unsafe.Pointer(&rec))
 	if fieldErr == nil || !strings.Contains(fieldErr.Error(), "exceeds limit") {
-		t.Fatalf("WriteBuild validation err=%v, want indexed string limit error", fieldErr)
+		t.Fatalf("Validate err=%v, want indexed string limit error", fieldErr)
+	}
+}
+
+type schemaTestStringValidationSlicesRec struct {
+	Tags   []string       `db:"tags" rbi:"index"`
+	Values []schemaTestVI `db:"values" rbi:"index"`
+}
+
+func TestStringValidationChecksSlices(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestStringValidationSlicesRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(rt.StringValidation) != 2 {
+		t.Fatalf("StringValidation len=%d want 2", len(rt.StringValidation))
+	}
+	long := strings.Repeat("x", indexdata.FieldStringRefMax+1)
+	rec := schemaTestStringValidationSlicesRec{Tags: []string{"ok", long}, Values: []schemaTestVI{"ok"}}
+	if err = rt.IndexedByName["tags"].Validate(unsafe.Pointer(&rec)); err == nil || !strings.Contains(err.Error(), `field "tags"`) {
+		t.Fatalf("tags validation err=%v, want field tags limit error", err)
+	}
+	rec = schemaTestStringValidationSlicesRec{Tags: []string{"ok"}, Values: []schemaTestVI{schemaTestVI(long)}}
+	if err = rt.IndexedByName["values"].Validate(unsafe.Pointer(&rec)); err == nil || !strings.Contains(err.Error(), `field "values"`) {
+		t.Fatalf("values validation err=%v, want field values limit error", err)
 	}
 }
 
@@ -782,7 +802,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	ptr := unsafe.Pointer(&rec)
 
 	stringLocal := NewBuildFieldLocalState(false, false)
-	rt.IndexedByName["name"].WriteBuild(ptr, BuildSink{State: &stringLocal, Idx: 1, Field: "name"})
+	rt.IndexedByName["name"].WriteBuild(ptr, BuildSink{State: &stringLocal, Idx: 1})
 	stringState := NewBuildFieldState(false)
 	stringLocal.FlushRegularInto(stringState)
 	stringStorage := stringState.MaterializeStorage()
@@ -792,7 +812,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	}
 
 	fixedLocal := NewBuildFieldLocalState(true, true)
-	rt.IndexedByName["scores"].WriteBuild(ptr, BuildSink{State: &fixedLocal, Idx: 2, Field: "scores"})
+	rt.IndexedByName["scores"].WriteBuild(ptr, BuildSink{State: &fixedLocal, Idx: 2})
 	fixedState := NewBuildFieldState(true)
 	fixedLocal.FlushAllInto(fixedState)
 	fixedStorage := fixedState.MaterializeStorage()
@@ -808,7 +828,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	}
 
 	nilLocal := NewBuildFieldLocalState(true, false)
-	rt.IndexedByName["maybe"].WriteBuild(ptr, BuildSink{State: &nilLocal, Idx: 3, Field: "maybe"})
+	rt.IndexedByName["maybe"].WriteBuild(ptr, BuildSink{State: &nilLocal, Idx: 3})
 	nilState := NewBuildFieldState(false)
 	nilLocal.FlushAllInto(nilState)
 	nilStorage := nilState.MaterializeNilStorage()

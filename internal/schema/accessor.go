@@ -7,6 +7,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 )
 
@@ -21,9 +22,11 @@ const smallDistinctLimit = 8
 type fieldAccessorBundle struct {
 	unique       UniqueScalarGetterFn
 	writeBuild   BuildFieldWriteAccessorFn
+	writeChecked BuildFieldWriteCheckedAccessorFn
 	writeIndex   IndexFieldWriteAccessorFn
 	writeInsert  InsertFieldWriteAccessorFn
 	writeScratch ScratchFieldWriteAccessorFn
+	validate     StringValidationAccessorFn
 	modified     FieldModifiedFn
 }
 
@@ -70,6 +73,42 @@ type lenStringValueSink interface {
 type lenFixedValueSink interface {
 	setLen(int)
 	addFixed(uint64)
+}
+
+type checkedBuildSink struct {
+	sink  BuildSink
+	field string
+	err   error
+}
+
+func validateStringKey(field string, key string) error {
+	if len(key) <= indexdata.FieldStringRefMax {
+		return nil
+	}
+	return fmt.Errorf("field %q indexed string value len %d exceeds limit %d", field, len(key), indexdata.FieldStringRefMax)
+}
+
+func (s *checkedBuildSink) setNil() {
+	if s.err == nil {
+		s.sink.setNil()
+	}
+}
+
+func (s *checkedBuildSink) setLen(length int) {
+	if s.err == nil {
+		s.sink.setLen(length)
+	}
+}
+
+func (s *checkedBuildSink) addString(key string) {
+	if s.err != nil {
+		return
+	}
+	if err := validateStringKey(s.field, key); err != nil {
+		s.err = err
+		return
+	}
+	s.sink.addString(key)
 }
 
 func resolveFieldTypeAndOffset(root reflect.Type, index []int) (reflect.Type, uintptr) {
@@ -597,9 +636,9 @@ func slicesModified[T comparable](lhs, rhs []T) bool {
 	return false
 }
 
-func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+func valueIndexerScalarReflectAccessorBundle(field string, fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
 	if fieldType.Kind() != reflect.Interface && fieldType.Kind() != reflect.Pointer {
-		return valueIndexerScalarPtrAccessorBundle(fieldType, offset)
+		return valueIndexerScalarPtrAccessorBundle(field, fieldType, offset)
 	}
 
 	return fieldAccessorBundle{
@@ -611,6 +650,15 @@ func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uint
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			key := fv.Interface().(ValueIndexer).IndexingValue()
+			if err := validateStringKey(field, key); err != nil {
+				return err
+			}
+			sink.addString(key)
+			return nil
+		},
 		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
@@ -623,6 +671,10 @@ func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uint
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
+		validate: func(ptr unsafe.Pointer) error {
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			return validateStringKey(field, fv.Interface().(ValueIndexer).IndexingValue())
+		},
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			fv1 := reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem()
 			fv2 := reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem()
@@ -631,7 +683,7 @@ func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uint
 	}
 }
 
-func valueIndexerScalarPtrAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+func valueIndexerScalarPtrAccessorBundle(field string, fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
 	tab := valueIndexerPtrTab(fieldType)
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
@@ -642,6 +694,15 @@ func valueIndexerScalarPtrAccessorBundle(fieldType reflect.Type, offset uintptr)
 			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
 			sink.addString(vi.IndexingValue())
 		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			key := vi.IndexingValue()
+			if err := validateStringKey(field, key); err != nil {
+				return err
+			}
+			sink.addString(key)
+			return nil
+		},
 		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
 			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
 			sink.addString(vi.IndexingValue())
@@ -653,6 +714,10 @@ func valueIndexerScalarPtrAccessorBundle(fieldType reflect.Type, offset uintptr)
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
 			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
 			sink.addString(vi.IndexingValue())
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			return validateStringKey(field, vi.IndexingValue())
 		},
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			vi1 := valueIndexerAt(tab, unsafe.Add(v1, offset))
@@ -662,16 +727,23 @@ func valueIndexerScalarPtrAccessorBundle(fieldType reflect.Type, offset uintptr)
 	}
 }
 
-func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+func valueIndexerSliceReflectAccessorBundle(field string, sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
 	elemType := sliceType.Elem()
 	if elemType.Kind() != reflect.Interface && elemType.Kind() != reflect.Pointer {
-		return valueIndexerSlicePtrAccessorBundle(sliceType, offset)
+		return valueIndexerSlicePtrAccessorBundle(field, sliceType, offset)
 	}
 
 	return fieldAccessorBundle{
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
+			checked := checkedBuildSink{sink: sink, field: field}
+			addDistinct := addDistinctValueIndexerStringsToSink(fv, &checked)
+			checked.setLen(addDistinct)
+			return checked.err
 		},
 		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
@@ -684,6 +756,15 @@ func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintp
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
+			for i := 0; i < fv.Len(); i++ {
+				if err := validateStringKey(field, fv.Index(i).Interface().(ValueIndexer).IndexingValue()); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			fv1 := reflect.NewAt(sliceType, unsafe.Add(v1, offset)).Elem()
@@ -702,7 +783,7 @@ func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintp
 	}
 }
 
-func valueIndexerSlicePtrAccessorBundle(sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+func valueIndexerSlicePtrAccessorBundle(field string, sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
 	elemType := sliceType.Elem()
 	tab := valueIndexerPtrTab(elemType)
 	size := elemType.Size()
@@ -710,6 +791,13 @@ func valueIndexerSlicePtrAccessorBundle(sliceType reflect.Type, offset uintptr) 
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			data, n := sliceFieldData(ptr, offset)
 			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			data, n := sliceFieldData(ptr, offset)
+			checked := checkedBuildSink{sink: sink, field: field}
+			addDistinct := addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, &checked)
+			checked.setLen(addDistinct)
+			return checked.err
 		},
 		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
 			data, n := sliceFieldData(ptr, offset)
@@ -722,6 +810,16 @@ func valueIndexerSlicePtrAccessorBundle(sliceType reflect.Type, offset uintptr) 
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
 			data, n := sliceFieldData(ptr, offset)
 			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			data, n := sliceFieldData(ptr, offset)
+			for i := 0; i < n; i++ {
+				vi := valueIndexerAt(tab, unsafe.Add(data, uintptr(i)*size))
+				if err := validateStringKey(field, vi.IndexingValue()); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			data1, n1 := sliceFieldData(v1, offset)
@@ -783,7 +881,7 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	}
 }
 
-func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
+func stringFieldAccessorBundle(field string, offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
@@ -794,10 +892,22 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 				return keycodec.IndexLookupString(*v), true, false
 			},
 
-			writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writePtrStringField(ptr, sink, offset) },
+			writeBuild: func(ptr unsafe.Pointer, sink BuildSink) { writePtrStringField(ptr, sink, offset) },
+			writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+				checked := checkedBuildSink{sink: sink, field: field}
+				writePtrStringField(ptr, &checked, offset)
+				return checked.err
+			},
 			writeIndex:   func(ptr unsafe.Pointer, sink IndexSink) { writePtrStringField(ptr, sink, offset) },
 			writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writePtrStringField(ptr, sink, offset) },
 			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writePtrStringField(ptr, sink, offset) },
+			validate: func(ptr unsafe.Pointer) error {
+				v := ptrFieldValue[string](ptr, offset)
+				if v == nil {
+					return nil
+				}
+				return validateStringKey(field, *v)
+			},
 
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[string](v1, offset)
@@ -814,10 +924,21 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 			return keycodec.IndexLookupString(scalarFieldValue[string](ptr, offset)), true, false
 		},
 
-		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeScalarStringField(ptr, sink, offset) },
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) { writeScalarStringField(ptr, sink, offset) },
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			key := scalarFieldValue[string](ptr, offset)
+			if err := validateStringKey(field, key); err != nil {
+				return err
+			}
+			sink.addString(key)
+			return nil
+		},
 		writeIndex:   func(ptr unsafe.Pointer, sink IndexSink) { writeScalarStringField(ptr, sink, offset) },
 		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeScalarStringField(ptr, sink, offset) },
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeScalarStringField(ptr, sink, offset) },
+		validate: func(ptr unsafe.Pointer) error {
+			return validateStringKey(field, scalarFieldValue[string](ptr, offset))
+		},
 
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[string](v1, offset) != scalarFieldValue[string](v2, offset)
@@ -1047,12 +1168,26 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 	}
 }
 
-func stringSliceAccessorBundle(offset uintptr) fieldAccessorBundle {
+func stringSliceAccessorBundle(field string, offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeStringSliceField(ptr, sink, offset) },
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) { writeStringSliceField(ptr, sink, offset) },
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			checked := checkedBuildSink{sink: sink, field: field}
+			writeStringSliceField(ptr, &checked, offset)
+			return checked.err
+		},
 		writeIndex:   func(ptr unsafe.Pointer, sink IndexSink) { writeStringSliceField(ptr, sink, offset) },
 		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeStringSliceField(ptr, sink, offset) },
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeStringSliceField(ptr, sink, offset) },
+		validate: func(ptr unsafe.Pointer) error {
+			vals := sliceFieldValue[string](ptr, offset)
+			for i := range vals {
+				if err := validateStringKey(field, vals[i]); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
 
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[string](v1, offset), sliceFieldValue[string](v2, offset))
@@ -1356,15 +1491,15 @@ func buildFieldAccessorBundle(f *Field, fieldType reflect.Type, offset uintptr) 
 
 	if f.UseVI {
 		if f.Slice {
-			return valueIndexerSliceReflectAccessorBundle(fieldType, offset), nil
+			return valueIndexerSliceReflectAccessorBundle(f.DBName, fieldType, offset), nil
 		}
-		return valueIndexerScalarReflectAccessorBundle(fieldType, offset), nil
+		return valueIndexerScalarReflectAccessorBundle(f.DBName, fieldType, offset), nil
 	}
 
 	if f.Slice {
 		switch f.Kind {
 		case reflect.String:
-			return stringSliceAccessorBundle(offset), nil
+			return stringSliceAccessorBundle(f.DBName, offset), nil
 		case reflect.Bool:
 			return boolSliceAccessorBundle(offset), nil
 		case reflect.Int:
@@ -1398,7 +1533,7 @@ func buildFieldAccessorBundle(f *Field, fieldType reflect.Type, offset uintptr) 
 
 	switch f.Kind {
 	case reflect.String:
-		return stringFieldAccessorBundle(offset, f.Ptr), nil
+		return stringFieldAccessorBundle(f.DBName, offset, f.Ptr), nil
 	case reflect.Bool:
 		return boolFieldAccessorBundle(offset, f.Ptr), nil
 	case reflect.Int:
@@ -1443,9 +1578,11 @@ func makeIndexedFieldAccessor(vtype reflect.Type, f *Field) (IndexedFieldAccesso
 	}
 
 	acc.WriteBuild = bundle.writeBuild
+	acc.WriteBuildChecked = bundle.writeChecked
 	acc.WriteIndex = bundle.writeIndex
 	acc.WriteInsert = bundle.writeInsert
 	acc.WriteScratch = bundle.writeScratch
+	acc.Validate = bundle.validate
 	acc.Modified = bundle.modified
 
 	if f.Unique && !f.Slice {
@@ -1478,7 +1615,7 @@ func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]
 		}
 		acc.Ordinal = len(access)
 		access = append(access, acc)
-		if f.UseVI || f.Kind == reflect.String {
+		if acc.Validate != nil {
 			validationAccess = append(validationAccess, acc)
 		}
 		fieldMap[f.DBName] = acc

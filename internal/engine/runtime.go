@@ -204,13 +204,8 @@ func (index *Index) ConfigureWrite(cfg *wexec.Config, broken *atomic.Bool, logge
 
 func (index *Index) ValidateStringValues(ptr unsafe.Pointer) error {
 	for _, acc := range index.schema.StringValidation {
-		var fieldErr error
-		acc.WriteBuild(ptr, schema.BuildSink{
-			Field: acc.Name,
-			Err:   &fieldErr,
-		})
-		if fieldErr != nil {
-			return fieldErr
+		if err := acc.Validate(ptr); err != nil {
+			return err
 		}
 	}
 	return nil

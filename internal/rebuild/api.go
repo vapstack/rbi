@@ -55,9 +55,11 @@ func Build(cfg Config, state State) (Result, error) {
 			continue
 		}
 		active = append(active, buildField{
-			acc:     acc,
-			slice:   acc.Field.Slice,
-			numeric: acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64,
+			acc:          acc,
+			write:        acc.WriteBuild,
+			writeChecked: acc.WriteBuildChecked,
+			slice:        acc.Field.Slice,
+			numeric:      acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64,
 		})
 	}
 	activeMeasures := make([]schema.MeasureFieldAccessor, 0, len(cfg.Schema.Measures))

@@ -293,20 +293,16 @@ func BenchmarkIndexedAccessorWriteBuild(b *testing.B) {
 		numeric := acc.Field.KeyKind == FieldWriteKeysOrderedU64
 		slice := acc.Field.Slice
 		b.Run(name, func(b *testing.B) {
-			var err error
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				state := NewBuildFieldLocalState(numeric, slice)
 				acc.WriteBuild(ptr, BuildSink{
 					State: &state,
 					Idx:   uint64(i + 1),
-					Field: acc.Name,
-					Err:   &err,
 				})
 				benchmarkSchemaIntSink = len(state.vals) + len(state.fixed) + len(state.lenMap)
 				state.Release()
 			}
-			benchmarkSchemaBoolSink = err == nil
 		})
 	}
 }
@@ -324,7 +320,6 @@ func BenchmarkBuildFieldStateFlushMaterialize(b *testing.B) {
 		acc.WriteBuild(ptr, BuildSink{
 			State: &local,
 			Idx:   uint64(i + 1),
-			Field: acc.Name,
 		})
 		local.FlushAllInto(state)
 		storage := state.MaterializeStorage()

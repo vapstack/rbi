@@ -145,6 +145,25 @@ func TestBuildMaterializesUint64FieldsLenAndMeasure(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsTooLongIndexedString(t *testing.T) {
+	bucket := []byte("rebuild_string_limit")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildTestSchema(t)
+
+	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: strings.Repeat("x", indexdata.FieldStringRefMax+1)})
+
+	_, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	if err == nil {
+		t.Fatalf("expected indexed string limit error")
+	}
+	msg := err.Error()
+	for _, want := range []string{`field="name"`, "indexed string value len", "exceeds limit"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("indexed string limit error missing %q: %v", want, err)
+		}
+	}
+}
+
 func TestBuildDecodeReleaseCallbackContract(t *testing.T) {
 	bucket := []byte("rebuild_callbacks")
 	db := openRebuildTestBolt(t, bucket)

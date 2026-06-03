@@ -175,16 +175,18 @@ func (m IndexedFieldMap) ResolveField(name string) (int, bool) {
 type MeasureFieldMap map[string]MeasureFieldAccessor
 
 type IndexedFieldAccessor struct {
-	Ordinal      int
-	PatchOrdinal int
-	Name         string
-	Field        *Field
-	UniqueGetter UniqueScalarGetterFn
-	WriteBuild   BuildFieldWriteAccessorFn
-	WriteIndex   IndexFieldWriteAccessorFn
-	WriteInsert  InsertFieldWriteAccessorFn
-	WriteScratch ScratchFieldWriteAccessorFn
-	Modified     FieldModifiedFn
+	Ordinal           int
+	PatchOrdinal      int
+	Name              string
+	Field             *Field
+	UniqueGetter      UniqueScalarGetterFn
+	WriteBuild        BuildFieldWriteAccessorFn
+	WriteBuildChecked BuildFieldWriteCheckedAccessorFn
+	WriteIndex        IndexFieldWriteAccessorFn
+	WriteInsert       InsertFieldWriteAccessorFn
+	WriteScratch      ScratchFieldWriteAccessorFn
+	Validate          StringValidationAccessorFn
+	Modified          FieldModifiedFn
 }
 
 type MeasureFieldAccessor struct {
@@ -609,11 +611,13 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 }
 
 type (
-	UniqueScalarGetterFn        func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool)
-	BuildFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink BuildSink)
-	IndexFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink IndexSink)
-	InsertFieldWriteAccessorFn  func(ptr unsafe.Pointer, sink InsertSink)
-	ScratchFieldWriteAccessorFn func(ptr unsafe.Pointer, sink *WriteScratch)
+	UniqueScalarGetterFn             func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool)
+	BuildFieldWriteAccessorFn        func(ptr unsafe.Pointer, sink BuildSink)
+	BuildFieldWriteCheckedAccessorFn func(ptr unsafe.Pointer, sink BuildSink) error
+	IndexFieldWriteAccessorFn        func(ptr unsafe.Pointer, sink IndexSink)
+	InsertFieldWriteAccessorFn       func(ptr unsafe.Pointer, sink InsertSink)
+	ScratchFieldWriteAccessorFn      func(ptr unsafe.Pointer, sink *WriteScratch)
+	StringValidationAccessorFn       func(ptr unsafe.Pointer) error
 )
 
 func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, single []int) error {

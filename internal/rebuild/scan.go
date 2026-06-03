@@ -16,9 +16,11 @@ import (
 )
 
 type buildField struct {
-	acc     schema.IndexedFieldAccessor
-	slice   bool
-	numeric bool
+	acc          schema.IndexedFieldAccessor
+	write        schema.BuildFieldWriteAccessorFn
+	writeChecked schema.BuildFieldWriteCheckedAccessorFn
+	slice        bool
+	numeric      bool
 }
 
 type rawdata struct {
@@ -102,13 +104,16 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 				lu = lu.BuildAdded(idx)
 
 				for k := range active {
-					var fieldErr error
-					active[k].acc.WriteBuild(ptr, schema.BuildSink{
+					sink := schema.BuildSink{
 						State: &localStates[k],
 						Idx:   idx,
-						Field: active[k].acc.Name,
-						Err:   &fieldErr,
-					})
+					}
+					var fieldErr error
+					if active[k].writeChecked != nil {
+						fieldErr = active[k].writeChecked(ptr, sink)
+					} else {
+						active[k].write(ptr, sink)
+					}
 					if fieldErr != nil {
 						cfg.Release(ptr)
 						data.localUniverse[widx] = lu
