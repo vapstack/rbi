@@ -2,7 +2,11 @@ package indexdata
 
 import (
 	"fmt"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -27,6 +31,75 @@ func poisonBytes(bufs ...[]byte) {
 		for j := range buf {
 			buf[j] = 0x7f
 		}
+	}
+}
+
+func fieldStorageLargePosting(base uint64) posting.List {
+	ids := make([]uint64, 128)
+	for i := range ids {
+		ids[i] = base + uint64(i)*3
+	}
+	return posting.BuildFromSorted(ids)
+}
+
+func assertRetainedFieldStorageBorrowedViewSurvivesSourceRelease(t *testing.T, storage FieldStorage, key string, want []uint64) {
+	t.Helper()
+
+	retained := storage
+	retained.retain()
+	defer retained.Release()
+
+	held := NewFieldIndexViewFromStorage(retained).LookupPostingRetained(key)
+	if held.IsEmpty() {
+		storage.Release()
+		t.Fatalf("expected retained posting for key %q", key)
+	}
+	defer held.Release()
+	if got := held.ToArray(); !slices.Equal(got, want) {
+		storage.Release()
+		t.Fatalf("posting %q before release: got=%v want=%v", key, got, want)
+	}
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
+	}
+
+	readerN := max(4, runtime.GOMAXPROCS(0))
+	start := make(chan struct{})
+	ready := make(chan struct{}, readerN)
+	var wg sync.WaitGroup
+	for i := 0; i < readerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ready <- struct{}{}
+			for i := 0; i < 1000; i++ {
+				if got := held.ToArray(); !slices.Equal(got, want) {
+					setFailed(fmt.Sprintf("posting %q changed while source storage was released: got=%v want=%v", key, got, want))
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	for i := 0; i < readerN; i++ {
+		<-ready
+	}
+	storage.Release()
+	wg.Wait()
+
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+	if got := held.ToArray(); !slices.Equal(got, want) {
+		t.Fatalf("posting %q after release: got=%v want=%v", key, got, want)
 	}
 }
 
@@ -561,6 +634,53 @@ func TestFieldStorageBuilder_RoundTrip(t *testing.T) {
 			fieldStorageAssertStorageMatchesEntries(t, storage, entries)
 		})
 	}
+}
+
+func TestFieldStorageFlatRetainedBorrowedPostingSurvivesSourceRelease(t *testing.T) {
+	const key = "k/0002"
+	entries := GetFieldEntrySlice(4)[:4]
+	var want []uint64
+	for i := range entries {
+		ids := fieldStorageLargePosting(uint64(i+1) << 20)
+		if i == 2 {
+			want = ids.ToArray()
+		}
+		entries[i] = Entry{
+			Key: keycodec.FromStoredString(fmt.Sprintf("k/%04d", i), false),
+			IDs: ids,
+		}
+	}
+	storage := newRegularFieldStorage(entries)
+	if storage.IsChunked() {
+		storage.Release()
+		t.Fatal("expected flat storage")
+	}
+
+	assertRetainedFieldStorageBorrowedViewSurvivesSourceRelease(t, storage, key, want)
+}
+
+func TestFieldStorageChunkedRetainedBorrowedPostingSurvivesSourceRelease(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 11
+	const keyIdx = fieldIndexChunkThreshold + 3
+	entries := GetFieldEntrySlice(total)[:total]
+	var want []uint64
+	for i := range entries {
+		ids := fieldStorageLargePosting(uint64(i+1) << 20)
+		if i == keyIdx {
+			want = ids.ToArray()
+		}
+		entries[i] = Entry{
+			Key: keycodec.FromStoredString(fmt.Sprintf("k/%04d", i), false),
+			IDs: ids,
+		}
+	}
+	storage := newRegularFieldStorage(entries)
+	if !storage.IsChunked() {
+		storage.Release()
+		t.Fatal("expected chunked storage")
+	}
+
+	assertRetainedFieldStorageBorrowedViewSurvivesSourceRelease(t, storage, fmt.Sprintf("k/%04d", keyIdx), want)
 }
 
 func TestRegularFieldStorageFromPostingMapOwned_ThresholdShape(t *testing.T) {

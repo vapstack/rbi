@@ -152,6 +152,72 @@ func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 	cached.Release()
 }
 
+func TestNumericRangeBucketEntryRetainedBorrowedViewSurvivesSourceRelease(t *testing.T) {
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
+
+	base := qcacheTestLargePosting()
+	want := base.ToArray()
+	stored, ok := entry.TryStoreFullSpan(0, 0, base.Borrow())
+	if !ok || stored.IsEmpty() {
+		base.Release()
+		entry.Release()
+		t.Fatal("expected full-span cache store to succeed")
+	}
+	stored.Release()
+	base.Release()
+
+	retained := entry
+	retained.Retain()
+	defer retained.Release()
+
+	held, ok := retained.LoadFullSpan(0, 0)
+	if !ok || held.IsEmpty() {
+		entry.Release()
+		t.Fatal("expected retained full-span posting")
+	}
+	defer held.Release()
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
+	}
+
+	readerN := max(4, runtime.GOMAXPROCS(0))
+	start := make(chan struct{})
+	ready := make(chan struct{}, readerN)
+	var wg sync.WaitGroup
+	for i := 0; i < readerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ready <- struct{}{}
+			for i := 0; i < 1000; i++ {
+				if got := held.ToArray(); !slices.Equal(got, want) {
+					setFailed(fmt.Sprintf("held full-span posting changed while source entry was released: got=%v want=%v", got, want))
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	for i := 0; i < readerN; i++ {
+		<-ready
+	}
+	entry.Release()
+	wg.Wait()
+
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+	qcacheTestAssertPostingSet(t, held, want)
+}
+
 func TestNumericRangeBucketIndex_BuildAndFullBucketSpan(t *testing.T) {
 	storage := qcacheTestFieldStorage(100, 1000)
 	defer storage.Release()

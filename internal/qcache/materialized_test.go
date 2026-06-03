@@ -652,6 +652,66 @@ func TestMaterializedPredCache_BorrowedViewSurvivesConcurrentEviction(t *testing
 	qcacheTestAssertPostingSet(t, held, want)
 }
 
+func TestMaterializedPredCacheRetainedBorrowedViewSurvivesSourceRelease(t *testing.T) {
+	cache := GetMaterializedPredCache(4, 0)
+
+	base := qcacheTestLargePosting()
+	want := base.ToArray()
+	key := MaterializedPredKeyFromOpaque("held")
+	cache.Store(key, base.Borrow())
+	base.Release()
+
+	cache.Retain()
+	defer cache.ReleaseRef()
+
+	held, ok := cache.Load(key)
+	if !ok || held.IsEmpty() {
+		cache.ReleaseRef()
+		t.Fatal("expected held cache entry")
+	}
+	defer held.Release()
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
+	}
+
+	readerN := max(4, runtime.GOMAXPROCS(0))
+	start := make(chan struct{})
+	ready := make(chan struct{}, readerN)
+	var wg sync.WaitGroup
+	for i := 0; i < readerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ready <- struct{}{}
+			for i := 0; i < 1000; i++ {
+				if got := held.ToArray(); !slices.Equal(got, want) {
+					setFailed(fmt.Sprintf("held materialized posting changed while source cache was released: got=%v want=%v", got, want))
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	for i := 0; i < readerN; i++ {
+		<-ready
+	}
+	cache.ReleaseRef()
+	wg.Wait()
+
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+	qcacheTestAssertPostingSet(t, held, want)
+}
+
 func TestMaterializedPredCache_RetainDrainRetiredAndMaxCardinality(t *testing.T) {
 	cache := GetMaterializedPredCache(1, 7)
 	if got := cache.MaxCardinality(); got != 7 {

@@ -160,40 +160,28 @@ func (sm *Registry) Unpin(seq uint64, ref *Ref) {
 		return
 	}
 	var (
-		drainCache *qcache.MaterializedPredCache
-		retired    []*View
+		cacheRetired qcache.MaterializedPredRetired
+		retired      []*View
 	)
 
 	sm.mu.Lock()
 	held := sm.bySeq[seq]
-	if held != ref || held.refs.Load() != 0 || held.snap != nil {
-		if held == ref && held.refs.Load() == 0 && held.snap != nil &&
-			held == sm.currentRef.Load() && held.retired != nil {
+	refsZero := held == ref && held.refs.Load() == 0
+	if held == ref && refsZero && held.snap == nil {
+		retired = sm.releaseRetiredSnapshotRefLocked(seq, held)
+	} else if refsZero && held.snap != nil && held == sm.currentRef.Load() {
+		if held.retired != nil {
 			retired = held.retired
 			held.retired = nil
 		}
-		if held == ref && held.snap != nil &&
-			held == sm.currentRef.Load() {
-			drainCache = held.snap.matPredCache
-			if drainCache != nil {
-				drainCache.Retain()
-			}
+		if held.snap.matPredCache != nil {
+			cacheRetired = held.snap.matPredCache.TakeRetired()
 		}
-		sm.mu.Unlock()
-
-		releaseRetiredSnapshots(retired)
-		if drainCache != nil {
-			drainCache.DrainRetired()
-			drainCache.ReleaseRef()
-		}
-		return
 	}
-
-	retired = sm.releaseRetiredSnapshotRefLocked(seq, held)
-
 	sm.mu.Unlock()
 
 	releaseRetiredSnapshots(retired)
+	cacheRetired.Release()
 }
 
 func (sm *Registry) retireSnapshotLocked(seq uint64) []*View {

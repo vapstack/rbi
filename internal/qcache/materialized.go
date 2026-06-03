@@ -50,6 +50,12 @@ type materializedPredCacheEntry struct {
 	stamp     atomic.Uint64
 }
 
+// MaterializedPredRetired carries detached retired entries past the caller's
+// reader barrier so payload release can run without blocking new readers.
+type MaterializedPredRetired struct {
+	entries []*materializedPredCacheEntry
+}
+
 type materializedPredCacheSlot struct {
 	key   MaterializedPredKey
 	hash  uint64
@@ -432,17 +438,26 @@ func (c *MaterializedPredCache) Clear() {
 }
 
 func (c *MaterializedPredCache) DrainRetired() {
+	c.TakeRetired().Release()
+}
+
+func (c *MaterializedPredCache) TakeRetired() MaterializedPredRetired {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.retired == nil {
+	retired := c.retired
+	c.retired = nil
+	return MaterializedPredRetired{entries: retired}
+}
+
+func (r MaterializedPredRetired) Release() {
+	if r.entries == nil {
 		return
 	}
-	for i := range c.retired {
-		c.retired[i].release()
+	for i := range r.entries {
+		r.entries[i].release()
 	}
-	materializedPredCacheRetiredPool.Put(c.retired)
-	c.retired = nil
+	materializedPredCacheRetiredPool.Put(r.entries)
 }
 
 func (c *MaterializedPredCache) release() {
