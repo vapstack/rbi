@@ -34,40 +34,33 @@ func TestAggregateGroupOrdinalMapResetDropsOversizedStorage(t *testing.T) {
 	}
 }
 
-func TestAggregateQueryReleaseClearsPooledPlannerSlices(t *testing.T) {
-	groups := aggregateFieldRefSlicePool.Get(2)
-	groups = append(groups,
-		aggregateFieldRef{name: "group_a", out: "ga", ordinary: schema.IndexedFieldAccessor{Name: "group_a", Field: &schema.Field{Name: "group_a"}}, kind: aggregateValueString},
-		aggregateFieldRef{name: "group_b", out: "gb", measure: schema.MeasureFieldAccessor{Name: "group_b", Field: &schema.Field{Name: "group_b"}}, isMeasure: true, kind: aggregateValueUnsigned},
-	)
-	metrics := aggregateMetricSlicePool.Get(2)
-	metrics = append(metrics,
-		aggregateMetric{op: aggregateMetricMax, out: "max_score", field: aggregateFieldRef{name: "score"}, rowCount: true},
-		aggregateMetric{op: aggregateMetricCountDistinct, out: "unique_tags", field: aggregateFieldRef{name: "tags"}},
-	)
-	order := aggregateOrderSlicePool.Get(2)
-	order = append(order, aggregateOrder{index: 1, desc: true}, aggregateOrder{index: 2})
-
+func TestAggregateQueryReleaseClearsOwnedPlannerSlices(t *testing.T) {
 	q := &Query{
-		groups:      groups,
-		metrics:     metrics,
+		groups: []aggregateFieldRef{
+			{name: "group_a", out: "ga", ordinary: schema.IndexedFieldAccessor{Name: "group_a", Field: &schema.Field{Name: "group_a"}}, kind: aggregateValueString},
+			{name: "group_b", out: "gb", measure: schema.MeasureFieldAccessor{Name: "group_b", Field: &schema.Field{Name: "group_b"}}, isMeasure: true, kind: aggregateValueUnsigned},
+		},
+		metrics: []aggregateMetric{
+			{op: aggregateMetricMax, out: "max_score", field: aggregateFieldRef{name: "score"}, rowCount: true},
+			{op: aggregateMetricCountDistinct, out: "unique_tags", field: aggregateFieldRef{name: "tags"}},
+		},
 		having:      aggregateHavingExpr{op: aggregateHavingGT, index: 1, value: valueFromSafeString("42")},
 		hasHaving:   true,
-		order:       order,
+		order:       []aggregateOrder{{index: 1, desc: true}, {index: 2}},
 		orderUnique: true,
 		offset:      3,
 		limit:       5,
 	}
 	q.Release()
 
-	if q.groups != nil || q.metrics != nil || q.order != nil || q.hasHaving {
-		t.Fatalf("released aggregate query retained pooled slices")
+	if len(q.groups) != 0 || len(q.metrics) != 0 || len(q.order) != 0 || q.hasHaving || q.orderUnique || q.offset != 0 || q.limit != 0 {
+		t.Fatalf("released aggregate query retained logical state")
 	}
 	if q.having.op != 0 || q.having.index != 0 || q.having.value.Kind() != ValueKindNone || q.having.values != nil || q.having.args != nil {
 		t.Fatalf("released aggregate query retained having state: %+v", q.having)
 	}
 
-	for i, entry := range groups[:cap(groups)] {
+	for i, entry := range q.groups[:cap(q.groups)] {
 		if entry.name != "" ||
 			entry.out != "" ||
 			entry.ordinary.Name != "" ||
@@ -79,7 +72,7 @@ func TestAggregateQueryReleaseClearsPooledPlannerSlices(t *testing.T) {
 			t.Fatalf("group slice retained stale entry at %d: %+v", i, entry)
 		}
 	}
-	for i, entry := range metrics[:cap(metrics)] {
+	for i, entry := range q.metrics[:cap(q.metrics)] {
 		if entry.op != aggregateMetricCount ||
 			entry.out != "" ||
 			entry.field.name != "" ||
@@ -88,10 +81,23 @@ func TestAggregateQueryReleaseClearsPooledPlannerSlices(t *testing.T) {
 			t.Fatalf("metric slice retained stale entry at %d: %+v", i, entry)
 		}
 	}
-	for i, entry := range order[:cap(order)] {
+	for i, entry := range q.order[:cap(q.order)] {
 		if entry.index != 0 || entry.desc {
 			t.Fatalf("order slice retained stale entry at %d: %+v", i, entry)
 		}
+	}
+}
+
+func TestAggregateQueryReleaseDropsOversizedPlannerSlices(t *testing.T) {
+	q := &Query{
+		groups:  make([]aggregateFieldRef, 0, aggregateFieldRefSliceMaxCap+1),
+		metrics: make([]aggregateMetric, 0, aggregateMetricSliceMaxCap+1),
+		order:   make([]aggregateOrder, 0, aggregateOrderSliceMaxCap+1),
+	}
+	q.Release()
+
+	if q.groups != nil || q.metrics != nil || q.order != nil {
+		t.Fatalf("released aggregate query retained oversized slices")
 	}
 }
 

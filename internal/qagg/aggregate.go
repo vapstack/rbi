@@ -218,18 +218,7 @@ func Execute(view *qexec.View, snap *snapshot.View, prepared *Query) (result Res
 }
 
 func (q *Query) Release() {
-	if q.filter != nil {
-		q.filter.Release()
-		q.filter = nil
-	}
-	aggregateFieldRefSlicePool.Put(q.groups)
-	q.groups = nil
-	aggregateMetricSlicePool.Put(q.metrics)
-	q.metrics = nil
-	q.having = aggregateHavingExpr{}
-	q.hasHaving = false
-	aggregateOrderSlicePool.Put(q.order)
-	q.order = nil
+	aggregateQueryPool.Put(q)
 }
 
 func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
@@ -248,16 +237,15 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 		return nil, err
 	}
 
-	out := &Query{
-		filter: filter,
-		offset: src.Window.Offset,
-		limit:  src.Window.Limit,
+	out := aggregateQueryPool.Get()
+	out.filter = filter
+	out.offset = src.Window.Offset
+	out.limit = src.Window.Limit
+	if cap(out.groups) < len(src.Reduction.Group) {
+		out.groups = make([]aggregateFieldRef, 0, len(src.Reduction.Group))
 	}
-	if len(src.Reduction.Group) != 0 {
-		out.groups = aggregateFieldRefSlicePool.Get(len(src.Reduction.Group))
-	}
-	if len(src.Reduction.Metrics) != 0 {
-		out.metrics = aggregateMetricSlicePool.Get(len(src.Reduction.Metrics))
+	if cap(out.metrics) < len(src.Reduction.Metrics) {
+		out.metrics = make([]aggregateMetric, 0, len(src.Reduction.Metrics))
 	}
 	outputPositions := aggregateOutputPositionMapPool.Get()
 	defer aggregateOutputPositionMapPool.Put(outputPositions)
@@ -314,18 +302,28 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	}
 
 	if len(src.Order) > 0 {
-		order, err := prepareAggregateOrder(src.Order, outputPositions)
-		if err != nil {
-			out.Release()
-			return nil, err
+		if cap(out.order) < len(src.Order) {
+			out.order = make([]aggregateOrder, 0, len(src.Order))
 		}
-		out.order = order
+		for i := range src.Order {
+			by := src.Order[i].By
+			if by.Kind != qx.KindOUT || by.Name == "" {
+				out.Release()
+				return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", qexec.ErrInvalidQuery)
+			}
+			pos, ok := outputPositions[by.Name]
+			if !ok {
+				out.Release()
+				return nil, fmt.Errorf("%w: unknown aggregate output %q in ORDER", qexec.ErrInvalidQuery, by.Name)
+			}
+			out.order = append(out.order, aggregateOrder{index: pos, desc: src.Order[i].Desc})
+		}
 		if len(out.groups) > 0 {
 			uniq := true
 			for i := range out.groups {
 				found := false
-				for j := range order {
-					if order[j].index == i {
+				for j := range out.order {
+					if out.order[j].index == i {
 						found = true
 						break
 					}
@@ -350,24 +348,6 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 	}
 	seen[name] = pos
 	return nil
-}
-
-func prepareAggregateOrder(src []qx.Order, outputs map[string]int) ([]aggregateOrder, error) {
-	order := aggregateOrderSlicePool.Get(len(src))
-	for i := range src {
-		by := src[i].By
-		if by.Kind != qx.KindOUT || by.Name == "" {
-			aggregateOrderSlicePool.Put(order)
-			return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", qexec.ErrInvalidQuery)
-		}
-		pos, ok := outputs[by.Name]
-		if !ok {
-			aggregateOrderSlicePool.Put(order)
-			return nil, fmt.Errorf("%w: unknown aggregate output %q in ORDER", qexec.ErrInvalidQuery, by.Name)
-		}
-		order = append(order, aggregateOrder{index: pos, desc: src[i].Desc})
-	}
-	return order, nil
 }
 
 func prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
