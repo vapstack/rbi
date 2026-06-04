@@ -144,6 +144,7 @@ func (c *NumericRangeBucketCache) StoreSlot(field string, ordinal int, entry *Nu
 
 	c.mu.Lock()
 	slot := c.slots[ordinal]
+	replaced := slot.entry
 	if slot.entry == nil {
 		if entry != nil {
 			c.count++
@@ -163,6 +164,9 @@ func (c *NumericRangeBucketCache) StoreSlot(field string, ordinal int, entry *Nu
 	slot.entry = entry
 	c.slots[ordinal] = slot
 	c.mu.Unlock()
+	if replaced != nil && replaced != entry {
+		replaced.Release()
+	}
 }
 
 func (c *NumericRangeBucketCache) LoadField(field string) (*NumericRangeBucketEntry, bool) {

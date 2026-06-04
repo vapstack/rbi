@@ -107,6 +107,44 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 	}
 }
 
+func TestNumericRangeBucketCacheStoreSlotReleasesReplacedEntry(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	cache := GetNumericRangeBucketCache(1, 0)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	oldEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+	newEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+
+	cache.StoreSlot("age", 0, oldEntry)
+	if _, ok := cache.LoadField("age"); !ok {
+		t.Fatal("expected field index to be built for old entry")
+	}
+	cache.StoreSlot("age", 0, newEntry)
+
+	if oldEntry.refs.Load() != 0 {
+		t.Fatalf("expected replaced numeric range entry to be released, refs=%d", oldEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 1 {
+		t.Fatalf("EntryCount after replacement=%d want 1", got)
+	}
+	if got, ok := cache.LoadSlot("age", 0); !ok || got != newEntry {
+		t.Fatal("expected ordinal load to return replacement entry")
+	}
+	if got, ok := cache.LoadField("age"); !ok || got != newEntry {
+		t.Fatal("expected field index to return replacement entry")
+	}
+
+	cache.StoreSlot("age", 0, nil)
+	if newEntry.refs.Load() != 0 {
+		t.Fatalf("expected cleared numeric range entry to be released, refs=%d", newEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after clear=%d want 0", got)
+	}
+}
+
 func TestNumericRangeBucketCacheDrainRetiredSkipsSharedEntries(t *testing.T) {
 	cache := GetNumericRangeBucketCache(2, 0)
 	defer ReleaseNumericRangeBucketCache(cache)
