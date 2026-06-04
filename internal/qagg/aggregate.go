@@ -152,15 +152,17 @@ type aggregateHavingExpr struct {
 }
 
 type Query struct {
-	filter      *qir.Query
-	groups      []aggregateFieldRef
-	metrics     []aggregateMetric
-	having      aggregateHavingExpr
-	hasHaving   bool
-	order       []aggregateOrder
-	orderUnique bool
-	offset      uint64
-	limit       uint64
+	filter       *qir.Query
+	groups       []aggregateFieldRef
+	metrics      []aggregateMetric
+	having       aggregateHavingExpr
+	havingArgs   []aggregateHavingExpr
+	havingValues []Value
+	hasHaving    bool
+	order        []aggregateOrder
+	orderUnique  bool
+	offset       uint64
+	limit        uint64
 }
 
 type aggregateMetricState struct {
@@ -292,7 +294,18 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	}
 
 	if !src.Reduction.Having.IsZero() {
-		having, err := prepareAggregateHaving(src.Reduction.Having, outputPositions)
+		havingArgs, havingValues, err := aggregateHavingStorageSize(src.Reduction.Having, outputPositions)
+		if err != nil {
+			out.Release()
+			return nil, err
+		}
+		if cap(out.havingArgs) < havingArgs {
+			out.havingArgs = make([]aggregateHavingExpr, 0, havingArgs)
+		}
+		if cap(out.havingValues) < havingValues {
+			out.havingValues = make([]Value, 0, havingValues)
+		}
+		having, err := out.prepareAggregateHaving(src.Reduction.Having, outputPositions)
 		if err != nil {
 			out.Release()
 			return nil, err
@@ -350,16 +363,91 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 	return nil
 }
 
-func prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
+func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int, error) {
+	if expr.Kind != qx.KindOP {
+		return 0, 0, fmt.Errorf("%w: aggregate HAVING root must be a predicate", qexec.ErrInvalidQuery)
+	}
+	args := 0
+	values := 0
+	switch expr.Name {
+	case qx.OpAND, qx.OpOR:
+		args += len(expr.Args)
+		for i := range expr.Args {
+			childArgs, childValues, err := aggregateHavingStorageSize(expr.Args[i], outputs)
+			if err != nil {
+				return 0, 0, err
+			}
+			args += childArgs
+			values += childValues
+		}
+	case qx.OpNOT:
+		if len(expr.Args) != 1 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", qexec.ErrInvalidQuery)
+		}
+		args++
+		childArgs, childValues, err := aggregateHavingStorageSize(expr.Args[0], outputs)
+		if err != nil {
+			return 0, 0, err
+		}
+		args += childArgs
+		values += childValues
+	case qx.OpEXISTS, qx.OpISNULL:
+		if len(expr.Args) != 1 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", qexec.ErrInvalidQuery, expr.Name)
+		}
+		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
+			return 0, 0, err
+		}
+	case qx.OpEQ, qx.OpNE, qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		if len(expr.Args) != 2 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", qexec.ErrInvalidQuery, expr.Name)
+		}
+		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
+			return 0, 0, err
+		}
+		if expr.Args[1].Kind != qx.KindLIT {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING right side supports only literals", qexec.ErrInvalidQuery)
+		}
+	case qx.OpIN:
+		if len(expr.Args) != 2 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", qexec.ErrInvalidQuery)
+		}
+		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
+			return 0, 0, err
+		}
+		if expr.Args[1].Kind != qx.KindLIT {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		}
+		raw := reflect.ValueOf(expr.Args[1].Value)
+		if !raw.IsValid() {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		}
+		raw, isNil := schema.UnwrapQueryValue(raw)
+		if isNil || raw.Kind() != reflect.Slice {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		}
+		if raw.Len() == 0 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN: no values provided", qexec.ErrInvalidQuery)
+		}
+		values += raw.Len()
+	default:
+		return 0, 0, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", qexec.ErrInvalidQuery)
+	}
+	return args, values, nil
+}
+
+func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
 	if expr.Kind != qx.KindOP {
 		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING root must be a predicate", qexec.ErrInvalidQuery)
 	}
 	switch expr.Name {
 
 	case qx.OpAND, qx.OpOR:
-		args := make([]aggregateHavingExpr, len(expr.Args))
+		start := len(q.havingArgs)
+		q.havingArgs = q.havingArgs[:start+len(expr.Args)]
+		args := q.havingArgs[start : start+len(expr.Args)]
 		for i := range expr.Args {
-			arg, err := prepareAggregateHaving(expr.Args[i], outputs)
+			arg, err := q.prepareAggregateHaving(expr.Args[i], outputs)
 			if err != nil {
 				return aggregateHavingExpr{}, err
 			}
@@ -375,11 +463,15 @@ func prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavi
 		if len(expr.Args) != 1 {
 			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", qexec.ErrInvalidQuery)
 		}
-		arg, err := prepareAggregateHaving(expr.Args[0], outputs)
+		start := len(q.havingArgs)
+		q.havingArgs = q.havingArgs[:start+1]
+		args := q.havingArgs[start : start+1]
+		arg, err := q.prepareAggregateHaving(expr.Args[0], outputs)
 		if err != nil {
 			return aggregateHavingExpr{}, err
 		}
-		return aggregateHavingExpr{op: aggregateHavingNot, args: []aggregateHavingExpr{arg}}, nil
+		args[0] = arg
+		return aggregateHavingExpr{op: aggregateHavingNot, args: args}, nil
 
 	case qx.OpEXISTS, qx.OpISNULL:
 		if len(expr.Args) != 1 {
@@ -417,7 +509,7 @@ func prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavi
 		if err != nil {
 			return aggregateHavingExpr{}, err
 		}
-		values, err := aggregateLiteralValueSlice(expr.Args[1])
+		values, err := q.aggregateLiteralValueSlice(expr.Args[1])
 		if err != nil {
 			return aggregateHavingExpr{}, err
 		}
@@ -499,7 +591,7 @@ func aggregateLiteralRawValue(raw any) (Value, error) {
 	}
 }
 
-func aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
+func (q *Query) aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 	if expr.Kind != qx.KindLIT {
 		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
 	}
@@ -515,7 +607,9 @@ func aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 		return nil, fmt.Errorf("%w: aggregate HAVING IN: no values provided", qexec.ErrInvalidQuery)
 	}
 
-	values := make([]Value, raw.Len())
+	start := len(q.havingValues)
+	q.havingValues = q.havingValues[:start+raw.Len()]
+	values := q.havingValues[start : start+raw.Len()]
 	for i := 0; i < raw.Len(); i++ {
 		value, err := aggregateLiteralRawValue(raw.Index(i).Interface())
 		if err != nil {

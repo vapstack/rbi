@@ -2,8 +2,10 @@ package qagg
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -44,16 +46,22 @@ func TestAggregateQueryReleaseClearsOwnedPlannerSlices(t *testing.T) {
 			{op: aggregateMetricMax, out: "max_score", field: aggregateFieldRef{name: "score"}, rowCount: true},
 			{op: aggregateMetricCountDistinct, out: "unique_tags", field: aggregateFieldRef{name: "tags"}},
 		},
-		having:      aggregateHavingExpr{op: aggregateHavingGT, index: 1, value: valueFromSafeString("42")},
-		hasHaving:   true,
-		order:       []aggregateOrder{{index: 1, desc: true}, {index: 2}},
-		orderUnique: true,
-		offset:      3,
-		limit:       5,
+		having: aggregateHavingExpr{op: aggregateHavingGT, index: 1, value: valueFromSafeString("42")},
+		havingArgs: []aggregateHavingExpr{
+			{op: aggregateHavingIN, index: 1, values: []Value{valueFromSafeString("42")}},
+			{op: aggregateHavingExists, index: 2},
+		},
+		havingValues: []Value{valueFromSafeString("42"), Value{num: 7, any: ValueKindUint}},
+		hasHaving:    true,
+		order:        []aggregateOrder{{index: 1, desc: true}, {index: 2}},
+		orderUnique:  true,
+		offset:       3,
+		limit:        5,
 	}
 	q.Release()
 
-	if len(q.groups) != 0 || len(q.metrics) != 0 || len(q.order) != 0 || q.hasHaving || q.orderUnique || q.offset != 0 || q.limit != 0 {
+	if len(q.groups) != 0 || len(q.metrics) != 0 || len(q.havingArgs) != 0 || len(q.havingValues) != 0 ||
+		len(q.order) != 0 || q.hasHaving || q.orderUnique || q.offset != 0 || q.limit != 0 {
 		t.Fatalf("released aggregate query retained logical state")
 	}
 	if q.having.op != 0 || q.having.index != 0 || q.having.value.Kind() != ValueKindNone || q.having.values != nil || q.having.args != nil {
@@ -81,6 +89,16 @@ func TestAggregateQueryReleaseClearsOwnedPlannerSlices(t *testing.T) {
 			t.Fatalf("metric slice retained stale entry at %d: %+v", i, entry)
 		}
 	}
+	for i, entry := range q.havingArgs[:cap(q.havingArgs)] {
+		if entry.op != 0 || entry.index != 0 || entry.value.Kind() != ValueKindNone || entry.values != nil || entry.args != nil {
+			t.Fatalf("having arg slice retained stale entry at %d: %+v", i, entry)
+		}
+	}
+	for i, entry := range q.havingValues[:cap(q.havingValues)] {
+		if entry.Kind() != ValueKindNone {
+			t.Fatalf("having value slice retained stale entry at %d: %+v", i, entry)
+		}
+	}
 	for i, entry := range q.order[:cap(q.order)] {
 		if entry.index != 0 || entry.desc {
 			t.Fatalf("order slice retained stale entry at %d: %+v", i, entry)
@@ -90,14 +108,29 @@ func TestAggregateQueryReleaseClearsOwnedPlannerSlices(t *testing.T) {
 
 func TestAggregateQueryReleaseDropsOversizedPlannerSlices(t *testing.T) {
 	q := &Query{
-		groups:  make([]aggregateFieldRef, 0, aggregateFieldRefSliceMaxCap+1),
-		metrics: make([]aggregateMetric, 0, aggregateMetricSliceMaxCap+1),
-		order:   make([]aggregateOrder, 0, aggregateOrderSliceMaxCap+1),
+		groups:       make([]aggregateFieldRef, 0, aggregateFieldRefSliceMaxCap+1),
+		metrics:      make([]aggregateMetric, 0, aggregateMetricSliceMaxCap+1),
+		havingArgs:   make([]aggregateHavingExpr, 0, aggregateHavingArgSliceMaxCap+1),
+		havingValues: make([]Value, 0, aggregateHavingValueSliceMaxCap+1),
+		order:        make([]aggregateOrder, 0, aggregateOrderSliceMaxCap+1),
 	}
 	q.Release()
 
-	if q.groups != nil || q.metrics != nil || q.order != nil {
+	if q.groups != nil || q.metrics != nil || q.havingArgs != nil || q.havingValues != nil || q.order != nil {
 		t.Fatalf("released aggregate query retained oversized slices")
+	}
+}
+
+func TestAggregateHavingStorageSizeValidatesLeftBeforeINValues(t *testing.T) {
+	_, values, err := aggregateHavingStorageSize(
+		qx.IN(qx.REF("country"), []uint64{1, 2, 3, 4}),
+		map[string]int{"rows": 0},
+	)
+	if err == nil || !strings.Contains(err.Error(), "left side supports only OUT references") {
+		t.Fatalf("aggregateHavingStorageSize err=%v", err)
+	}
+	if values != 0 {
+		t.Fatalf("invalid HAVING IN counted values=%d", values)
 	}
 }
 

@@ -6,6 +6,8 @@ const (
 	aggregateMetricStateSlicePoolMaxCap = 1 << 20
 	aggregateMetricSliceMaxCap          = 4 << 10
 	aggregateFieldRefSliceMaxCap        = 4 << 10
+	aggregateHavingArgSliceMaxCap       = 4 << 10
+	aggregateHavingValueSliceMaxCap     = 4 << 10
 	aggregateOrderSliceMaxCap           = 4 << 10
 	aggregateOutputPositionMapMaxLen    = 4 << 10
 	aggregateGroupOrdinalMapMaxLen      = 8 << 20
@@ -32,6 +34,18 @@ var aggregateQueryPool = pooled.Pointers[Query]{
 		}
 		q.having = aggregateHavingExpr{}
 		q.hasHaving = false
+		if cap(q.havingArgs) > aggregateHavingArgSliceMaxCap {
+			q.havingArgs = nil
+		} else {
+			clear(q.havingArgs[:cap(q.havingArgs)])
+			q.havingArgs = q.havingArgs[:0]
+		}
+		if cap(q.havingValues) > aggregateHavingValueSliceMaxCap {
+			q.havingValues = nil
+		} else {
+			clear(q.havingValues[:cap(q.havingValues)])
+			q.havingValues = q.havingValues[:0]
+		}
 		if cap(q.order) > aggregateOrderSliceMaxCap {
 			q.order = nil
 		} else {
