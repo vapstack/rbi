@@ -73,11 +73,23 @@ func testView(index map[string]indexdata.FieldStorage) *View {
 	}
 }
 
+func testFieldLookupPostingRetained(v *View, field, key string) posting.List {
+	storage, ok := v.FieldIndexStorage(field)
+	if !ok {
+		return posting.List{}
+	}
+	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
+}
+
 func testMatPredEntryCount(v *View) int {
 	if v == nil || v.matPredCache == nil {
 		return 0
 	}
 	return v.matPredCache.EntryCount()
+}
+
+func testRuntimeMatPredObservedEntryCount(v *View) int {
+	return v.runtimeMatPredObserved.EntryCount()
 }
 
 func testScalarMatPredKey(field, key string) qcache.MaterializedPredKey {
@@ -164,13 +176,13 @@ func TestViewOrderedORObservedPromotionAccumulates(t *testing.T) {
 	if testShouldPromoteObservedMaterializedPred(v, key, 10, 25) {
 		t.Fatalf("expected first observed work below threshold to stay local")
 	}
-	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
+	if got := testRuntimeMatPredObservedEntryCount(v); got != 1 {
 		t.Fatalf("expected one ordered OR observed-work entry, got=%d", got)
 	}
 	if !testShouldPromoteObservedMaterializedPred(v, key, 15, 25) {
 		t.Fatalf("expected accumulated observed work to trigger promotion")
 	}
-	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
+	if got := testRuntimeMatPredObservedEntryCount(v); got != 1 {
 		t.Fatalf("expected promoted ordered OR observed-work entry to stay as evidence, got=%d", got)
 	}
 	if got := v.ObservedMaterializedPredWork(key); got != 25 {
@@ -870,7 +882,7 @@ func TestBuildPreparedPatchTouchedFieldSeparatesDirtyObservedMaterializedPredWor
 	if next.ShouldPromoteObservedMaterializedPredKey(key, 20, 25) {
 		t.Fatal("expected inherited dirty work not to participate in promotion")
 	}
-	if got := next.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
+	if got := testRuntimeMatPredObservedEntryCount(next); got != 1 {
 		t.Fatalf("expected only new observed work entry, got=%d", got)
 	}
 	if next.ShouldPromoteObservedMaterializedPredKey(secondKey, 30, 25) {
@@ -901,7 +913,7 @@ func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	if v.RuntimeMaterializedPredSeenEntryCount() != 1 {
 		t.Fatal("expected runtime seen-key entry before clear")
 	}
-	if v.RuntimeMaterializedPredObservedEntryCount() != 1 {
+	if testRuntimeMatPredObservedEntryCount(v) != 1 {
 		t.Fatal("expected ordered OR observed-work entry before clear")
 	}
 
@@ -913,7 +925,7 @@ func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	if got := v.RuntimeMaterializedPredSeenEntryCount(); got != 0 {
 		t.Fatalf("expected runtime seen-key cache to clear, got=%d", got)
 	}
-	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 0 {
+	if got := testRuntimeMatPredObservedEntryCount(v); got != 0 {
 		t.Fatalf("expected ordered OR observed-work cache to clear, got=%d", got)
 	}
 }

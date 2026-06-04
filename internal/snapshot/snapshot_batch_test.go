@@ -34,7 +34,7 @@ func snapshotBatchStorageRuntime(t *testing.T) *schema.Schema {
 }
 
 func snapshotBatchFieldContains(s *View, field, key string, id uint64) bool {
-	ids := s.FieldLookupPostingRetained(field, key)
+	ids := testFieldLookupPostingRetained(s, field, key)
 	ok := ids.Contains(id)
 	ids.Release()
 	return ok
@@ -96,12 +96,12 @@ func TestBuildPreparedFullReplaceRebuildsStorage(t *testing.T) {
 	if got := next.Universe.Cardinality(); got != 2 {
 		t.Fatalf("universe cardinality=%d want 2", got)
 	}
-	ids := next.FieldLookupPostingRetained("Name", "new-a")
+	ids := testFieldLookupPostingRetained(next, "Name", "new-a")
 	if !ids.Contains(1) {
 		t.Fatal("expected rebuilt snapshot to contain new-a id")
 	}
 	ids.Release()
-	ids = next.FieldLookupPostingRetained("Name", "old-a")
+	ids = testFieldLookupPostingRetained(next, "Name", "old-a")
 	if !ids.IsEmpty() {
 		ids.Release()
 		t.Fatal("expected rebuilt snapshot to drop old-a id")
@@ -131,7 +131,7 @@ func TestBuildPreparedDeleteAllBuildsEmptySnapshot(t *testing.T) {
 	if !next.Universe.IsEmpty() {
 		t.Fatal("expected delete-all snapshot to have empty universe")
 	}
-	ids := next.FieldLookupPostingRetained("Name", "old-a")
+	ids := testFieldLookupPostingRetained(next, "Name", "old-a")
 	if !ids.IsEmpty() {
 		ids.Release()
 		t.Fatal("expected delete-all snapshot to drop index storage")
@@ -586,7 +586,7 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 		}
 		slices.Sort(names)
 		for _, key := range names {
-			ids := snap.FieldLookupPostingRetained("Name", key)
+			ids := testFieldLookupPostingRetained(snap, "Name", key)
 			assertPosting(label+": Name "+key, ids, nameWant[key])
 		}
 
@@ -596,7 +596,7 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 		}
 		slices.Sort(tags)
 		for _, key := range tags {
-			ids := snap.FieldLookupPostingRetained("Tags", key)
+			ids := testFieldLookupPostingRetained(snap, "Tags", key)
 			assertPosting(label+": Tags "+key, ids, tagWant[key])
 		}
 
@@ -606,7 +606,7 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 		}
 		slices.Sort(opts)
 		for _, key := range opts {
-			ids := snap.FieldLookupPostingRetained("Opt", key)
+			ids := testFieldLookupPostingRetained(snap, "Opt", key)
 			assertPosting(label+": Opt "+key, ids, optWant[key])
 		}
 

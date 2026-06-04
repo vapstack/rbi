@@ -178,10 +178,6 @@ func (v *View) RuntimeMaterializedPredSeenEntryCount() int {
 	return v.runtimeMatPredSeen.EntryCount()
 }
 
-func (v *View) RuntimeMaterializedPredObservedEntryCount() int {
-	return v.runtimeMatPredObserved.EntryCount()
-}
-
 func (v *View) drainRetiredRuntimeCaches() {
 	if v.numericRangeBucketCache != nil {
 		v.numericRangeBucketCache.DrainRetired()

@@ -547,7 +547,7 @@ func BenchmarkViewStorageHelpers(b *testing.B) {
 	b.Run("FieldLookupPostingRetained", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			ids := snap.FieldLookupPostingRetained("Name", "u_0_0")
+			ids := testFieldLookupPostingRetained(snap, "Name", "u_0_0")
 			if ids.IsEmpty() {
 				b.Fatal("lookup")
 			}

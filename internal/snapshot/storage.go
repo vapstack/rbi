@@ -61,17 +61,6 @@ func (v *View) LenFieldNameSet() map[string]struct{} {
 	return fields
 }
 
-func (v *View) FieldLookupPostingRetained(field, key string) posting.List {
-	if v.Index == nil {
-		return posting.List{}
-	}
-	acc, ok := v.IndexedFieldByName[field]
-	if !ok || acc.Ordinal >= len(v.Index) {
-		return posting.List{}
-	}
-	return indexdata.NewFieldIndexViewFromStorage(v.Index[acc.Ordinal]).LookupPostingRetained(key)
-}
-
 func (v *View) FieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
 	if v.Index == nil {
 		return posting.List{}

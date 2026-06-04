@@ -22,12 +22,19 @@ func TestViewReleaseStorageKeepsSharedFlatRootRetained(t *testing.T) {
 	current.retainSharedOwnedStorageFrom(old)
 
 	old.releaseStorage()
-	if !current.FieldLookupPostingRetained("f", "shared").Contains(1) {
+	ids := testFieldLookupPostingRetained(current, "f", "shared")
+	if !ids.Contains(1) {
+		ids.Release()
 		t.Fatalf("current snapshot lost shared posting after old prune")
 	}
-	if !current.FieldLookupPostingRetained("f", "shared").Contains(191) {
+	ids.Release()
+
+	ids = testFieldLookupPostingRetained(current, "f", "shared")
+	if !ids.Contains(191) {
+		ids.Release()
 		t.Fatalf("current snapshot shared posting corrupted after old prune")
 	}
+	ids.Release()
 
 	shared.Release()
 }
