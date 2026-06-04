@@ -3627,7 +3627,7 @@ func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
 		return false
 	}
 
-	var keys [cardinalityORScalarDisjointMaxBranches]string
+	var keys [cardinalityORScalarDisjointMaxBranches]keycodec.IndexLookupKey
 	var nils [cardinalityORScalarDisjointMaxBranches]bool
 	for branchIdx, op := range expr.Operands {
 		leaves, ok = qir.CollectAndLeavesInto(op, leavesBuf[:0], qir.LeafModeCollect)
@@ -3636,14 +3636,14 @@ func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
 		}
 
 		found := false
-		var key string
+		var key keycodec.IndexLookupKey
 		var isNil bool
 		for i := range leaves {
 			e := leaves[i]
 			if e.Not || e.Op != qir.OpEQ || e.FieldOrdinal != fieldOrdinal || len(e.Operands) != 0 {
 				continue
 			}
-			nextKey, isSlice, nextNil, err := qv.exprValueToIdxScalar(e)
+			nextKey, isSlice, nextNil, err := qv.exprValueToLookupKey(e)
 			if err != nil || isSlice {
 				return false
 			}
