@@ -1884,10 +1884,7 @@ func (qv *View) selectOROrder(q *qir.Shape, facts *plannerORFacts) plannerOROrde
 	costFallback := float64(facts.sumCard) + float64(expectedRows)
 	costStream := float64(expectedRows) * streamChecks * plannerFieldStatsSkew(facts.orderStats)
 	cacheLimit := qv.snap.MaterializedPredCacheLimit()
-	cacheEntries := 0
-	if cache := qv.snap.MaterializedPredCache(); cache != nil {
-		cacheEntries = cache.EntryCount()
-	}
+	cacheEntries := qv.snap.MaterializedPredCacheEntryCount()
 	cacheColdTiny := cacheLimit <= 0 || (cacheLimit < facts.branchCount && cacheEntries < facts.branchCount)
 	cacheCold := cacheEntries == 0
 	hasFullSpanOrderBranch := facts.hasFullSpanOrderBranch()
@@ -2112,10 +2109,7 @@ func (qv *View) orderedORKWayCandidateTraceWork(q *qir.Shape, facts *plannerORFa
 
 	if routeOK {
 		cacheLimit := qv.snap.MaterializedPredCacheLimit()
-		cacheEntries := 0
-		if cache := qv.snap.MaterializedPredCache(); cache != nil {
-			cacheEntries = cache.EntryCount()
-		}
+		cacheEntries := qv.snap.MaterializedPredCacheEntryCount()
 		cacheColdTiny := cacheLimit <= 0 || (cacheLimit < facts.branchCount && cacheEntries < facts.branchCount)
 		cacheCold := cacheEntries == 0
 		hasBroadResidual := false
@@ -2173,8 +2167,7 @@ func (qv *View) orderedORSelectorCacheRoute(q *qir.Shape, facts *plannerORFacts)
 	if qv.snap == nil {
 		return plannerMaterializedCacheDisabled, 1
 	}
-	cache := qv.snap.MaterializedPredCache()
-	if cache == nil {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return plannerMaterializedCacheDisabled, 1
 	}
 	if q == nil || facts == nil || !q.HasOrder || facts.universe == 0 {
@@ -2187,7 +2180,7 @@ func (qv *View) orderedORSelectorCacheRoute(q *qir.Shape, facts *plannerORFacts)
 	if potentialKeys == 0 {
 		return plannerMaterializedCacheDisabled, 1
 	}
-	if plannerMaterializedCacheRouteEnvelopeRetained(cache, potentialKeys, facts.universe) {
+	if qv.snap.CanRetainMaterializedPredRoute(potentialKeys, facts.universe) {
 		return plannerMaterializedCacheColdRegularAdmissible, 1
 	}
 

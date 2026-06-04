@@ -151,10 +151,7 @@ func plannerArgminOROrderCandidatesForTest(
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	candidates.streamCost = float64(expectedRows)*streamChecks*plannerFieldStatsSkew(orderStats) + eagerCost
 	cacheLimit := qv.snap.MaterializedPredCacheLimit()
-	cacheEntries := 0
-	if cache := qv.snap.MaterializedPredCache(); cache != nil {
-		cacheEntries = cache.EntryCount()
-	}
+	cacheEntries := qv.snap.MaterializedPredCacheEntryCount()
 	cacheColdTiny := cacheLimit <= 0 || (cacheLimit < branchCount && cacheEntries < branchCount)
 	cacheCold := cacheEntries == 0
 	hasFullSpanOrderBranch := branches.hasFullSpanOrderBranch(analysis.mergeStats)

@@ -2643,7 +2643,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCacheEntryCount(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before query: %d", got)
 	}
 
@@ -2662,7 +2662,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 	assertSameSlice(t, got, want)
 
 	after := db.engine.snapshot.Current()
-	if got := after.MaterializedPredCache().EntryCount(); got == 0 {
+	if got := after.MaterializedPredCacheEntryCount(); got == 0 {
 		t.Fatalf("expected ordered predicate path to materialize broad complement, cache entries=%d", got)
 	}
 }
@@ -2689,7 +2689,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	if _, err := db.QueryKeys(small); err != nil {
 		t.Fatalf("small QueryKeys: %v", err)
 	}
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCacheEntryCount(); got == 0 {
 		t.Fatalf("expected materialized predicate cache for small ordered window: %d", got)
 	}
 
@@ -2706,7 +2706,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	}
 	assertSameSlice(t, got, want)
 
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCacheEntryCount(); got == 0 {
 		t.Fatalf("expected deep ordered window to keep materialized numeric range predicate")
 	}
 }
@@ -3467,12 +3467,11 @@ func TestQuery_OrderBasic_BaseCoreOversizedPromotionStaysBounded(t *testing.T) {
 	}
 	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, uint64(rows), 10)
 
-	cache := view.snap.MaterializedPredCache()
-	limit := qcache.MaterializedPredOversizedLimit(cache.Limit())
-	if got := cache.OversizedCount(); got > limit {
+	limit := view.snap.MaterializedPredCacheOversizedLimit()
+	if got := view.snap.MaterializedPredCacheOversizedEntryCount(); got > limit {
 		t.Fatalf("oversized materialized predicates=%d want <=%d", got, limit)
 	}
-	if cache.EntryCount() == 0 {
+	if view.snap.MaterializedPredCacheEntryCount() == 0 {
 		t.Fatalf("expected at least one bounded oversized materialized predicate")
 	}
 }

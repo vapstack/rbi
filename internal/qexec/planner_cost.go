@@ -802,8 +802,7 @@ func (qv *View) orderedORCacheCandidateState(
 	if qv.snap == nil {
 		return plannerMaterializedCacheDisabled, 0, 1
 	}
-	cache := qv.snap.MaterializedPredCache()
-	if cache == nil {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return plannerMaterializedCacheDisabled, 0, 1
 	}
 	var branchUniverses [plannerORBranchLimit]uint64
@@ -830,7 +829,7 @@ func (qv *View) orderedORCacheCandidateState(
 		if potentialKeys == 0 {
 			return plannerMaterializedCacheDisabled, 0, 1
 		}
-		if plannerMaterializedCacheRouteEnvelopeRetained(cache, potentialKeys, maxUniverse) {
+		if qv.snap.CanRetainMaterializedPredRoute(potentialKeys, maxUniverse) {
 			return plannerMaterializedCacheColdRegularAdmissible, 0, 1
 		}
 	}
@@ -942,11 +941,7 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	costFallback := float64(sumCard) + float64(expectedRows)
 	cacheLimit := qv.snap.MaterializedPredCacheLimit()
-	cacheEntries := 0
-	cache := qv.snap.MaterializedPredCache()
-	if cache != nil {
-		cacheEntries = cache.EntryCount()
-	}
+	cacheEntries := qv.snap.MaterializedPredCacheEntryCount()
 	cacheColdTiny := cacheLimit <= 0 || (cacheLimit < branchCount && cacheEntries < branchCount)
 	cacheCold := cacheEntries == 0
 	hasFullSpanOrderBranch := branches.hasFullSpanOrderBranch(analysis.mergeStats)
@@ -995,8 +990,7 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	var cacheState plannerMaterializedCacheState
 	eagerBuildWork := uint64(0)
 	cachePressurePenalty := 1.0
-	if cache != nil && q.Offset == 0 && potentialCacheKeys > 0 &&
-		plannerMaterializedCacheRouteEnvelopeRetained(cache, potentialCacheKeys, cacheRouteUniverse) {
+	if q.Offset == 0 && qv.snap.CanRetainMaterializedPredRoute(potentialCacheKeys, cacheRouteUniverse) {
 		cacheState = plannerMaterializedCacheColdRegularAdmissible
 	} else {
 		cacheState, eagerBuildWork, cachePressurePenalty = qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)

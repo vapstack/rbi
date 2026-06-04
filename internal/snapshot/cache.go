@@ -25,10 +25,6 @@ func (v *View) NumericRangeBucketCache() *qcache.NumericRangeBucketCache {
 	return v.numericRangeBucketCache
 }
 
-func (v *View) MaterializedPredCache() *qcache.MaterializedPredCache {
-	return v.matPredCache
-}
-
 func (v *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *qcache.NumericRangeBucketEntry {
 	if storage.KeyCount() == 0 {
 		return nil
@@ -56,6 +52,13 @@ func (v *View) MaterializedPredCacheEntryCount() int {
 		return 0
 	}
 	return v.matPredCache.EntryCount()
+}
+
+func (v *View) MaterializedPredCacheOversizedEntryCount() int32 {
+	if v.matPredCache == nil {
+		return 0
+	}
+	return v.matPredCache.OversizedCount()
 }
 
 func (v *View) AllowsMaterializedPredCard(card uint64) bool {
@@ -90,6 +93,35 @@ func (v *View) CanShareModeratelyOversizedMaterializedPred(est uint64) bool {
 		return false
 	}
 	return est <= maxCard*mul
+}
+
+func (v *View) MaterializedPredCacheMaxCardinality() uint64 {
+	if v.matPredCache == nil {
+		return 0
+	}
+	return v.matPredCache.MaxCardinality()
+}
+
+func (v *View) MaterializedPredCacheOversizedLimit() int32 {
+	if v.matPredCache == nil {
+		return 0
+	}
+	return qcache.MaterializedPredOversizedLimit(v.matPredCache.Limit())
+}
+
+func (v *View) CanRetainMaterializedPredRoute(potentialKeys int, universe uint64) bool {
+	if v.matPredCache == nil || potentialKeys <= 0 {
+		return false
+	}
+	limit := v.matPredCache.Limit()
+	if potentialKeys > limit {
+		return false
+	}
+	maxCard := v.matPredCache.MaxCardinality()
+	if maxCard == 0 || universe <= maxCard {
+		return true
+	}
+	return int(qcache.MaterializedPredOversizedLimit(limit)) >= potentialKeys
 }
 
 func inheritMaterializedPredCache(next, prev *View, fields schema.IndexedFieldMap, changedFields []bool) {

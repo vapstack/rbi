@@ -406,15 +406,10 @@ func (qv *View) classifyPlannerMaterializedCacheKey(key qcache.MaterializedPredK
 	if requiresSecondHit && !qv.snap.HasRuntimeMaterializedPredSeenKey(key) {
 		return plannerMaterializedCacheColdSecondHitRequired
 	}
-	cache := qv.snap.MaterializedPredCache()
-	if cache == nil {
-		return plannerMaterializedCacheDisabled
-	}
-	maxCard := cache.MaxCardinality()
-	if maxCard == 0 || est <= maxCard {
+	if qv.snap.AllowsMaterializedPredCard(est) {
 		return plannerMaterializedCacheColdRegularAdmissible
 	}
-	if qcache.MaterializedPredOversizedLimit(cache.Limit()) > 0 {
+	if qv.snap.MaterializedPredCacheOversizedLimit() > 0 {
 		return plannerMaterializedCacheColdOversizedAdmissible
 	}
 	return plannerMaterializedCacheColdUnretainedByCardinality
@@ -429,17 +424,6 @@ func plannerMaterializedCacheStateRetained(s plannerMaterializedCacheState) bool
 func plannerMaterializedCacheStateUnretained(s plannerMaterializedCacheState) bool {
 	return s == plannerMaterializedCacheColdUnretainedByCardinality ||
 		s == plannerMaterializedCacheColdUnretainedByPolicy
-}
-
-func plannerMaterializedCacheRouteEnvelopeRetained(cache *qcache.MaterializedPredCache, potentialKeys int, universe uint64) bool {
-	if cache == nil || potentialKeys <= 0 || potentialKeys > cache.Limit() {
-		return false
-	}
-	maxCard := cache.MaxCardinality()
-	if maxCard == 0 || universe <= maxCard {
-		return true
-	}
-	return qcache.MaterializedPredOversizedLimit(cache.Limit()) >= int32(potentialKeys)
 }
 
 const plannerMaterializedCacheRouteKeyMax = plannerORBranchLimit * plannerPredicateFastPathMaxLeaves
@@ -461,13 +445,12 @@ func (set *plannerMaterializedCacheRouteSet) init(qv *View) {
 	if qv == nil || qv.snap == nil {
 		return
 	}
-	cache := qv.snap.MaterializedPredCache()
-	if cache == nil {
+	set.limit = qv.snap.MaterializedPredCacheLimit()
+	if set.limit <= 0 {
 		return
 	}
-	set.limit = cache.Limit()
-	set.oversizedLimit = qcache.MaterializedPredOversizedLimit(set.limit)
-	set.maxCard = cache.MaxCardinality()
+	set.oversizedLimit = qv.snap.MaterializedPredCacheOversizedLimit()
+	set.maxCard = qv.snap.MaterializedPredCacheMaxCardinality()
 }
 
 func (set *plannerMaterializedCacheRouteSet) add(key qcache.MaterializedPredKey, est uint64, state plannerMaterializedCacheState) bool {
@@ -1091,13 +1074,8 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 		return plannerOrderedLimitCandidate{}, false, false, nil
 	}
 
-	cache := qv.snap.MaterializedPredCache()
-	limit := 0
-	maxCard := uint64(0)
-	if cache != nil {
-		limit = cache.Limit()
-		maxCard = cache.MaxCardinality()
-	}
+	limit := qv.snap.MaterializedPredCacheLimit()
+	maxCard := qv.snap.MaterializedPredCacheMaxCardinality()
 
 	var (
 		cacheState plannerMaterializedCacheState

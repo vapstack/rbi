@@ -412,7 +412,7 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 		t.Fatal("expected warm predicate to materialize")
 	}
 	releasePredicates(warm)
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCacheEntryCount(); got == 0 {
 		t.Fatalf("expected prewarmed materialized predicate cache")
 	}
 

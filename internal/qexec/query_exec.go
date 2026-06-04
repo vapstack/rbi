@@ -1364,9 +1364,7 @@ func (qv *View) materializedPredObservationCandidate(key qcache.MaterializedPred
 	if qv.snap.HasMaterializedPredKey(key) {
 		return false
 	}
-	cache := qv.snap.MaterializedPredCache()
-	maxCard := cache.MaxCardinality()
-	return maxCard == 0 || est <= maxCard || qcache.MaterializedPredOversizedLimit(cache.Limit()) > 0
+	return qv.snap.AllowsMaterializedPredCard(est) || qv.snap.MaterializedPredCacheOversizedLimit() > 0
 }
 
 func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core orderBasicBaseCore, universe uint64) bool {

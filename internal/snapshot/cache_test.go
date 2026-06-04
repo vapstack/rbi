@@ -1254,12 +1254,12 @@ func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnp
 	second.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
 	m.Publish(second)
 
-	if first.MaterializedPredCache() == nil || first.NumericRangeBucketCache() == nil {
+	if first.matPredCache == nil || first.NumericRangeBucketCache() == nil {
 		t.Fatal("expected pinned retired same-seq snapshot to retain runtime caches before unpin")
 	}
 
 	m.Unpin(first.Seq, ref)
-	if first.MaterializedPredCache() != nil || first.NumericRangeBucketCache() != nil {
+	if first.matPredCache != nil || first.NumericRangeBucketCache() != nil {
 		t.Fatal("expected retired same-seq snapshot runtime caches to be released after last unpin")
 	}
 	if m.Current() != second {
