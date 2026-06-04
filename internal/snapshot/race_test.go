@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 )
 
 func TestManagerRace_UnpinDoesNotDrainCurrentCacheAfterRefRevived(t *testing.T) {
@@ -26,8 +27,8 @@ func TestManagerRace_UnpinDoesNotDrainCurrentCacheAfterRefRevived(t *testing.T) 
 		t.Fatal("expected current snapshot ref")
 	}
 
-	key := testMatPredKey("race-large")
-	otherKey := testMatPredKey("race-other")
+	key := qcache.MaterializedPredKeyFromOpaque("race-large")
+	otherKey := qcache.MaterializedPredKeyFromOpaque("race-other")
 
 	ids := make([]uint64, 8192)
 	for i := range ids {

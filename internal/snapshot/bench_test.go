@@ -372,7 +372,7 @@ func BenchmarkManagerPublishSameSeqReplace(b *testing.B) {
 func BenchmarkMaterializedCacheInheritRelease(b *testing.B) {
 	prev := testMatPredView(128, 0)
 	for i := 0; i < 128; i++ {
-		testStoreMaterializedPred(prev, fmt.Sprintf("email\x1f1\x1f%d", i), testPosting(uint64(i+1)))
+		testStoreMaterializedPred(prev, qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, fmt.Sprintf("%d", i)), testPosting(uint64(i+1)))
 	}
 	defer prev.releaseRuntimeCaches()
 

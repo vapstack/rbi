@@ -3,7 +3,6 @@ package qexec
 import (
 	"math"
 	"math/bits"
-	"strconv"
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -1536,11 +1535,6 @@ func (qv *View) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcac
 	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, b.ids)
 }
 
-func (qv *View) evalLazyMaterializedPredicate(raw qir.Expr, cacheKey string) posting.List {
-	parsed, _ := qcache.MaterializedPredKeyFromEncoded(cacheKey)
-	return qv.evalLazyMaterializedPredicateWithKey(raw, parsed)
-}
-
 func (qv *View) materializedPredKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
 	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
@@ -1549,10 +1543,6 @@ func (qv *View) materializedPredKeyForScalar(field string, op qir.Op, key string
 		return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
 	}
 	return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
-}
-
-func (qv *View) materializedPredCacheKeyForScalar(field string, op qir.Op, key string) string {
-	return qv.materializedPredKeyForScalar(field, op, key).String()
 }
 
 func (qv *View) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
@@ -1599,17 +1589,6 @@ func (qv *View) materializedPredKey(e qir.Expr) qcache.MaterializedPredKey {
 	}
 
 	return qcache.MaterializedPredKeyForLookupKey(fieldName, e.Op, key)
-}
-
-func (qv *View) materializedPredCacheKey(e qir.Expr) string {
-	return qv.materializedPredKey(e).String()
-}
-
-func materializedPredCacheKeyFromScalar(field string, op qir.Op, key string) string {
-	if field == "" || !op.IsMaterializedScalarCache() {
-		return ""
-	}
-	return field + "\x1f" + strconv.Itoa(int(op)) + "\x1f" + key
 }
 
 // tryShareMaterializedPred caches ids and, on success, rewrites the caller

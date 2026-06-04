@@ -2806,7 +2806,7 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 	ageKey := db.engine.materializedPredCacheKey(ageExpr)
 	_ = ageKey
 	scoreKey := db.engine.materializedPredCacheKey(scoreExpr)
-	if scoreKey != "" {
+	if !scoreKey.IsZero() {
 		if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), scoreKey); ok {
 			t.Fatalf("unexpected materialized cache entry for deferred order-field range")
 		}

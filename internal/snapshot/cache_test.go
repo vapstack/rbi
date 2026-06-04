@@ -11,7 +11,6 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/pooled"
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
@@ -81,34 +80,32 @@ func testMatPredEntryCount(v *View) int {
 	return v.matPredCache.EntryCount()
 }
 
-func testMatPredKey(key string) qcache.MaterializedPredKey {
-	if parsed, ok := qcache.MaterializedPredKeyFromEncoded(key); ok {
-		return parsed
-	}
-	if key == "" {
-		return qcache.MaterializedPredKey{}
-	}
-	return qcache.MaterializedPredKeyFromOpaque(key)
+func testScalarMatPredKey(field, key string) qcache.MaterializedPredKey {
+	return qcache.MaterializedPredKeyForScalar(field, qir.OpPREFIX, key)
 }
 
-func testLoadMaterializedPred(v *View, key string) (posting.List, bool) {
-	return v.LoadMaterializedPredKey(testMatPredKey(key))
+func testBucketMatPredKey(field string, bucket int) qcache.MaterializedPredKey {
+	return qcache.MaterializedPredKeyForNumericBucketSpan(field, bucket, bucket)
 }
 
-func testStoreMaterializedPred(v *View, key string, ids posting.List) {
-	v.StoreMaterializedPredKey(testMatPredKey(key), ids)
+func testLoadMaterializedPred(v *View, key qcache.MaterializedPredKey) (posting.List, bool) {
+	return v.LoadMaterializedPredKey(key)
 }
 
-func testTryStoreMaterializedPredOversized(v *View, key string, ids posting.List) bool {
-	return v.TryStoreMaterializedPredOversizedKey(testMatPredKey(key), ids)
+func testStoreMaterializedPred(v *View, key qcache.MaterializedPredKey, ids posting.List) {
+	v.StoreMaterializedPredKey(key, ids)
 }
 
-func testShouldPromoteRuntimeMaterializedPred(v *View, key string) bool {
-	return v.ShouldPromoteRuntimeMaterializedPredKey(testMatPredKey(key))
+func testTryStoreMaterializedPredOversized(v *View, key qcache.MaterializedPredKey, ids posting.List) bool {
+	return v.TryStoreMaterializedPredOversizedKey(key, ids)
 }
 
-func testShouldPromoteObservedMaterializedPred(v *View, key string, observedWork uint64, buildWork uint64) bool {
-	return v.ShouldPromoteObservedMaterializedPredKey(testMatPredKey(key), observedWork, buildWork)
+func testShouldPromoteRuntimeMaterializedPred(v *View, key qcache.MaterializedPredKey) bool {
+	return v.ShouldPromoteRuntimeMaterializedPredKey(key)
+}
+
+func testShouldPromoteObservedMaterializedPred(v *View, key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {
+	return v.ShouldPromoteObservedMaterializedPredKey(key, observedWork, buildWork)
 }
 
 func testRunConcurrent(n int, fn func(i int)) {
@@ -146,24 +143,24 @@ func TestViewRuntimeSeenPromotionBounded(t *testing.T) {
 	}
 
 	for i := 0; i < limit+6; i++ {
-		key := fmt.Sprintf("age\x1f5\x1f%d", i)
+		key := testScalarMatPredKey("age", fmt.Sprintf("%d", i))
 		if testShouldPromoteRuntimeMaterializedPred(v, key) {
-			t.Fatalf("expected first runtime sight for %q to stay local", key)
+			t.Fatalf("expected first runtime sight for %q to stay local", key.String())
 		}
 	}
 	if got := v.RuntimeMaterializedPredSeenEntryCount(); got > limit {
 		t.Fatalf("runtime seen-key cache exceeded limit: got=%d want<=%d", got, limit)
 	}
 
-	lastKey := fmt.Sprintf("age\x1f5\x1f%d", limit+5)
+	lastKey := testScalarMatPredKey("age", fmt.Sprintf("%d", limit+5))
 	if !testShouldPromoteRuntimeMaterializedPred(v, lastKey) {
-		t.Fatalf("expected recent runtime key %q to promote on second sight", lastKey)
+		t.Fatalf("expected recent runtime key %q to promote on second sight", lastKey.String())
 	}
 }
 
 func TestViewOrderedORObservedPromotionAccumulates(t *testing.T) {
 	v := testMatPredView(2, 0)
-	key := "age\x1fcount_range_complement\x1f5\x1f30"
+	key := qcache.MaterializedPredComplementKeyForScalar("age", qir.OpGTE, "30")
 	if testShouldPromoteObservedMaterializedPred(v, key, 10, 25) {
 		t.Fatalf("expected first observed work below threshold to stay local")
 	}
@@ -176,7 +173,7 @@ func TestViewOrderedORObservedPromotionAccumulates(t *testing.T) {
 	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
 		t.Fatalf("expected promoted ordered OR observed-work entry to stay as evidence, got=%d", got)
 	}
-	if got := v.ObservedMaterializedPredWork(testMatPredKey(key)); got != 25 {
+	if got := v.ObservedMaterializedPredWork(key); got != 25 {
 		t.Fatalf("observed work after promotion=%d want 25", got)
 	}
 }
@@ -186,7 +183,7 @@ func TestViewStoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t *testing
 	for round := 0; round < 16; round++ {
 		v := testMatPredView(1, 0)
 		testRunConcurrent(n, func(i int) {
-			testStoreMaterializedPred(v, fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), posting.List{})
+			testStoreMaterializedPred(v, testScalarMatPredKey("email", fmt.Sprintf("%d", i)), posting.List{})
 		})
 		if got := v.matPredCache.EntryCount(); got > 1 {
 			t.Fatalf("round=%d materialized cache count exceeded limit: got=%d", round, got)
@@ -200,9 +197,10 @@ func TestViewStoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t *testing
 func TestViewStoreMaterializedPredConcurrentSameKeyStoresSingleEntry(t *testing.T) {
 	n := max(16, runtime.GOMAXPROCS(0)*8)
 	v := testMatPredView(8, 0)
+	key := testScalarMatPredKey("email", "same")
 
 	testRunConcurrent(n, func(i int) {
-		testStoreMaterializedPred(v, "email\x1f1\x1fsame", testPosting(uint64(i+1)))
+		testStoreMaterializedPred(v, key, testPosting(uint64(i+1)))
 	})
 
 	if got := v.matPredCache.EntryCount(); got != 1 {
@@ -219,7 +217,7 @@ func TestViewTryStoreMaterializedPredOversizedConcurrentDistinctKeysRespectsTota
 	for round := 0; round < 16; round++ {
 		v := testMatPredView(1, 1)
 		testRunConcurrent(n, func(i int) {
-			testTryStoreMaterializedPredOversized(v, fmt.Sprintf("age\x1frange_bucket\x1f%d", i), bm)
+			testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", i), bm)
 		})
 		if got := v.matPredCache.EntryCount(); got > 1 {
 			t.Fatalf("round=%d oversized cache count exceeded limit: got=%d", round, got)
@@ -237,9 +235,10 @@ func TestViewTryStoreMaterializedPredOversizedConcurrentSameKeyDoesNotLeakCounte
 	n := max(16, runtime.GOMAXPROCS(0)*8)
 	bm := testPosting(1, 2)
 	v := testMatPredView(8, 1)
+	key := testBucketMatPredKey("age", 0)
 
 	testRunConcurrent(n, func(i int) {
-		testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1fsame", bm)
+		testTryStoreMaterializedPredOversized(v, key, bm)
 	})
 
 	if got := v.matPredCache.EntryCount(); got != 1 {
@@ -260,7 +259,7 @@ func TestViewMaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *testing.
 	large := testPosting(1, 2)
 
 	for i := 0; i < 8; i++ {
-		testStoreMaterializedPred(v, fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
+		testStoreMaterializedPred(v, testScalarMatPredKey("email", fmt.Sprintf("%d", i)), small)
 	}
 	if got := v.matPredCache.EntryCount(); got != 8 {
 		t.Fatalf("expected regular cache to fill total limit, got=%d", got)
@@ -269,13 +268,13 @@ func TestViewMaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *testing.
 		t.Fatalf("expected eight regular cache entries before oversized admission, got=%d", got)
 	}
 
-	if !testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1f0", large) {
+	if !testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", 0), large) {
 		t.Fatalf("expected first oversized cache entry to replace an older entry")
 	}
-	if !testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1f1", large) {
+	if !testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", 1), large) {
 		t.Fatalf("expected second oversized cache entry to replace an older entry")
 	}
-	if !testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1f2", large) {
+	if !testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", 2), large) {
 		t.Fatalf("expected oversized cache admission to replace an older oversized entry at limit")
 	}
 
@@ -288,14 +287,14 @@ func TestViewMaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *testing.
 	if got := v.matPredCache.OversizedCount(); got != 2 {
 		t.Fatalf("expected oversized counter to settle at 2, got=%d", got)
 	}
-	if _, ok := testLoadMaterializedPred(v, "age\x1frange_bucket\x1f2"); !ok {
+	if _, ok := testLoadMaterializedPred(v, testBucketMatPredKey("age", 2)); !ok {
 		t.Fatalf("expected newest oversized entry to remain cached")
 	}
 	kept := 0
-	for _, key := range []string{
-		"age\x1frange_bucket\x1f0",
-		"age\x1frange_bucket\x1f1",
-		"age\x1frange_bucket\x1f2",
+	for _, key := range []qcache.MaterializedPredKey{
+		testBucketMatPredKey("age", 0),
+		testBucketMatPredKey("age", 1),
+		testBucketMatPredKey("age", 2),
 	} {
 		if _, ok := testLoadMaterializedPred(v, key); ok {
 			kept++
@@ -313,16 +312,17 @@ func TestViewMaterializedPredCacheRegularAdmissionTurnsOverOlderRegularEntries(t
 	large := testPosting(1, 2)
 
 	for i := 0; i < 8; i++ {
-		testStoreMaterializedPred(v, fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
+		testStoreMaterializedPred(v, testScalarMatPredKey("email", fmt.Sprintf("%d", i)), small)
 	}
-	if !testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1f0", large) {
+	if !testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", 0), large) {
 		t.Fatalf("expected first oversized cache entry to be admitted")
 	}
-	if !testTryStoreMaterializedPredOversized(v, "age\x1frange_bucket\x1f1", large) {
+	if !testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", 1), large) {
 		t.Fatalf("expected second oversized cache entry to be admitted")
 	}
 
-	testStoreMaterializedPred(v, "email\x1f1\x1flate", small)
+	lateKey := testScalarMatPredKey("email", "late")
+	testStoreMaterializedPred(v, lateKey, small)
 
 	if got := v.matPredCache.EntryCount(); got != 8 {
 		t.Fatalf("expected total cache count to remain bounded by limit, got=%d", got)
@@ -333,7 +333,7 @@ func TestViewMaterializedPredCacheRegularAdmissionTurnsOverOlderRegularEntries(t
 	if got := v.matPredCache.OversizedCount(); got != 2 {
 		t.Fatalf("expected regular turnover to keep oversized entries resident, got=%d", got)
 	}
-	if _, ok := testLoadMaterializedPred(v, "email\x1f1\x1flate"); !ok {
+	if _, ok := testLoadMaterializedPred(v, lateKey); !ok {
 		t.Fatalf("expected newest regular entry to replace an older regular entry")
 	}
 }
@@ -342,8 +342,10 @@ func TestViewInheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *tes
 	prev := testMatPredView(8, 0)
 	nameIDs := testPosting(1)
 	emailIDs := testPosting(2)
-	testStoreMaterializedPred(prev, "name\x1f1\x1fa", nameIDs)
-	testStoreMaterializedPred(prev, "email\x1f1\x1fb", emailIDs)
+	nameKey := testScalarMatPredKey("name", "a")
+	emailKey := testScalarMatPredKey("email", "b")
+	testStoreMaterializedPred(prev, nameKey, nameIDs)
+	testStoreMaterializedPred(prev, emailKey, emailIDs)
 
 	next := testMatPredView(8, 0)
 	fields := map[string]schema.IndexedFieldAccessor{
@@ -355,10 +357,10 @@ func TestViewInheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *tes
 
 	inheritMaterializedPredCache(next, prev, fields, changed)
 
-	if _, ok := testLoadMaterializedPred(next, "name\x1f1\x1fa"); ok {
+	if _, ok := testLoadMaterializedPred(next, nameKey); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")
 	}
-	cached, ok := testLoadMaterializedPred(next, "email\x1f1\x1fb")
+	cached, ok := testLoadMaterializedPred(next, emailKey)
 	if !ok || cached != emailIDs {
 		t.Fatalf("expected untouched-field cache entry to be inherited")
 	}
@@ -366,8 +368,9 @@ func TestViewInheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *tes
 
 func TestViewInheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T) {
 	prev := testMatPredView(8, 0)
-	testStoreMaterializedPred(prev, "opaque", testPosting(1))
-	testStoreMaterializedPred(prev, "name\x1f1\x1fb", posting.List{})
+	validKey := testScalarMatPredKey("name", "b")
+	testStoreMaterializedPred(prev, qcache.MaterializedPredKeyFromOpaque("opaque"), testPosting(1))
+	testStoreMaterializedPred(prev, validKey, posting.List{})
 
 	next := testMatPredView(8, 0)
 	inheritMaterializedPredCache(next, prev, nil, nil)
@@ -375,7 +378,7 @@ func TestViewInheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T) {
 	if got := next.matPredCache.EntryCount(); got != 1 {
 		t.Fatalf("expected exactly one valid inherited entry, got=%d", got)
 	}
-	cached, ok := testLoadMaterializedPred(next, "name\x1f1\x1fb")
+	cached, ok := testLoadMaterializedPred(next, validKey)
 	if !ok || !cached.IsEmpty() {
 		t.Fatalf("expected valid negative cache entry to survive malformed-entry filtering")
 	}
@@ -384,8 +387,8 @@ func TestViewInheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T) {
 func TestViewInheritMaterializedPredCacheKeepsOversizedCount(t *testing.T) {
 	prev := testMatPredView(8, 1)
 	oversized := testPosting(1, 2)
-	testTryStoreMaterializedPredOversized(prev, "a\x1f1\x1f1", oversized)
-	testTryStoreMaterializedPredOversized(prev, "b\x1f1\x1f2", oversized)
+	testTryStoreMaterializedPredOversized(prev, testScalarMatPredKey("a", "1"), oversized)
+	testTryStoreMaterializedPredOversized(prev, testScalarMatPredKey("b", "2"), oversized)
 
 	next := testMatPredView(8, 1)
 	inheritMaterializedPredCache(next, prev, nil, nil)
@@ -400,9 +403,11 @@ func TestViewInheritMaterializedPredCacheKeepsOversizedCount(t *testing.T) {
 
 func TestViewInheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
 	prev := testMatPredView(8, 0)
-	testStoreMaterializedPred(prev, "email\x1f1\x1fa", testPosting(1))
-	testStoreMaterializedPred(prev, "name\x1f1\x1fb", testPosting(2))
-	if ids, ok := testLoadMaterializedPred(prev, "email\x1f1\x1fa"); ok {
+	emailKey := testScalarMatPredKey("email", "a")
+	nameKey := testScalarMatPredKey("name", "b")
+	testStoreMaterializedPred(prev, emailKey, testPosting(1))
+	testStoreMaterializedPred(prev, nameKey, testPosting(2))
+	if ids, ok := testLoadMaterializedPred(prev, emailKey); ok {
 		ids.Release()
 	}
 
@@ -410,10 +415,10 @@ func TestViewInheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
 	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	inheritedClock := next.matPredCache.Clock()
-	if _, ok := testLoadMaterializedPred(next, "email\x1f1\x1fa"); !ok {
+	if _, ok := testLoadMaterializedPred(next, emailKey); !ok {
 		t.Fatalf("expected first cache entry to be inherited")
 	}
-	if _, ok := testLoadMaterializedPred(next, "name\x1f1\x1fb"); !ok {
+	if _, ok := testLoadMaterializedPred(next, nameKey); !ok {
 		t.Fatalf("expected second cache entry to be inherited")
 	}
 	if want, got := prev.matPredCache.Clock(), inheritedClock; got != want {
@@ -493,10 +498,10 @@ func TestViewMaterializedPredMixedRegularAndOversizedConcurrentRespectsGlobalLim
 		v := testMatPredView(1, 1)
 		testRunConcurrent(n, func(i int) {
 			if i%2 == 0 {
-				testStoreMaterializedPred(v, fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
+				testStoreMaterializedPred(v, testScalarMatPredKey("email", fmt.Sprintf("%d", i)), small)
 				return
 			}
-			testTryStoreMaterializedPredOversized(v, fmt.Sprintf("age\x1frange_bucket\x1f%d", i), large)
+			testTryStoreMaterializedPredOversized(v, testBucketMatPredKey("age", i), large)
 		})
 
 		if got := v.matPredCache.EntryCount(); got > 1 {
@@ -516,8 +521,9 @@ func TestViewMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
 		base = base.BuildAdded(i * 5)
 	}
 	want := base.ToArray()
+	key := testScalarMatPredKey("email", "al")
 
-	testStoreMaterializedPred(v, "email\x1f1\xfal", base.Borrow())
+	testStoreMaterializedPred(v, key, base.Borrow())
 	base.Release()
 
 	remove := testPosting(want[0], want[1], want[2])
@@ -543,7 +549,7 @@ func TestViewMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for i := 0; i < 1000; i++ {
-				cached, ok := testLoadMaterializedPred(v, "email\x1f1\xfal")
+				cached, ok := testLoadMaterializedPred(v, key)
 				if !ok {
 					setFailed("cache entry unexpectedly missing")
 					return
@@ -562,7 +568,7 @@ func TestViewMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 300; i++ {
-			cached, ok := testLoadMaterializedPred(v, "email\x1f1\xfal")
+			cached, ok := testLoadMaterializedPred(v, key)
 			if !ok {
 				setFailed("writer load unexpectedly missed cache")
 				return
@@ -581,7 +587,7 @@ func TestViewMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
 		t.Fatal(*msg)
 	}
 
-	cached, ok := testLoadMaterializedPred(v, "email\x1f1\xfal")
+	cached, ok := testLoadMaterializedPred(v, key)
 	if !ok {
 		t.Fatalf("cache entry missing after concurrent mutation")
 	}

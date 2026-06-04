@@ -533,7 +533,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 
 	expr := qx.PREFIX("email", "user1")
 	cacheKey := db.engine.materializedPredCacheKey(expr)
-	if cacheKey == "" {
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty materialized cache key for prefix predicate")
 	}
 	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
@@ -585,8 +585,8 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	}
 
 	expr := qx.PREFIX("email", "user1")
-	if cacheKey := db.engine.materializedPredCacheKey(expr); cacheKey != "" {
-		t.Fatalf("expected empty materialized cache key when cache is disabled, got %q", cacheKey)
+	if cacheKey := db.engine.materializedPredCacheKey(expr); !cacheKey.IsZero() {
+		t.Fatalf("expected empty materialized cache key when cache is disabled, got %q", cacheKey.String())
 	}
 
 	fm := db.engine.schema.Fields["email"]
@@ -611,12 +611,8 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	}
 	releasePredicates([]predicate{p})
 
-	rawKey := materializedPredCacheKeyFromScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user1")
-	parsedKey, ok := qcache.MaterializedPredKeyFromEncoded(rawKey)
-	if !ok {
-		t.Fatalf("expected parseable materialized cache key %q", rawKey)
-	}
-	if db.engine.snapshot.Current().HasMaterializedPredKey(parsedKey) {
+	key := qcache.MaterializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user1")
+	if db.engine.snapshot.Current().HasMaterializedPredKey(key) {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
 	if cache := db.engine.snapshot.Current().MaterializedPredCache(); cache != nil {
@@ -1145,9 +1141,9 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	fullCacheKey := view.materializedPredKey(compiled).String()
-	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if fullCacheKey == "" || complementCacheKey == "" {
+	fullCacheKey := view.materializedPredKey(compiled)
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if fullCacheKey.IsZero() || complementCacheKey.IsZero() {
 		t.Fatalf("expected non-empty scalar and complement cache keys")
 	}
 
@@ -1207,7 +1203,7 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
 
 	p, ok := view.buildPredicateWithMode(compiled, false)
 	if !ok {
@@ -1266,8 +1262,8 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -1326,8 +1322,8 @@ func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEager
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -1380,8 +1376,8 @@ func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsW
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -1640,8 +1636,8 @@ func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMate
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -2642,7 +2638,7 @@ func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *tes
 	}
 }
 
-func TestMaterializedPredCacheKeyFromScalar_SupportsRangeAndPrefix(t *testing.T) {
+func TestMaterializedPredKeyForScalar_SupportsRangeAndPrefix(t *testing.T) {
 	type tc struct {
 		op      qx.Op
 		wantHit bool
@@ -2659,11 +2655,11 @@ func TestMaterializedPredCacheKeyFromScalar_SupportsRangeAndPrefix(t *testing.T)
 		{op: qx.OpIN, wantHit: false},
 	}
 	for _, c := range cases {
-		got := materializedPredCacheKeyFromScalar("f", compileScalarOpForTest(c.op), "v")
-		if c.wantHit && got == "" {
+		got := qcache.MaterializedPredKeyForScalar("f", compileScalarOpForTest(c.op), "v")
+		if c.wantHit && got.IsZero() {
 			t.Fatalf("expected non-empty key for op=%v", c.op)
 		}
-		if !c.wantHit && got != "" {
+		if !c.wantHit && !got.IsZero() {
 			t.Fatalf("expected empty key for op=%v", c.op)
 		}
 	}

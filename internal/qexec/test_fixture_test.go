@@ -1107,13 +1107,13 @@ func (qe *queryEngine) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches,
 	return qe.currentQueryViewForTests().execPlanOROrderKWay(&viewQ, branches, nil, trace)
 }
 
-func (qe *queryEngine) materializedPredCacheKey(e qx.Expr) string {
+func (qe *queryEngine) materializedPredCacheKey(e qx.Expr) qcache.MaterializedPredKey {
 	prepared, expr, err := prepareTestExpr(qe, e)
 	if err != nil {
-		return ""
+		return qcache.MaterializedPredKey{}
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().materializedPredCacheKey(expr)
+	return qe.currentQueryViewForTests().materializedPredKey(expr)
 }
 
 func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *schema.Field, ov indexdata.FieldIndexView, allowMaterialize bool) (predicate, bool) {
@@ -1282,22 +1282,12 @@ func (qe *queryEngine) evalSimple(e qx.Expr) (postingResult, error) {
 	return qe.currentQueryViewForTests().evalSimple(expr)
 }
 
-func snapshotExtMatPredKey(key string) qcache.MaterializedPredKey {
-	if parsed, ok := qcache.MaterializedPredKeyFromEncoded(key); ok {
-		return parsed
-	}
-	if key == "" {
-		return qcache.MaterializedPredKey{}
-	}
-	return qcache.MaterializedPredKeyFromOpaque(key)
+func snapshotExtLoadMaterializedPred(s *snapshot.View, key qcache.MaterializedPredKey) (posting.List, bool) {
+	return s.LoadMaterializedPredKey(key)
 }
 
-func snapshotExtLoadMaterializedPred(s *snapshot.View, key string) (posting.List, bool) {
-	return s.LoadMaterializedPredKey(snapshotExtMatPredKey(key))
-}
-
-func snapshotExtStoreMaterializedPred(s *snapshot.View, key string, ids posting.List) {
-	s.StoreMaterializedPredKey(snapshotExtMatPredKey(key), ids)
+func snapshotExtStoreMaterializedPred(s *snapshot.View, key qcache.MaterializedPredKey, ids posting.List) {
+	s.StoreMaterializedPredKey(key, ids)
 }
 
 func (db *testDB) buildORBranchesOrdered(ops []qx.Expr, orderField string, orderedWindow int) (plannerORBranches, bool, bool) {

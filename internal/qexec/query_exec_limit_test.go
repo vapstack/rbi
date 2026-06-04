@@ -2698,8 +2698,8 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -2790,8 +2790,8 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
-	if cacheKey == "" {
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound)
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
@@ -3076,7 +3076,7 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 	if isSlice || isNil {
 		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
 	}
-	cacheKey := db.engine.currentQueryViewForTests().materializedPredCacheKeyForScalar("score", compileScalarOpForTest(qx.OpLT), keyValue)
+	cacheKey := db.engine.currentQueryViewForTests().materializedPredKeyForScalar("score", compileScalarOpForTest(qx.OpLT), keyValue)
 	prevSnap := db.engine.snapshot.Current()
 	prevBM, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
 	if !ok || prevBM.IsEmpty() {
@@ -3123,8 +3123,8 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 
 	fillView := db.engine.currentQueryViewForTests()
 	lteExpr := mustLimitQIRExpr(t, db, qx.LTE("age", 40))
-	lteCacheKey := fillView.materializedPredCacheKey(lteExpr)
-	lteIDs := fillView.evalLazyMaterializedPredicate(lteExpr, lteCacheKey)
+	lteCacheKey := fillView.materializedPredKey(lteExpr)
+	lteIDs := fillView.evalLazyMaterializedPredicateWithKey(lteExpr, lteCacheKey)
 	lteIDs.Release()
 
 	view := db.engine.currentQueryViewForTests()
@@ -3136,8 +3136,8 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	if err != nil || isSlice {
 		t.Fatalf("exprValueToNormalizedScalarBound(LTE age): err=%v isSlice=%v", err, isSlice)
 	}
-	gteComplementKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", gteBound).String()
-	lteScalarKey := view.materializedPredKeyForNormalizedScalarBound("age", lteBound).String()
+	gteComplementKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", gteBound)
+	lteScalarKey := view.materializedPredKeyForNormalizedScalarBound("age", lteBound)
 	complementSeed := posting.List{}.BuildAdded(1)
 	defer complementSeed.Release()
 	snapshotExtStoreMaterializedPred(db.engine.snapshot.Current(), gteComplementKey, complementSeed)
@@ -3341,8 +3341,8 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		}
 		t.Fatalf("expected warm ordered query to promote materialized range base ops, missing=%v", missing)
 	}
-	exactKey := qcache.MaterializedPredKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds).String()
-	if exactKey == "" {
+	exactKey := qcache.MaterializedPredKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds)
+	if exactKey.IsZero() {
 		t.Fatalf("expected collapsed exact range cache key")
 	}
 	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), exactKey); !ok {

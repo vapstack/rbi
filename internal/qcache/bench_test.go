@@ -81,33 +81,6 @@ func BenchmarkMaterializedPredKeyConstructDistinctSet(b *testing.B) {
 	}
 }
 
-func BenchmarkMaterializedPredKeyParseScalar(b *testing.B) {
-	encoded := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user-12345").String()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		key, ok := MaterializedPredKeyFromEncoded(encoded)
-		if !ok {
-			b.Fatal("parse miss")
-		}
-		qcacheBenchKey = key
-	}
-}
-
-func BenchmarkMaterializedPredKeyParseDistinctSet(b *testing.B) {
-	vals := []string{"alpha", "beta", "gamma", "delta"}
-	encoded := MaterializedPredKeyForDistinctSetTerms("tags", qir.OpHASANY, vals, true).String()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		key, ok := MaterializedPredKeyFromEncoded(encoded)
-		if !ok {
-			b.Fatal("parse miss")
-		}
-		qcacheBenchKey = key
-	}
-}
-
 func BenchmarkMaterializedPredKeySlicePoolGetPut(b *testing.B) {
 	keys := qcacheBenchKeys(16)
 	b.ReportAllocs()
