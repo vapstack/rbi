@@ -11,7 +11,7 @@ import (
 var (
 	benchIndexKeyA = FromString("member:000000000001")
 	benchIndexKeyB = FromString("member:000000000099")
-	benchDBKey     = DataKeyFromUserKey(uint64(0x0102030405060708), false)
+	benchDataKey   = DataKeyFromUserKey(uint64(0x0102030405060708), false)
 	benchBytes     []byte
 	benchString    string
 	benchInt       int
@@ -249,7 +249,7 @@ func TestPrefixUpperBoundBoundaryComparisons(t *testing.T) {
 	}
 }
 
-func TestDBKeyBytesAndRoundTrip(t *testing.T) {
+func TestDataKeyBytesAndRoundTrip(t *testing.T) {
 	var buf [8]byte
 	num := DataKeyFromUserKey(uint64(0x0102030405060708), false)
 	if got := num.Bytes(false, &buf); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
@@ -383,46 +383,46 @@ func TestNumericKeyFormattingAndOrdering(t *testing.T) {
 	}
 }
 
-func TestIDBytesAndRoundTripWithKind(t *testing.T) {
+func TestUserKeyBytesAndRoundTrip(t *testing.T) {
 	var buf [8]byte
 	if got := UserKeyBytesWithBuf(uint64(0x0102030405060708), false, &buf); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
-		t.Fatalf("numeric ID bytes mismatch: %x", got)
+		t.Fatalf("numeric UserKey bytes mismatch: %x", got)
 	}
 	if got := UserKeyFromBytes[uint64]([]byte{1, 2, 3, 4, 5, 6, 7, 8}, false); got != 0x0102030405060708 {
-		t.Fatalf("numeric IDFromBytesWithKind mismatch: %x", got)
+		t.Fatalf("numeric UserKeyFromBytes mismatch: %x", got)
 	}
 
 	raw := []byte("user-1")
 	if got := string(UserKeyBytesWithBuf("user-1", true, &buf)); got != "user-1" {
-		t.Fatalf("string ID bytes mismatch: %q", got)
+		t.Fatalf("string UserKey bytes mismatch: %q", got)
 	}
 	got := UserKeyFromBytes[string](raw, true)
 	raw[0] = 'X'
 	if got != "user-1" {
-		t.Fatalf("string IDFromBytesWithKind must copy source bytes: got=%q", got)
+		t.Fatalf("string UserKeyFromBytes must copy source bytes: got=%q", got)
 	}
 }
 
-func TestDBKeyBytesNoAllocation(t *testing.T) {
+func TestDataKeyBytesNoAllocation(t *testing.T) {
 	num := DataKeyFromUserKey(uint64(42), false)
 	var buf [8]byte
 	if allocs := testing.AllocsPerRun(1000, func() {
 		benchBytes = num.Bytes(false, &buf)
 	}); allocs != 0 {
-		t.Fatalf("numeric DBKey.Bytes allocated: %.2f", allocs)
+		t.Fatalf("numeric DataKey.Bytes allocated: %.2f", allocs)
 	}
 
 	str := DataKeyFromUserKey("user-42", true)
 	if allocs := testing.AllocsPerRun(1000, func() {
 		benchBytes = str.Bytes(true, &buf)
 	}); allocs != 0 {
-		t.Fatalf("string DBKey.Bytes allocated: %.2f", allocs)
+		t.Fatalf("string DataKey.Bytes allocated: %.2f", allocs)
 	}
 
 	if allocs := testing.AllocsPerRun(1000, func() {
 		benchBytes = UserKeyBytesWithBuf(uint64(42), false, &buf)
 	}); allocs != 0 {
-		t.Fatalf("numeric IDBytesWithKindBuf allocated: %.2f", allocs)
+		t.Fatalf("numeric UserKeyBytesWithBuf allocated: %.2f", allocs)
 	}
 }
 
@@ -555,16 +555,16 @@ func BenchmarkStringPrefixUpperBoundCompare(b *testing.B) {
 	}
 }
 
-func BenchmarkDBKeyBytesUint64(b *testing.B) {
+func BenchmarkDataKeyBytesUint64(b *testing.B) {
 	b.ReportAllocs()
-	key := benchDBKey
+	key := benchDataKey
 	var buf [8]byte
 	for b.Loop() {
 		benchBytes = key.Bytes(false, &buf)
 	}
 }
 
-func BenchmarkIDBytesWithKindBufUint64(b *testing.B) {
+func BenchmarkUserKeyBytesWithBufUint64(b *testing.B) {
 	b.ReportAllocs()
 	var buf [8]byte
 	for i := 0; i < b.N; i++ {
@@ -572,7 +572,7 @@ func BenchmarkIDBytesWithKindBufUint64(b *testing.B) {
 	}
 }
 
-func BenchmarkIDBytesWithKindBufString(b *testing.B) {
+func BenchmarkUserKeyBytesWithBufString(b *testing.B) {
 	b.ReportAllocs()
 	var buf [8]byte
 	for i := 0; i < b.N; i++ {
@@ -580,7 +580,7 @@ func BenchmarkIDBytesWithKindBufString(b *testing.B) {
 	}
 }
 
-func BenchmarkIDFromBytesWithKindUint64(b *testing.B) {
+func BenchmarkUserKeyFromBytesUint64(b *testing.B) {
 	b.ReportAllocs()
 	raw := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	for b.Loop() {
@@ -588,7 +588,7 @@ func BenchmarkIDFromBytesWithKindUint64(b *testing.B) {
 	}
 }
 
-func BenchmarkIDFromBytesWithKindString(b *testing.B) {
+func BenchmarkUserKeyFromBytesString(b *testing.B) {
 	raw := []byte("member:000000000001")
 	b.ReportAllocs()
 	for b.Loop() {
@@ -596,7 +596,7 @@ func BenchmarkIDFromBytesWithKindString(b *testing.B) {
 	}
 }
 
-func BenchmarkDBKeyBytesString(b *testing.B) {
+func BenchmarkDataKeyBytesString(b *testing.B) {
 	key := DataKeyFromUserKey("member:000000000001", true)
 	var buf [8]byte
 	b.ReportAllocs()
