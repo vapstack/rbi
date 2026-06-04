@@ -823,7 +823,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	universe := (posting.List{}).BuildAdded(2)
 	lenStorage, _ := fixedState.MaterializeLenStorage(universe)
 	defer lenStorage.Release()
-	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 2) {
 		t.Fatal("len build materialization lost posting")
 	}
 
@@ -884,7 +884,7 @@ func TestIndexStateCollectAndMaterialize(t *testing.T) {
 	}
 	lenStorage, _ := fixedState.MaterializeLenStorage((posting.List{}).BuildAdded(2))
 	defer lenStorage.Release()
-	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 2) {
 		t.Fatal("len overlay materialization lost posting")
 	}
 
@@ -939,7 +939,7 @@ func TestIndexStateMaterializedStorageSurvivesStateRelease(t *testing.T) {
 	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 1) {
 		t.Fatal("materialized nil storage did not survive index state release")
 	}
-	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 1) {
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 1) {
 		t.Fatal("materialized len storage did not survive index state release")
 	}
 }
@@ -983,7 +983,7 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 	nameOrdinal := rt.IndexedByName["name"].Ordinal
 	prevMap := indexdata.GetPostingMap()
 	prevMap["alice"] = (posting.List{}).BuildAdded(1)
-	prev[nameOrdinal] = indexdata.NewRegularFieldStorageFromPostingMapOwned(prevMap, false)
+	prev[nameOrdinal] = indexdata.NewRegularFieldStorageFromPostingMapOwned(prevMap)
 	defer prev[nameOrdinal].Release()
 	InitInsertStateHints(states, rt.Indexed, prev, nil, nil, 4)
 	if states[nameOrdinal].indexHint != 4 {
@@ -1034,10 +1034,10 @@ func TestInsertStateResetDropsPreviousLogicalEntries(t *testing.T) {
 	if !schemaTestIndexViewContains(storage, "new", 2) || !schemaTestIndexViewContains(storage, "next", 2) {
 		t.Fatal("insert state reset lost new string postings")
 	}
-	if schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(1), 1) {
+	if schemaTestIndexViewContainsKey(lenStorage, 1, 1) {
 		t.Fatal("insert state reset kept old len posting")
 	}
-	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 2) {
 		t.Fatal("insert state reset lost new len posting")
 	}
 	state.discard()
@@ -1162,10 +1162,10 @@ func TestBatchStateResetDropsPreviousLogicalEntries(t *testing.T) {
 	if !schemaTestIndexViewContains(storage, "fresh", 2) {
 		t.Fatal("batch state reset lost new string diff")
 	}
-	if schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 1) {
+	if schemaTestIndexViewContainsKey(lenStorage, 2, 1) {
 		t.Fatal("batch state reset kept old len diff")
 	}
-	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(1), 2) {
+	if !schemaTestIndexViewContainsKey(lenStorage, 1, 2) {
 		t.Fatal("batch state reset lost new len diff")
 	}
 	state.discard()

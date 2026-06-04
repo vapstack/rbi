@@ -21,7 +21,7 @@ const benchWriterSize = 64 << 10
 func benchmarkFieldEntries(n int, numeric bool) []Entry {
 	entries := make([]Entry, n)
 	for i := range entries {
-		key := keycodec.FromStoredString(fmt.Sprintf("k/%06d", i), false)
+		key := keycodec.FromString(fmt.Sprintf("k/%06d", i))
 		if numeric {
 			key = keycodec.FromU64(uint64(i * 2))
 		}
@@ -37,7 +37,7 @@ func benchmarkFieldEntriesWithPostingCardinality(n int, numeric bool, card int) 
 	entries := make([]Entry, n)
 	ids := make([]uint64, card)
 	for i := range entries {
-		key := keycodec.FromStoredString(fmt.Sprintf("k/%06d", i), false)
+		key := keycodec.FromString(fmt.Sprintf("k/%06d", i))
 		if numeric {
 			key = keycodec.FromU64(uint64(i * 2))
 		}
@@ -222,7 +222,7 @@ func BenchmarkWriteKey(b *testing.B) {
 		name string
 		key  keycodec.IndexKey
 	}{
-		{name: "String", key: keycodec.FromStoredString("k/000001", false)},
+		{name: "String", key: keycodec.FromString("k/000001")},
 		{name: "Numeric", key: keycodec.FromU64(42)},
 	}
 
@@ -254,7 +254,7 @@ func BenchmarkEntryWriteInto(b *testing.B) {
 		{
 			name: "StringSingleton",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: (posting.List{}).BuildAdded(1),
 			},
 		},
@@ -268,7 +268,7 @@ func BenchmarkEntryWriteInto(b *testing.B) {
 		{
 			name: "StringMultiPosting",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: multi,
 			},
 		},
@@ -508,7 +508,7 @@ func BenchmarkReadKey(b *testing.B) {
 		name string
 		key  keycodec.IndexKey
 	}{
-		{name: "String", key: keycodec.FromStoredString("k/000001", false)},
+		{name: "String", key: keycodec.FromString("k/000001")},
 		{name: "Numeric", key: keycodec.FromU64(42)},
 	}
 
@@ -538,7 +538,7 @@ func BenchmarkSkipKey(b *testing.B) {
 		name string
 		key  keycodec.IndexKey
 	}{
-		{name: "String", key: keycodec.FromStoredString("k/000001", false)},
+		{name: "String", key: keycodec.FromString("k/000001")},
 		{name: "Numeric", key: keycodec.FromU64(42)},
 	}
 
@@ -570,7 +570,7 @@ func BenchmarkReadEntry(b *testing.B) {
 		{
 			name: "StringSingleton",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: (posting.List{}).BuildAdded(1),
 			},
 		},
@@ -584,7 +584,7 @@ func BenchmarkReadEntry(b *testing.B) {
 		{
 			name: "StringMultiPosting",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: multi,
 			},
 		},
@@ -623,7 +623,7 @@ func BenchmarkSkipEntry(b *testing.B) {
 		{
 			name: "StringSingleton",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: (posting.List{}).BuildAdded(1),
 			},
 		},
@@ -637,7 +637,7 @@ func BenchmarkSkipEntry(b *testing.B) {
 		{
 			name: "StringMultiPosting",
 			entry: Entry{
-				Key: keycodec.FromStoredString("k/000001", false),
+				Key: keycodec.FromString("k/000001"),
 				IDs: multi,
 			},
 		},
@@ -1087,41 +1087,25 @@ func BenchmarkNewRegularFieldStorageFromFixedPostingMapOwnedChunked(b *testing.B
 func BenchmarkNewRegularFieldStorageFromPostingMapOwnedChunked(b *testing.B) {
 	const rows = FieldChunkThreshold * 4
 
-	tests := []struct {
-		name   string
-		fixed8 bool
-	}{
-		{name: "String"},
-		{name: "Fixed8", fixed8: true},
+	b.ReportAllocs()
+	b.ResetTimer()
+	var total uint64
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		m := GetPostingMap()
+		for j := 0; j < rows; j++ {
+			m[fmt.Sprintf("k/%06d", j*2)] = (posting.List{}).BuildAdded(uint64(j + 1))
+		}
+		b.StartTimer()
+
+		storage := NewRegularFieldStorageFromPostingMapOwned(m)
+		total += uint64(storage.KeyCount())
+
+		b.StopTimer()
+		storage.Release()
+		b.StartTimer()
 	}
-
-	for _, tc := range tests {
-		b.Run(tc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.ResetTimer()
-			var total uint64
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				m := GetPostingMap()
-				for j := 0; j < rows; j++ {
-					key := fmt.Sprintf("k/%06d", j*2)
-					if tc.fixed8 {
-						key = fmt.Sprintf("%08d", j*2)
-					}
-					m[key] = (posting.List{}).BuildAdded(uint64(j + 1))
-				}
-				b.StartTimer()
-
-				storage := NewRegularFieldStorageFromPostingMapOwned(m, tc.fixed8)
-				total += uint64(storage.KeyCount())
-
-				b.StopTimer()
-				storage.Release()
-				b.StartTimer()
-			}
-			benchUint64 = total
-		})
-	}
+	benchUint64 = total
 }
 
 func BenchmarkNewRegularFieldStorageFromRunsOwned(b *testing.B) {
@@ -1564,7 +1548,7 @@ func BenchmarkFieldStorageMergeStringPostingAdds(b *testing.B) {
 		for j := 0; j < deltaCount; j++ {
 			adds = AddStringPostingAdd(adds, &arena, keys[j], uint64(i*deltaCount+j+1), deltaCount)
 		}
-		storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, true)
+		storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, true)
 		total += storage.KeyCount()
 		storage.Release()
 		clear(adds)
@@ -1621,7 +1605,7 @@ func BenchmarkFieldStorageApplyStringPostingDiff(b *testing.B) {
 			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(base+j+1), false)
 			deltas = AddStringPostingDiff(deltas, &arena, keys[j], uint64(10_000_000+i*deltaCount+j), true)
 		}
-		next := storage.ApplyStringPostingDiff(deltas, &arena, false, true)
+		next := storage.ApplyStringPostingDiff(deltas, &arena, true)
 		total += next.KeyCount()
 		next.Release()
 		clear(deltas)

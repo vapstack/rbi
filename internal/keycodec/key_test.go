@@ -30,13 +30,10 @@ func keycodecMutableString(b []byte) string {
 func TestIndexKeyNumericAndRaw8(t *testing.T) {
 	raw := "\x01\x02\x03\x04\x05\x06\x07\x08"
 	want := binary.BigEndian.Uint64([]byte(raw))
-	if got := Fixed8StringToU64(raw); got != want {
-		t.Fatalf("Fixed8StringToU64: got=%x want=%x", got, want)
-	}
 
-	key := FromStoredString(raw, true)
+	key := FromU64(want)
 	if !key.IsNumeric() {
-		t.Fatalf("raw-8 key must be numeric")
+		t.Fatalf("u64 key must be numeric")
 	}
 	if key.U64() != want {
 		t.Fatalf("numeric value mismatch: got=%x want=%x", key.U64(), want)
@@ -91,39 +88,35 @@ func TestPrefixUpperBound(t *testing.T) {
 	}
 }
 
-func TestNumericKeyStringPredicatesUseRaw8Order(t *testing.T) {
+func TestNumericKeyIsDistinctFromRaw8String(t *testing.T) {
 	key := FromU64(0x6162636465666768)
-	if CompareString(key, "abcdefgh") != 0 {
-		t.Fatalf("numeric raw-8 compare mismatch")
+	raw := FromString("abcdefgh")
+	if Compare(key, raw) <= 0 || Compare(raw, key) >= 0 {
+		t.Fatalf("numeric/raw-8 string type tie-break mismatch")
 	}
-	if !EqualsString(key, "abcdefgh") {
-		t.Fatalf("numeric raw-8 equality mismatch")
+	if CompareString(key, "abcdefgh") == 0 {
+		t.Fatalf("numeric key must not compare equal to raw-8 string")
 	}
-	if !HasPrefixString(key, "abc") || !HasSuffixString(key, "fgh") || !ContainsString(key, "cde") {
-		t.Fatalf("numeric raw-8 substring predicates failed")
+	if EqualsString(key, "abcdefgh") {
+		t.Fatalf("numeric key must not equal raw-8 string")
+	}
+	if HasPrefixString(key, "abc") || HasSuffixString(key, "fgh") || ContainsString(key, "cde") {
+		t.Fatalf("numeric key must not match string predicates")
+	}
+	if !HasPrefixString(key, "") || !HasSuffixString(key, "") || !ContainsString(key, "") {
+		t.Fatalf("empty string predicates must match")
 	}
 }
 
-func TestIndexKeyStoredStringConstructors(t *testing.T) {
+func TestIndexKeyRaw8StringConstructor(t *testing.T) {
 	raw := "\x01\x02\x03\x04\x05\x06\x07\x08"
-	want := Fixed8StringToU64(raw)
 
-	fixed := FromStoredString(raw, true)
-	if !fixed.IsNumeric() || fixed.U64() != want || fixed.UnsafeString() != raw {
-		t.Fatalf("fixed stored raw-8 mismatch: numeric=%v u64=%x raw=%q", fixed.IsNumeric(), fixed.U64(), fixed.UnsafeString())
+	key := FromString(raw)
+	if key.IsNumeric() || key.UnsafeString() != raw {
+		t.Fatalf("raw-8 string mismatch: numeric=%v raw=%q", key.IsNumeric(), key.UnsafeString())
 	}
 
-	plain := FromStoredString(raw, false)
-	if plain.IsNumeric() || plain.UnsafeString() != raw {
-		t.Fatalf("plain stored raw-8 mismatch: numeric=%v raw=%q", plain.IsNumeric(), plain.UnsafeString())
-	}
-
-	short := FromStoredString("short", true)
-	if short.IsNumeric() || short.UnsafeString() != "short" {
-		t.Fatalf("short fixed stored string mismatch: numeric=%v raw=%q", short.IsNumeric(), short.UnsafeString())
-	}
-
-	empty := FromStoredString("", true)
+	empty := FromString("")
 	if empty.IsNumeric() || empty.ByteLen() != 0 || empty.UnsafeString() != "" {
 		t.Fatalf("empty stored key mismatch: numeric=%v len=%d raw=%q", empty.IsNumeric(), empty.ByteLen(), empty.UnsafeString())
 	}
@@ -157,23 +150,10 @@ func TestIndexKeyFromStringBorrowsStringData(t *testing.T) {
 	}
 }
 
-func TestIndexKeyFixedStoredStringDoesNotBorrowSourceBytes(t *testing.T) {
-	raw := []byte("\x01\x02\x03\x04\x05\x06\x07\x08")
-	key := FromStoredString(keycodecMutableString(raw), true)
-	if !key.IsNumeric() {
-		t.Fatalf("fixed8 stored string must become numeric")
-	}
-
-	raw[0] = 0xff
-	if key.UnsafeString() != "\x01\x02\x03\x04\x05\x06\x07\x08" {
-		t.Fatalf("numeric fixed8 key must not borrow source bytes: %x", []byte(key.UnsafeString()))
-	}
-}
-
 func TestIndexKeyMixedComparisonsUseByteOrder(t *testing.T) {
 	key := FromU64(0x6162636465666768)
-	if Compare(key, FromString("abcdefgh")) != 0 {
-		t.Fatalf("mixed raw-8 compare equality mismatch")
+	if Compare(key, FromString("abcdefgh")) <= 0 {
+		t.Fatalf("numeric key should sort after matching raw-8 string")
 	}
 	if Compare(key, FromString("abcdefg")) <= 0 {
 		t.Fatalf("numeric key should sort after shorter matching string")
@@ -184,7 +164,7 @@ func TestIndexKeyMixedComparisonsUseByteOrder(t *testing.T) {
 	if Compare(key, FromString("abcdeg")) >= 0 {
 		t.Fatalf("numeric key should sort before greater mismatching string")
 	}
-	if CompareString(key, "abcdefg") <= 0 || CompareString(key, "abcdefghi") >= 0 {
+	if CompareString(key, "abcdefgh") <= 0 || CompareString(key, "abcdefg") <= 0 || CompareString(key, "abcdefghi") >= 0 {
 		t.Fatalf("mixed CompareString length ordering mismatch")
 	}
 }
@@ -489,28 +469,12 @@ func BenchmarkIndexKeyCompareString(b *testing.B) {
 	}
 }
 
-func BenchmarkIndexKeyHasPrefixRaw8(b *testing.B) {
-	key := FromU64(0x6162636465666768)
-	b.ReportAllocs()
-	for b.Loop() {
-		benchBool = HasPrefixString(key, "abc")
-	}
-}
-
 func BenchmarkPrefixUpperBoundCompare(b *testing.B) {
 	upper, _ := NewPrefixUpperBound("member:0000000000")
 	key := benchIndexKeyA
 	b.ReportAllocs()
 	for b.Loop() {
 		benchInt = ComparePrefixUpperBound(key, upper)
-	}
-}
-
-func BenchmarkFixed8StringToU64(b *testing.B) {
-	s := "\x01\x02\x03\x04\x05\x06\x07\x08"
-	b.ReportAllocs()
-	for b.Loop() {
-		benchUint64 = Fixed8StringToU64(s)
 	}
 }
 

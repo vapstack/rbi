@@ -351,7 +351,7 @@ func (d *LenPostingDiff) AddNonEmpty(idx uint64, isAdd bool) {
 	}
 }
 
-func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingDiffArena, fixed8 bool) []PostingDelta {
+func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingDiffArena) []PostingDelta {
 	if len(deltas) == 0 {
 		return nil
 	}
@@ -370,7 +370,7 @@ func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingD
 			continue
 		}
 		buf = append(buf, PostingDelta{
-			Key:   keycodec.FromStoredString(raw, fixed8),
+			Key:   keycodec.FromString(raw),
 			Delta: delta,
 		})
 	}
@@ -416,10 +416,9 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 func (s FieldStorage) ApplyStringPostingDiff(
 	deltas map[string]uint32,
 	arena *PostingDiffArena,
-	fixed8 bool,
 	allowChunk bool,
 ) FieldStorage {
-	buf := sortedStringPostingDeltasBufOwned(deltas, arena, fixed8)
+	buf := sortedStringPostingDeltasBufOwned(deltas, arena)
 	if buf == nil {
 		return s
 	}
@@ -438,7 +437,7 @@ func (s FieldStorage) ApplyFixedPostingDiff(
 	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddArena, fixed8 bool) []PostingDelta {
+func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddArena) []PostingDelta {
 	if len(adds) == 0 {
 		return nil
 	}
@@ -453,7 +452,7 @@ func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddAr
 		ref := adds[raw]
 		ids := arena.accum(ref).materializeOwned()
 		buf = append(buf, PostingDelta{
-			Key: keycodec.FromStoredString(raw, fixed8),
+			Key: keycodec.FromString(raw),
 			Delta: BatchPostingDelta{
 				Add: ids,
 			},
@@ -491,13 +490,12 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]uint32, arena *PostingAddAre
 func (s FieldStorage) MergeStringPostingAdds(
 	adds map[string]uint32,
 	arena *PostingAddArena,
-	fixed8 bool,
 	allowChunk bool,
 ) FieldStorage {
 	if len(adds) == 0 {
 		return s
 	}
-	buf := sortedStringPostingAddsBufOwned(adds, arena, fixed8)
+	buf := sortedStringPostingAddsBufOwned(adds, arena)
 	if buf == nil {
 		return s
 	}

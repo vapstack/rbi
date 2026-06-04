@@ -58,7 +58,7 @@ func testFieldIndexViewFromEntries(entries []indexdata.Entry) (indexdata.FieldIn
 		}
 		m[key.UnsafeString()] = ids
 	}
-	storage := indexdata.NewFlatFieldStorageFromPostingMapOwned(m, false)
+	storage := indexdata.NewFlatFieldStorageFromPostingMapOwned(m)
 	return indexdata.NewFieldIndexViewFromStorage(storage), storage
 }
 

@@ -914,13 +914,13 @@ func NewNilFieldStorageOwned(ids posting.List) FieldStorage {
 	}
 	entries := GetFieldEntrySlice(1)
 	entries = append(entries, Entry{
-		Key: keycodec.FromStoredString(NilIndexEntryKey, false),
+		Key: keycodec.FromString(NilIndexEntryKey),
 		IDs: ids,
 	})
 	return newFlatFieldStorage(entries, nil)
 }
 
-func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
+func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List) FieldStorage {
 	if len(m) == 0 {
 		ReleasePostingMap(m)
 		return FieldStorage{}
@@ -943,7 +943,7 @@ func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bo
 	entries := GetFieldEntrySlice(len(keys))[:len(keys)]
 	for i := range keys {
 		entries[i] = Entry{
-			Key: keycodec.FromStoredString(keys[i], fixed8),
+			Key: keycodec.FromString(keys[i]),
 			IDs: m[keys[i]],
 		}
 	}
@@ -952,7 +952,7 @@ func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bo
 	return newFlatFieldStorage(entries, nil)
 }
 
-func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
+func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List) FieldStorage {
 	if len(m) == 0 {
 		ReleasePostingMap(m)
 		return FieldStorage{}
@@ -976,7 +976,7 @@ func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8
 		entries := GetFieldEntrySlice(len(keys))[:len(keys)]
 		for i := range keys {
 			entries[i] = Entry{
-				Key: keycodec.FromStoredString(keys[i], fixed8),
+				Key: keycodec.FromString(keys[i]),
 				IDs: m[keys[i]],
 			}
 		}
@@ -989,35 +989,23 @@ func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8
 	for start := 0; start < len(keys); {
 		size := nextStringFieldIndexChunkSizeStrings(keys, start)
 		end := start + size
-		if fixed8 {
-			numeric := fieldUint64Slice(end - start)
-			posts := fieldPostingSlice(end - start)
-			var rows uint64
-			for i, key := range keys[start:end] {
-				numeric[i] = keycodec.Fixed8StringToU64(key)
-				posts[i] = m[key]
-				rows += posts[i].Cardinality()
-			}
-			builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, rows))
-		} else {
-			totalBytes := 0
-			for _, key := range keys[start:end] {
-				totalBytes += len(key)
-			}
-			data := fieldByteSlice(totalBytes)
-			refs := fieldStringRefSlice(end - start)
-			posts := fieldPostingSlice(end - start)
-			off := 0
-			var rows uint64
-			for i, key := range keys[start:end] {
-				n := copy(data[off:], key)
-				refs[i] = newFieldIndexStringRef(off, n)
-				posts[i] = m[key]
-				rows += posts[i].Cardinality()
-				off += n
-			}
-			builder.appendChunk(newStringFieldIndexChunk(posts, refs, data, rows))
+		totalBytes := 0
+		for _, key := range keys[start:end] {
+			totalBytes += len(key)
 		}
+		data := fieldByteSlice(totalBytes)
+		refs := fieldStringRefSlice(end - start)
+		posts := fieldPostingSlice(end - start)
+		off := 0
+		var rows uint64
+		for i, key := range keys[start:end] {
+			n := copy(data[off:], key)
+			refs[i] = newFieldIndexStringRef(off, n)
+			posts[i] = m[key]
+			rows += posts[i].Cardinality()
+			off += n
+		}
+		builder.appendChunk(newStringFieldIndexChunk(posts, refs, data, rows))
 		start = end
 	}
 	pooled.ReleaseStringSlice(keys)

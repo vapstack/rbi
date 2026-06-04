@@ -805,7 +805,7 @@ func persistTestMeasureStorage() indexdata.MeasureStorage {
 func persistTestRegularStorage(key string, id uint64) indexdata.FieldStorage {
 	m := indexdata.GetPostingMap()
 	m[key] = (posting.List{}).BuildAdded(id)
-	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m, false)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m)
 }
 
 func writePersistTestUniverse(t *testing.T, writer *bufio.Writer) {

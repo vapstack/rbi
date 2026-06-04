@@ -80,7 +80,7 @@ func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
 func fieldStorageEntriesForTest(n int, numeric bool) []Entry {
 	entries := make([]Entry, n)
 	for i := 0; i < n; i++ {
-		key := keycodec.FromStoredString(fmt.Sprintf("k/%06d", i), false)
+		key := keycodec.FromString(fmt.Sprintf("k/%06d", i))
 		if numeric {
 			key = keycodec.FromU64(uint64(i * 2))
 		}
@@ -92,10 +92,10 @@ func fieldStorageEntriesForTest(n int, numeric bool) []Entry {
 	return entries
 }
 
-func fieldStorageOwnedChunkRef(size int, fixed8 bool) fieldIndexChunkRef {
+func fieldStorageOwnedChunkRef(size int, numeric bool) fieldIndexChunkRef {
 	posts := make([]posting.List, size)
 	rows := uint64(size * 2)
-	if fixed8 {
+	if numeric {
 		keys := make([]uint64, size)
 		for i := 0; i < size; i++ {
 			keys[i] = uint64(i * 2)
@@ -111,18 +111,18 @@ func fieldStorageOwnedChunkRef(size int, fixed8 bool) fieldIndexChunkRef {
 	}
 	keys := make([]keycodec.IndexKey, size)
 	for i := 0; i < size; i++ {
-		keys[i] = keycodec.FromStoredString(fmt.Sprintf("k/%04d", i*2), false)
+		keys[i] = keycodec.FromString(fmt.Sprintf("k/%04d", i*2))
 		posts[i] = fieldStorageOwnedTestPosting(uint64(i + 1))
 	}
 	chunk := newFieldIndexChunkFromKeys(posts, keys, rows)
 	return fieldIndexChunkRef{last: chunk.keyAt(size - 1), chunk: chunk}
 }
 
-func fieldStorageInsertedTestKey(pos int, fixed8 bool) keycodec.IndexKey {
-	if fixed8 {
+func fieldStorageInsertedTestKey(pos int, numeric bool) keycodec.IndexKey {
+	if numeric {
 		return keycodec.FromU64(uint64(pos*2 + 1))
 	}
-	return keycodec.FromStoredString(fmt.Sprintf("k/%04d", pos*2+1), false)
+	return keycodec.FromString(fmt.Sprintf("k/%04d", pos*2+1))
 }
 
 func fieldStorageSingleChunkRoot(ref fieldIndexChunkRef) *fieldIndexChunkedRoot {
@@ -168,13 +168,19 @@ func fieldStorageFullPageSplitNumericRoot() *fieldIndexChunkedRoot {
 
 func fieldStorageAssertPostingContains(t *testing.T, storage FieldStorage, key string, want ...uint64) {
 	t.Helper()
-	ids := NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromString(key), want...)
+}
+
+func fieldStorageAssertPostingContainsKey(t *testing.T, storage FieldStorage, key keycodec.IndexKey, want ...uint64) {
+	t.Helper()
+	ids := NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(key)
+	keyString := key.UnsafeString()
 	if ids.Cardinality() != uint64(len(want)) {
-		t.Fatalf("posting %q cardinality: got %d want %d", key, ids.Cardinality(), len(want))
+		t.Fatalf("posting %q cardinality: got %d want %d", keyString, ids.Cardinality(), len(want))
 	}
 	for _, id := range want {
 		if !ids.Contains(id) {
-			t.Fatalf("posting %q missing id %d", key, id)
+			t.Fatalf("posting %q missing id %d", keyString, id)
 		}
 	}
 }

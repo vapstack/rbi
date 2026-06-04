@@ -20,7 +20,7 @@ func TestApplyFieldPostingDiffChunked_StringOwnerChunkKeepsStringLayout(t *testi
 	entries := make([]Entry, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("k%04d", i)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -40,13 +40,13 @@ func TestApplyFieldPostingDiffChunked_StringOwnerChunkKeepsStringLayout(t *testi
 	newKey := "k0095a"
 	deltas := []PostingDelta{
 		{
-			Key: keycodec.FromStoredString(oldKey, false),
+			Key: keycodec.FromString(oldKey),
 			Delta: BatchPostingDelta{
 				Remove: fieldStorageSingleton(96),
 			},
 		},
 		{
-			Key: keycodec.FromStoredString(newKey, false),
+			Key: keycodec.FromString(newKey),
 			Delta: BatchPostingDelta{
 				Add: fieldStorageSingleton(900_001),
 			},
@@ -128,14 +128,14 @@ func TestApplyFieldPostingDiffChunked_NumericOwnerChunkKeepsNumericLayout(t *tes
 	if !repl.chunk.hasUniqueNumericOwners() {
 		t.Fatalf("expected owner layout to be preserved for singleton result numeric chunk")
 	}
-	if ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(oldKey)); !ids.IsEmpty() {
+	if ids := storage.chunked.lookupPostingRetainedKey(keycodec.FromU64(oldKey)); !ids.IsEmpty() {
 		t.Fatalf("expected old key to be removed, got %v", ids)
 	}
-	ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(newKey))
+	ids := storage.chunked.lookupPostingRetainedKey(keycodec.FromU64(newKey))
 	if ids.Cardinality() != 1 || !ids.Contains(900_001) {
 		t.Fatalf("unexpected new key posting: %v", ids)
 	}
-	if ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(oldKey + 2)); ids.Cardinality() != 1 || !ids.Contains(97) {
+	if ids := storage.chunked.lookupPostingRetainedKey(keycodec.FromU64(oldKey + 2)); ids.Cardinality() != 1 || !ids.Contains(97) {
 		t.Fatalf("neighbor key lookup broken: %v", ids)
 	}
 }
@@ -144,7 +144,7 @@ func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPostin
 	entries := make([]Entry, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("k%04d", i)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -156,7 +156,7 @@ func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPostin
 	defer root.release()
 
 	storage := root.applySinglePostingDiff(PostingDelta{
-		Key: keycodec.FromStoredString("k0095", false),
+		Key: keycodec.FromString("k0095"),
 		Delta: BatchPostingDelta{
 			Add: fieldStorageSingleton(900_002),
 		},
@@ -221,7 +221,7 @@ func TestApplySingleFieldPostingDiffChunked_NumericOwnerChunkDemotesOnMultiPosti
 	if repl.chunk.hasUniqueNumericOwners() {
 		t.Fatalf("expected owner layout to be dropped after multi-posting numeric update")
 	}
-	ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(uint64(95 * 2)))
+	ids := storage.chunked.lookupPostingRetainedKey(keycodec.FromU64(uint64(95 * 2)))
 	if ids.Cardinality() != 2 || !ids.Contains(96) || !ids.Contains(900_002) {
 		t.Fatalf("unexpected expanded posting: %v", ids)
 	}
@@ -338,13 +338,13 @@ func TestSortPostingDeltasBufOrdersByKey(t *testing.T) {
 
 func TestApplyFieldPostingDiffStorage_NoOpFlatRemoveReturnsBase(t *testing.T) {
 	entries := []Entry{{
-		Key: keycodec.FromStoredString("a", false),
+		Key: keycodec.FromString("a"),
 		IDs: fieldStorageOwnedTestPosting(1),
 	}}
 	storage := newFlatFieldStorage(entries, nil)
 	defer storage.Release()
 
-	missing := keycodec.FromStoredString("b", false)
+	missing := keycodec.FromString("b")
 	delta := PostingDelta{
 		Key: missing,
 		Delta: BatchPostingDelta{
@@ -382,16 +382,16 @@ func TestApplyFieldPostingDiffStorage_NoOpFlatRemoveReturnsBase(t *testing.T) {
 
 func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *testing.T) {
 	entries := []Entry{{
-		Key: keycodec.FromStoredString("a", false),
+		Key: keycodec.FromString("a"),
 		IDs: fieldStorageOwnedTestPosting(1),
 	}}
 	base := newFlatFieldStorage(entries, nil)
 	defer base.Release()
 
 	deltas := []PostingDelta{
-		{Key: keycodec.FromStoredString("a", false)},
+		{Key: keycodec.FromString("a")},
 		{
-			Key: keycodec.FromStoredString("b", false),
+			Key: keycodec.FromString("b"),
 			Delta: BatchPostingDelta{
 				Add: fieldStorageOwnedTestPosting(2),
 			},
@@ -414,9 +414,9 @@ func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *t
 
 func TestFieldStorageApplyPostingDiff_FlatStringKeysSurviveBaseRelease(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("hot", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("shared", false), IDs: fieldStorageSingleton(2)},
-		{Key: keycodec.FromStoredString("tag-076", false), IDs: fieldStorageSingleton(3)},
+		{Key: keycodec.FromString("hot"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("shared"), IDs: fieldStorageSingleton(2)},
+		{Key: keycodec.FromString("tag-076"), IDs: fieldStorageSingleton(3)},
 	}
 	base := newRegularFieldStorage(entries)
 	if base.flat == nil || base.flat.stringData == nil {
@@ -424,7 +424,7 @@ func TestFieldStorageApplyPostingDiff_FlatStringKeysSurviveBaseRelease(t *testin
 	}
 
 	next := base.applyPostingDiff([]PostingDelta{{
-		Key: keycodec.FromStoredString("tag-076", false),
+		Key: keycodec.FromString("tag-076"),
 		Delta: BatchPostingDelta{
 			Remove: fieldStorageSingleton(3),
 		},
@@ -450,8 +450,8 @@ func TestFieldStorageApplyPostingDiff_FlatStringKeysSurviveBaseRelease(t *testin
 
 func TestFieldStorageApplyPostingDiffCopiesBorrowedDeltaKeyBytes(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("diff-direct/a", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("diff-direct/c", false), IDs: fieldStorageSingleton(3)},
+		{Key: keycodec.FromString("diff-direct/a"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("diff-direct/c"), IDs: fieldStorageSingleton(3)},
 	}
 	base := newRegularFieldStorage(entries)
 
@@ -478,8 +478,8 @@ func TestFieldStorageApplyPostingDiffCopiesBorrowedDeltaKeyBytes(t *testing.T) {
 
 func TestFieldStorageApplyPostingDiffBufOwnedCopiesBorrowedDeltaKeyBytes(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("diff-buf/a", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("diff-buf/c", false), IDs: fieldStorageSingleton(3)},
+		{Key: keycodec.FromString("diff-buf/a"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("diff-buf/c"), IDs: fieldStorageSingleton(3)},
 	}
 	base := newRegularFieldStorage(entries)
 
@@ -511,7 +511,7 @@ func TestFieldStorageApplyPostingDiffChunkedToFlatCopiesStringKeys(t *testing.T)
 	entries := make([]Entry, total)
 	for i := range entries {
 		entries[i] = Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("down/%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("down/%04d", i)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -535,7 +535,7 @@ func TestFieldStorageApplyPostingDiffChunkedToFlatCopiesStringKeys(t *testing.T)
 			continue
 		}
 		deltas = append(deltas, PostingDelta{
-			Key: keycodec.FromStoredString(fmt.Sprintf("down/%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("down/%04d", i)),
 			Delta: BatchPostingDelta{
 				Remove: fieldStorageSingleton(uint64(i + 1)),
 			},
@@ -569,7 +569,7 @@ func TestFieldStorageApplyPostingDiffChunkedChainSurvivesIntermediateReleaseAndP
 	entries := make([]Entry, total)
 	for i := range entries {
 		entries[i] = Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("chain/%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("chain/%04d", i)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -580,7 +580,7 @@ func TestFieldStorageApplyPostingDiffChunkedChainSurvivesIntermediateReleaseAndP
 		t.Fatalf("expected chunked base")
 	}
 
-	key := keycodec.FromStoredString("chain/0095", false)
+	key := keycodec.FromString("chain/0095")
 	baseChunk := base.chunked.touchChunkIndexFrom(0, key)
 	if baseChunk < 0 {
 		base.Release()
@@ -711,7 +711,7 @@ func TestFieldStorageMergeStringPostingAdds_SortsAndDeduplicates(t *testing.T) {
 	adds = AddStringPostingAdd(adds, &arena, "a", 2, 8)
 	defer arena.Reset()
 
-	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, false)
+	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -735,7 +735,7 @@ func TestFieldStorageMergeStringPostingAddsCopiesCallerKeyBytes(t *testing.T) {
 	adds := AddStringPostingAdd(nil, &arena, fieldStorageMutableString(keyB), 20, 8)
 	adds = AddStringPostingAdd(adds, &arena, fieldStorageMutableString(keyA), 10, 8)
 
-	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false, false)
+	storage := FieldStorage{}.MergeStringPostingAdds(adds, &arena, false)
 	arena.Reset()
 	poisonBytes(keyA, keyB)
 	defer storage.Release()
@@ -764,14 +764,14 @@ func TestFieldStorageMergeFixedPostingAdds_SortsAndDeduplicates(t *testing.T) {
 	if got := ov.KeyAt(1).U64(); got != 6 {
 		t.Fatalf("key 1: got %d want 6", got)
 	}
-	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 1)
-	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(6), 3)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(2), 1)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(6), 3)
 }
 
 func TestFieldStorageApplyStringPostingDiff_UpdatesAndRemoves(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageSingleton(2)},
+		{Key: keycodec.FromString("a"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("b"), IDs: fieldStorageSingleton(2)},
 	}
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
@@ -782,7 +782,7 @@ func TestFieldStorageApplyStringPostingDiff_UpdatesAndRemoves(t *testing.T) {
 	deltas = AddStringPostingDiff(deltas, &arena, "c", 3, true)
 	defer arena.Reset()
 
-	storage := base.ApplyStringPostingDiff(deltas, &arena, false, false)
+	storage := base.ApplyStringPostingDiff(deltas, &arena, false)
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
@@ -795,8 +795,8 @@ func TestFieldStorageApplyStringPostingDiff_UpdatesAndRemoves(t *testing.T) {
 
 func TestFieldStorageApplyStringPostingDiffCopiesCallerKeyBytes(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("owned-diff/a", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("owned-diff/c", false), IDs: fieldStorageSingleton(3)},
+		{Key: keycodec.FromString("owned-diff/a"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("owned-diff/c"), IDs: fieldStorageSingleton(3)},
 	}
 	base := newRegularFieldStorage(entries)
 
@@ -805,7 +805,7 @@ func TestFieldStorageApplyStringPostingDiffCopiesCallerKeyBytes(t *testing.T) {
 	deltas := AddStringPostingDiff(nil, &arena, fieldStorageMutableString(key), 2, true)
 	deltas = AddStringPostingDiff(deltas, &arena, "owned-diff/c", 30, true)
 
-	storage := base.ApplyStringPostingDiff(deltas, &arena, false, false)
+	storage := base.ApplyStringPostingDiff(deltas, &arena, false)
 	arena.Reset()
 	if storage == base {
 		storage.Release()
@@ -845,7 +845,7 @@ func TestFieldStorageApplyStringPostingDiffModelReplayReleasePoison(t *testing.T
 		model[key] = set
 	}
 
-	storage := NewRegularFieldStorageFromPostingMapOwned(baseMap, false)
+	storage := NewRegularFieldStorageFromPostingMapOwned(baseMap)
 	if storage.IsChunked() {
 		storage.Release()
 		t.Fatalf("expected initial flat storage")
@@ -901,7 +901,7 @@ func TestFieldStorageApplyStringPostingDiffModelReplayReleasePoison(t *testing.T
 		} else {
 			touched := make(map[int]struct{}, len(ops))
 			for _, op := range ops {
-				pos := storage.chunked.touchChunkIndexFrom(0, keycodec.FromStoredString(op.key, false))
+				pos := storage.chunked.touchChunkIndexFrom(0, keycodec.FromString(op.key))
 				if pos < 0 {
 					t.Fatalf("%s: missing touched chunk for %q", label, op.key)
 				}
@@ -950,7 +950,7 @@ func TestFieldStorageApplyStringPostingDiffModelReplayReleasePoison(t *testing.T
 		}
 
 		old := storage
-		next := storage.ApplyStringPostingDiff(deltas, &arena, false, allowChunk)
+		next := storage.ApplyStringPostingDiff(deltas, &arena, allowChunk)
 		arena.Reset()
 		if next == old {
 			t.Fatalf("%s: diff returned unchanged storage", label)
@@ -1041,11 +1041,11 @@ func TestFieldStorageApplyFixedPostingDiff_UpdatesAndRemoves(t *testing.T) {
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
-	if ov.LookupCardinality(keycodec.U64ByteString(2)) != 0 {
+	if ov.LookupCardinalityKey(keycodec.FromU64(2)) != 0 {
 		t.Fatalf("removed fixed key still has posting")
 	}
-	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(4), 2, 9)
-	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(6), 3)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(4), 2, 9)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(6), 3)
 }
 
 func TestFieldStorageApplyFixedPostingDiffModelReplayReleasePoison(t *testing.T) {
@@ -1262,25 +1262,25 @@ func TestFieldStorageApplyLenPostingDiff_UpdatesNonEmptyMarker(t *testing.T) {
 	defer storage.Release()
 
 	ov := NewFieldIndexViewFromStorage(storage)
-	if ov.LookupCardinality(keycodec.U64ByteString(1)) != 0 {
+	if ov.LookupCardinalityKey(keycodec.FromU64(1)) != 0 {
 		t.Fatalf("old len bucket still has posting")
 	}
-	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 1)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(2), 1)
 	fieldStorageAssertPostingContains(t, storage, LenIndexNonEmptyKey, 1)
 }
 
 func TestApplySingleFieldPostingDiffChunked_OwnsUntouchedPostingsOnExistingKeyFastPath(t *testing.T) {
 	tests := []struct {
-		name   string
-		fixed8 bool
+		name    string
+		numeric bool
 	}{
-		{name: "String", fixed8: false},
-		{name: "Numeric", fixed8: true},
+		{name: "String", numeric: false},
+		{name: "Numeric", numeric: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ref := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, tc.fixed8)
+			ref := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, tc.numeric)
 			root := fieldStorageSingleChunkRoot(ref)
 			pos := fieldIndexChunkTargetEntries / 2
 			key := ref.chunk.keyAt(pos)

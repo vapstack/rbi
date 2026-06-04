@@ -569,22 +569,13 @@ func orderedDistinctLookupKeys(vals []keycodec.IndexLookupKey, desc bool) []keyc
 				}
 			} else {
 				s := v.StringKey()
-				if len(s) == 8 {
-					if len(fixed.keys) == 0 {
-						fixed = getU64Set(len(vals))
-					}
-					if !fixed.Add(keycodec.Fixed8StringToU64(s)) {
-						continue
-					}
-				} else {
-					if set == nil {
-						set = stringSetPool.Get()
-					}
-					if _, ok := set[s]; ok {
-						continue
-					}
-					set[s] = struct{}{}
+				if set == nil {
+					set = stringSetPool.Get()
 				}
+				if _, ok := set[s]; ok {
+					continue
+				}
+				set[s] = struct{}{}
 			}
 			write--
 			vals[write] = v
@@ -613,22 +604,13 @@ func orderedDistinctLookupKeys(vals []keycodec.IndexLookupKey, desc bool) []keyc
 			}
 		} else {
 			s := v.StringKey()
-			if len(s) == 8 {
-				if len(fixed.keys) == 0 {
-					fixed = getU64Set(len(vals))
-				}
-				if !fixed.Add(keycodec.Fixed8StringToU64(s)) {
-					continue
-				}
-			} else {
-				if set == nil {
-					set = stringSetPool.Get()
-				}
-				if _, ok := set[s]; ok {
-					continue
-				}
-				set[s] = struct{}{}
+			if set == nil {
+				set = stringSetPool.Get()
 			}
+			if _, ok := set[s]; ok {
+				continue
+			}
+			set[s] = struct{}{}
 		}
 		vals[write] = v
 		write++
@@ -663,13 +645,6 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 			continue
 		}
 		s := v.StringKey()
-		if len(s) == 8 {
-			if len(fixed.keys) == 0 {
-				fixed = getU64Set(len(vals))
-			}
-			fixed.Add(keycodec.Fixed8StringToU64(s))
-			continue
-		}
 		if set == nil {
 			set = stringSetPool.Get()
 		}
@@ -693,13 +668,6 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 		}
 
 		s := key.UnsafeString()
-		if len(s) == 8 {
-			if !fixed.Has(keycodec.Fixed8StringToU64(s)) {
-				ok = false
-				break
-			}
-			continue
-		}
 		if set == nil {
 			ok = false
 			break

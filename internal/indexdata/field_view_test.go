@@ -11,11 +11,11 @@ import (
 func TestFieldIndexViewFlatCursorReturnsBorrowedPostings(t *testing.T) {
 	entries := []Entry{
 		{
-			Key: keycodec.FromStoredString("a", false),
+			Key: keycodec.FromString("a"),
 			IDs: fieldStorageOwnedTestPosting(10),
 		},
 		{
-			Key: keycodec.FromStoredString("b", false),
+			Key: keycodec.FromString("b"),
 			IDs: fieldStorageOwnedTestPosting(20),
 		},
 	}
@@ -151,8 +151,8 @@ func TestFieldIndexViewCursorNextPostingOrSingle(t *testing.T) {
 	}
 
 	multi := []Entry{
-		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageOwnedTestPosting(10)},
-		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageOwnedTestPosting(20)},
+		{Key: keycodec.FromString("a"), IDs: fieldStorageOwnedTestPosting(10)},
+		{Key: keycodec.FromString("b"), IDs: fieldStorageOwnedTestPosting(20)},
 	}
 	defer multi[0].IDs.Release()
 	defer multi[1].IDs.Release()
@@ -208,8 +208,8 @@ func TestFieldIndexViewCursorNextKeyPostingOrSingle(t *testing.T) {
 	}
 
 	multi := []Entry{
-		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageOwnedTestPosting(10)},
-		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageOwnedTestPosting(20)},
+		{Key: keycodec.FromString("a"), IDs: fieldStorageOwnedTestPosting(10)},
+		{Key: keycodec.FromString("b"), IDs: fieldStorageOwnedTestPosting(20)},
 	}
 	defer multi[0].IDs.Release()
 	defer multi[1].IDs.Release()
@@ -321,7 +321,7 @@ func TestIndexViewRangeStats_ChunkedMatchesPostingCardinality(t *testing.T) {
 			expected += ids.Cardinality()
 		}
 		entries = append(entries, Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("k%04d", i)),
 			IDs: ids,
 		})
 	}
@@ -430,11 +430,11 @@ func TestBoundsApplyPrefixIntersectionAndContradiction(t *testing.T) {
 
 func TestFieldIndexViewRangeForBounds_PrefixIntersectsRange(t *testing.T) {
 	entries := []Entry{
-		{Key: keycodec.FromStoredString("aa", false)},
-		{Key: keycodec.FromStoredString("ab", false)},
-		{Key: keycodec.FromStoredString("ac", false)},
-		{Key: keycodec.FromStoredString("ad", false)},
-		{Key: keycodec.FromStoredString("b0", false)},
+		{Key: keycodec.FromString("aa")},
+		{Key: keycodec.FromString("ab")},
+		{Key: keycodec.FromString("ac")},
+		{Key: keycodec.FromString("ad")},
+		{Key: keycodec.FromString("b0")},
 	}
 	ov := NewFieldIndexView(&entries)
 
@@ -478,7 +478,7 @@ func TestFieldIndexViewRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T
 
 			var exact Bounds
 			var missing Bounds
-			var wantKey string
+			var wantKey keycodec.IndexKey
 			if tc.numeric {
 				exact = Bounds{
 					HasLo:     true,
@@ -490,12 +490,12 @@ func TestFieldIndexViewRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T
 					LoIndex:   keycodec.FromU64(uint64(rank*2 + 1)),
 					LoNumeric: true,
 				}
-				wantKey = keycodec.U64ByteString(uint64((rank + 1) * 2))
+				wantKey = keycodec.FromU64(uint64((rank + 1) * 2))
 			} else {
 				key := fmt.Sprintf("k/%06d", rank)
 				exact = Bounds{HasLo: true, LoKey: key}
 				missing = Bounds{HasLo: true, LoKey: key + "~"}
-				wantKey = fmt.Sprintf("k/%06d", rank+1)
+				wantKey = keycodec.FromString(fmt.Sprintf("k/%06d", rank+1))
 			}
 
 			br := ov.RangeForBounds(exact)
@@ -507,8 +507,8 @@ func TestFieldIndexViewRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T
 			if !ok {
 				t.Fatalf("expected first row after exact lower bound")
 			}
-			if !keycodec.EqualsString(gotKey, wantKey) {
-				t.Fatalf("first key after exact lower: got %q want %q", gotKey.UnsafeString(), wantKey)
+			if keycodec.Compare(gotKey, wantKey) != 0 {
+				t.Fatalf("first key after exact lower: got %q want %q", gotKey.UnsafeString(), wantKey.UnsafeString())
 			}
 			if ids.Cardinality() != 1 || !ids.Contains(uint64(rank+2)) {
 				t.Fatalf("first posting after exact lower: %v", ids)
@@ -683,7 +683,7 @@ func TestFieldIndexViewRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			entries := make([]Entry, 0, rows)
 			for i := 0; i < rows; i++ {
-				key := keycodec.FromStoredString(fmt.Sprintf("k/%06d", i), false)
+				key := keycodec.FromString(fmt.Sprintf("k/%06d", i))
 				if tc.numeric {
 					key = keycodec.FromU64(uint64(i * 2))
 				}
@@ -715,7 +715,7 @@ func TestFieldIndexViewRangeStats_ChunkedRankOnlyRangeUsesRankBounds(t *testing.
 	entries := make([]Entry, 0, fieldIndexChunkThreshold+17)
 	for i := 0; i < fieldIndexChunkThreshold+17; i++ {
 		entries = append(entries, Entry{
-			Key: keycodec.FromStoredString(fmt.Sprintf("k/%04d", i), false),
+			Key: keycodec.FromString(fmt.Sprintf("k/%04d", i)),
 			IDs: posting.BuildFromSorted([]uint64{uint64(i), uint64(i + 100_000)}),
 		})
 	}
@@ -797,7 +797,7 @@ func TestFieldIndexViewAccessorsFlatAndChunked(t *testing.T) {
 			if ids := ov.PostingAt(9); ids.Cardinality() != 1 || !ids.Contains(10) {
 				t.Fatalf("overlay posting at rank: %v", ids)
 			}
-			if got := ov.LookupCardinality(keycodec.U64ByteString(18)); got != 1 {
+			if got := ov.LookupCardinalityKey(keycodec.FromU64(18)); got != 1 {
 				t.Fatalf("overlay lookup cardinality: got %d want 1", got)
 			}
 		})

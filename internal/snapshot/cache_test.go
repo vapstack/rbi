@@ -50,7 +50,7 @@ func testStorage(keys ...string) indexdata.FieldStorage {
 	for i, key := range keys {
 		m[key] = (posting.List{}).BuildAdded(uint64(i + 1))
 	}
-	return indexdata.NewFlatFieldStorageFromPostingMapOwned(m, false)
+	return indexdata.NewFlatFieldStorageFromPostingMapOwned(m)
 }
 
 func testView(index map[string]indexdata.FieldStorage) *View {

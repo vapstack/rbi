@@ -46,9 +46,9 @@ func TestCollectChunkedFieldIndexStats_NumericOwnerChunkCountsOnlyOwnersAsStruct
 
 func TestFieldStorageStats_FlatAndChunked(t *testing.T) {
 	flatEntries := []Entry{
-		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageSingleton(1)},
-		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageSingleton(2).BuildAdded(22)},
-		{Key: keycodec.FromStoredString("c", false), IDs: fieldStorageSingleton(3)},
+		{Key: keycodec.FromString("a"), IDs: fieldStorageSingleton(1)},
+		{Key: keycodec.FromString("b"), IDs: fieldStorageSingleton(2).BuildAdded(22)},
+		{Key: keycodec.FromString("c"), IDs: fieldStorageSingleton(3)},
 	}
 	flat := newRegularFieldStorage(flatEntries)
 	flatStats := flat.Stats(true)

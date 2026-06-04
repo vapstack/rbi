@@ -45,20 +45,6 @@ func FromU64(v uint64) IndexKey {
 	}
 }
 
-func fromFixed8String(s string) IndexKey {
-	if len(s) != 8 {
-		return FromString(s)
-	}
-	return FromU64(Fixed8StringToU64(s))
-}
-
-func FromStoredString(s string, fixed8 bool) IndexKey {
-	if fixed8 && len(s) == 8 {
-		return fromFixed8String(s)
-	}
-	return FromString(s)
-}
-
 func (k IndexKey) IsNumeric() bool {
 	return k.ptr == indexKeyNumericSentinel
 }
@@ -88,18 +74,6 @@ func (k IndexKey) AppendBytes(dst []byte) []byte {
 	return append(dst, unsafe.Slice(k.ptr, int(k.meta))...)
 }
 
-func Fixed8StringToU64(s string) uint64 {
-	_ = s[7]
-	return uint64(s[0])<<56 |
-		uint64(s[1])<<48 |
-		uint64(s[2])<<40 |
-		uint64(s[3])<<32 |
-		uint64(s[4])<<24 |
-		uint64(s[5])<<16 |
-		uint64(s[6])<<8 |
-		uint64(s[7])
-}
-
 func Compare(a, b IndexKey) int {
 	if a.ptr == indexKeyNumericSentinel && b.ptr == indexKeyNumericSentinel {
 		if a.meta < b.meta {
@@ -120,16 +94,6 @@ func Compare(a, b IndexKey) int {
 }
 
 func compareU64String(v uint64, s string) int {
-	if len(s) == 8 {
-		u := Fixed8StringToU64(s)
-		if v < u {
-			return -1
-		}
-		if v > u {
-			return 1
-		}
-		return 0
-	}
 	slen := len(s)
 	n := min(8, slen)
 	for i := 0; i < n; i++ {
@@ -145,7 +109,10 @@ func compareU64String(v uint64, s string) int {
 	if 8 > slen {
 		return 1
 	}
-	return -1
+	if 8 < slen {
+		return -1
+	}
+	return 1
 }
 
 func CompareString(a IndexKey, b string) int {
@@ -159,35 +126,14 @@ func EqualsString(a IndexKey, b string) bool {
 	if a.ptr != indexKeyNumericSentinel {
 		return unsafe.String(a.ptr, int(a.meta)) == b
 	}
-	return len(b) == 8 && a.meta == Fixed8StringToU64(b)
+	return false
 }
 
 func HasPrefixString(a IndexKey, prefix string) bool {
 	if a.ptr != indexKeyNumericSentinel {
 		return strings.HasPrefix(unsafe.String(a.ptr, int(a.meta)), prefix)
 	}
-	switch len(prefix) {
-	case 0:
-		return true
-	case 1:
-		return byte(a.meta>>56) == prefix[0]
-	case 2:
-		return uint16(a.meta>>48) == uint16(prefix[0])<<8|uint16(prefix[1])
-	case 3:
-		return uint32(a.meta>>40) == uint32(prefix[0])<<16|uint32(prefix[1])<<8|uint32(prefix[2])
-	case 4:
-		return uint32(a.meta>>32) == uint32(prefix[0])<<24|uint32(prefix[1])<<16|uint32(prefix[2])<<8|uint32(prefix[3])
-	case 5:
-		return a.meta>>24 == uint64(prefix[0])<<32|uint64(prefix[1])<<24|uint64(prefix[2])<<16|uint64(prefix[3])<<8|uint64(prefix[4])
-	case 6:
-		return a.meta>>16 == uint64(prefix[0])<<40|uint64(prefix[1])<<32|uint64(prefix[2])<<24|uint64(prefix[3])<<16|uint64(prefix[4])<<8|uint64(prefix[5])
-	case 7:
-		return a.meta>>8 == uint64(prefix[0])<<48|uint64(prefix[1])<<40|uint64(prefix[2])<<32|uint64(prefix[3])<<24|uint64(prefix[4])<<16|uint64(prefix[5])<<8|uint64(prefix[6])
-	case 8:
-		return a.meta == Fixed8StringToU64(prefix)
-	default:
-		return false
-	}
+	return len(prefix) == 0
 }
 
 type PrefixUpperBound struct {
@@ -273,28 +219,7 @@ func HasSuffixString(a IndexKey, suffix string) bool {
 	if a.ptr != indexKeyNumericSentinel {
 		return strings.HasSuffix(unsafe.String(a.ptr, int(a.meta)), suffix)
 	}
-	switch len(suffix) {
-	case 0:
-		return true
-	case 1:
-		return byte(a.meta) == suffix[0]
-	case 2:
-		return uint16(a.meta) == uint16(suffix[0])<<8|uint16(suffix[1])
-	case 3:
-		return uint32(a.meta&0xffffff) == uint32(suffix[0])<<16|uint32(suffix[1])<<8|uint32(suffix[2])
-	case 4:
-		return uint32(a.meta) == uint32(suffix[0])<<24|uint32(suffix[1])<<16|uint32(suffix[2])<<8|uint32(suffix[3])
-	case 5:
-		return a.meta&0xffffffffff == uint64(suffix[0])<<32|uint64(suffix[1])<<24|uint64(suffix[2])<<16|uint64(suffix[3])<<8|uint64(suffix[4])
-	case 6:
-		return a.meta&0xffffffffffff == uint64(suffix[0])<<40|uint64(suffix[1])<<32|uint64(suffix[2])<<24|uint64(suffix[3])<<16|uint64(suffix[4])<<8|uint64(suffix[5])
-	case 7:
-		return a.meta&0xffffffffffffff == uint64(suffix[0])<<48|uint64(suffix[1])<<40|uint64(suffix[2])<<32|uint64(suffix[3])<<24|uint64(suffix[4])<<16|uint64(suffix[5])<<8|uint64(suffix[6])
-	case 8:
-		return a.meta == Fixed8StringToU64(suffix)
-	default:
-		return false
-	}
+	return len(suffix) == 0
 }
 
 func ContainsString(a IndexKey, needle string) bool {
@@ -303,31 +228,6 @@ func ContainsString(a IndexKey, needle string) bool {
 	}
 	if a.ptr != indexKeyNumericSentinel {
 		return strings.Contains(unsafe.String(a.ptr, int(a.meta)), needle)
-	}
-	return containsU64String(a.meta, needle)
-}
-
-func containsU64String(v uint64, needle string) bool {
-	alen := 8
-	nlen := len(needle)
-	if nlen > alen {
-		return false
-	}
-	limit := alen - nlen
-	for i := 0; i <= limit; i++ {
-		if byte(v>>uint(56-i*8)) != needle[0] {
-			continue
-		}
-		ok := true
-		for j := 1; j < nlen; j++ {
-			if byte(v>>uint(56-(i+j)*8)) != needle[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
 	}
 	return false
 }

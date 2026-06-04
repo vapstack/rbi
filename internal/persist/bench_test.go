@@ -706,7 +706,7 @@ func benchPersistStringStorage(rows int, prefix string) indexdata.FieldStorage {
 	for i := 0; i < rows; i++ {
 		m[fmt.Sprintf("%s/%06d", prefix, i)] = (posting.List{}).BuildAdded(uint64(i + 1))
 	}
-	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m, false)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m)
 }
 
 func benchPersistNumericStorage(rows int) indexdata.FieldStorage {
@@ -731,7 +731,7 @@ func benchPersistTagStorage(rows int) indexdata.FieldStorage {
 		}
 		m[fmt.Sprintf("tag/%05d", key)] = posting.BuildFromSorted(ids)
 	}
-	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m, false)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m)
 }
 
 func benchPersistNilStorage(rows int) indexdata.FieldStorage {

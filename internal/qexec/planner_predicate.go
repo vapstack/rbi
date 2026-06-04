@@ -1539,18 +1539,12 @@ func (qv *View) materializedPredKeyForScalar(field string, op qir.Op, key string
 	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
-	if fm := qv.exec.Schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
-	}
 	return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
 }
 
 func (qv *View) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
 	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
-	}
-	if fm := qv.exec.Schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
 	}
 	return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
 }

@@ -50,7 +50,7 @@ func snapshotBatchNilContains(s *View, field string, id uint64) bool {
 
 func snapshotBatchLenContains(s *View, field string, ln uint64, id uint64) bool {
 	acc := s.IndexedFieldByName[field]
-	ids := indexdata.NewFieldIndexViewFromStorage(s.LenIndex[acc.Ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln))
+	ids := indexdata.NewFieldIndexViewFromStorage(s.LenIndex[acc.Ordinal]).LookupPostingRetainedKey(keycodec.FromU64(ln))
 	ok := ids.Contains(id)
 	ids.Release()
 	return ok
@@ -523,6 +523,11 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 		ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
 		assertPosting(label, ids, want)
 	}
+	assertStoragePostingKey := func(label string, storage indexdata.FieldStorage, key keycodec.IndexKey, want map[uint64]struct{}) {
+		t.Helper()
+		ids := indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(key)
+		assertPosting(label, ids, want)
+	}
 
 	assertModel := func(label string, snap *View) {
 		t.Helper()
@@ -628,7 +633,7 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 			if useZeroComplement && ln == 0 {
 				want = nil
 			}
-			assertStoragePosting(label+": Tags len", lenStorage, keycodec.U64ByteString(ln), want)
+			assertStoragePostingKey(label+": Tags len", lenStorage, keycodec.FromU64(ln), want)
 		}
 		if useZeroComplement {
 			assertStoragePosting(label+": Tags non-empty", lenStorage, indexdata.LenIndexNonEmptyKey, nonEmptyWant)

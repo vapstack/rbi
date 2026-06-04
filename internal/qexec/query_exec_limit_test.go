@@ -629,9 +629,9 @@ func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
 	}
 }
 
-func TestArrayPosOrderPrioritiesDedupByIndexKey(t *testing.T) {
+func TestArrayPosOrderPrioritiesKeepTypedLookupKeysDistinct(t *testing.T) {
 	raw := string([]byte{0, 0, 0, 0, 0, 0, 0, 7})
-	fixed := keycodec.Fixed8StringToU64(raw)
+	fixed := uint64(7)
 
 	asc := []keycodec.IndexLookupKey{
 		keycodec.IndexLookupU64(fixed),
@@ -639,7 +639,7 @@ func TestArrayPosOrderPrioritiesDedupByIndexKey(t *testing.T) {
 		keycodec.IndexLookupString("tag"),
 	}
 	asc = orderedDistinctLookupKeys(asc, false)
-	if len(asc) != 2 || asc[0] != keycodec.IndexLookupU64(fixed) || asc[1] != keycodec.IndexLookupString("tag") {
+	if len(asc) != 3 || asc[0] != keycodec.IndexLookupU64(fixed) || asc[1] != keycodec.IndexLookupString(raw) || asc[2] != keycodec.IndexLookupString("tag") {
 		t.Fatalf("ascending distinct priorities mismatch: got=%+v", asc)
 	}
 
@@ -649,12 +649,12 @@ func TestArrayPosOrderPrioritiesDedupByIndexKey(t *testing.T) {
 		keycodec.IndexLookupString("tag"),
 	}
 	desc = orderedDistinctLookupKeys(desc, true)
-	if len(desc) != 2 || desc[0] != keycodec.IndexLookupString("tag") || desc[1] != keycodec.IndexLookupString(raw) {
+	if len(desc) != 3 || desc[0] != keycodec.IndexLookupString("tag") || desc[1] != keycodec.IndexLookupString(raw) || desc[2] != keycodec.IndexLookupU64(fixed) {
 		t.Fatalf("descending distinct priorities mismatch: got=%+v", desc)
 	}
 }
 
-func TestArrayPosOrderNumericCoverageAcceptsFixedWidthStringPriorities(t *testing.T) {
+func TestArrayPosOrderNumericCoverageRejectsFixedWidthStringPriorities(t *testing.T) {
 	fixed := indexdata.GetFixedPostingMap()
 	fixed[7] = (posting.List{}).BuildAdded(1)
 	fixed[11] = (posting.List{}).BuildAdded(2)
@@ -667,8 +667,8 @@ func TestArrayPosOrderNumericCoverageAcceptsFixedWidthStringPriorities(t *testin
 		keycodec.IndexLookupString(string(keycodec.AppendU64Bytes(buf[:0], 7))),
 		keycodec.IndexLookupString(string(keycodec.AppendU64Bytes(buf[:0], 11))),
 	}
-	if !scalarArrayPosPriorityCoversAllKeysIndexView(ov, vals) {
-		t.Fatalf("expected fixed-width string priorities to cover numeric index keys")
+	if scalarArrayPosPriorityCoversAllKeysIndexView(ov, vals) {
+		t.Fatalf("fixed-width string priorities must not cover numeric index keys")
 	}
 }
 
@@ -3113,14 +3113,10 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	keyValue, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.LT("score", 4_000.0))
-	if err != nil {
-		t.Fatalf("exprValueToIdxScalar: %v", err)
+	cacheKey := db.engine.materializedPredCacheKey(qx.LT("score", 4_000.0))
+	if cacheKey.IsZero() {
+		t.Fatalf("expected score range cache key")
 	}
-	if isSlice || isNil {
-		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
-	}
-	cacheKey := db.engine.currentQueryViewForTests().materializedPredKeyForScalar("score", compileScalarOpForTest(qx.OpLT), keyValue)
 	prevSnap := db.engine.snapshot.Current()
 	prevBM, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
 	if !ok || prevBM.IsEmpty() {

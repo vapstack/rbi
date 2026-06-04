@@ -118,13 +118,13 @@ func (state *IndexState) MaterializeStorage(numeric bool) indexdata.FieldStorage
 	}
 	idx := state.index
 	state.index = nil
-	return indexdata.NewRegularFieldStorageFromPostingMapOwned(idx, false)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(idx)
 }
 
 func (state *IndexState) MaterializeNilStorage() indexdata.FieldStorage {
 	nils := state.nils
 	state.nils = nil
-	return indexdata.NewFlatFieldStorageFromPostingMapOwned(nils, false)
+	return indexdata.NewFlatFieldStorageFromPostingMapOwned(nils)
 }
 
 func (state *IndexState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
@@ -384,11 +384,11 @@ func (acc IndexedFieldAccessor) MergeInsertStorageOwned(base indexdata.FieldStor
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
 		return base.MergeFixedPostingAdds(state.fixed, &state.arena, allowChunk)
 	}
-	return base.MergeStringPostingAdds(state.index, &state.arena, false, allowChunk)
+	return base.MergeStringPostingAdds(state.index, &state.arena, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) MergeInsertNilStorageOwned(base indexdata.FieldStorage, state *InsertState) indexdata.FieldStorage {
-	return base.MergeStringPostingAdds(state.nils, &state.arena, false, false)
+	return base.MergeStringPostingAdds(state.nils, &state.arena, false)
 }
 
 func (state *InsertState) Reset() {
@@ -544,11 +544,11 @@ func (acc IndexedFieldAccessor) ApplyBatchStorageOwned(base indexdata.FieldStora
 	if acc.Field.KeyKind == FieldWriteKeysOrderedU64 {
 		return base.ApplyFixedPostingDiff(state.fixed, &state.arena, allowChunk)
 	}
-	return base.ApplyStringPostingDiff(state.index, &state.arena, false, allowChunk)
+	return base.ApplyStringPostingDiff(state.index, &state.arena, allowChunk)
 }
 
 func (acc IndexedFieldAccessor) ApplyBatchNilStorageOwned(base indexdata.FieldStorage, state *BatchState) indexdata.FieldStorage {
-	return base.ApplyStringPostingDiff(state.nils, &state.arena, false, false)
+	return base.ApplyStringPostingDiff(state.nils, &state.arena, false)
 }
 
 func (state *BatchState) Reset() {

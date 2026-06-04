@@ -13,7 +13,7 @@ func TestViewReleaseStorageKeepsSharedFlatRootRetained(t *testing.T) {
 	}
 	sharedMap := indexdata.GetPostingMap()
 	sharedMap["shared"] = shared
-	sharedStorage := indexdata.NewFlatFieldStorageFromPostingMapOwned(sharedMap, false)
+	sharedStorage := indexdata.NewFlatFieldStorageFromPostingMapOwned(sharedMap)
 
 	old := testView(map[string]indexdata.FieldStorage{"f": sharedStorage})
 	old.Seq = 1

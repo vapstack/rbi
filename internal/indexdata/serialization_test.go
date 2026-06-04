@@ -13,8 +13,8 @@ import (
 
 func TestFieldIndexChunk_StringSingletonRoundTripUsesOwnerLayout(t *testing.T) {
 	keys := []keycodec.IndexKey{
-		keycodec.FromStoredString("alpha", false),
-		keycodec.FromStoredString("beta", false),
+		keycodec.FromString("alpha"),
+		keycodec.FromString("beta"),
 	}
 	posts := []posting.List{
 		fieldStorageSingleton(11),
@@ -161,7 +161,7 @@ func TestFieldStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 		flatRound.Release()
 		t.Fatalf("expected flat storage after round trip")
 	}
-	fieldStorageAssertPostingContains(t, flatRound, keycodec.U64ByteString(3), 30, 1_000_030)
+	fieldStorageAssertPostingContainsKey(t, flatRound, keycodec.FromU64(3), 30, 1_000_030)
 	flat.Release()
 	flatRound.Release()
 
@@ -169,7 +169,7 @@ func TestFieldStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 	for i := 0; i < FieldChunkThreshold+17; i++ {
 		stringMap[fmt.Sprintf("k/%04d", i)] = fieldStorageOwnedTestPosting(uint64(i + 1))
 	}
-	chunkedString := NewRegularFieldStorageFromPostingMapOwned(stringMap, false)
+	chunkedString := NewRegularFieldStorageFromPostingMapOwned(stringMap)
 	if !chunkedString.IsChunked() {
 		t.Fatalf("expected string storage to be chunked")
 	}
@@ -213,7 +213,7 @@ func TestFieldStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 		t.Fatalf("expected numeric storage to stay chunked")
 	}
 	numericProbe := uint64(FieldChunkTargetEntries * 2)
-	fieldStorageAssertPostingContains(t, numericRound, keycodec.U64ByteString(numericProbe), 10_000+uint64(FieldChunkTargetEntries), 1_010_000+uint64(FieldChunkTargetEntries))
+	fieldStorageAssertPostingContainsKey(t, numericRound, keycodec.FromU64(numericProbe), 10_000+uint64(FieldChunkTargetEntries), 1_010_000+uint64(FieldChunkTargetEntries))
 	chunkedNumeric.Release()
 	numericRound.Release()
 }
@@ -222,7 +222,7 @@ func TestFieldStorageReadCopiesInputBufferStringKeys(t *testing.T) {
 	flatMap := GetPostingMap()
 	flatMap["ser-flat/a"] = fieldStorageSingleton(1)
 	flatMap["ser-flat/b"] = fieldStorageSingleton(2)
-	flat := NewRegularFieldStorageFromPostingMapOwned(flatMap, false)
+	flat := NewRegularFieldStorageFromPostingMapOwned(flatMap)
 	if flat.IsChunked() {
 		flat.Release()
 		t.Fatalf("expected flat string storage")
@@ -253,7 +253,7 @@ func TestFieldStorageReadCopiesInputBufferStringKeys(t *testing.T) {
 	for i := 0; i < FieldChunkThreshold+5; i++ {
 		chunkedMap[fmt.Sprintf("ser-chunk/%04d", i)] = fieldStorageSingleton(uint64(i + 1))
 	}
-	chunked := NewRegularFieldStorageFromPostingMapOwned(chunkedMap, false)
+	chunked := NewRegularFieldStorageFromPostingMapOwned(chunkedMap)
 	if !chunked.IsChunked() {
 		chunked.Release()
 		t.Fatalf("expected chunked string storage")
@@ -284,11 +284,11 @@ func TestFieldStorageReadCopiesInputBufferStringKeys(t *testing.T) {
 
 func TestSerializationSkipEntryAndKey(t *testing.T) {
 	first := Entry{
-		Key: keycodec.FromStoredString("skip", false),
+		Key: keycodec.FromString("skip"),
 		IDs: fieldStorageOwnedTestPosting(1),
 	}
 	second := Entry{
-		Key: keycodec.FromStoredString("read", false),
+		Key: keycodec.FromString("read"),
 		IDs: fieldStorageOwnedTestPosting(2),
 	}
 	defer first.IDs.Release()
@@ -320,10 +320,10 @@ func TestSerializationSkipEntryAndKey(t *testing.T) {
 
 	var keysRaw bytes.Buffer
 	writer = bufio.NewWriter(&keysRaw)
-	if err := writeKey(writer, keycodec.FromStoredString("skip-key", false)); err != nil {
+	if err := writeKey(writer, keycodec.FromString("skip-key")); err != nil {
 		t.Fatalf("write first key: %v", err)
 	}
-	if err := writeKey(writer, keycodec.FromStoredString("read-key", false)); err != nil {
+	if err := writeKey(writer, keycodec.FromString("read-key")); err != nil {
 		t.Fatalf("write second key: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
