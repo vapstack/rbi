@@ -349,7 +349,7 @@ func (db *DB[K, V]) Close() error {
 
 func (db *DB[K, V]) publish(entries []snapshot.BatchEntry) {
 	db.engine.seq++
-	next := snapshot.BuildPrepared(db.engine.seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.cfg, nil, nil, entries)
+	next := snapshot.Build(db.engine.seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.cfg, nil, nil, entries)
 	db.engine.snapshot.Publish(next)
 }
 
@@ -666,7 +666,7 @@ func (db *testDB) seedData(t testing.TB, n int) []uint64 {
 	}
 
 	db.seq++
-	db.snap = snapshot.BuildPrepared(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
 	return ids
 }
 
@@ -680,7 +680,7 @@ func (db *testDB) seedGeneratedData(t testing.TB, n int, gen func(uint64) testRe
 		entries[i-1] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i-1])}
 	}
 	db.seq++
-	db.snap = snapshot.BuildPrepared(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
 }
 
 func (db *testDB) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {

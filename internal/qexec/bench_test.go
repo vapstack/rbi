@@ -434,7 +434,7 @@ func seedQexecBenchData(b *testing.B, db *testDB, rows int, gen func(uint64) tes
 			entries[i] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i])}
 		}
 		db.seq++
-		db.snap = snapshot.BuildPrepared(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
 	}
 }
 

@@ -752,7 +752,7 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 		newRec := oldRec
 		newRec.Name = "zach"
 		db.seq++
-		db.snap = snapshot.BuildPrepared(db.seq, db.snap, db.rt, db.cfg, nil, db.rt.Patch.Fields, []snapshot.BatchEntry{{
+		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, db.rt.Patch.Fields, []snapshot.BatchEntry{{
 			ID:        1,
 			Old:       unsafe.Pointer(&oldRec),
 			New:       unsafe.Pointer(&newRec),

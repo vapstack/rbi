@@ -1113,7 +1113,7 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 			cur[i] = vals[i]
 			entries[i] = snapshot.BatchEntry{ID: ids[i], Old: old, New: unsafe.Pointer(vals[i])}
 		}
-		next := snapshot.BuildPrepared(seq, qe.snapshot.Current(), rt, cfg, sm, nil, entries)
+		next := snapshot.Build(seq, qe.snapshot.Current(), rt, cfg, sm, nil, entries)
 		qe.snapshot.Publish(next)
 		seq++
 	}

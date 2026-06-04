@@ -597,7 +597,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	snap := snapshot.BuildPrepared(
+	snap := snapshot.BuildInPlace(
 		seq,
 		b.snapshotOps.Manager.Current(),
 		b.snapshotOps.Schema,

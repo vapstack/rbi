@@ -122,7 +122,7 @@ func TestGroupedOrdinaryMapRouteMatchesRecursive(t *testing.T) {
 		}
 		entries[i] = snapshot.BatchEntry{ID: row * 1_000_000, New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -174,7 +174,7 @@ func TestGroupedOrdinaryByIDSharedFieldOverflowReturnsError(t *testing.T) {
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -226,7 +226,7 @@ func TestGroupedOrdinaryByIDMapSharedFieldOverflowReturnsError(t *testing.T) {
 		rows[i] = qaggGroupedOrdinaryOverflowRec{Group: group, Value: value}
 		entries[i] = snapshot.BatchEntry{ID: uint64(i+1) * 1_000_000, New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -501,7 +501,7 @@ func TestCountDistinctUniqueFieldUsesNonNullFilterCardinality(t *testing.T) {
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
 	execRuntime := qexec.NewRuntime(qexec.Config{Schema: rt})
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
@@ -1015,7 +1015,7 @@ func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *q
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: ids[i], New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
 	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
 }
 

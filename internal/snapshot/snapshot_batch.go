@@ -18,14 +18,37 @@ type BatchEntry struct {
 	PatchOnly bool
 }
 
-func BuildPrepared(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+// Build treats entries as caller-owned and does not mutate them.
+func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
 	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, strMap, entries); ok {
 		return snap
 	}
 	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, strMap, entries); ok {
 		return snap
 	}
-	return buildPreparedSnapshotAggregated(seq, prev, s, cfg, strMap, patchFields, entries)
+	var normalized []BatchEntry
+	var scratch []BatchEntry
+	if len(entries) > 0 {
+		scratch = batchEntrySlicePool.Get(len(entries))[:len(entries)]
+		copy(scratch, entries)
+		normalized = normalizePreparedBatchForSnapshotInPlace(scratch)
+	}
+	snap := buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, strMap, patchFields, normalized)
+	if scratch != nil {
+		batchEntrySlicePool.Put(scratch)
+	}
+	return snap
+}
+
+// BuildInPlace consumes entries and may compact or rewrite them.
+func BuildInPlace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, strMap, entries); ok {
+		return snap
+	}
+	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, strMap, entries); ok {
+		return snap
+	}
+	return buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, strMap, patchFields, normalizePreparedBatchForSnapshotInPlace(entries))
 }
 
 func cloneFieldIndexBoolSlots(src []bool, size int) []bool {
@@ -59,7 +82,7 @@ func (deltas *indexedFieldBatchDeltas) markTouched(ordinal int) {
 	deltas.touched = append(deltas.touched, ordinal)
 }
 
-func normalizePreparedBatchForSnapshot(entries []BatchEntry) []BatchEntry {
+func normalizePreparedBatchForSnapshotInPlace(entries []BatchEntry) []BatchEntry {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -570,16 +593,15 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, 
 	return next
 }
 
-func buildPreparedSnapshotAggregated(
+func buildPreparedSnapshotAggregatedNormalized(
 	seq uint64,
 	prev *View,
 	s *schema.Schema,
 	cfg CacheConfig,
 	strMap *strmap.Mapper,
 	patchFields map[string]*schema.Field,
-	entries []BatchEntry,
+	normalized []BatchEntry,
 ) *View {
-	normalized := normalizePreparedBatchForSnapshot(entries)
 	if prevCard := prev.Universe.Cardinality(); prevCard == uint64(len(normalized)) && prevCard > 0 {
 		allDelete := true
 		allReplace := true

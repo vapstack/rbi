@@ -51,7 +51,7 @@ func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{
 		MatPredMaxEntries: 32,
 		MatPredMaxCard:    64 << 10,
 	}, nil, nil, entries)
@@ -458,11 +458,11 @@ func TestExecutePinnedSnapshotIsolation(t *testing.T) {
 	exec := qexec.NewRuntime(qexec.Config{Schema: rt})
 
 	oldRec := qaggPinnedSnapshotRec{Amount: 10}
-	oldSnap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
+	oldSnap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRec)},
 	})
 	newRec := qaggPinnedSnapshotRec{Amount: 99}
-	newSnap := snapshot.BuildPrepared(2, oldSnap, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
+	newSnap := snapshot.Build(2, oldSnap, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRec), New: unsafe.Pointer(&newRec)},
 	})
 

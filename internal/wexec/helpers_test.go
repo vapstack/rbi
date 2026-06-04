@@ -166,7 +166,7 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, uniqueErr erro
 	}
 	current := snapshot.NewView(0, nil, rt, snapshot.CacheConfig{}, snapshot.Storage{})
 	if len(seed) != 0 {
-		current = snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, rt.Patch.Fields, seed)
+		current = snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, rt.Patch.Fields, seed)
 	}
 	manager := snapshot.NewRegistry(false)
 	manager.Publish(current)
@@ -204,7 +204,7 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 	sm := strmap.New(0, 64)
 	seed := attemptRec{V: seedValue}
 	seedIdx, _ := sm.Create(seedKey)
-	current := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, sm, rt.Patch.Fields, []snapshot.BatchEntry{
+	current := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, sm, rt.Patch.Fields, []snapshot.BatchEntry{
 		{ID: seedIdx, New: unsafe.Pointer(&seed)},
 	})
 	manager := snapshot.NewRegistry(false)

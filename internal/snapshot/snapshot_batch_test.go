@@ -58,7 +58,7 @@ func snapshotBatchLenContains(s *View, field string, ln uint64, id uint64) bool 
 
 func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	var rec struct{}
-	snap := BuildPrepared(1, nil, &schema.Schema{}, CacheConfig{}, nil, nil, []BatchEntry{
+	snap := Build(1, nil, &schema.Schema{}, CacheConfig{}, nil, nil, []BatchEntry{
 		{ID: 7, New: unsafe.Pointer(&rec)},
 	})
 	defer snap.releaseRuntimeCaches()
@@ -78,7 +78,7 @@ func TestBuildPreparedFullReplaceRebuildsStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldRecords := []snapshotBatchRec{{Name: "old-a", Age: 10, Score: 1}, {Name: "old-b", Age: 20, Score: 2}}
-	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
 		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
 	})
@@ -86,7 +86,7 @@ func TestBuildPreparedFullReplaceRebuildsStorage(t *testing.T) {
 	defer prev.releaseStorage()
 
 	newRecords := []snapshotBatchRec{{Name: "new-a", Age: 30, Score: 3}, {Name: "new-b", Age: 40, Score: 4}}
-	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRecords[0]), New: unsafe.Pointer(&newRecords[0])},
 		{ID: 2, Old: unsafe.Pointer(&oldRecords[1]), New: unsafe.Pointer(&newRecords[1])},
 	})
@@ -114,14 +114,14 @@ func TestBuildPreparedDeleteAllBuildsEmptySnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldRecords := []snapshotBatchRec{{Name: "old-a", Age: 10, Score: 1}, {Name: "old-b", Age: 20, Score: 2}}
-	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
 		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
 	})
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
-	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRecords[0])},
 		{ID: 2, Old: unsafe.Pointer(&oldRecords[1])},
 	})
@@ -138,6 +138,52 @@ func TestBuildPreparedDeleteAllBuildsEmptySnapshot(t *testing.T) {
 	}
 }
 
+func TestBuildPreparedDoesNotMutateCallerEntries(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	oldRec := snapshotBatchStorageRec{Name: "bob", Tags: []string{"yellow"}}
+	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRec)},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	midRec := snapshotBatchStorageRec{Name: "bob", Tags: []string{"green"}}
+	newRec := snapshotBatchStorageRec{Name: "bobby", Tags: []string{"green", "blue"}}
+	entries := []BatchEntry{
+		{
+			ID:        1,
+			Old:       unsafe.Pointer(&oldRec),
+			New:       unsafe.Pointer(&midRec),
+			Patch:     []schema.PatchItem{{Name: "Tags", Value: midRec.Tags}},
+			PatchOnly: true,
+		},
+		{ID: 2},
+		{
+			ID:        1,
+			Old:       unsafe.Pointer(&midRec),
+			New:       unsafe.Pointer(&newRec),
+			Patch:     []schema.PatchItem{{Name: "Name", Value: newRec.Name}, {Name: "Tags", Value: newRec.Tags}},
+			PatchOnly: true,
+		},
+	}
+	original := make([]BatchEntry, len(entries))
+	copy(original, entries)
+
+	next := Build(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, entries)
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if !reflect.DeepEqual(entries, original) {
+		t.Fatalf("BuildPrepared mutated caller entries:\n got=%#v\nwant=%#v", entries, original)
+	}
+	if snapshotBatchFieldContains(next, "Name", "bob", 1) {
+		t.Fatal("repeated-id snapshot kept stale scalar posting")
+	}
+	if !snapshotBatchFieldContains(next, "Name", "bobby", 1) {
+		t.Fatal("repeated-id snapshot is missing updated scalar posting")
+	}
+}
+
 func TestBuildPreparedKeepsPreviousSnapshotStorageImmutableAcrossUpdateAndDelete(t *testing.T) {
 	rt := snapshotBatchStorageRuntime(t)
 	opt := "zzz"
@@ -145,7 +191,7 @@ func TestBuildPreparedKeepsPreviousSnapshotStorageImmutableAcrossUpdateAndDelete
 		{Name: "bob", Tags: []string{"go", "db"}},
 		{Name: "alice", Tags: []string{"go"}},
 	}
-	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
 		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
 	})
@@ -153,7 +199,7 @@ func TestBuildPreparedKeepsPreviousSnapshotStorageImmutableAcrossUpdateAndDelete
 	defer prev.releaseStorage()
 
 	newRec := snapshotBatchStorageRec{Name: "charlie", Tags: []string{"go"}, Opt: &opt}
-	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRecords[0]), New: unsafe.Pointer(&newRec)},
 		{ID: 2, Old: unsafe.Pointer(&oldRecords[1])},
 	})
@@ -209,7 +255,7 @@ func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpd
 		{Name: "u3"},
 		{Name: "u4"},
 	}
-	prev := BuildPrepared(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
 		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
 		{ID: 3, New: unsafe.Pointer(&oldRecords[2])},
@@ -227,7 +273,7 @@ func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpd
 	}
 
 	newRec := snapshotBatchStorageRec{Name: "u1", Tags: []string{}}
-	next := BuildPrepared(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(2, prev, rt, CacheConfig{}, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRecords[0]), New: unsafe.Pointer(&newRec)},
 	})
 	defer next.releaseRuntimeCaches()
@@ -241,7 +287,7 @@ func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpd
 	}
 }
 
-// BuildPrepared views must own or retain all storage they expose before the
+// Build views must own or retain all storage they expose before the
 // caller can retire the predecessor view.
 func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T) {
 	rt := snapshotBatchStorageRuntime(t)
@@ -250,7 +296,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 	opt2 := "opt2"
 	rec1 := snapshotBatchStorageRec{Name: "alice", Tags: []string{"red"}}
 	rec2 := snapshotBatchStorageRec{Name: "bob", Tags: []string{"green", "yellow"}, Opt: &opt2}
-	current := BuildPrepared(1, nil, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	current := Build(1, nil, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&rec1)},
 		{ID: 2, New: unsafe.Pointer(&rec2)},
 	})
@@ -260,7 +306,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 
 	opt3 := "opt3"
 	rec3 := snapshotBatchStorageRec{Name: "cara", Tags: []string{"blue"}, Opt: &opt3}
-	next := BuildPrepared(2, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(2, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 3, New: unsafe.Pointer(&rec3)},
 	})
 	current.releaseRuntimeCaches()
@@ -280,7 +326,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 	}
 
 	rec1Patch := snapshotBatchStorageRec{Name: "alicia", Tags: rec1.Tags}
-	next = BuildPrepared(3, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(3, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{
 			ID:        1,
 			Old:       unsafe.Pointer(&rec1),
@@ -304,7 +350,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 
 	rec2Mid := snapshotBatchStorageRec{Name: "bob", Tags: []string{"green"}, Opt: &opt2}
 	rec2Patch := snapshotBatchStorageRec{Name: "bobby", Tags: []string{"green", "blue"}, Opt: &opt2}
-	next = BuildPrepared(4, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(4, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{
 			ID:        2,
 			Old:       unsafe.Pointer(&rec2),
@@ -337,7 +383,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 	}
 
 	rec3Replace := snapshotBatchStorageRec{Name: "dana", Tags: []string{"orange"}}
-	next = BuildPrepared(5, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(5, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 3, Old: unsafe.Pointer(&rec3), New: unsafe.Pointer(&rec3Replace)},
 	})
 	current.releaseRuntimeCaches()
@@ -353,7 +399,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 		t.Fatal("set-replace snapshot is missing nil opt membership")
 	}
 
-	next = BuildPrepared(6, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(6, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&rec1Patch)},
 	})
 	current.releaseRuntimeCaches()
@@ -369,7 +415,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 		t.Fatal("delete snapshot kept deleted slice posting")
 	}
 
-	next = BuildPrepared(7, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(7, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 2, Old: unsafe.Pointer(&rec2Patch)},
 		{ID: 3, Old: unsafe.Pointer(&rec3Replace)},
 	})
@@ -386,7 +432,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 	opt5 := "opt5"
 	rec4 := snapshotBatchStorageRec{Name: "erin", Tags: []string{"silver"}}
 	rec5 := snapshotBatchStorageRec{Name: "frank", Tags: []string{"gold", "white"}, Opt: &opt5}
-	next = BuildPrepared(8, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(8, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 4, New: unsafe.Pointer(&rec4)},
 		{ID: 5, New: unsafe.Pointer(&rec5)},
 	})
@@ -400,7 +446,7 @@ func TestBuildPreparedImmediateRetireChainKeepsCurrentSnapshotOwned(t *testing.T
 	opt4Replace := "opt4"
 	rec4Replace := snapshotBatchStorageRec{Name: "erin2", Tags: []string{"black"}, Opt: &opt4Replace}
 	rec5Replace := snapshotBatchStorageRec{Name: "frank2"}
-	next = BuildPrepared(9, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
+	next = Build(9, current, rt, cfg, nil, rt.Patch.Fields, []BatchEntry{
 		{ID: 4, Old: unsafe.Pointer(&rec4), New: unsafe.Pointer(&rec4Replace)},
 		{ID: 5, Old: unsafe.Pointer(&rec5), New: unsafe.Pointer(&rec5Replace)},
 	})
@@ -657,7 +703,7 @@ func TestBuildPreparedModelReplayImmediateRetireWithBorrowedInputs(t *testing.T)
 		var inputs []*snapshotBatchStorageRec
 		entries := build(&bufs, &inputs)
 		seq++
-		next := BuildPrepared(seq, current, rt, cfg, nil, rt.Patch.Fields, entries)
+		next := Build(seq, current, rt, cfg, nil, rt.Patch.Fields, entries)
 		if current != nil {
 			current.releaseRuntimeCaches()
 			current.releaseStorage()
