@@ -3,7 +3,6 @@ package qcache
 import (
 	"testing"
 
-	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
@@ -88,16 +87,24 @@ func TestMaterializedPredKeyLookup_Constructors(t *testing.T) {
 }
 
 func TestMaterializedPredKeyDistinctSet(t *testing.T) {
-	vals := pooled.GetStringSlice(2)
-	defer pooled.ReleaseStringSlice(vals)
-	vals = append(vals, "DE", "FR")
+	vals := keycodec.GetIndexLookupKeySlice(2)
+	defer keycodec.ReleaseIndexLookupKeySlice(vals)
+	vals = append(vals, keycodec.IndexLookupString("DE"), keycodec.IndexLookupString("FR"))
 
-	key := MaterializedPredKeyForDistinctSetTerms("country", qir.OpIN, vals, true)
+	key := MaterializedPredKeyForDistinctLookupKeys("country", qir.OpIN, vals, true)
 	if key.IsZero() {
 		t.Fatal("expected non-zero distinct-set cache key")
 	}
 	if key.String() == "" {
 		t.Fatal("expected printable distinct-set cache key")
+	}
+
+	numeric := MaterializedPredKeyForDistinctLookupKeys("age", qir.OpIN, []keycodec.IndexLookupKey{
+		keycodec.IndexLookupU64(keycodec.OrderedInt64Key(18)),
+		keycodec.IndexLookupU64(keycodec.OrderedInt64Key(21)),
+	}, false)
+	if numeric.IsZero() || numeric == key {
+		t.Fatalf("unexpected numeric distinct-set cache key: %#v", numeric)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 
-	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -315,12 +314,12 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 
 		}
 
-		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
@@ -331,12 +330,12 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		if f.Slice {
 			return postingResult{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
-		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -355,7 +354,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		defer builder.release()
 
 		for i := 0; i < valCount; i++ {
-			ids := ov.LookupPostingRetained(valsBuf[i])
+			ids := lookupScalarPostingRetained(ov, valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
@@ -373,12 +372,12 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		if !f.Slice {
 			return postingResult{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
-		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -391,7 +390,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		if e.Op == qir.OpHASALL {
 			var acc posting.List
 			for i := 0; i < valCount; i++ {
-				ids := ov.LookupPostingRetained(valsBuf[i])
+				ids := lookupScalarPostingRetained(ov, valsBuf[i])
 				if ids.IsEmpty() {
 					// if any value is missing, result is empty
 					acc.Release()
@@ -413,7 +412,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(valCount)))
 		defer builder.release()
 		for i := 0; i < valCount; i++ {
-			ids := ov.LookupPostingRetained(valsBuf[i])
+			ids := lookupScalarPostingRetained(ov, valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
@@ -497,7 +496,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 //
 // Callers pass distinct values; duplicates are removed before this point so
 // this path can stay read-only.
-func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []string) (postingResult, error) {
+func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []keycodec.IndexLookupKey) (postingResult, error) {
 	valCount := len(vals)
 	lenOV := qv.fieldIndexViewFromSlotsRef(qv.snap.LenIndex, field, fieldOrdinal)
 
@@ -527,7 +526,7 @@ func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []string) (post
 	ov := qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
-		ids := ov.LookupPostingRetained(vals[i])
+		ids := lookupScalarPostingRetained(ov, vals[i])
 		if ids.IsEmpty() {
 			acc.Release()
 			return postingResult{}, nil
@@ -582,6 +581,23 @@ func lookupScalarCardinality(ov indexdata.FieldIndexView, key keycodec.IndexLook
 		return ov.LookupCardinalityKey(key.IndexKey())
 	}
 	return ov.LookupCardinality(key.StringKey())
+}
+
+func lookupScalarPostingsInView(ov indexdata.FieldIndexView, keys []keycodec.IndexLookupKey, capExtra int) ([]posting.List, uint64) {
+	keyCount := len(keys)
+	postsBuf := posting.GetSlice(keyCount + capExtra)
+	var est uint64
+
+	for i := 0; i < keyCount; i++ {
+		ids := lookupScalarPostingRetained(ov, keys[i])
+		if ids.IsEmpty() {
+			continue
+		}
+		postsBuf = append(postsBuf, ids)
+		est += ids.Cardinality()
+	}
+
+	return postsBuf, est
 }
 
 func scalarValueToLookupKeyRaw(raw any, v reflect.Value) (keycodec.IndexLookupKey, error) {
@@ -1066,14 +1082,18 @@ func applyNormalizedScalarBound(rb *indexdata.Bounds, b normalizedScalarBound) {
 	}
 }
 
-func dedupStringBufInPlace(buf []string) []string {
+func compareLookupKey(a, b keycodec.IndexLookupKey) int {
+	return keycodec.Compare(a.IndexKey(), b.IndexKey())
+}
+
+func dedupLookupKeyBufInPlace(buf []keycodec.IndexLookupKey) []keycodec.IndexLookupKey {
 	if len(buf) < 2 {
 		return buf
 	}
-	slices.Sort(buf)
+	slices.SortFunc(buf, compareLookupKey)
 	write := 1
 	for read := 1; read < len(buf); read++ {
-		if buf[read] == buf[write-1] {
+		if compareLookupKey(buf[read], buf[write-1]) == 0 {
 			continue
 		}
 		if write != read {
@@ -1084,12 +1104,12 @@ func dedupStringBufInPlace(buf []string) []string {
 	return buf[:write]
 }
 
-func sliceValueToIdxStringBuf(v reflect.Value, fm *schema.Field) ([]string, bool, error) {
+func sliceValueToLookupKeyBuf(v reflect.Value, fm *schema.Field) ([]keycodec.IndexLookupKey, bool, error) {
 	if v.Len() == 0 {
 		return nil, false, nil
 	}
 
-	ixsBuf := pooled.GetStringSlice(v.Len())
+	ixsBuf := keycodec.GetIndexLookupKeySlice(v.Len())
 	hasNil := false
 
 	for i := 0; i < v.Len(); i++ {
@@ -1105,40 +1125,28 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *schema.Field) ([]string, bool
 			continue
 		}
 		if elem.Kind() == reflect.Slice {
-			pooled.ReleaseStringSlice(ixsBuf)
+			keycodec.ReleaseIndexLookupKeySlice(ixsBuf)
 			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())
 		}
 
-		key, err := scalarValueToIdxField(raw, elem, fm)
+		key, err := scalarValueToLookupKeyField(raw, elem, fm)
 		if err != nil {
-			pooled.ReleaseStringSlice(ixsBuf)
+			keycodec.ReleaseIndexLookupKeySlice(ixsBuf)
 			return nil, false, err
 		}
 		ixsBuf = append(ixsBuf, key)
 	}
 
 	if len(ixsBuf) == 0 {
-		pooled.ReleaseStringSlice(ixsBuf)
+		keycodec.ReleaseIndexLookupKeySlice(ixsBuf)
 		return nil, hasNil, nil
 	}
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *View) scalarLookupPostings(field string, fieldOrdinal int, keys []string, includeNil bool) ([]posting.List, uint64) {
-	keyCount := len(keys)
-	postsBuf := posting.GetSlice(keyCount + btoi(includeNil))
-
-	var est uint64
-
+func (qv *View) scalarLookupPostings(field string, fieldOrdinal int, keys []keycodec.IndexLookupKey, includeNil bool) ([]posting.List, uint64) {
 	ov := qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, fieldOrdinal)
-	for i := 0; i < keyCount; i++ {
-		ids := ov.LookupPostingRetained(keys[i])
-		if ids.IsEmpty() {
-			continue
-		}
-		postsBuf = append(postsBuf, ids)
-		est += ids.Cardinality()
-	}
+	postsBuf, est := lookupScalarPostingsInView(ov, keys, btoi(includeNil))
 
 	if includeNil {
 		ids := qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, fieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
@@ -1190,9 +1198,9 @@ func (qv *View) diffPostingResult(acc, sub postingResult) (postingResult, error)
 	return acc, nil
 }
 
-// exprValueToDistinctIdxBuf returns caller-owned indexed values deduplicated
+// exprValueToDistinctLookupKeyBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
-func (qv *View) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, bool, error) {
+func (qv *View) exprValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.IndexLookupKey, bool, bool, error) {
 	fm := qv.fieldMetaByExpr(expr)
 
 	if expr.Value == nil {
@@ -1208,11 +1216,13 @@ func (qv *View) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, bool, 
 			if len(v) == 0 {
 				return nil, true, false, nil
 			}
-			valsBuf := pooled.GetStringSlice(len(v))
-			valsBuf = append(valsBuf, v...)
-			valsBuf = dedupStringBufInPlace(valsBuf)
+			valsBuf := keycodec.GetIndexLookupKeySlice(len(v))
+			for i := range v {
+				valsBuf = append(valsBuf, keycodec.IndexLookupString(v[i]))
+			}
+			valsBuf = dedupLookupKeyBufInPlace(valsBuf)
 			if len(valsBuf) == 0 {
-				pooled.ReleaseStringSlice(valsBuf)
+				keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 				return nil, true, false, nil
 			}
 			return valsBuf, true, false, nil
@@ -1229,16 +1239,16 @@ func (qv *View) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, bool, 
 	}
 
 	if queryValueIsCollectionForField(v, fm) {
-		valsBuf, hasNil, err := sliceValueToIdxStringBuf(v, fm)
+		valsBuf, hasNil, err := sliceValueToLookupKeyBuf(v, fm)
 		if err != nil {
 			return nil, true, false, err
 		}
 		if valsBuf == nil {
 			return nil, true, hasNil, nil
 		}
-		valsBuf = dedupStringBufInPlace(valsBuf)
+		valsBuf = dedupLookupKeyBufInPlace(valsBuf)
 		if len(valsBuf) == 0 {
-			pooled.ReleaseStringSlice(valsBuf)
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 			return nil, true, hasNil, nil
 		}
 		return valsBuf, true, hasNil, nil

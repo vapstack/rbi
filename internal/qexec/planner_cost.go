@@ -5,6 +5,7 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -2800,13 +2801,13 @@ func (qv *View) estimateEqSelectivity(field string, value any, universe uint64, 
 }
 
 func (qv *View) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           qir.OpIN,
 		FieldOrdinal: qv.fieldOrdinalByName(field),
 		Value:        value,
 	})
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 
 	valueCount := len(valsBuf)
@@ -2825,7 +2826,7 @@ func (qv *View) estimateInLikeSelectivity(field string, value any, universe uint
 	}
 
 	for i := 0; i < valueCount; i++ {
-		card := ov.LookupCardinality(valsBuf[i])
+		card := lookupScalarCardinality(ov, valsBuf[i])
 		sum += card
 		if minCard == 0 || card < minCard {
 			minCard = card

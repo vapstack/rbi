@@ -13,6 +13,7 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -625,6 +626,49 @@ func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
 	}
 	if got := last.ArrayPosOrderRoute.Selected; got != plannerArrayPosOrderCandidateSingleHasAny.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerArrayPosOrderCandidateSingleHasAny.String(), last.ArrayPosOrderRoute)
+	}
+}
+
+func TestArrayPosOrderPrioritiesDedupByIndexKey(t *testing.T) {
+	raw := string([]byte{0, 0, 0, 0, 0, 0, 0, 7})
+	fixed := keycodec.Fixed8StringToU64(raw)
+
+	asc := []keycodec.IndexLookupKey{
+		keycodec.IndexLookupU64(fixed),
+		keycodec.IndexLookupString(raw),
+		keycodec.IndexLookupString("tag"),
+	}
+	asc = orderedDistinctLookupKeys(asc, false)
+	if len(asc) != 2 || asc[0] != keycodec.IndexLookupU64(fixed) || asc[1] != keycodec.IndexLookupString("tag") {
+		t.Fatalf("ascending distinct priorities mismatch: got=%+v", asc)
+	}
+
+	desc := []keycodec.IndexLookupKey{
+		keycodec.IndexLookupU64(fixed),
+		keycodec.IndexLookupString(raw),
+		keycodec.IndexLookupString("tag"),
+	}
+	desc = orderedDistinctLookupKeys(desc, true)
+	if len(desc) != 2 || desc[0] != keycodec.IndexLookupString("tag") || desc[1] != keycodec.IndexLookupString(raw) {
+		t.Fatalf("descending distinct priorities mismatch: got=%+v", desc)
+	}
+}
+
+func TestArrayPosOrderNumericCoverageAcceptsFixedWidthStringPriorities(t *testing.T) {
+	fixed := indexdata.GetFixedPostingMap()
+	fixed[7] = (posting.List{}).BuildAdded(1)
+	fixed[11] = (posting.List{}).BuildAdded(2)
+	storage := indexdata.NewRegularFieldStorageFromFixedPostingMapOwned(fixed)
+	defer storage.Release()
+
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
+	var buf [8]byte
+	vals := []keycodec.IndexLookupKey{
+		keycodec.IndexLookupString(string(keycodec.AppendU64Bytes(buf[:0], 7))),
+		keycodec.IndexLookupString(string(keycodec.AppendU64Bytes(buf[:0], 11))),
+	}
+	if !scalarArrayPosPriorityCoversAllKeysIndexView(ov, vals) {
+		t.Fatalf("expected fixed-width string priorities to cover numeric index keys")
 	}
 }
 

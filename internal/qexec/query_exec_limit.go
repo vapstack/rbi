@@ -1596,12 +1596,12 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keysBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		keysBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.ReleaseStringSlice(keysBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(keysBuf)
 		}
 		keyCount := len(keysBuf)
 		if !isSlice || (keyCount == 0 && !hasNil) {
@@ -1634,12 +1634,12 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keysBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		keysBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.ReleaseStringSlice(keysBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(keysBuf)
 		}
 		keyCount := len(keysBuf)
 		if !isSlice || keyCount == 0 {
@@ -1650,7 +1650,7 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 
 		var est uint64
 		for i := 0; i < keyCount; i++ {
-			ids := ov.LookupPostingRetained(keysBuf[i])
+			ids := lookupScalarPostingRetained(ov, keysBuf[i])
 			if ids.IsEmpty() {
 				posting.ReleaseSlice(postsBuf)
 				return emptyLeaf(), true, nil
@@ -1675,18 +1675,18 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keysBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		keysBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.ReleaseStringSlice(keysBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(keysBuf)
 		}
 		if !isSlice || len(keysBuf) == 0 {
 			return leafPred{}, false, nil
 		}
 
-		postsBuf, est := ov.LookupPostings(keysBuf)
+		postsBuf, est := lookupScalarPostingsInView(ov, keysBuf, 0)
 		if len(postsBuf) == 0 {
 			posting.ReleaseSlice(postsBuf)
 			return emptyLeaf(), true, nil

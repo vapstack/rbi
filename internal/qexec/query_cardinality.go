@@ -3,6 +3,7 @@ package qexec
 import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -97,9 +98,9 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 		return cardinalityLookupComplement(qv.snap.Universe.Cardinality(), hit, expr.Not), true, nil
 
 	case qir.OpIN:
-		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(expr)
+		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(expr)
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		valCount := len(valsBuf)
 		if err != nil || !isSlice || (valCount == 0 && !hasNil) {
@@ -108,7 +109,7 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 
 		var sum uint64
 		for i := 0; i < valCount; i++ {
-			sum += ov.LookupCardinality(valsBuf[i])
+			sum += lookupScalarCardinality(ov, valsBuf[i])
 		}
 		if hasNil {
 			sum += qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, expr).LookupCardinality(indexdata.NilIndexEntryKey)
@@ -217,9 +218,9 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 		return 0, false, nil
 	}
 
-	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(expr)
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(expr)
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if err != nil {
@@ -278,7 +279,7 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 
 		var examined uint64
 		for i := 0; i < valCount; i++ {
-			ids := ov.LookupPostingRetained(valsBuf[i])
+			ids := lookupScalarPostingRetained(ov, valsBuf[i])
 			card := ids.Cardinality()
 			examined = satAddUint64(examined, card)
 			if ids.IsEmpty() {
@@ -882,7 +883,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		if fm == nil || fm.Slice {
 			continue
 		}
-		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 			Op:           qir.OpIN,
 			FieldOrdinal: e.FieldOrdinal,
 			Value:        e.Value,
@@ -890,7 +891,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		totalVals := 0
 		if valsBuf != nil {
 			totalVals = len(valsBuf)
-			pooled.ReleaseStringSlice(valsBuf)
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if hasNil {
 			totalVals++
@@ -914,13 +915,13 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		return 0, false, nil
 	}
 
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           qir.OpIN,
 		FieldOrdinal: inLeaf.FieldOrdinal,
 		Value:        inLeaf.Value,
 	})
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 
 	valCount := len(valsBuf)
@@ -967,7 +968,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	var cnt uint64
 	var examined uint64
 	for i := 0; i < valCount; i++ {
-		ids := ov.LookupPostingRetained(valsBuf[i])
+		ids := lookupScalarPostingRetained(ov, valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -162,12 +163,12 @@ func (qv *View) execSelectedNoOrderSingleNegativeScalarUniverseScan(q *qir.Shape
 		}
 
 	case qir.OpIN:
-		keysBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		keysBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
 			return nil, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.ReleaseStringSlice(keysBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(keysBuf)
 		}
 		if !isSlice || (len(keysBuf) == 0 && !hasNil) {
 			return nil, false, nil
@@ -1073,9 +1074,9 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			}
 			return nil
 		}
-		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1089,9 +1090,9 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		if fm.Slice {
 			return fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
-		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1109,9 +1110,9 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		if !fm.Slice {
 			return fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
-		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if valsBuf != nil {
-			defer pooled.ReleaseStringSlice(valsBuf)
+			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if err != nil {
 			return err

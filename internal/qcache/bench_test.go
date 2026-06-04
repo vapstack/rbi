@@ -73,11 +73,16 @@ func BenchmarkMaterializedPredKeyConstructExactNumericRange(b *testing.B) {
 }
 
 func BenchmarkMaterializedPredKeyConstructDistinctSet(b *testing.B) {
-	vals := []string{"alpha", "beta", "gamma", "delta"}
+	vals := []keycodec.IndexLookupKey{
+		keycodec.IndexLookupString("alpha"),
+		keycodec.IndexLookupString("beta"),
+		keycodec.IndexLookupString("gamma"),
+		keycodec.IndexLookupString("delta"),
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		qcacheBenchKey = MaterializedPredKeyForDistinctSetTerms("tags", qir.OpHASANY, vals, true)
+		qcacheBenchKey = MaterializedPredKeyForDistinctLookupKeys("tags", qir.OpHASANY, vals, true)
 	}
 }
 

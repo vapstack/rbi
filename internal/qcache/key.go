@@ -85,7 +85,7 @@ type MaterializedPredKey struct {
 	flags       uint8
 	startBucket int
 	endBucket   int
-	setTerms    [materializedPredKeyDistinctSetInlineMax]string
+	setTerms    [materializedPredKeyDistinctSetInlineMax]keycodec.IndexLookupKey
 	setValueCnt uint8
 }
 
@@ -129,12 +129,21 @@ func (key MaterializedPredKey) String() string {
 		}
 
 		var numBuf [24]byte
+		var raw [8]byte
 		for i := 0; i < int(key.setValueCnt); i++ {
 			v := key.setTerms[i]
 			buf.WriteByte('\x1e')
-			buf.Write(strconv.AppendInt(numBuf[:0], int64(len(v)), 10))
+			if v.IsNumeric() {
+				buf.WriteByte('n')
+				buf.WriteByte('\x1f')
+				buf.Write(keycodec.AppendU64Bytes(raw[:0], v.U64()))
+				continue
+			}
+			s := v.StringKey()
+			buf.WriteByte('s')
+			buf.Write(strconv.AppendInt(numBuf[:0], int64(len(s)), 10))
 			buf.WriteByte('\x1f')
-			buf.WriteString(v)
+			buf.WriteString(s)
 		}
 		return buf.String()
 
@@ -301,7 +310,14 @@ func (key *MaterializedPredKey) hash() uint64 {
 		h = materializedPredKeyHashUint(h, uint64(key.flags))
 		h = materializedPredKeyHashUint(h, uint64(key.setValueCnt))
 		for i := 0; i < int(key.setValueCnt); i++ {
-			h = materializedPredKeyHashString(h, key.setTerms[i])
+			term := key.setTerms[i]
+			if term.IsNumeric() {
+				h = materializedPredKeyHashUint(h, 1)
+				h = materializedPredKeyHashUint(h, term.U64())
+			} else {
+				h = materializedPredKeyHashUint(h, 0)
+				h = materializedPredKeyHashString(h, term.StringKey())
+			}
 		}
 		return h
 
@@ -456,7 +472,7 @@ func MaterializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
-func MaterializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []string, includeNil bool) MaterializedPredKey {
+func MaterializedPredKeyForDistinctLookupKeys(field string, op qir.Op, vals []keycodec.IndexLookupKey, includeNil bool) MaterializedPredKey {
 	termCount := len(vals)
 	if includeNil {
 		termCount++

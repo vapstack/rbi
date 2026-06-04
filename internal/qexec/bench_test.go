@@ -9,6 +9,7 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/snapshot"
@@ -4265,11 +4266,13 @@ func benchmarkPostsAnyState(b *testing.B, db *testDB, rows int, tag string, mode
 	if !ok {
 		b.Fatal("missing tags index")
 	}
-	keys := []string{tag, "go"}
+	keys := keycodec.GetIndexLookupKeySlice(2)
+	keys = append(keys, keycodec.IndexLookupString(tag), keycodec.IndexLookupString("go"))
 	if mode == "count_direct" {
-		keys = []string{tag}
+		keys = keys[:1]
 	}
 	posts, _ := view.scalarLookupPostings("tags", acc.Ordinal, keys, false)
+	keycodec.ReleaseIndexLookupKeySlice(keys)
 	defer posting.ReleaseSlice(posts)
 	if len(posts) == 0 {
 		b.Fatal("expected tag postings")

@@ -4,8 +4,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 )
 
 func TestExprValueToDistinctIdxBufClonesStringSlice(t *testing.T) {
@@ -13,22 +13,22 @@ func TestExprValueToDistinctIdxBufClonesStringSlice(t *testing.T) {
 	src := []string{"x"}
 	expr := mustTestQIRExprForDB(t, db, qx.IN("name", src))
 
-	vals, isSlice, hasNil, err := db.engine.currentQueryViewForTests().exprValueToDistinctIdxBuf(expr)
+	vals, isSlice, hasNil, err := db.engine.currentQueryViewForTests().exprValueToDistinctLookupKeyBuf(expr)
 	if err != nil {
-		t.Fatalf("exprValueToDistinctIdxBuf: %v", err)
+		t.Fatalf("exprValueToDistinctLookupKeyBuf: %v", err)
 	}
-	defer pooled.ReleaseStringSlice(vals)
+	defer keycodec.ReleaseIndexLookupKeySlice(vals)
 	if !isSlice {
 		t.Fatalf("expected slice input")
 	}
 	if hasNil {
 		t.Fatalf("did not expect nil values")
 	}
-	if !slices.Equal(vals, []string{"x"}) {
+	if !slices.Equal(vals, []keycodec.IndexLookupKey{keycodec.IndexLookupString("x")}) {
 		t.Fatalf("owned values mismatch: got=%v want=%v", vals, []string{"x"})
 	}
 
-	vals[0] = "y"
+	vals[0] = keycodec.IndexLookupString("y")
 	if src[0] != "x" {
 		t.Fatalf("owned values mutated source slice: got=%q want=%q", src[0], "x")
 	}
@@ -39,11 +39,11 @@ func TestExprValueToDistinctIdxBufDoesNotMutateSource(t *testing.T) {
 	src := []string{"b", "a", "a"}
 	expr := mustTestQIRExprForDB(t, db, qx.IN("name", src))
 
-	vals, isSlice, hasNil, err := db.engine.currentQueryViewForTests().exprValueToDistinctIdxBuf(expr)
+	vals, isSlice, hasNil, err := db.engine.currentQueryViewForTests().exprValueToDistinctLookupKeyBuf(expr)
 	if err != nil {
-		t.Fatalf("exprValueToDistinctIdxBuf: %v", err)
+		t.Fatalf("exprValueToDistinctLookupKeyBuf: %v", err)
 	}
-	defer pooled.ReleaseStringSlice(vals)
+	defer keycodec.ReleaseIndexLookupKeySlice(vals)
 	if !isSlice {
 		t.Fatalf("expected slice input")
 	}
@@ -51,7 +51,7 @@ func TestExprValueToDistinctIdxBufDoesNotMutateSource(t *testing.T) {
 		t.Fatalf("did not expect nil values")
 	}
 
-	if !slices.Equal(vals, []string{"a", "b"}) {
+	if !slices.Equal(vals, []keycodec.IndexLookupKey{keycodec.IndexLookupString("a"), keycodec.IndexLookupString("b")}) {
 		t.Fatalf("distinct values mismatch: got=%v want=%v", vals, []string{"a", "b"})
 	}
 	if !slices.Equal(src, []string{"b", "a", "a"}) {

@@ -946,7 +946,7 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 		return predicate{}, false
 	}
 
-	valsBuf, _, _, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, _, _, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -955,7 +955,7 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 
 	b, err := qv.evalSliceEQ(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, valsBuf)
@@ -1040,7 +1040,7 @@ func (qv *View) buildPredInCandidate(e qir.Expr, fm *schema.Field) (predicate, b
 		return predicate{}, false
 	}
 
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -1049,7 +1049,7 @@ func (qv *View) buildPredInCandidate(e qir.Expr, fm *schema.Field) (predicate, b
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 
 	valCount := len(valsBuf)
@@ -1062,7 +1062,7 @@ func (qv *View) buildPredInCandidate(e qir.Expr, fm *schema.Field) (predicate, b
 	cacheKey := qcache.MaterializedPredKey{}
 
 	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
-		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(fieldName, e.Op, valsBuf, hasNil)
+		cacheKey = qcache.MaterializedPredKeyForDistinctLookupKeys(fieldName, e.Op, valsBuf, hasNil)
 	}
 
 	if e.Not {
@@ -1130,7 +1130,7 @@ func (qv *View) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata
 		return predicate{}, false
 	}
 
-	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -1139,7 +1139,7 @@ func (qv *View) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
@@ -1149,7 +1149,7 @@ func (qv *View) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata
 	raw.Not = false
 	var cacheKey qcache.MaterializedPredKey
 	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
-		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.exec.FieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
+		cacheKey = qcache.MaterializedPredKeyForDistinctLookupKeys(qv.exec.FieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
 
 		if !cacheKey.IsZero() {
 
@@ -1211,7 +1211,7 @@ func (qv *View) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata
 	var minCard uint64
 
 	for i := 0; i < len(valsBuf); i++ {
-		ids := ov.LookupPostingRetained(valsBuf[i])
+		ids := lookupScalarPostingRetained(ov, valsBuf[i])
 		if ids.IsEmpty() {
 			posting.ReleaseSlice(postsBuf)
 			if e.Not {
@@ -1258,7 +1258,7 @@ func (qv *View) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexd
 		return predicate{}, false
 	}
 
-	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -1267,7 +1267,7 @@ func (qv *View) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexd
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
@@ -1278,7 +1278,7 @@ func (qv *View) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexd
 	var est uint64
 
 	for i := 0; i < len(valsBuf); i++ {
-		ids := ov.LookupPostingRetained(valsBuf[i])
+		ids := lookupScalarPostingRetained(ov, valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1288,7 +1288,7 @@ func (qv *View) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexd
 
 	cacheKey := qcache.MaterializedPredKey{}
 	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
-		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
+		cacheKey = qcache.MaterializedPredKeyForDistinctLookupKeys(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
 	}
 
 	if e.Not {

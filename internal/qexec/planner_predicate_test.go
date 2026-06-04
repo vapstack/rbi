@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -2390,10 +2389,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	}
 
 	t.Run("IN", func(t *testing.T) {
-		vals := pooled.GetStringSlice(2)
-		vals = append(vals, "DE", "FR")
-		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		pooled.ReleaseStringSlice(vals)
+		vals := keycodec.GetIndexLookupKeySlice(2)
+		vals = append(vals, keycodec.IndexLookupString("DE"), keycodec.IndexLookupString("FR"))
+		cacheKey := qcache.MaterializedPredKeyForDistinctLookupKeys("country", compileScalarOpForTest(qx.OpIN), vals, false)
+		keycodec.ReleaseIndexLookupKeySlice(vals)
 
 		run(t,
 			qx.IN("country", []string{"DE", "FR"}),
@@ -2417,10 +2416,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("HASANY", func(t *testing.T) {
-		vals := pooled.GetStringSlice(2)
-		vals = append(vals, "db", "go")
-		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		pooled.ReleaseStringSlice(vals)
+		vals := keycodec.GetIndexLookupKeySlice(2)
+		vals = append(vals, keycodec.IndexLookupString("db"), keycodec.IndexLookupString("go"))
+		cacheKey := qcache.MaterializedPredKeyForDistinctLookupKeys("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
+		keycodec.ReleaseIndexLookupKeySlice(vals)
 
 		run(t,
 			qx.HASANY("tags", []string{"go", "db"}),
@@ -2447,10 +2446,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("NOTIN", func(t *testing.T) {
-		vals := pooled.GetStringSlice(2)
-		vals = append(vals, "DE", "FR")
-		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		pooled.ReleaseStringSlice(vals)
+		vals := keycodec.GetIndexLookupKeySlice(2)
+		vals = append(vals, keycodec.IndexLookupString("DE"), keycodec.IndexLookupString("FR"))
+		cacheKey := qcache.MaterializedPredKeyForDistinctLookupKeys("country", compileScalarOpForTest(qx.OpIN), vals, false)
+		keycodec.ReleaseIndexLookupKeySlice(vals)
 
 		run(t,
 			qx.NOT(qx.IN("country", []string{"DE", "FR"})),
@@ -2474,10 +2473,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("HASNONE", func(t *testing.T) {
-		vals := pooled.GetStringSlice(2)
-		vals = append(vals, "db", "go")
-		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		pooled.ReleaseStringSlice(vals)
+		vals := keycodec.GetIndexLookupKeySlice(2)
+		vals = append(vals, keycodec.IndexLookupString("db"), keycodec.IndexLookupString("go"))
+		cacheKey := qcache.MaterializedPredKeyForDistinctLookupKeys("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
+		keycodec.ReleaseIndexLookupKeySlice(vals)
 
 		run(t,
 			qx.NOT(qx.HASANY("tags", []string{"go", "db"})),
@@ -2526,10 +2525,10 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 		}
 	})
 
-	vals := pooled.GetStringSlice(2)
-	vals = append(vals, "db", "go")
-	cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
-	pooled.ReleaseStringSlice(vals)
+	vals := keycodec.GetIndexLookupKeySlice(2)
+	vals = append(vals, keycodec.IndexLookupString("db"), keycodec.IndexLookupString("go"))
+	cacheKey := qcache.MaterializedPredKeyForDistinctLookupKeys("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
+	keycodec.ReleaseIndexLookupKeySlice(vals)
 
 	expr := qx.HASALL("tags", []string{"go", "db"})
 

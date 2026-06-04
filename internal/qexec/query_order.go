@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
@@ -549,47 +548,101 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 	return cursor.out, nil
 }
 
-func orderedDistinctStrings(vals []string, desc bool) []string {
+func orderedDistinctLookupKeys(vals []keycodec.IndexLookupKey, desc bool) []keycodec.IndexLookupKey {
 	if len(vals) < 2 {
 		return vals
 	}
 
-	seen := stringSetPool.Get()
-	defer stringSetPool.Put(seen)
+	var fixed u64set
+	var set map[string]struct{}
 
 	if desc {
-		out := make([]string, 0, len(vals))
+		write := len(vals)
 		for i := len(vals) - 1; i >= 0; i-- {
 			v := vals[i]
-			if _, ok := seen[v]; ok {
-				continue
+			if v.IsNumeric() {
+				if len(fixed.keys) == 0 {
+					fixed = getU64Set(len(vals))
+				}
+				if !fixed.Add(v.U64()) {
+					continue
+				}
+			} else {
+				s := v.StringKey()
+				if len(s) == 8 {
+					if len(fixed.keys) == 0 {
+						fixed = getU64Set(len(vals))
+					}
+					if !fixed.Add(keycodec.Fixed8StringToU64(s)) {
+						continue
+					}
+				} else {
+					if set == nil {
+						set = stringSetPool.Get()
+					}
+					if _, ok := set[s]; ok {
+						continue
+					}
+					set[s] = struct{}{}
+				}
 			}
-			seen[v] = struct{}{}
-			out = append(out, v)
+			write--
+			vals[write] = v
+		}
+		out := vals[write:]
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+		if set != nil {
+			stringSetPool.Put(set)
+		}
+		if len(fixed.keys) != 0 {
+			releaseU64Set(&fixed)
 		}
 		return out
 	}
 
-	for i, v := range vals {
-		if _, ok := seen[v]; ok {
-			out := make([]string, 0, len(vals))
-			out = append(out, vals[:i]...)
-			for j := i + 1; j < len(vals); j++ {
-				v = vals[j]
-				if _, ok := seen[v]; ok {
+	write := 0
+	for _, v := range vals {
+		if v.IsNumeric() {
+			if len(fixed.keys) == 0 {
+				fixed = getU64Set(len(vals))
+			}
+			if !fixed.Add(v.U64()) {
+				continue
+			}
+		} else {
+			s := v.StringKey()
+			if len(s) == 8 {
+				if len(fixed.keys) == 0 {
+					fixed = getU64Set(len(vals))
+				}
+				if !fixed.Add(keycodec.Fixed8StringToU64(s)) {
 					continue
 				}
-				seen[v] = struct{}{}
-				out = append(out, v)
+			} else {
+				if set == nil {
+					set = stringSetPool.Get()
+				}
+				if _, ok := set[s]; ok {
+					continue
+				}
+				set[s] = struct{}{}
 			}
-			return out
 		}
-		seen[v] = struct{}{}
+		vals[write] = v
+		write++
 	}
-	return vals
+	if set != nil {
+		stringSetPool.Put(set)
+	}
+	if len(fixed.keys) != 0 {
+		releaseU64Set(&fixed)
+	}
+	return vals[:write]
 }
 
-func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, vals []string) bool {
+func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, vals []keycodec.IndexLookupKey) bool {
 	keyCount := ov.KeyCount()
 	if keyCount == 0 {
 		return true
@@ -599,10 +652,29 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 	}
 
 	var fixed u64set
-	fixedBuilt := false
 
 	var set map[string]struct{}
-	setBuilt := false
+	for _, v := range vals {
+		if v.IsNumeric() {
+			if len(fixed.keys) == 0 {
+				fixed = getU64Set(len(vals))
+			}
+			fixed.Add(v.U64())
+			continue
+		}
+		s := v.StringKey()
+		if len(s) == 8 {
+			if len(fixed.keys) == 0 {
+				fixed = getU64Set(len(vals))
+			}
+			fixed.Add(keycodec.Fixed8StringToU64(s))
+			continue
+		}
+		if set == nil {
+			set = stringSetPool.Get()
+		}
+		set[s] = struct{}{}
+	}
 
 	ok := true
 	cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
@@ -613,17 +685,6 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 		}
 
 		if key.IsNumeric() {
-			if !fixedBuilt {
-				for _, v := range vals {
-					if len(v) == 8 {
-						if len(fixed.keys) == 0 {
-							fixed = getU64Set(len(vals))
-						}
-						fixed.Add(keycodec.Fixed8StringToU64(v))
-					}
-				}
-				fixedBuilt = true
-			}
 			if !fixed.Has(key.U64()) {
 				ok = false
 				break
@@ -631,20 +692,25 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 			continue
 		}
 
-		if !setBuilt {
-			set = stringSetPool.Get()
-			for _, v := range vals {
-				set[v] = struct{}{}
+		s := key.UnsafeString()
+		if len(s) == 8 {
+			if !fixed.Has(keycodec.Fixed8StringToU64(s)) {
+				ok = false
+				break
 			}
-			setBuilt = true
+			continue
 		}
-		if _, found := set[key.UnsafeString()]; !found {
+		if set == nil {
+			ok = false
+			break
+		}
+		if _, found := set[s]; !found {
 			ok = false
 			break
 		}
 	}
 
-	if setBuilt {
+	if set != nil {
 		stringSetPool.Put(set)
 	}
 	if len(fixed.keys) != 0 {
@@ -653,7 +719,7 @@ func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, v
 	return ok
 }
 
-func scalarArrayPosPriorityCoversAllResultsIndexView(resultBM posting.List, ov, nilOV indexdata.FieldIndexView, vals []string) bool {
+func scalarArrayPosPriorityCoversAllResultsIndexView(resultBM posting.List, ov, nilOV indexdata.FieldIndexView, vals []keycodec.IndexLookupKey) bool {
 	if !scalarArrayPosPriorityCoversAllKeysIndexView(ov, vals) {
 		return false
 	}
@@ -673,6 +739,9 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	if err != nil {
 		return nil, err
 	}
+	if vals != nil {
+		defer keycodec.ReleaseIndexLookupKeySlice(vals)
+	}
 	if fm := qv.fieldMetaByOrder(o); fm != nil && !fm.Slice {
 		return qv.queryOrderArrayPosScalarIndexView(result, qv.exec.FieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
@@ -686,7 +755,7 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	if !o.Desc {
 		for _, v := range vals {
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(v), result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, lookupScalarPostingRetained(ov, v), result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil
@@ -696,7 +765,7 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	} else {
 		for i := len(vals) - 1; i >= 0; i-- {
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(vals[i]), result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, lookupScalarPostingRetained(ov, vals[i]), result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil
@@ -864,9 +933,9 @@ func (qv *View) dispatchArrayPosOrder(
 }
 
 func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plannerArrayPosOrderFacts, trace *Trace) ([]uint64, bool, error) {
-	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(facts.expr)
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(facts.expr)
 	if valsBuf != nil {
-		defer pooled.ReleaseStringSlice(valsBuf)
+		defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 	}
 	if err != nil {
 		return nil, false, err
@@ -879,13 +948,14 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 	if err != nil || len(orderVals) == 0 {
 		return nil, false, err
 	}
+	defer keycodec.ReleaseIndexLookupKeySlice(orderVals)
 
 	ov := facts.ov
 	if !ov.HasData() && !qv.hasIndexedFieldForOrder(facts.order) {
 		return nil, false, nil
 	}
 
-	var filterKey string
+	var filterKey keycodec.IndexLookupKey
 	var filterIDs posting.List
 	filterSet := false
 	defer func() {
@@ -894,7 +964,7 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 		}
 	}()
 	for i := 0; i < len(valsBuf); i++ {
-		ids := ov.LookupPostingRetained(valsBuf[i])
+		ids := lookupScalarPostingRetained(ov, valsBuf[i])
 		if ids.IsEmpty() {
 			ids.Release()
 			continue
@@ -921,10 +991,10 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 	if !q.Order.Desc {
 		for i := 0; i < len(orderVals); i++ {
 			v := orderVals[i]
-			if v == filterKey {
+			if compareLookupKey(v, filterKey) == 0 {
 				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
 			}
-			ids := ov.LookupPostingRetained(v)
+			ids := lookupScalarPostingRetained(ov, v)
 			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
 			ids.Release()
 			if intersects {
@@ -934,10 +1004,10 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 	} else {
 		for i := len(orderVals) - 1; i >= 0; i-- {
 			v := orderVals[i]
-			if v == filterKey {
+			if compareLookupKey(v, filterKey) == 0 {
 				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
 			}
-			ids := ov.LookupPostingRetained(v)
+			ids := lookupScalarPostingRetained(ov, v)
 			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
 			ids.Release()
 			if intersects {
@@ -974,7 +1044,7 @@ func emitSinglePostingOrderArrayPosResult(ids posting.List, card, skip, need uin
 	return cursor.out
 }
 
-func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldIndexView, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldIndexView, vals []keycodec.IndexLookupKey, desc bool, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -985,7 +1055,7 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 		nilOV = qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, fieldOrdinal)
 	}
 
-	orderedVals := orderedDistinctStrings(vals, desc)
+	orderedVals := orderedDistinctLookupKeys(vals, desc)
 	coversAll := !result.neg && len(orderedVals) > 0 &&
 		scalarArrayPosPriorityCoversAllResultsIndexView(result.ids, ov, nilOV, orderedVals)
 
@@ -999,7 +1069,7 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 		!result.neg &&
 		shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
 		for _, v := range orderedVals {
-			ids := ov.LookupPostingRetained(v).Borrow().BuildAnd(result.ids)
+			ids := lookupScalarPostingRetained(ov, v).Borrow().BuildAnd(result.ids)
 			out = appendMaterializedNumericPostingKeys(out, ids)
 			ids.Release()
 		}
@@ -1018,7 +1088,7 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 
 	for _, v := range orderedVals {
 		var done bool
-		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(v), result)
+		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, lookupScalarPostingRetained(ov, v), result)
 		if done {
 			tmp.Release()
 			return cursor.out, nil
@@ -1042,13 +1112,22 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 	return cursor.out, nil
 }
 
-func (qv *View) orderDataValues(v any, fm *schema.Field) ([]string, error) {
+func (qv *View) orderDataValues(v any, fm *schema.Field) ([]keycodec.IndexLookupKey, error) {
 	if vals, ok := v.([]string); ok {
-		return vals, nil
+		if len(vals) == 0 {
+			return nil, nil
+		}
+		out := keycodec.GetIndexLookupKeySlice(len(vals))
+		for i := range vals {
+			out = append(out, keycodec.IndexLookupString(vals[i]))
+		}
+		return out, nil
 	}
 
 	if s, ok := v.(string); ok {
-		return []string{s}, nil
+		out := keycodec.GetIndexLookupKeySlice(1)
+		out = append(out, keycodec.IndexLookupString(s))
+		return out, nil
 	}
 
 	rv := reflect.ValueOf(v)
@@ -1063,25 +1142,20 @@ func (qv *View) orderDataValues(v any, fm *schema.Field) ([]string, error) {
 	}
 
 	if collection {
-		valsBuf, _, err := sliceValueToIdxStringBuf(rv, fm)
+		valsBuf, _, err := sliceValueToLookupKeyBuf(rv, fm)
 		if err != nil {
 			return nil, err
 		}
-		if valsBuf == nil {
-			return nil, nil
-		}
-		defer pooled.ReleaseStringSlice(valsBuf)
-
-		out := make([]string, len(valsBuf))
-		copy(out, valsBuf)
-		return out, nil
+		return valsBuf, nil
 	}
 
-	key, err := scalarValueToIdxField(v, rv, fm)
+	key, err := scalarValueToLookupKeyField(v, rv, fm)
 	if err != nil {
 		return nil, err
 	}
-	return []string{key}, nil
+	out := keycodec.GetIndexLookupKeySlice(1)
+	out = append(out, key)
+	return out, nil
 }
 
 func (qv *View) queryOrderArrayCount(result postingResult, ov indexdata.FieldIndexView, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
