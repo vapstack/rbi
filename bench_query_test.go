@@ -959,8 +959,6 @@ func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
 	return db
 }
 
-const dynamicBenchN = 200_000
-
 type dynamicBenchDistribution int
 
 const (

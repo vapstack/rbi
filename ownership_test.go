@@ -77,12 +77,10 @@ func TestOwnershipE2E_ModelAfterChunkedPatchDeleteTransitions(t *testing.T) {
 		return rec.FullName == "full-0200"
 	})
 
-	emptyTags := []string{}
 	emptyIDs := []uint64{2, 200, 418}
-	if err := db.BatchPatch(emptyIDs, []Field{{Name: "tags", Value: emptyTags}}); err != nil {
+	if err := db.BatchPatch(emptyIDs, []Field{{Name: "tags", Value: []string{}}}); err != nil {
 		t.Fatalf("BatchPatch(empty tags): %v", err)
 	}
-	emptyTags = append(emptyTags, "poison-empty")
 	for _, id := range emptyIDs {
 		rec := model[id]
 		rec.Tags = []string{}
@@ -282,12 +280,10 @@ func TestOwnershipE2E_ReopenModelAfterPatchDeleteTransitions(t *testing.T) {
 		model[id] = rec
 	}
 
-	emptyTags := []string{}
 	emptyIDs := []uint64{5, 200, 417}
-	if err := db.BatchPatch(emptyIDs, []Field{{Name: "tags", Value: emptyTags}}); err != nil {
+	if err := db.BatchPatch(emptyIDs, []Field{{Name: "tags", Value: []string{}}}); err != nil {
 		t.Fatalf("BatchPatch(empty tags): %v", err)
 	}
-	emptyTags = append(emptyTags, "poison-empty")
 	for _, id := range emptyIDs {
 		rec := model[id]
 		rec.Tags = []string{}

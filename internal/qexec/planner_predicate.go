@@ -3502,12 +3502,6 @@ const (
 	rangePostingFilterKeepRowsMaxCard     = 8_192
 )
 
-type rangePostingFilterProbe interface {
-	linearContains(uint64) bool
-	buildAndNotPosting(posting.List) posting.List
-	appendIntersectingPosting(posting.List, postingUnionBuilder) postingUnionBuilder
-}
-
 func shouldUseNumericRangePostingFilter(e qir.Expr, fm *schema.Field) bool {
 	if !schema.FieldUsesOrderedNumericKeys(fm) || !e.Op.IsNumericRange() {
 		return false

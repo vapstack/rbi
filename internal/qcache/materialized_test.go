@@ -188,7 +188,7 @@ func TestRecentKeyCacheClearReleasesAndClearsOwnedState(t *testing.T) {
 	cache.Clear()
 
 	if cache.slots != nil || cache.index != nil || cache.indexLen != 0 || cache.clock != 0 {
-		t.Fatalf("cleared recent-key cache retained state: %+v", cache)
+		t.Fatalf("cleared recent-key cache retained state: clock=%v, slots=%v, index=%v, indexLen=%v", cache.clock, cache.slots, cache.index, cache.indexLen)
 	}
 	for i := range slots[:cap(slots)] {
 		if slots[:cap(slots)][i].used || !slots[:cap(slots)][i].key.IsZero() || slots[:cap(slots)][i].hash != 0 || slots[:cap(slots)][i].stamp != 0 || slots[:cap(slots)][i].work != 0 {

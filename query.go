@@ -71,8 +71,6 @@ type (
 	PlannerFieldStats = qexec.PlannerFieldStats
 )
 
-const randStreamMix uint64 = 0x9e3779b97f4a7c15
-
 // Aggregate evaluates a reduction query against the current index snapshot.
 func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	if err := db.unavailableErr(); err != nil {

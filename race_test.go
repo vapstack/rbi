@@ -877,33 +877,6 @@ func raceExtraOpenTempDBUint64(t *testing.T, opts Options) *DB[uint64, raceExtra
 	return db
 }
 
-func raceExtraOpenTempDBString(t *testing.T, opts Options) *DB[string, raceExtraRec] {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "race_extra_string.db")
-	raw, err := bbolt.Open(path, 0o600, nil)
-	if err != nil {
-		t.Fatalf("bbolt.Open: %v", err)
-	}
-
-	opts = testOptions(opts)
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
-
-	db, err := New[string, raceExtraRec](raw, opts)
-	if err != nil {
-		_ = raw.Close()
-		t.Fatalf("New: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	return db
-}
-
 func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec], n int, gen func(i int) *raceExtraRec) {
 	t.Helper()
 
@@ -933,41 +906,6 @@ func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec]
 		batchIDs = append(batchIDs, uint64(i))
 		batchVals = append(batchVals, gen(i))
 		if len(batchIDs) == cap(batchIDs) {
-			flush()
-		}
-	}
-	flush()
-}
-
-func raceExtraSeedGeneratedStringData(t *testing.T, db *DB[string, raceExtraRec], keys []string, gen func(i int, key string) *raceExtraRec) {
-	t.Helper()
-
-	db.disableSync()
-	defer db.enableSync()
-
-	batchSize := 32 << 10
-	if len(keys) > 0 && len(keys) < batchSize {
-		batchSize = len(keys)
-	}
-	batchKeys := make([]string, 0, batchSize)
-	batchVals := make([]*raceExtraRec, 0, batchSize)
-
-	flush := func() {
-		t.Helper()
-		if len(batchKeys) == 0 {
-			return
-		}
-		if err := db.BatchSet(batchKeys, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchKeys), err)
-		}
-		batchKeys = batchKeys[:0]
-		batchVals = batchVals[:0]
-	}
-
-	for i, key := range keys {
-		batchKeys = append(batchKeys, key)
-		batchVals = append(batchVals, gen(i+1, key))
-		if len(batchKeys) == cap(batchKeys) {
 			flush()
 		}
 	}

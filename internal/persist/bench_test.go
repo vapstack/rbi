@@ -30,8 +30,8 @@ const (
 )
 
 var (
-	benchPersistStaleErr   = errors.New("bench persisted index is stale")
-	benchPersistInvalidErr = errors.New("bench persisted index is invalid")
+	errBenchPersistStale   = errors.New("bench persisted index is stale")
+	errBenchPersistInvalid = errors.New("bench persisted index is invalid")
 	benchPersistSink       uint64
 )
 
@@ -488,14 +488,14 @@ func BenchmarkLoadRejects(b *testing.B) {
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq + 1,
 			Schema:     &schema.Schema{},
-			Errors:     Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
+			Errors:     Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
 		}
 		b.SetBytes(int64(buf.Len()))
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, err := Load(cfg)
-			if !errors.Is(err, benchPersistStaleErr) {
+			if !errors.Is(err, errBenchPersistStale) {
 				b.Fatalf("Load err=%v, want stale sentinel", err)
 			}
 		}
@@ -512,14 +512,14 @@ func BenchmarkLoadRejects(b *testing.B) {
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq,
 			Schema:     &schema.Schema{},
-			Errors:     Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
+			Errors:     Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
 		}
 		b.SetBytes(1)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, err := Load(cfg)
-			if !errors.Is(err, benchPersistInvalidErr) {
+			if !errors.Is(err, errBenchPersistInvalid) {
 				b.Fatalf("Load err=%v, want invalid sentinel", err)
 			}
 		}
@@ -957,7 +957,7 @@ func benchPersistLoadConfig(s *schema.Schema, file string, seq uint64) LoadConfi
 		CurrentSeq:      seq,
 		Schema:          s,
 		StrMapCompactAt: benchPersistStrMapCompactAt,
-		Errors:          Errors{Stale: benchPersistStaleErr, Invalid: benchPersistInvalidErr},
+		Errors:          Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
 	}
 }
 
