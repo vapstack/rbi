@@ -656,13 +656,6 @@ func (s MeasureStorage) ChunkSlices(pos int) ([]uint64, []uint64) {
 	return chunk.ids, chunk.values
 }
 
-func (s MeasureStorage) TailChunkRows() int {
-	if s.chunked == nil || len(s.chunked.refsByID) == 0 {
-		return 0
-	}
-	return len(s.chunked.refsByID[len(s.chunked.refsByID)-1].chunk.ids)
-}
-
 func (s MeasureStorage) LookupSteps() uint64 {
 	if s.chunked != nil {
 		return uint64(bits.Len(uint(len(s.chunked.refsByID))) + bits.Len(uint(MeasureChunkTargetRows)))

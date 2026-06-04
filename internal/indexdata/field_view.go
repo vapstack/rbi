@@ -205,13 +205,6 @@ func (br FieldIndexRange) Len() int {
 	return br.BaseEnd - br.BaseStart
 }
 
-func NewFieldIndexView(base *[]Entry) FieldIndexView {
-	if base == nil {
-		return FieldIndexView{}
-	}
-	return FieldIndexView{base: *base}
-}
-
 func NewFieldIndexViewFromStorage(storage FieldStorage) FieldIndexView {
 	if storage.chunked != nil {
 		return FieldIndexView{chunked: storage.chunked}
@@ -386,21 +379,6 @@ func (o FieldIndexView) LookupPostingRetainedKey(key keycodec.IndexKey) posting.
 		return posting.List{}
 	}
 	return o.base[i].IDs.Borrow()
-}
-
-func (o FieldIndexView) PostingAt(rank int) posting.List {
-	if rank < 0 || rank >= o.KeyCount() {
-		return posting.List{}
-	}
-	if o.chunked != nil {
-		pos := o.chunked.posForRank(rank)
-		ref, ok := o.chunked.refAtChunk(pos.chunk)
-		if !ok {
-			return posting.List{}
-		}
-		return ref.chunk.postingAt(pos.entry)
-	}
-	return o.base[rank].IDs.Borrow()
 }
 
 func (o FieldIndexView) LookupPostings(keys []string) ([]posting.List, uint64) {

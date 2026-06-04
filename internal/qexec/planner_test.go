@@ -484,7 +484,8 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		{Key: keycodec.FromString("alina"), IDs: postingOf(2)},
 		{Key: keycodec.FromString("bob"), IDs: postingOf(3)},
 	}
-	ov := indexdata.NewFieldIndexView(&s)
+	ov, storage := testFieldIndexViewFromEntries(s)
+	defer storage.Release()
 
 	exprs := []qx.Expr{
 		qx.PREFIX("name", "al"),
@@ -1543,12 +1544,14 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 	residualChecks := pooled.GetIntSlice(1)
 	residualChecks = append(residualChecks, 1)
 
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{{IDs: bucket.Borrow()}})
+	defer storage.Release()
 	iter := plannerOROrderBranchIter{
 		branch:         &plannerORBranch{preds: preds, leadIdx: -1},
 		checks:         checks,
 		exactChecks:    exactChecks,
 		residualChecks: residualChecks,
-		indexView:      indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: bucket.Borrow()}}),
+		indexView:      ov,
 		single:         -1,
 		exactSingle:    0,
 		residualSingle: 1,

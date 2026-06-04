@@ -24,6 +24,59 @@ func fieldStorageOwnedTestPosting(id uint64) posting.List {
 	return fieldStorageSingleton(id).BuildAdded(id + 1000000)
 }
 
+func NewFieldIndexView(base *[]Entry) FieldIndexView {
+	if base == nil {
+		return FieldIndexView{}
+	}
+	return FieldIndexView{base: *base}
+}
+
+func (o FieldIndexView) PostingAt(rank int) posting.List {
+	if rank < 0 || rank >= o.KeyCount() {
+		return posting.List{}
+	}
+	if o.chunked != nil {
+		pos := o.chunked.posForRank(rank)
+		ref, ok := o.chunked.refAtChunk(pos.chunk)
+		if !ok {
+			return posting.List{}
+		}
+		return ref.chunk.postingAt(pos.entry)
+	}
+	return o.base[rank].IDs.Borrow()
+}
+
+func (s MeasureStorage) TailChunkRows() int {
+	if s.chunked == nil || len(s.chunked.refsByID) == 0 {
+		return 0
+	}
+	return len(s.chunked.refsByID[len(s.chunked.refsByID)-1].chunk.ids)
+}
+
+func newFieldIndexChunkedRootFromPages(pages []*fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
+	if len(pages) == 0 {
+		return nil
+	}
+	pageBuf := fieldIndexChunkDirPageSlicePool.Get(len(pages))
+	pageBuf = append(pageBuf, pages...)
+	return newFieldIndexChunkedRootFromOwnedPages(pageBuf)
+}
+
+func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
+	if r == nil || limit <= 0 {
+		return 0
+	}
+	if limit >= r.chunkCount {
+		return r.keyCount
+	}
+	page := searchIntLower(r.chunkPrefix[1:], limit)
+	if r.pages == nil || page >= len(r.pages) {
+		return r.keyCount
+	}
+	off := limit - r.chunkPrefix[page]
+	return r.prefix[page] + r.pages[page].prefix[off]
+}
+
 func fieldStorageEntriesForTest(n int, numeric bool) []Entry {
 	entries := make([]Entry, n)
 	for i := 0; i < n; i++ {

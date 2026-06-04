@@ -107,7 +107,7 @@ func TestReadIndexKeyRejectsTooLongString(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	_, err := ReadKey(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	_, err := readKey(bufio.NewReader(bytes.NewReader(raw.Bytes())))
 	if err == nil {
 		t.Fatalf("expected indexed string validation error")
 	}
@@ -306,10 +306,10 @@ func TestSerializationSkipEntryAndKey(t *testing.T) {
 		t.Fatalf("flush entries: %v", err)
 	}
 	reader := bufio.NewReader(bytes.NewReader(entriesRaw.Bytes()))
-	if err := SkipEntry(reader); err != nil {
+	if err := skipEntry(reader); err != nil {
 		t.Fatalf("skip entry: %v", err)
 	}
-	gotEntry, err := ReadEntry(reader)
+	gotEntry, err := readEntry(reader)
 	if err != nil {
 		t.Fatalf("read entry after skip: %v", err)
 	}
@@ -320,20 +320,20 @@ func TestSerializationSkipEntryAndKey(t *testing.T) {
 
 	var keysRaw bytes.Buffer
 	writer = bufio.NewWriter(&keysRaw)
-	if err := WriteKey(writer, keycodec.FromStoredString("skip-key", false)); err != nil {
+	if err := writeKey(writer, keycodec.FromStoredString("skip-key", false)); err != nil {
 		t.Fatalf("write first key: %v", err)
 	}
-	if err := WriteKey(writer, keycodec.FromStoredString("read-key", false)); err != nil {
+	if err := writeKey(writer, keycodec.FromStoredString("read-key", false)); err != nil {
 		t.Fatalf("write second key: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
 		t.Fatalf("flush keys: %v", err)
 	}
 	reader = bufio.NewReader(bytes.NewReader(keysRaw.Bytes()))
-	if err := SkipKey(reader); err != nil {
+	if err := skipKey(reader); err != nil {
 		t.Fatalf("skip key: %v", err)
 	}
-	gotKey, err := ReadKey(reader)
+	gotKey, err := readKey(reader)
 	if err != nil {
 		t.Fatalf("read key after skip: %v", err)
 	}

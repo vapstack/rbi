@@ -193,7 +193,7 @@ func WriteEntries(writer *bufio.Writer, entries []Entry) error {
 }
 
 func (entry Entry) WriteInto(writer *bufio.Writer) error {
-	if err := WriteKey(writer, entry.Key); err != nil {
+	if err := writeKey(writer, entry.Key); err != nil {
 		return fmt.Errorf("encode: writing entry key: %w", err)
 	}
 	if err := entry.IDs.WriteTo(writer); err != nil {
@@ -202,7 +202,7 @@ func (entry Entry) WriteInto(writer *bufio.Writer) error {
 	return nil
 }
 
-func WriteKey(writer *bufio.Writer, key keycodec.IndexKey) error {
+func writeKey(writer *bufio.Writer, key keycodec.IndexKey) error {
 	if key.IsNumeric() {
 		if err := writer.WriteByte(indexKeyEncodingRaw8); err != nil {
 			return err
@@ -308,7 +308,7 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 		}
 		if !keep {
 			for i := uint64(0); i < count; i++ {
-				if err := SkipEntry(reader); err != nil {
+				if err := skipEntry(reader); err != nil {
 					return FieldStorage{}, fmt.Errorf("skipping flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
 				}
 			}
@@ -703,8 +703,8 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 	}
 }
 
-func ReadEntry(reader *bufio.Reader) (Entry, error) {
-	key, err := ReadKey(reader)
+func readEntry(reader *bufio.Reader) (Entry, error) {
+	key, err := readKey(reader)
 	if err != nil {
 		return Entry{}, fmt.Errorf("reading Entry key: %w", err)
 	}
@@ -715,8 +715,8 @@ func ReadEntry(reader *bufio.Reader) (Entry, error) {
 	return Entry{Key: key, IDs: ids}, nil
 }
 
-func SkipEntry(reader *bufio.Reader) error {
-	if err := SkipKey(reader); err != nil {
+func skipEntry(reader *bufio.Reader) error {
+	if err := skipKey(reader); err != nil {
 		return fmt.Errorf("skipping Entry key: %w", err)
 	}
 	if err := posting.Skip(reader); err != nil {
@@ -725,7 +725,7 @@ func SkipEntry(reader *bufio.Reader) error {
 	return nil
 }
 
-func ReadKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
+func readKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
 	tag, err := reader.ReadByte()
 	if err != nil {
 		return keycodec.IndexKey{}, err
@@ -754,7 +754,7 @@ func ReadKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
 	}
 }
 
-func SkipKey(reader *bufio.Reader) error {
+func skipKey(reader *bufio.Reader) error {
 	tag, err := reader.ReadByte()
 	if err != nil {
 		return err

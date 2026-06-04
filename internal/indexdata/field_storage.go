@@ -2047,15 +2047,6 @@ func (b *fieldIndexChunkBuilder) root() *fieldIndexChunkedRoot {
 	return newFieldIndexChunkedRootFromOwnedPages(pages)
 }
 
-func newFieldIndexChunkedRootFromPages(pages []*fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
-	if len(pages) == 0 {
-		return nil
-	}
-	pageBuf := fieldIndexChunkDirPageSlicePool.Get(len(pages))
-	pageBuf = append(pageBuf, pages...)
-	return newFieldIndexChunkedRootFromOwnedPages(pageBuf)
-}
-
 func newFieldIndexChunkedRootFromOwnedPages(pages []*fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
 	if len(pages) == 0 {
 		return nil
@@ -2245,21 +2236,6 @@ func (r *fieldIndexChunkedRoot) refAtChunk(chunk int) (fieldIndexChunkRef, bool)
 		return fieldIndexChunkRef{}, false
 	}
 	return r.pages[page].refs[off], true
-}
-
-func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
-	if r == nil || limit <= 0 {
-		return 0
-	}
-	if limit >= r.chunkCount {
-		return r.keyCount
-	}
-	page := searchIntLower(r.chunkPrefix[1:], limit)
-	if r.pages == nil || page >= len(r.pages) {
-		return r.keyCount
-	}
-	off := limit - r.chunkPrefix[page]
-	return r.prefix[page] + r.pages[page].prefix[off]
 }
 
 func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {

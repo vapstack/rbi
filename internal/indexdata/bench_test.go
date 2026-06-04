@@ -120,7 +120,7 @@ func benchmarkEntryBytes(entry Entry) []byte {
 func benchmarkKeyBytes(key keycodec.IndexKey) []byte {
 	var buf bytes.Buffer
 	writer := bufio.NewWriterSize(&buf, benchWriterSize)
-	if err := WriteKey(writer, key); err != nil {
+	if err := writeKey(writer, key); err != nil {
 		panic(err)
 	}
 	if err := writer.Flush(); err != nil {
@@ -232,7 +232,7 @@ func BenchmarkWriteKey(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := WriteKey(writer, tc.key); err != nil {
+				if err := writeKey(writer, tc.key); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -522,7 +522,7 @@ func BenchmarkReadKey(b *testing.B) {
 			var total int
 			for i := 0; i < b.N; i++ {
 				benchmarkResetReader(&src, reader, payload)
-				key, err := ReadKey(reader)
+				key, err := readKey(reader)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -551,7 +551,7 @@ func BenchmarkSkipKey(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				benchmarkResetReader(&src, reader, payload)
-				if err := SkipKey(reader); err != nil {
+				if err := skipKey(reader); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -600,7 +600,7 @@ func BenchmarkReadEntry(b *testing.B) {
 			var total uint64
 			for i := 0; i < b.N; i++ {
 				benchmarkResetReader(&src, reader, payload)
-				entry, err := ReadEntry(reader)
+				entry, err := readEntry(reader)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -652,7 +652,7 @@ func BenchmarkSkipEntry(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				benchmarkResetReader(&src, reader, payload)
-				if err := SkipEntry(reader); err != nil {
+				if err := skipEntry(reader); err != nil {
 					b.Fatal(err)
 				}
 			}

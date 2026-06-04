@@ -46,6 +46,23 @@ func runPredicatePostingFilter(t *testing.T, pred predicate, universe posting.Li
 	return posting.List{}
 }
 
+func testFieldIndexViewFromEntries(entries []indexdata.Entry) (indexdata.FieldIndexView, indexdata.FieldStorage) {
+	m := indexdata.GetPostingMap()
+	for i := range entries {
+		key := entries[i].Key
+		if key.ByteLen() == 0 {
+			key = keycodec.FromString(fmt.Sprintf("k/%08d", i))
+		}
+		ids := entries[i].IDs
+		if ids.IsEmpty() {
+			ids = (posting.List{}).BuildAdded(uint64(i + 1))
+		}
+		m[key.UnsafeString()] = ids
+	}
+	storage := indexdata.NewFlatFieldStorageFromPostingMapOwned(m, false)
+	return indexdata.NewFieldIndexViewFromStorage(storage), storage
+}
+
 func TestExecPlanLeadScanNoOrderUsesSelectedLead(t *testing.T) {
 	narrow := posting.BuildFromSorted([]uint64{3})
 	wide := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
@@ -323,8 +340,10 @@ func TestIndexViewRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
 	defer bucket.Release()
 
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{{IDs: probeIDs.Borrow()}})
+	defer storage.Release()
 	probe := fieldIndexRangeProbe{
-		ov:            indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: probeIDs.Borrow()}}),
+		ov:            ov,
 		spanCnt:       1,
 		useComplement: true,
 		probeLen:      1,
@@ -347,9 +366,11 @@ func TestIndexViewRangePredicateState_CountBucket_ComplementProbe(t *testing.T) 
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
 	defer bucket.Release()
 
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{{IDs: probeIDs.Borrow()}})
+	defer storage.Release()
 	state := &fieldIndexRangePredicateState{
 		probe: fieldIndexRangeProbe{
-			ov:            indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: probeIDs.Borrow()}}),
+			ov:            ov,
 			spanCnt:       1,
 			useComplement: true,
 			probeLen:      1,
@@ -397,10 +418,12 @@ func TestIndexViewRangePredicateState_Matches_MaterializedComplementProbe(t *tes
 
 func TestPredicateSetExpectedContainsCalls_UpdatesFieldIndexRangeState(t *testing.T) {
 	state := fieldIndexRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}})
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}})
+	defer storage.Release()
+	state.ov = ov
 	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 3}
 	state.probe = fieldIndexRangeProbe{
-		ov:       indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}}),
+		ov:       ov,
 		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 3}},
 		spanCnt:  1,
 		probeLen: 32,
@@ -430,9 +453,11 @@ func TestIndexViewRangePredicateState_LinearContains_NonLinearModeSkipsLinearPos
 		{Key: keycodec.FromString("b"), IDs: posting.BuildFromSorted([]uint64{3, 4})},
 	}
 	state := fieldIndexRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldIndexView(&base)
+	ov, storage := testFieldIndexViewFromEntries(base)
+	defer storage.Release()
+	state.ov = ov
 	state.probe = fieldIndexRangeProbe{
-		ov:       indexdata.NewFieldIndexView(&base),
+		ov:       ov,
 		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 2}},
 		spanCnt:  1,
 		probeLen: 2,
@@ -453,10 +478,12 @@ func TestIndexViewRangePredicateState_LinearContains_NonLinearModeSkipsLinearPos
 
 func TestAcquireFieldIndexRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
 	state := fieldIndexRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}})
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}})
+	defer storage.Release()
+	state.ov = ov
 	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 1}
 	state.probe = fieldIndexRangeProbe{
-		ov:       indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}}),
+		ov:       ov,
 		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 1}},
 		spanCnt:  1,
 		probeLen: 1,
@@ -913,7 +940,12 @@ func TestIndexViewRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 			buckets[i].IDs.Release()
 		}
 	}()
-	ov := indexdata.NewFieldIndexView(&buckets)
+	ov, storage := testFieldIndexViewFromEntries([]indexdata.Entry{
+		{IDs: buckets[0].IDs.Borrow()},
+		{IDs: buckets[1].IDs.Borrow()},
+		{IDs: buckets[2].IDs.Borrow()},
+	})
+	defer storage.Release()
 	br := ov.RangeByRanks(0, ov.KeyCount())
 
 	run := func() {
