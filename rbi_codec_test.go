@@ -237,7 +237,8 @@ func TestCodec_SetBeforeStoreSnapshotUsesCodecMethods(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket missing")
 		}
-		payload := b.Get(keycodec.U64Bytes(1))
+		var key [8]byte
+		payload := b.Get(keycodec.U64BytesWithBuf(1, &key))
 		if len(payload) == 0 {
 			return fmt.Errorf("stored payload missing")
 		}
@@ -278,7 +279,8 @@ func TestCodec_NewBuildIndexUsesCodecDecode(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return b.Put(keycodec.U64Bytes(1), payload.Bytes())
+		var key [8]byte
+		return b.Put(keycodec.U64BytesWithBuf(1, &key), payload.Bytes())
 	}); err != nil {
 		t.Fatalf("seed custom payload: %v", err)
 	}

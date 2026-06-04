@@ -34,7 +34,7 @@ func TestIndexKeyNumericAndRaw8(t *testing.T) {
 		t.Fatalf("Fixed8StringToU64: got=%x want=%x", got, want)
 	}
 
-	key := FromFixed8String(raw)
+	key := FromStoredString(raw, true)
 	if !key.IsNumeric() {
 		t.Fatalf("raw-8 key must be numeric")
 	}
@@ -47,10 +47,8 @@ func TestIndexKeyNumericAndRaw8(t *testing.T) {
 	if key.UnsafeString() != raw {
 		t.Fatalf("numeric unsafe string mismatch")
 	}
-	for i := 0; i < 8; i++ {
-		if key.ByteAt(i) != raw[i] {
-			t.Fatalf("ByteAt(%d): got=%x want=%x", i, key.ByteAt(i), raw[i])
-		}
+	if got := string(key.AppendBytes(nil)); got != raw {
+		t.Fatalf("numeric AppendBytes: got=%x want=%x", []byte(got), []byte(raw))
 	}
 }
 
@@ -358,8 +356,9 @@ func TestIndexLookupKey(t *testing.T) {
 }
 
 func TestNumericKeyFormattingAndOrdering(t *testing.T) {
-	if got := U64Bytes(0x0102030405060708); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
-		t.Fatalf("U64Bytes mismatch: %x", got)
+	var buf [8]byte
+	if got := U64BytesWithBuf(0x0102030405060708, &buf); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
+		t.Fatalf("U64BytesWithBuf mismatch: %x", got)
 	}
 	if got := U64ByteString(0x0102030405060708); got != "\x01\x02\x03\x04\x05\x06\x07\x08" {
 		t.Fatalf("U64ByteString mismatch: %x", []byte(got))

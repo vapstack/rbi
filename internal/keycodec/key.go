@@ -45,7 +45,7 @@ func FromU64(v uint64) IndexKey {
 	}
 }
 
-func FromFixed8String(s string) IndexKey {
+func fromFixed8String(s string) IndexKey {
 	if len(s) != 8 {
 		return FromString(s)
 	}
@@ -54,7 +54,7 @@ func FromFixed8String(s string) IndexKey {
 
 func FromStoredString(s string, fixed8 bool) IndexKey {
 	if fixed8 && len(s) == 8 {
-		return FromFixed8String(s)
+		return fromFixed8String(s)
 	}
 	return FromString(s)
 }
@@ -86,14 +86,6 @@ func (k IndexKey) AppendBytes(dst []byte) []byte {
 		return AppendU64Bytes(dst, k.meta)
 	}
 	return append(dst, unsafe.Slice(k.ptr, int(k.meta))...)
-}
-
-func (k IndexKey) ByteAt(i int) byte {
-	if k.IsNumeric() {
-		shift := uint(56 - i*8)
-		return byte(k.meta >> shift)
-	}
-	return *(*byte)(unsafe.Add(unsafe.Pointer(k.ptr), i))
 }
 
 func Fixed8StringToU64(s string) uint64 {
@@ -340,12 +332,6 @@ func containsU64String(v uint64, needle string) bool {
 	return false
 }
 
-func U64Bytes(v uint64) []byte {
-	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], v)
-	return key[:]
-}
-
 func AppendU64Bytes(dst []byte, v uint64) []byte {
 	return append(dst,
 		byte(v>>56),
@@ -367,7 +353,8 @@ func U64BytesWithBuf(v uint64, buf *[8]byte) []byte {
 // U64ByteString is an allocationful compatibility helper. Hot paths should
 // pass numeric keys as IndexKey/uint64 or write bytes into caller-owned storage.
 func U64ByteString(v uint64) string {
-	b := U64Bytes(v)
+	var key [8]byte
+	b := U64BytesWithBuf(v, &key)
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 

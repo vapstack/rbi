@@ -106,7 +106,8 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 			return err
 		}
 		// Invalid msgpack payload to force buildIndex decode error in Wrap.
-		return b.Put(keycodec.U64Bytes(1), []byte{0xc1})
+		var key [8]byte
+		return b.Put(keycodec.U64BytesWithBuf(1, &key), []byte{0xc1})
 	}); err != nil {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
