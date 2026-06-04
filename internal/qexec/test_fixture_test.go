@@ -708,27 +708,6 @@ func (db *testDB) beginTrace(q qir.Shape) *Trace {
 	return db.exec.BeginTrace(q, orderField)
 }
 
-func (db *testDB) prepareExprs(exprs []qx.Expr) ([]*qir.Query, []qir.Expr, error) {
-	prepared := make([]*qir.Query, 0, len(exprs))
-	out := make([]qir.Expr, 0, len(exprs))
-	for i := range exprs {
-		p, err := qir.PrepareCountExprsResolved(db.rt.IndexedByName, exprs[i])
-		if err != nil {
-			releaseTestPrepared(prepared)
-			return nil, nil, err
-		}
-		prepared = append(prepared, p)
-		out = append(out, p.Expr)
-	}
-	return prepared, out, nil
-}
-
-func releaseTestPrepared(prepared []*qir.Query) {
-	for i := range prepared {
-		prepared[i].Release()
-	}
-}
-
 func (qe *queryEngine) currentQueryViewForTests() *View {
 	if qe == nil || qe.snapshot == nil {
 		return &View{snap: &snapshot.View{}}
@@ -1290,34 +1269,6 @@ func snapshotExtStoreMaterializedPred(s *snapshot.View, key qcache.MaterializedP
 	s.StoreMaterializedPredKey(key, ids)
 }
 
-func (db *testDB) buildORBranchesOrdered(ops []qx.Expr, orderField string, orderedWindow int) (plannerORBranches, bool, bool) {
-	prepared, compiledOps, err := db.prepareExprs(ops)
-	if err != nil {
-		return plannerORBranches{}, false, false
-	}
-	defer releaseTestPrepared(prepared)
-	return db.view().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, 0)
-}
-
-func (db *testDB) selectPlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
-	prepared, viewQ, err := db.prepareQuery(q)
-	if err != nil {
-		return plannerORNoOrderDecision{}
-	}
-	defer prepared.Release()
-	return db.view().selectPlanORNoOrder(&viewQ, branches)
-}
-
-func (db *testDB) setPlannerStatsSnapshot(universe uint64, scoreStats PlannerFieldStats) {
-	db.exec.Stats.Store(&PlannerStatsSnapshot{
-		Version:             1,
-		UniverseCardinality: universe,
-		Fields: map[string]PlannerFieldStats{
-			"score": scoreStats,
-		},
-	})
-}
-
 func (db *testDB) assertKeysMatchReference(t testing.TB, label string, q *qx.QX, got []uint64) {
 	t.Helper()
 	if err := testValidateNoDuplicateKeys(label, got); err != nil {
@@ -1453,28 +1404,4 @@ func testOrderWindow(q *qx.QX) (int, bool) {
 
 func cloneQuery(q *qx.QX) *qx.QX {
 	return qx.Clone(q)
-}
-
-func makeORBranchForPlannerDecisionTest(estCard uint64, extraChecks int) plannerORBranch {
-	if extraChecks < 0 {
-		extraChecks = 0
-	}
-	preds := make([]predicate, 0, 1+extraChecks)
-	preds = append(preds, predicate{
-		estCard:  estCard,
-		iter:     func() posting.Iterator { return (posting.List{}).Iter() },
-		contains: func(uint64) bool { return true },
-	})
-	for i := 0; i < extraChecks; i++ {
-		preds = append(preds, predicate{
-			contains: func(uint64) bool { return true },
-		})
-	}
-	predSet := newPredicateSet(len(preds))
-	for i := range preds {
-		predSet.Append(preds[i])
-	}
-	b := newPlannerORBranch(qir.Expr{}, predSet)
-	b.leadIdx = 0
-	return b
 }

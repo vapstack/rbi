@@ -2523,10 +2523,6 @@ func (qv *View) materializeCustomPredicateForCardinality(p *predicate) error {
 	return nil
 }
 
-func (qv *View) prepareCardinalityPredicate(p *predicate, probeEst uint64, universe uint64) error {
-	return qv.prepareCardinalityPredicateWithTrace(p, probeEst, universe, nil)
-}
-
 func (qv *View) prepareCardinalityPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *Trace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil

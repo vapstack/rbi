@@ -559,50 +559,6 @@ func leafPredsEmitPosting(
 	return false, false, exactWork, applyWork
 }
 
-func (qv *View) extractNoOrderBounds(leaves []qir.Expr) (string, indexdata.Bounds, bool, error) {
-	var (
-		f      string
-		bounds indexdata.Bounds
-		found  bool
-	)
-
-	for _, e := range leaves {
-		if !isBoundOp(e.Op) {
-			continue
-		}
-		if e.Not || e.FieldOrdinal < 0 {
-			return "", indexdata.Bounds{}, false, nil
-		}
-		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-		if !found {
-			found = true
-			f = fieldName
-		} else if fieldName != f {
-			return "", indexdata.Bounds{}, false, nil
-		}
-	}
-	if !found {
-		return "", indexdata.Bounds{}, false, nil
-	}
-
-	bounds.Has = true
-	for _, e := range leaves {
-		if !isBoundOp(e.Op) {
-			continue
-		}
-		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
-		if err != nil {
-			return "", indexdata.Bounds{}, true, err
-		}
-		if isSlice {
-			return "", indexdata.Bounds{}, false, nil
-		}
-		applyNormalizedScalarBound(&bounds, bound)
-	}
-
-	return f, bounds, true, nil
-}
-
 // execSelectedNoOrderUniqueEq executes a direct no-order path for conjunctions that
 // contain at least one positive EQ predicate on a unique scalar field.
 //
@@ -805,11 +761,6 @@ func hasPrefixBoundForFieldOrdinal(leaves []qir.Expr, fieldOrdinal int) bool {
 		}
 	}
 	return false
-}
-
-func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, trace *Trace) ([]uint64, bool, error) {
-	out, used, _, err := qv.execNoOrderBounds(q, field, qv.fieldOrdinalByName(field), bounds, leaves, plannerNoOrderLimitRuntimeGuard{}, trace)
-	return out, used, err
 }
 
 func (qv *View) execNoOrderBounds(q *qir.Shape, field string, fieldOrdinal int, bounds indexdata.Bounds, leaves []qir.Expr, guard plannerNoOrderLimitRuntimeGuard, trace *Trace) ([]uint64, bool, bool, error) {

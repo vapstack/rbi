@@ -2491,26 +2491,25 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 		),
 	).Sort("age", qx.ASC).Limit(120)
 
-	view := db.engine.currentQueryViewForTests()
-	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
-	if !ok {
-		t.Fatalf("buildORBranchesOrdered: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
-	}
-	defer branches.Release()
-
 	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
-	decision := view.selectPlanOROrder(&viewQ, branches)
-	if decision.plan != plannerOROrderStream && decision.plan != plannerOROrderMerge {
-		t.Fatalf("expected ordered OR stream/merge plan for fully order-bounded branches, got=%v", decision.plan)
+	view := db.engine.currentQueryViewForTests()
+	var facts plannerORFacts
+	if !view.collectORFacts(&viewQ, &facts) {
+		t.Fatalf("collectORFacts: ok=false")
+	}
+	defer facts.Release()
+
+	decision := view.selectOR(&viewQ, &facts)
+	if decision.kind != plannerORDecisionOrder {
+		t.Fatalf("expected ordered OR decision, got=%v", decision.kind)
+	}
+	if decision.order.plan != plannerOROrderStream && decision.order.plan != plannerOROrderMerge {
+		t.Fatalf("expected ordered OR stream/merge plan for fully order-bounded branches, got=%v", decision.order.plan)
 	}
 }
 
@@ -2704,10 +2703,19 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 		t.Fatalf("expected merge route estimate to beat stream: kway=%v stream=%v", routeCost.kWay, streamCost)
 	}
 
-	decision := view.selectPlanOROrder(&viewQ, branches)
-	if decision.plan != plannerOROrderMerge {
-		if decision.plan != plannerOROrderStream || !branches.hasKWayExactBucketApplyWork(mergeStats) {
-			t.Fatalf("expected ordered OR merge or stream vetoed by exact bucket work, got=%v", decision.plan)
+	var facts plannerORFacts
+	if !view.collectORFacts(&viewQ, &facts) {
+		t.Fatalf("collectORFacts: ok=false")
+	}
+	defer facts.Release()
+
+	decision := view.selectOR(&viewQ, &facts)
+	if decision.kind != plannerORDecisionOrder {
+		t.Fatalf("expected ordered OR decision, got=%v", decision.kind)
+	}
+	if decision.order.plan != plannerOROrderMerge {
+		if decision.order.plan != plannerOROrderStream || !branches.hasKWayExactBucketApplyWork(mergeStats) {
+			t.Fatalf("expected ordered OR merge or stream vetoed by exact bucket work, got=%v", decision.order.plan)
 		}
 	}
 }
@@ -3714,10 +3722,19 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		t.Fatalf("prepareTestQuery complex: %v", err)
 	}
 	defer preparedComplex.Release()
-	decisionComplex := db.engine.currentQueryViewForTests().selectPlanOROrder(&viewComplex, branchesComplex)
-	if decisionComplex.selected.kind != plannerOROrderCandidateBranchCollect {
+	view := db.engine.currentQueryViewForTests()
+	var factsComplex plannerORFacts
+	if !view.collectORFacts(&viewComplex, &factsComplex) {
+		t.Fatalf("collectORFacts complex: ok=false")
+	}
+	defer factsComplex.Release()
+	decisionComplex := view.selectOR(&viewComplex, &factsComplex)
+	if decisionComplex.kind != plannerORDecisionOrder {
+		t.Fatalf("expected ordered OR decision for complex query, got=%v", decisionComplex.kind)
+	}
+	if decisionComplex.order.selected.kind != plannerOROrderCandidateBranchCollect {
 		if !db.engine.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
-			if decisionComplex.plan != plannerOROrderStream {
+			if decisionComplex.order.plan != plannerOROrderStream {
 				t.Fatalf("expected fallback-first, runtime fallback guard, or stream plan for complex offset ordered OR")
 			}
 		}
@@ -3755,8 +3772,16 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		t.Fatalf("prepareTestQuery light: %v", err)
 	}
 	defer preparedLight.Release()
-	decisionLight := db.engine.currentQueryViewForTests().selectPlanOROrder(&viewLight, branchesLight)
-	if decisionLight.selected.kind == plannerOROrderCandidateBranchCollect {
+	var factsLight plannerORFacts
+	if !view.collectORFacts(&viewLight, &factsLight) {
+		t.Fatalf("collectORFacts light: ok=false")
+	}
+	defer factsLight.Release()
+	decisionLight := view.selectOR(&viewLight, &factsLight)
+	if decisionLight.kind != plannerORDecisionOrder {
+		t.Fatalf("expected ordered OR decision for light query, got=%v", decisionLight.kind)
+	}
+	if decisionLight.order.selected.kind == plannerOROrderCandidateBranchCollect {
 		t.Fatalf("unexpected branch-collect preference for light ordered OR")
 	}
 }

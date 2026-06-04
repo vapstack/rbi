@@ -2862,10 +2862,6 @@ func (qv *View) buildPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool
 	return qv.buildPredicatesWithColdMode(leaves, allowMaterialize, allowMaterialize)
 }
 
-func (qv *View) buildPredicates(leaves []qir.Expr) (predicateSet, bool) {
-	return qv.buildPredicatesWithMode(leaves, true)
-}
-
 func (qv *View) isOrderRangeCoveredLeaf(orderField string, e qir.Expr) bool {
 	switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
 	case orderFieldScalarLeafRange, orderFieldScalarLeafPrefix:
@@ -2873,10 +2869,6 @@ func (qv *View) isOrderRangeCoveredLeaf(orderField string, e qir.Expr) bool {
 	default:
 		return false
 	}
-}
-
-func (qv *View) buildPredicatesOrdered(leaves []qir.Expr, orderField string) (predicateSet, bool) {
-	return qv.buildPredicatesOrderedWithMode(leaves, orderField, true, 0, 0, true, true)
 }
 
 type orderedScalarRangeRouting struct {
@@ -4410,10 +4402,6 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 	return cursor.out, true
 }
 
-func (qv *View) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, trace *Trace) ([]uint64, bool) {
-	return qv.execPlanOrderedBasicReaderGuarded(q, preds, plannerOrderedLimitRuntimeGuard{}, trace)
-}
-
 func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateReader, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
 	o := q.Order
 
@@ -4711,32 +4699,6 @@ func (qv *View) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, pred
 	exactWork.Release()
 
 	return cursor.out
-}
-
-func (qv *View) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (indexdata.Bounds, []bool, bool, bool) {
-	var rb indexdata.Bounds
-	covered := pooled.GetBoolSlice(n)[:n]
-	clear(covered)
-	has := false
-
-	for i := 0; i < n; i++ {
-		e := exprAt(i)
-		if e.Not || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != field {
-			continue
-		}
-		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			pooled.ReleaseBoolSlice(covered)
-			return indexdata.Bounds{}, nil, false, false
-		} else if applied {
-			covered[i] = true
-			has = true
-		}
-	}
-	if !has {
-		covered = covered[:0]
-	}
-
-	return rb, covered, has, true
 }
 
 func (qv *View) collectPredicateRangeBoundsReader(field string, preds predicateReader) (indexdata.Bounds, []bool, bool, bool) {

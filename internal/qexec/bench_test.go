@@ -1877,38 +1877,28 @@ func benchmarkORPlannerDecision(b *testing.B, db *testDB, q *qx.QX, ordered bool
 	}
 
 	view := db.view()
-	window, _ := orderWindow(&shape)
-	orderField := ""
-	if shape.HasOrder {
-		orderField = db.exec.FieldNameByOrdinal(shape.Order.FieldOrdinal)
+	var facts plannerORFacts
+	if !view.collectORFacts(&shape, &facts) {
+		b.Fatalf("collectORFacts failed")
 	}
-
-	var branches plannerORBranches
-	var alwaysFalse bool
-	var ok bool
-	if ordered {
-		branches, alwaysFalse, ok = view.buildORBranchesOrdered(shape.Expr.Operands, orderField, window, shape.Offset)
-	} else {
-		branches, alwaysFalse, ok = view.buildORBranches(shape.Expr.Operands)
-	}
-	if !ok {
-		b.Fatalf("buildORBranches failed")
-	}
-	if alwaysFalse {
+	if facts.allFalse {
 		b.Fatalf("unexpected always-false OR")
 	}
-	defer branches.Release()
+	if facts.ordered != ordered {
+		b.Fatalf("ordered=%v want %v", facts.ordered, ordered)
+	}
+	defer facts.Release()
 
 	var decisionRows uint64
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if ordered {
-			d := view.selectPlanOROrder(&shape, branches)
-			decisionRows = d.expectedRows
-		} else {
-			d := view.selectPlanORNoOrder(&shape, branches)
-			decisionRows = d.expectedRows
+		d := view.selectOR(&shape, &facts)
+		switch d.kind {
+		case plannerORDecisionOrder:
+			decisionRows = d.order.expectedRows
+		case plannerORDecisionNoOrder:
+			decisionRows = d.noOrder.expectedRows
 		}
 	}
 	qexecBenchCount = decisionRows

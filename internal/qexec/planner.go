@@ -934,22 +934,6 @@ func (qv *View) orderMergeBranchStats(orderField string, branches plannerORBranc
 	return stats
 }
 
-func (branches plannerORBranches) hasFullSpanOrderBranch(stats [plannerORBranchLimit]plannerOROrderMergeBranchStats) bool {
-	n := branches.Len()
-	if n > plannerORBranchLimit {
-		n = plannerORBranchLimit
-	}
-	for i := 0; i < n; i++ {
-		if branches.owner[i].alwaysTrue {
-			continue
-		}
-		if !stats[i].rangeBounded {
-			return true
-		}
-	}
-	return false
-}
-
 func (branches plannerORBranches) hasKWayExactBucketApplyWork(stats [plannerORBranchLimit]plannerOROrderMergeBranchStats) bool {
 	n := branches.Len()
 	if n > plannerORBranchLimit {
@@ -5123,11 +5107,6 @@ func orderWindow(q *qir.Shape) (int, bool) {
 	return int(need), true
 }
 
-func (qv *View) shouldUseOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) bool {
-	d, ok := qv.decideOROrderKWayRuntimeFallback(q, branches, needWindow)
-	return ok && d.enable
-}
-
 func (qv *View) decideOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) (plannerOROrderRuntimeGuardDecision, bool) {
 	return qv.decideOROrderKWayRuntimeFallbackWithAnalysis(q, branches, needWindow, nil)
 }
@@ -5937,15 +5916,6 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 		it.curResidual = len(it.checks) > 0
 		it.curSplitExact = len(it.exactChecks) > 0 && len(it.residualChecks) > 0
 	}
-}
-
-func (qv *View) execPlanOROrderKWay(
-	q *qir.Shape,
-	branches plannerORBranches,
-	analysis *plannerOROrderAnalysis,
-	trace *Trace,
-) ([]uint64, bool, error) {
-	return qv.execPlanOROrderKWayWithFallback(q, branches, analysis, plannerOROrderCandidate{}, trace)
 }
 
 func (qv *View) execPlanOROrderKWayWithFallback(
