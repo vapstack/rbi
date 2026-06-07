@@ -708,6 +708,106 @@ func (db *testDB) beginTrace(q qir.Shape) *Trace {
 	return db.exec.BeginTrace(q, orderField)
 }
 
+func (qv *View) buildPredicates(leaves []qir.Expr) (predicateSet, bool) {
+	return qv.buildPredicatesWithMode(leaves, true)
+}
+
+func (qv *View) buildPredicatesOrdered(leaves []qir.Expr, orderField string) (predicateSet, bool) {
+	return qv.buildPredicatesOrderedWithMode(leaves, orderField, true, 0, 0, true, true)
+}
+
+func (qv *View) prepareCardinalityPredicate(p *predicate, probeEst uint64, universe uint64) error {
+	return qv.prepareCardinalityPredicateWithTrace(p, probeEst, universe, nil)
+}
+
+func (qv *View) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, trace *Trace) ([]uint64, bool) {
+	return qv.execPlanOrderedBasicReaderGuarded(q, preds, plannerOrderedLimitRuntimeGuard{}, trace)
+}
+
+func (qv *View) execPlanOROrderKWay(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *Trace) ([]uint64, bool, error) {
+	return qv.execPlanOROrderKWayWithFallback(q, branches, analysis, plannerOROrderCandidate{}, trace)
+}
+
+func (qv *View) shouldUseOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) bool {
+	d, ok := qv.decideOROrderKWayRuntimeFallback(q, branches, needWindow)
+	return ok && d.enable
+}
+
+func (qv *View) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (indexdata.Bounds, []bool, bool, bool) {
+	var rb indexdata.Bounds
+	covered := pooled.GetBoolSlice(n)[:n]
+	clear(covered)
+	has := false
+
+	for i := 0; i < n; i++ {
+		e := exprAt(i)
+		if e.Not || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != field {
+			continue
+		}
+		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
+			pooled.ReleaseBoolSlice(covered)
+			return indexdata.Bounds{}, nil, false, false
+		} else if applied {
+			covered[i] = true
+			has = true
+		}
+	}
+	if !has {
+		covered = covered[:0]
+	}
+
+	return rb, covered, has, true
+}
+
+func (qv *View) extractNoOrderBounds(leaves []qir.Expr) (string, indexdata.Bounds, bool, error) {
+	var (
+		f      string
+		bounds indexdata.Bounds
+		found  bool
+	)
+
+	for _, e := range leaves {
+		if !isBoundOp(e.Op) {
+			continue
+		}
+		if e.Not || e.FieldOrdinal < 0 {
+			return "", indexdata.Bounds{}, false, nil
+		}
+		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+		if !found {
+			found = true
+			f = fieldName
+		} else if fieldName != f {
+			return "", indexdata.Bounds{}, false, nil
+		}
+	}
+	if !found {
+		return "", indexdata.Bounds{}, false, nil
+	}
+
+	bounds.Has = true
+	for _, e := range leaves {
+		if !isBoundOp(e.Op) {
+			continue
+		}
+		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
+		if err != nil {
+			return "", indexdata.Bounds{}, true, err
+		}
+		if isSlice {
+			return "", indexdata.Bounds{}, false, nil
+		}
+		applyNormalizedScalarBound(&bounds, bound)
+	}
+
+	return f, bounds, true, nil
+}
+
+func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, trace *Trace) ([]uint64, bool, error) {
+	out, used, _, err := qv.execNoOrderBounds(q, field, qv.fieldOrdinalByName(field), bounds, leaves, plannerNoOrderLimitRuntimeGuard{}, trace)
+	return out, used, err
+}
+
 func (qe *queryEngine) currentQueryViewForTests() *View {
 	if qe == nil || qe.snapshot == nil {
 		return &View{snap: &snapshot.View{}}
