@@ -13,20 +13,20 @@ If the target DB is empty, the runner seeds it with the standard benchmark datas
 Interactive mode:
 
 ```bash
-go run ./stress -db stress.db
+go run ./cmd/stress -db stress.db
 ```
 
 Headless timed mode:
 
 ```bash
-go run ./stress -db sress.db -out stress_report.json -duration 30s -r_smp 8 -w_med 4
+go run ./cmd/stress -db stress.db -out stress_report.json -duration 30s -r_smp 8 -w_med 4
 ```
 
 Focused profiling run for one problematic query:
 
 ```bash
-go run ./stress \
-  -db stress/stress.db \
+go run ./cmd/stress \
+  -db cmd/stress/stress.db \
   -headless \
   -duration 20s \
   -class r_med \
@@ -39,8 +39,8 @@ go run ./stress \
 Focused alloc-profile run for one exact query class:
 
 ```bash
-go run ./stress \
-  -db stress/stress.db \
+go run ./cmd/stress \
+  -db cmd/stress/stress.db \
   -alloc-profile /tmp/discovery.allocs.pprof \
   -alloc-ops 64 \
   -alloc-source prepared \
@@ -54,8 +54,8 @@ go run ./stress \
 Focused alloc-profile on the original stochastic stress workload path:
 
 ```bash
-go run ./stress \
-  -db stress/stress.db \
+go run ./cmd/stress \
+  -db cmd/stress/stress.db \
   -alloc-profile /tmp/discovery-workload.allocs.pprof \
   -duration 15s \
   -alloc-source workload \
@@ -66,7 +66,7 @@ go run ./stress \
 Headless until `Ctrl+C`:
 
 ```bash
-go run ./stress -db stress.db -headless -out stress_report.json -r_idx 128 -w_fst 16
+go run ./cmd/stress -db stress.db -headless -out stress_report.json -r_idx 128 -w_fst 16
 ```
 
 ## Main Flags
@@ -123,10 +123,10 @@ Aliases:
 Examples:
 
 ```bash
-go run ./stress -db stress.db -r 4 -w 2
-go run ./stress -db stress.db -a 2 -r 24 -w_hvy 1
-go run ./stress -db stress.db -r_idx 8 -w_fst 4
-go run ./stress -db stress.db -read_simple 8 -write_medium 4
+go run ./cmd/stress -db stress.db -r 4 -w 2
+go run ./cmd/stress -db stress.db -a 2 -r 24 -w_hvy 1
+go run ./cmd/stress -db stress.db -r_idx 8 -w_fst 4
+go run ./cmd/stress -db stress.db -read_simple 8 -write_medium 4
 ```
 
 ## Interactive Commands

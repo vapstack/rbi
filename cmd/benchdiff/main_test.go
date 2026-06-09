@@ -929,7 +929,7 @@ func TestRunFollowCLIHandlesCompletedGoTestOutput(t *testing.T) {
 	currentText := strings.Join([]string{
 		"goos: linux",
 		"goarch: amd64",
-		"pkg: github.com/vapstack/rbi/benchdiff",
+		"pkg: github.com/vapstack/rbi/cmd/benchdiff",
 		"Benchmark__Foo-16 100 800 ns/op 100 B/op 1 allocs/op",
 		"Benchmark__Bar-16 100 2400 ns/op 200 B/op 2 allocs/op",
 		"PASS",

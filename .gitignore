@@ -2,9 +2,9 @@ old.txt
 new.txt
 *.test
 *.out
-benchdiff
+/cmd/benchdiff/benchdiff
 bench/bench
-stress/stress
+/cmd/stress/stress
 bench.db
 bench.db.UserBench.rbi
 stress.db
