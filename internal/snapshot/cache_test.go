@@ -627,7 +627,7 @@ func buildCacheRuntime(t testing.TB) *schema.Schema {
 
 func buildCacheSeedView(t testing.TB, s *schema.Schema, rec *buildCacheRec) *View {
 	t.Helper()
-	snap := Build(1, nil, s, CacheConfig{MatPredMaxEntries: 64}, nil, s.Patch.Fields, []BatchEntry{
+	snap := Build(1, nil, s, CacheConfig{MatPredMaxEntries: 64}, s.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(rec)},
 	})
 	if snap == nil {
@@ -638,7 +638,7 @@ func buildCacheSeedView(t testing.TB, s *schema.Schema, rec *buildCacheRec) *Vie
 
 func buildCachePatchView(t testing.TB, s *schema.Schema, prev *View, oldRec, newRec *buildCacheRec, patch []schema.PatchItem) *View {
 	t.Helper()
-	snap := Build(2, prev, s, CacheConfig{MatPredMaxEntries: 64}, nil, s.Patch.Fields, []BatchEntry{{
+	snap := Build(2, prev, s, CacheConfig{MatPredMaxEntries: 64}, s.Patch.Fields, []BatchEntry{{
 		ID:        1,
 		Old:       unsafe.Pointer(oldRec),
 		New:       unsafe.Pointer(newRec),
@@ -664,7 +664,7 @@ func TestBuildPreparedEmptyBaseDropsTouchedMaterializedPredCache(t *testing.T) {
 	}
 
 	rec := buildCacheRec{Name: "alice", Email: "user1@example.com"}
-	next := Build(1, prev, rt, CacheConfig{MatPredMaxEntries: 64}, nil, rt.Patch.Fields, []BatchEntry{
+	next := Build(1, prev, rt, CacheConfig{MatPredMaxEntries: 64}, rt.Patch.Fields, []BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&rec)},
 	})
 	defer next.releaseRuntimeCaches()

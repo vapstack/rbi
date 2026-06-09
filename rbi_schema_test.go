@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
@@ -30,17 +32,17 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 		}
 	}
 
-	if _, err := db.Query(qx.Query()); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("Query(all) err=%v want %v", err, ErrNoIndex)
+	if _, err := db.Query(qx.Query()); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("Query(all) err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
-	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("QueryKeys(all) err=%v want %v", err, ErrNoIndex)
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("QueryKeys(all) err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
-	if _, err := db.Count(); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("Count() err=%v want %v", err, ErrNoIndex)
+	if _, err := db.Count(); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("Count() err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
-	if err := db.RefreshPlannerStats(); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("RefreshPlannerStats err=%v want %v", err, ErrNoIndex)
+	if err := db.RefreshPlannerStats(); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("RefreshPlannerStats err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
 	if got := db.PlannerStats(); got.Version != 0 || got.FieldCount != 0 || got.AnalyzeInterval != 0 || got.TraceSampleEvery != 0 || len(got.Fields) != 0 {
 		t.Fatalf("PlannerStats in transparent mode=%+v want zero planner payload", got)
@@ -58,32 +60,47 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	}
 
 	var rawSeq []string
-	if err := db.SeqScanRaw("k-02", func(id string, raw []byte) (bool, error) {
+	if err := scanRawBolt(t, db, "k-02", func(id string, raw []byte) (bool, error) {
 		rawSeq = append(rawSeq, id)
 		if len(raw) == 0 {
-			t.Fatal("SeqScanRaw returned empty payload")
+			t.Fatal("raw bbolt scan returned empty payload")
 		}
 		return true, nil
 	}); err != nil {
-		t.Fatalf("SeqScanRaw: %v", err)
+		t.Fatalf("raw bbolt scan: %v", err)
 	}
 	if !slices.Equal(rawSeq, []string{"k-02", "k-10"}) {
-		t.Fatalf("SeqScanRaw=%v", rawSeq)
+		t.Fatalf("raw bbolt scan=%v", rawSeq)
 	}
 
 	if err := raw.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
+		bucket := tx.Bucket(db.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
+		old := bucket.Get([]byte("k-02"))
+		oldIdx := keycodec.U64FromBytes(old[:8])
 		if err := bucket.Delete([]byte("k-02")); err != nil {
+			return err
+		}
+		m := tx.Bucket(db.strmapBucket)
+		var mapKey [8]byte
+		if err := m.Delete(keycodec.U64BytesWithBuf(oldIdx, &mapKey)); err != nil {
 			return err
 		}
 		buf := new(bytes.Buffer)
 		if err := db.encode(&noIndexRec{Name: "k-03", Age: 4}, buf); err != nil {
 			return err
 		}
-		payload := append([]byte(nil), buf.Bytes()...)
+		idx, err := m.NextSequence()
+		if err != nil {
+			return err
+		}
+		if err = m.Put(keycodec.U64BytesWithBuf(idx, &mapKey), []byte("k-03")); err != nil {
+			return err
+		}
+		payload := keycodec.AppendU64Bytes(nil, idx)
+		payload = append(payload, buf.Bytes()...)
 		return bucket.Put([]byte("k-03"), payload)
 	}); err != nil {
 		t.Fatalf("out-of-band mutate: %v", err)
@@ -101,23 +118,93 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	}
 
 	rawSeq = rawSeq[:0]
-	if err := db.SeqScanRaw("k-02", func(id string, raw []byte) (bool, error) {
+	if err := scanRawBolt(t, db, "k-02", func(id string, raw []byte) (bool, error) {
 		rawSeq = append(rawSeq, id)
 		if len(raw) == 0 {
-			t.Fatal("SeqScanRaw(after mutate) returned empty payload")
+			t.Fatal("raw bbolt scan after mutate returned empty payload")
 		}
 		return true, nil
 	}); err != nil {
-		t.Fatalf("SeqScanRaw(after mutate): %v", err)
+		t.Fatalf("raw bbolt scan after mutate: %v", err)
 	}
 	if !slices.Equal(rawSeq, []string{"k-03", "k-10"}) {
-		t.Fatalf("SeqScanRaw(after mutate)=%v want [k-03 k-10]", rawSeq)
+		t.Fatalf("raw bbolt scan after mutate=%v want [k-03 k-10]", rawSeq)
 	}
 
+	var scanSeq []string
 	if err := db.ScanKeys("", func(id string) (bool, error) {
+		scanSeq = append(scanSeq, id)
 		return true, nil
-	}); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("ScanKeys err=%v want %v", err, ErrNoIndex)
+	}); err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+	if !slices.Equal(scanSeq, []string{"k-01", "k-03", "k-10"}) {
+		t.Fatalf("ScanKeys=%v want [k-01 k-03 k-10]", scanSeq)
+	}
+}
+
+func TestTransparentMode_StringOverwriteSkipsOldPayloadDecode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_string_overwrite.db")
+
+	db, raw := openBoltAndNew[string, noIndexRec](t, path)
+	defer func() {
+		_ = db.Close()
+		_ = raw.Close()
+	}()
+
+	if err := db.Set("k", &noIndexRec{Name: "old", Age: 1}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+
+	var oldIdx uint64
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		stored := bucket.Get([]byte("k"))
+		oldIdx = keycodec.U64FromBytes(stored[:8])
+		bad := keycodec.AppendU64Bytes(nil, oldIdx)
+		bad = append(bad, 0xc1)
+		return bucket.Put([]byte("k"), bad)
+	}); err != nil {
+		t.Fatalf("corrupt old payload: %v", err)
+	}
+
+	if err := db.Set("k", &noIndexRec{Name: "fresh", Age: 2}); err != nil {
+		t.Fatalf("overwrite corrupt old payload: %v", err)
+	}
+
+	got, err := db.Get("k")
+	if err != nil {
+		t.Fatalf("Get(k): %v", err)
+	}
+	if got == nil || got.Name != "fresh" || got.Age != 2 {
+		t.Fatalf("Get(k)=%#v want fresh", got)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		idx := keycodec.U64FromBytes(bucket.Get([]byte("k"))[:8])
+		if idx != oldIdx {
+			return fmt.Errorf("idx changed: got=%d want=%d", idx, oldIdx)
+		}
+		m := tx.Bucket(db.strmapBucket)
+		if m == nil {
+			return fmt.Errorf("string map bucket does not exist")
+		}
+		var mapKey [8]byte
+		key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
+		if !slices.Equal(key, []byte("k")) {
+			return fmt.Errorf("map[%d]=%q want k", idx, key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify durable id: %v", err)
 	}
 }
 
@@ -170,8 +257,8 @@ func TestIndexTags_OptInSupportRBI(t *testing.T) {
 		}
 	}
 
-	if err := db.Set(3, &optInTaggedRec{Unique: 200}); !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("duplicate unique rbi tag err=%v want %v", err, ErrUniqueViolation)
+	if err := db.Set(3, &optInTaggedRec{Unique: 200}); !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("duplicate unique rbi tag err=%v want %v", err, rbierrors.ErrUniqueViolation)
 	}
 }
 
@@ -184,8 +271,8 @@ func TestIndexTags_OptInLeavesUntaggedStructTransparent(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
 }
 
@@ -231,8 +318,8 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 	}
 	if err := db.Set(2, &embeddedEnabledByParentRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "bob", Email: "alice@example.com"},
-	}); !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("duplicate embedded unique err=%v want %v", err, ErrUniqueViolation)
+	}); !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("duplicate embedded unique err=%v want %v", err, rbierrors.ErrUniqueViolation)
 	}
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice"))); err == nil {
 		t.Fatal("embedded parent index tag must not enable untagged child field")
@@ -258,8 +345,8 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
 }
 
@@ -310,8 +397,8 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 	if err := db.Set(1, &optionsIndexRec{Name: "alice", Email: "ignored", Score: 10, Amount: 100}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &optionsIndexRec{Name: "bob", Email: "ignored", Score: 10, Amount: 200}); !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("duplicate unique from Options.Index err=%v want %v", err, ErrUniqueViolation)
+	if err := db.Set(2, &optionsIndexRec{Name: "bob", Email: "ignored", Score: 10, Amount: 200}); !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("duplicate unique from Options.Index err=%v want %v", err, rbierrors.ErrUniqueViolation)
 	}
 	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
@@ -402,8 +489,8 @@ func TestIndexOptions_EmptyMapDisablesTags(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("QueryKeys err=%v want %v", err, ErrNoIndex)
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, rbierrors.ErrNoIndex) {
+		t.Fatalf("QueryKeys err=%v want %v", err, rbierrors.ErrNoIndex)
 	}
 }
 

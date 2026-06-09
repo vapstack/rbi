@@ -10,6 +10,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbierrors"
 )
 
 const (
@@ -25,9 +26,8 @@ var uniqueUint64IntMapPool = pooled.Maps[uint64, int]{
 }
 
 type UniqueContext struct {
-	Schema          *schema.Schema
-	Current         func() *snapshot.View
-	UniqueViolation error
+	Schema  *schema.Schema
+	Current func() *snapshot.View
 }
 
 type uniqueBatchCheckState struct {
@@ -177,7 +177,7 @@ func (ctx UniqueContext) checkBatchCandidateAndCollectSeen(
 
 	if sm := state.seen[pos]; sm != nil {
 		if prev, ok := sm[single]; ok && prev != idx {
-			return seenWrites, fmt.Errorf("%w: duplicate value for field %v within batch", ctx.UniqueViolation, acc.Name)
+			return seenWrites, fmt.Errorf("%w: duplicate value for field %v within batch", rbierrors.ErrUniqueViolation, acc.Name)
 		}
 	}
 
@@ -195,7 +195,7 @@ func (ctx UniqueContext) checkBatchCandidateAndCollectSeen(
 		if ids.Cardinality() == 1 && ids.Contains(idx) {
 			return append(seenWrites, uniqueSeenWrite{pos: pos, key: single}), nil
 		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+		return seenWrites, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 
 	iter := ids.Iter()
@@ -209,7 +209,7 @@ func (ctx UniqueContext) checkBatchCandidateAndCollectSeen(
 		if lv.Contains(other) {
 			continue
 		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+		return seenWrites, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 
 	return append(seenWrites, uniqueSeenWrite{pos: pos, key: single}), nil
@@ -421,7 +421,7 @@ func (ctx UniqueContext) checkBatchCandidateMulti(
 
 	sm := state.ensureSeen(pos)
 	if prev, ok := sm[single]; ok && prev != idx {
-		return false, fmt.Errorf("%w: duplicate value for field %v within batch", ctx.UniqueViolation, acc.Name)
+		return false, fmt.Errorf("%w: duplicate value for field %v within batch", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 	sm[single] = idx
 
@@ -446,7 +446,7 @@ func (ctx UniqueContext) checkBatchCandidateMulti(
 		if ids.Cardinality() == 1 && ids.Contains(idx) {
 			return false, nil
 		}
-		return false, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+		return false, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 
 	iter := ids.Iter()
@@ -460,7 +460,7 @@ func (ctx UniqueContext) checkBatchCandidateMulti(
 		if lv.Contains(other) {
 			continue
 		}
-		return false, fmt.Errorf("%w: value for field %v already exists", ctx.UniqueViolation, acc.Name)
+		return false, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 	return false, nil
 }
@@ -511,9 +511,6 @@ func (b *Batcher) filterAccepted(att *attemptState, atomicAll bool) error {
 				b.sched.stats.UniqueRejected.Add(1)
 			}
 			op.req.Err = err
-			if b.strKey && op.idxNew && op.oldVal == nil && op.newVal != nil {
-				b.strMap.RollbackCreated(op.req.id.String(), op.idx)
-			}
 			continue
 		}
 		att.accepted = append(att.accepted, op)

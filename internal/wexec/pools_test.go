@@ -23,6 +23,7 @@ func TestRequestPoolCleanupReleasesPayloadAndDrainsDone(t *testing.T) {
 	req.setValue = unsafe.Pointer(&v)
 	req.setBaseline = unsafe.Pointer(&v)
 	req.setPayload = payload
+	req.payloadOff = 8
 	req.patch = append(req.patch, schema.PatchItem{Name: "x"})
 	req.patchIgnoreUnknown = true
 	req.beforeProcess = append(req.beforeProcess, func(keycodec.DataKey, unsafe.Pointer) error { return nil })
@@ -41,6 +42,9 @@ func TestRequestPoolCleanupReleasesPayloadAndDrainsDone(t *testing.T) {
 	}
 	if req.setPayload != nil || req.setValue != nil || req.setBaseline != nil {
 		t.Fatalf("set state was not cleared: payload=%v value=%v baseline=%v", req.setPayload, req.setValue, req.setBaseline)
+	}
+	if req.payloadOff != 0 {
+		t.Fatalf("payload offset was not cleared: %d", req.payloadOff)
 	}
 	if len(req.patch) != 0 || req.patchIgnoreUnknown {
 		t.Fatalf("patch state was not cleared: len=%d ignore=%v", len(req.patch), req.patchIgnoreUnknown)

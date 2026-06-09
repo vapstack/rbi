@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"reflect"
 	"slices"
 	"strings"
@@ -231,8 +232,8 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	err := db.Set(1, nil)
-	if err == nil || !errors.Is(err, ErrNilValue) {
-		t.Fatalf("expected ErrNilValue, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrNilValue) {
+		t.Fatalf("expected rbierrors.ErrNilValue, got: %v", err)
 	}
 
 	v, err := db.Get(1)
@@ -275,8 +276,8 @@ func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
 			nil,
 		},
 	)
-	if err == nil || !errors.Is(err, ErrNilValue) {
-		t.Fatalf("expected ErrNilValue from BatchSet, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrNilValue) {
+		t.Fatalf("expected rbierrors.ErrNilValue from BatchSet, got: %v", err)
 	}
 
 	v1, err := db.Get(1)
@@ -404,7 +405,7 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 
 	var beforeRaw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -420,7 +421,7 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 	}
 
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -440,7 +441,7 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 
 	var afterRaw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -479,7 +480,7 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 
 	var beforeRaw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -495,7 +496,7 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 	}
 
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -515,7 +516,7 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 
 	var afterRaw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}

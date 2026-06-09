@@ -15,7 +15,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -60,6 +59,51 @@ func putRebuildTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec
 	}
 }
 
+func putRebuildTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec rebuildTestRec) uint64 {
+	t.Helper()
+
+	data, err := msgpack.Marshal(&rec)
+	if err != nil {
+		t.Fatalf("msgpack.Marshal: %v", err)
+	}
+	var idx uint64
+	if err = db.Update(func(tx *bbolt.Tx) error {
+		m := tx.Bucket(mapBucket)
+		var err error
+		idx, err = m.NextSequence()
+		if err != nil {
+			return err
+		}
+		var mapKey [8]byte
+		if err = m.Put(keycodec.U64BytesWithBuf(idx, &mapKey), keycodec.StringBytes(key)); err != nil {
+			return err
+		}
+		value := keycodec.AppendU64Bytes(nil, idx)
+		value = append(value, data...)
+		return tx.Bucket(bucket).Put(keycodec.StringBytes(key), value)
+	}); err != nil {
+		t.Fatalf("put string record: %v", err)
+	}
+	return idx
+}
+
+func createRebuildStringMap(t testing.TB, db *bbolt.DB, bucket []byte) []byte {
+	t.Helper()
+
+	mapBucket := rebuildStringMapBucket(bucket)
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucket(mapBucket)
+		return err
+	}); err != nil {
+		t.Fatalf("create string map: %v", err)
+	}
+	return mapBucket
+}
+
+func rebuildStringMapBucket(bucket []byte) []byte {
+	return append(append([]byte(nil), bucket...), ".rbimap"...)
+}
+
 func compileRebuildTestSchema(t *testing.T) *schema.Schema {
 	t.Helper()
 
@@ -98,11 +142,11 @@ func releaseRebuildTestRec(ptr unsafe.Pointer) {
 
 func baseRebuildTestConfig(db *bbolt.DB, bucket []byte, s *schema.Schema) Config {
 	return Config{
-		Bolt:    db,
-		Bucket:  bucket,
-		Schema:  s,
-		Decode:  decodeRebuildTestRec,
-		Release: releaseRebuildTestRec,
+		Bolt:       db,
+		DataBucket: bucket,
+		Schema:     s,
+		Decode:     decodeRebuildTestRec,
+		Release:    releaseRebuildTestRec,
 	}
 }
 
@@ -529,24 +573,17 @@ func TestBuildRejectsInvalidUint64KeySize(t *testing.T) {
 	}
 }
 
-func TestBuildStringKeysUseLiveMapper(t *testing.T) {
+func TestBuildStringKeysUseDurableIDs(t *testing.T) {
 	bucket := []byte("rebuild_strings")
 	db := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
 
-	data, err := msgpack.Marshal(&rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
-	if err != nil {
-		t.Fatalf("msgpack.Marshal: %v", err)
-	}
-	if err = db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucket).Put(keycodec.StringBytes("user-1"), data)
-	}); err != nil {
-		t.Fatalf("put string record: %v", err)
-	}
+	putRebuildTestStringRec(t, db, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
 
 	cfg := baseRebuildTestConfig(db, bucket, rt)
 	cfg.StrKey = true
-	cfg.StrMap = strmap.New(0, 256)
+	cfg.StrMapBucket = mapBucket
 	result, err := Build(cfg, newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -554,11 +591,8 @@ func TestBuildStringKeysUseLiveMapper(t *testing.T) {
 	if result.Storage.Universe.Cardinality() != 1 {
 		t.Fatalf("universe cardinality=%d want 1", result.Storage.Universe.Cardinality())
 	}
-	if result.Storage.StrMap != nil {
-		t.Fatalf("rebuild result must not carry strmap snapshot")
-	}
-	if idx, ok := cfg.StrMap.Create("user-1"); idx != 1 || ok {
-		t.Fatalf("live mapper mapping after rebuild: idx=%d created=%v want=1/false", idx, ok)
+	if !result.Storage.Universe.Contains(1) {
+		t.Fatalf("universe does not contain durable id 1")
 	}
 }
 
@@ -593,20 +627,32 @@ func TestMaterializeStringKeyMeasureRunsSortByNumericID(t *testing.T) {
 	}
 }
 
-func TestBuildStringKeyScanFailureKeepsMappingsAndUnlocksWriter(t *testing.T) {
+func TestBuildStringKeyScanFailureDoesNotMutateMappings(t *testing.T) {
 	bucket := []byte("rebuild_string_error")
 	db := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
 
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucket).Put(keycodec.StringBytes("bad-key"), []byte{0xff})
+		m := tx.Bucket(mapBucket)
+		idx, err := m.NextSequence()
+		if err != nil {
+			return err
+		}
+		var mapKey [8]byte
+		if err = m.Put(keycodec.U64BytesWithBuf(idx, &mapKey), keycodec.StringBytes("bad-key")); err != nil {
+			return err
+		}
+		value := keycodec.AppendU64Bytes(nil, idx)
+		value = append(value, 0xff)
+		return tx.Bucket(bucket).Put(keycodec.StringBytes("bad-key"), value)
 	}); err != nil {
 		t.Fatalf("put corrupt string record: %v", err)
 	}
 
 	cfg := baseRebuildTestConfig(db, bucket, rt)
 	cfg.StrKey = true
-	cfg.StrMap = strmap.New(0, 256)
+	cfg.StrMapBucket = mapBucket
 	_, err := Build(cfg, newRebuildTestState(rt))
 	if err == nil {
 		t.Fatalf("expected string-key decode error")
@@ -614,10 +660,20 @@ func TestBuildStringKeyScanFailureKeepsMappingsAndUnlocksWriter(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, "scan error") || !strings.Contains(msg, `id="bad-key"`) {
 		t.Fatalf("unexpected string-key scan error: %v", err)
 	}
-	if idx, ok := cfg.StrMap.Create("bad-key"); idx != 1 || ok {
-		t.Fatalf("mapping created before failed scan was rolled back or changed: idx=%d created=%v", idx, ok)
+	if seq := readRebuildStringMapSequence(t, db, mapBucket); seq != 1 {
+		t.Fatalf("string map sequence = %d, want 1", seq)
 	}
-	if idx, ok := cfg.StrMap.Create("next-key"); idx != 2 || !ok {
-		t.Fatalf("strmap writer was not unlocked after failed scan: idx=%d created=%v", idx, ok)
+}
+
+func readRebuildStringMapSequence(t testing.TB, db *bbolt.DB, mapBucket []byte) uint64 {
+	t.Helper()
+
+	var seq uint64
+	if err := db.View(func(tx *bbolt.Tx) error {
+		seq = tx.Bucket(mapBucket).Sequence()
+		return nil
+	}); err != nil {
+		t.Fatalf("read string map sequence: %v", err)
 	}
+	return seq
 }

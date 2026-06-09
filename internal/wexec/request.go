@@ -87,6 +87,8 @@ var (
 	errUnknownOp    = errors.New("unknown auto-batch op")
 )
 
+const stringValuePrefixLen = 8
+
 type request struct {
 	op Op
 	id keycodec.DataKey
@@ -94,6 +96,7 @@ type request struct {
 	setValue    unsafe.Pointer
 	setBaseline unsafe.Pointer
 	setPayload  *bytes.Buffer
+	payloadOff  uint8
 
 	patch []schema.PatchItem
 
@@ -186,6 +189,7 @@ func (b *Batcher) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, b
 		}
 	} else {
 		buf := encodePool.Get()
+		req.payloadOff = reserveStringValuePrefix(buf, b.strKey)
 		if err := b.ops.Encode(newVal, buf); err != nil {
 			encodePool.Put(buf)
 			requestPool.Put(req)
@@ -241,7 +245,7 @@ func (b *Batcher) buildDeleteRequest(key keycodec.DataKey, beforeCommit []Before
 	req.id = key
 	req.beforeCommit = beforeCommit
 	req.policy = reqRepeatIDSafeShared
-	if len(beforeCommit) == 0 {
+	if len(beforeCommit) == 0 && !b.strKey {
 		req.policy |= reqSetDeleteCoalescible
 	}
 	return req
@@ -251,7 +255,7 @@ func (req *request) payloadBytes() []byte {
 	if req.setPayload == nil {
 		return nil
 	}
-	return req.setPayload.Bytes()
+	return req.setPayload.Bytes()[req.payloadOff:]
 }
 
 func (req *request) hasPolicy(policy reqPolicy) bool {

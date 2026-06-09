@@ -17,28 +17,23 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 const (
-	benchPersistSeq             = 77
-	benchPersistStrMapCompactAt = 256
-	benchPersistBufferSize      = 64 << 10
+	benchPersistSeq        = 77
+	benchPersistBufferSize = 64 << 10
 )
 
-var (
-	errBenchPersistStale   = errors.New("bench persisted index is stale")
-	errBenchPersistInvalid = errors.New("bench persisted index is invalid")
-	benchPersistSink       uint64
-)
+var benchPersistSink uint64
 
 type persistBenchFixture struct {
 	rt    *schema.Schema
 	snap  *snapshot.View
-	stats *qexec.PlannerStatsSnapshot
+	stats *rbistats.PlannerSnapshot
 }
 
 func BenchmarkSidecarStringCodec(b *testing.B) {
@@ -392,7 +387,7 @@ func BenchmarkPersistMemory(b *testing.B) {
 			br.Reset(reader)
 
 			b.StartTimer()
-			result, err := loadPayload(br, fx.rt, benchPersistStrMapCompactAt)
+			result, err := loadPayload(br, fx.rt)
 			b.StopTimer()
 			if err != nil {
 				b.Fatalf("loadPayload: %v", err)
@@ -488,14 +483,13 @@ func BenchmarkLoadRejects(b *testing.B) {
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq + 1,
 			Schema:     &schema.Schema{},
-			Errors:     Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
 		}
 		b.SetBytes(int64(buf.Len()))
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, err := Load(cfg)
-			if !errors.Is(err, errBenchPersistStale) {
+			if !errors.Is(err, rbierrors.ErrPersistedIndexStale) {
 				b.Fatalf("Load err=%v, want stale sentinel", err)
 			}
 		}
@@ -512,14 +506,13 @@ func BenchmarkLoadRejects(b *testing.B) {
 			Bucket:     []byte("bench"),
 			CurrentSeq: benchPersistSeq,
 			Schema:     &schema.Schema{},
-			Errors:     Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
 		}
 		b.SetBytes(1)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, err := Load(cfg)
-			if !errors.Is(err, errBenchPersistInvalid) {
+			if !errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
 				b.Fatalf("Load err=%v, want invalid sentinel", err)
 			}
 		}
@@ -574,7 +567,7 @@ func benchmarkLoadPayloadBytes(b *testing.B, payload []byte, s *schema.Schema) {
 	for i := 0; i < b.N; i++ {
 		reader.Reset(payload)
 		br.Reset(reader)
-		result, err := loadPayload(br, s, benchPersistStrMapCompactAt)
+		result, err := loadPayload(br, s)
 		if err != nil {
 			b.Fatalf("loadPayload: %v", err)
 		}
@@ -586,6 +579,7 @@ func benchmarkLoadPayloadBytes(b *testing.B, payload []byte, s *schema.Schema) {
 
 func newPersistBenchFixture(tb testing.TB, rows int, withStrMap bool) *persistBenchFixture {
 	tb.Helper()
+	_ = withStrMap
 	rt := benchPersistRuntime("tags", "amount")
 
 	index := indexdata.GetFieldStorageSlice(len(rt.Indexed))[:len(rt.Indexed)]
@@ -601,11 +595,6 @@ func newPersistBenchFixture(tb testing.TB, rows int, withStrMap bool) *persistBe
 	lenIndex[2] = benchPersistLenStorage(rows, universe)
 	measure[0] = benchPersistMeasureStorage(rows)
 
-	var sm *strmap.Snapshot
-	if withStrMap {
-		sm = benchPersistStrMapSnapshot(rows)
-	}
-
 	snap := &snapshot.View{
 		Seq:                benchPersistSeq,
 		Index:              index,
@@ -614,7 +603,6 @@ func newPersistBenchFixture(tb testing.TB, rows int, withStrMap bool) *persistBe
 		Measure:            measure,
 		IndexedFieldByName: rt.IndexedByName,
 		Universe:           universe,
-		StrMap:             sm,
 	}
 
 	return &persistBenchFixture{
@@ -775,20 +763,12 @@ func benchPersistMeasureStorage(rows int) indexdata.MeasureStorage {
 	return indexdata.NewMeasureStorageFromEntriesOwned(entries)
 }
 
-func benchPersistStrMapSnapshot(rows int) *strmap.Snapshot {
-	m := strmap.New(uint64(rows), benchPersistStrMapCompactAt)
-	for i := 0; i < rows; i++ {
-		m.Create(fmt.Sprintf("pk/%08d", i+1))
-	}
-	return m.Snapshot()
-}
-
-func benchPersistStats(rows, nameKeys, ageKeys, tagKeys int) *qexec.PlannerStatsSnapshot {
-	return &qexec.PlannerStatsSnapshot{
+func benchPersistStats(rows, nameKeys, ageKeys, tagKeys int) *rbistats.PlannerSnapshot {
+	return &rbistats.PlannerSnapshot{
 		Version:             11,
 		GeneratedAt:         time.Unix(1700000000, int64(rows)).UTC(),
 		UniverseCardinality: uint64(rows),
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"name": benchPersistFieldStats(rows, nameKeys),
 			"age":  benchPersistFieldStats(rows, ageKeys),
 			"tags": benchPersistFieldStats(rows, tagKeys),
@@ -796,14 +776,14 @@ func benchPersistStats(rows, nameKeys, ageKeys, tagKeys int) *qexec.PlannerStats
 	}
 }
 
-func benchPersistFieldStats(rows, keys int) qexec.PlannerFieldStats {
+func benchPersistFieldStats(rows, keys int) rbistats.PlannerField {
 	maxCard := uint64(1)
 	if keys > 0 {
 		if avg := rows / keys; avg > 1 {
 			maxCard = uint64(avg + 1)
 		}
 	}
-	return qexec.PlannerFieldStats{
+	return rbistats.PlannerField{
 		DistinctKeys:    uint64(keys),
 		NonEmptyKeys:    uint64(keys),
 		TotalBucketCard: uint64(rows),
@@ -829,13 +809,13 @@ func benchPersistFieldMaps(n int, incompatibleEvery int) (map[string]*schema.Fie
 	return stored, current
 }
 
-func benchPersistPlannerStats(n int) (*qexec.PlannerStatsSnapshot, map[string]bool, map[string]bool) {
-	fields := make(map[string]qexec.PlannerFieldStats, n)
+func benchPersistPlannerStats(n int) (*rbistats.PlannerSnapshot, map[string]bool, map[string]bool) {
+	fields := make(map[string]rbistats.PlannerField, n)
 	all := make(map[string]bool, n)
 	half := make(map[string]bool, n/2+1)
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("field_%04d", i)
-		fields[name] = qexec.PlannerFieldStats{
+		fields[name] = rbistats.PlannerField{
 			DistinctKeys:    uint64(i + 1),
 			NonEmptyKeys:    uint64(i + 1),
 			TotalBucketCard: uint64((i + 1) * 3),
@@ -849,7 +829,7 @@ func benchPersistPlannerStats(n int) (*qexec.PlannerStatsSnapshot, map[string]bo
 			half[name] = true
 		}
 	}
-	return &qexec.PlannerStatsSnapshot{
+	return &rbistats.PlannerSnapshot{
 		Version:             19,
 		GeneratedAt:         time.Unix(1700000001, 2).UTC(),
 		UniverseCardinality: uint64(n * 3),
@@ -883,7 +863,7 @@ func benchPersistFieldsBytes(tb testing.TB, fields map[string]*schema.Field) []b
 	return buf.Bytes()
 }
 
-func benchPersistPlannerStatsBytes(tb testing.TB, stats *qexec.PlannerStatsSnapshot) []byte {
+func benchPersistPlannerStatsBytes(tb testing.TB, stats *rbistats.PlannerSnapshot) []byte {
 	tb.Helper()
 	var buf bytes.Buffer
 	writer := bufio.NewWriterSize(&buf, benchPersistBufferSize)
@@ -951,13 +931,11 @@ func benchPersistStoreConfig(fx *persistBenchFixture, file string) StoreConfig {
 
 func benchPersistLoadConfig(s *schema.Schema, file string, seq uint64) LoadConfig {
 	return LoadConfig{
-		File:            file,
-		DBPath:          "bench.db",
-		Bucket:          []byte("bench"),
-		CurrentSeq:      seq,
-		Schema:          s,
-		StrMapCompactAt: benchPersistStrMapCompactAt,
-		Errors:          Errors{Stale: errBenchPersistStale, Invalid: errBenchPersistInvalid},
+		File:       file,
+		DBPath:     "bench.db",
+		Bucket:     []byte("bench"),
+		CurrentSeq: seq,
+		Schema:     s,
 	}
 }
 
@@ -965,9 +943,6 @@ func benchPersistLoadResultMetric(result LoadResult) uint64 {
 	total := result.Storage.Universe.Cardinality()
 	total += uint64(len(result.SkipFields) + len(result.SkipMeasureFields))
 	if result.LenLoaded {
-		total++
-	}
-	if result.StrMap != nil {
 		total++
 	}
 	if result.PlannerStats != nil {

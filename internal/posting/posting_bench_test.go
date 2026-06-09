@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"strconv"
 	"testing"
+
+	"github.com/vapstack/rbi/internal/mathutil"
 )
 
 var (
@@ -886,7 +888,7 @@ func postingBenchBitmapWords(shape string, seed uint64) []uint64 {
 			words[i] = uint64(1) << uint((uint64(i)+seed)&63)
 		}
 	case "dense":
-		x := uint64(0x9e3779b97f4a7c15) + seed*0xbf58476d1ce4e5b9
+		x := mathutil.Mix64(seed)
 		for i := range words {
 			x ^= x << 13
 			x ^= x >> 7

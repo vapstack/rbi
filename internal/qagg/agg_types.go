@@ -5,19 +5,6 @@ import (
 	"math"
 	"strconv"
 	"unsafe"
-
-	"github.com/vapstack/rbi/internal/qexec"
-)
-
-const (
-	PlanAggregate          qexec.PlanName = "plan_aggregate"
-	PlanCountMaterialized  qexec.PlanName = "plan_count_materialized"
-	PlanCountUniqueEq      qexec.PlanName = "plan_count_unique_eq"
-	PlanCountScalarLookup  qexec.PlanName = "plan_count_scalar_lookup"
-	PlanCountScalarInSplit qexec.PlanName = "plan_count_scalar_in_split"
-	PlanCountPredicates    qexec.PlanName = "plan_count_predicates"
-	PlanCountORPredicates  qexec.PlanName = "plan_count_or_predicates"
-	PlanCountORHybrid      qexec.PlanName = "plan_count_or_hybrid"
 )
 
 type (

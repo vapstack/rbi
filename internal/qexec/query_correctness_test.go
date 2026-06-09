@@ -14,6 +14,7 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type correctnessRowLess func(aID uint64, a *Rec, bID uint64, b *Rec) bool
@@ -258,8 +259,8 @@ func TestCardinalityORByPredicates_DisjointScalarEQBranches(t *testing.T) {
 	if got != want {
 		t.Fatalf("disjoint cardinality OR mismatch: got=%d want=%d", got, want)
 	}
-	if trace.Event().Plan != string(planFilterCardinalityORPredicates) {
-		t.Fatalf("disjoint cardinality OR plan=%q, want %q", trace.Event().Plan, planFilterCardinalityORPredicates)
+	if trace.Event().Plan != rbitrace.PlanCountORPredicates {
+		t.Fatalf("disjoint cardinality OR plan=%q, want %q", trace.Event().Plan, rbitrace.PlanCountORPredicates)
 	}
 
 	overlap := qx.OR(
@@ -1042,6 +1043,7 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 	}
 	exec := NewRuntime(Config{
 		Schema:                         rt,
+		StrKey:                         true,
 		AnalyzeInterval:                -1,
 		NumericRangeBucketSize:         testNumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys: testNumericRangeMinKeys,
@@ -1113,7 +1115,7 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 			cur[i] = vals[i]
 			entries[i] = snapshot.BatchEntry{ID: ids[i], Old: old, New: unsafe.Pointer(vals[i])}
 		}
-		next := snapshot.Build(seq, qe.snapshot.Current(), rt, cfg, sm, nil, entries)
+		next := snapshot.Build(seq, qe.snapshot.Current(), rt, cfg, nil, entries)
 		qe.snapshot.Publish(next)
 		seq++
 	}

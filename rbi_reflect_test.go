@@ -3,6 +3,7 @@ package rbi
 import (
 	"encoding/hex"
 	"errors"
+	"github.com/vapstack/rbi/rbierrors"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -324,8 +325,8 @@ func TestReflectExt_UniqueValueIndexerScalarNamedString_UsesIndexingValue(t *tes
 	if err == nil {
 		t.Fatalf("expected unique violation for equal IndexingValue()")
 	}
-	if !errors.Is(err, ErrUniqueViolation) && !strings.Contains(err.Error(), ErrUniqueViolation.Error()) {
-		t.Fatalf("expected ErrUniqueViolation-compatible error, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) && !strings.Contains(err.Error(), rbierrors.ErrUniqueViolation.Error()) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation-compatible error, got: %v", err)
 	}
 }
 
@@ -498,8 +499,8 @@ func TestReflectExt_ValueIndexerDirectIfaceMap_QueryUnique(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected unique violation for duplicate map-backed ValueIndexer")
 	}
-	if !errors.Is(err, ErrUniqueViolation) && !strings.Contains(err.Error(), ErrUniqueViolation.Error()) {
-		t.Fatalf("expected ErrUniqueViolation-compatible error, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) && !strings.Contains(err.Error(), rbierrors.ErrUniqueViolation.Error()) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation-compatible error, got: %v", err)
 	}
 }
 
@@ -522,8 +523,8 @@ func TestReflectExt_ValueIndexerDirectIfaceWordStruct_QueryUnique(t *testing.T) 
 	if err == nil {
 		t.Fatalf("expected unique violation for duplicate direct-iface struct ValueIndexer")
 	}
-	if !errors.Is(err, ErrUniqueViolation) && !strings.Contains(err.Error(), ErrUniqueViolation.Error()) {
-		t.Fatalf("expected ErrUniqueViolation-compatible error, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) && !strings.Contains(err.Error(), rbierrors.ErrUniqueViolation.Error()) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation-compatible error, got: %v", err)
 	}
 }
 
@@ -810,7 +811,7 @@ func TestReflectExt_EmbeddedUnsafeAccessors_QueryUnique(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected unique violation for duplicate embedded ValueIndexer field")
 	}
-	if !errors.Is(err, ErrUniqueViolation) && !strings.Contains(err.Error(), ErrUniqueViolation.Error()) {
-		t.Fatalf("expected ErrUniqueViolation-compatible error, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) && !strings.Contains(err.Error(), rbierrors.ErrUniqueViolation.Error()) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation-compatible error, got: %v", err)
 	}
 }

@@ -16,30 +16,19 @@ import (
 type prepared struct {
 	req *request
 
-	key     []byte
-	payload []byte
-	idx     uint64
-	idxNew  bool
-	oldVal  unsafe.Pointer
-	newVal  unsafe.Pointer
+	key      []byte
+	payload  []byte
+	physical []byte
+	idx      uint64
+	idxNew   bool
+	oldVal   unsafe.Pointer
+	newVal   unsafe.Pointer
 }
 
 func assignPreparedErr(ops []prepared, err error) {
 	for _, op := range ops {
 		if op.req.Err == nil {
 			op.req.Err = err
-		}
-	}
-}
-
-func (b *Batcher) rollbackCreatedPrepared(ops []prepared) {
-	if !b.strKey {
-		return
-	}
-	for i := range ops {
-		op := ops[i]
-		if op.idxNew && op.oldVal == nil && op.newVal != nil {
-			b.strMap.RollbackCreated(op.req.id.String(), op.idx)
 		}
 	}
 }
@@ -51,14 +40,17 @@ type recordState struct {
 	idx      uint64
 	idxKnown bool
 	idxNew   bool
+	exists   bool
 
 	value           unsafe.Pointer
 	ownedPayload    *bytes.Buffer
+	payloadOff      uint8
 	borrowedPayload []byte
 }
 
 type attemptState struct {
-	bucket       *bbolt.Bucket
+	dataBucket   *bbolt.Bucket
+	strmapBucket *bbolt.Bucket
 	statsEnabled bool
 	release      func(unsafe.Pointer)
 	singleState  bool
@@ -103,24 +95,29 @@ func (b *Batcher) prepareActive(att *attemptState, active []*request) {
 	}
 }
 
-func (b *Batcher) ensureIdx(state *recordState, id keycodec.DataKey, create bool) {
+func (b *Batcher) ensureIdx(att *attemptState, state *recordState, id keycodec.DataKey, create bool) error {
 	if state.idxKnown {
-		return
+		return nil
 	}
 	if b.strKey {
-		var created bool
-		state.idx, created = b.strMap.Create(id.String())
+		idx, err := att.strmapBucket.NextSequence()
+		if err != nil {
+			return fmt.Errorf("advance string map sequence: %w", err)
+		}
+		state.idx = idx
 		if create {
-			state.idxNew = created
+			state.idxNew = true
 		}
 	} else {
 		state.idx = id.Uint()
 	}
 	state.idxKnown = true
+	return nil
 }
 
 func (b *Batcher) prepareSet(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req, b.indexed || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0)
+	needOldValue := b.indexed || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0
+	state, err := b.loadState(att, req, b.strKey || needOldValue, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -129,7 +126,12 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 	oldVal := state.value
 	newVal := req.setValue
 	payload := req.payloadBytes()
+	physical := payload
+	if req.setPayload != nil {
+		physical = req.setPayload.Bytes()
+	}
 	var ownedPayload *bytes.Buffer
+	payloadOff := req.payloadOff
 
 	if len(req.beforeStore) > 0 {
 		if att.statsEnabled {
@@ -163,6 +165,7 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 
 		buf := encodePool.Get()
+		payloadOff = reserveStringValuePrefix(buf, b.strKey)
 		if err = b.ops.Encode(newVal, buf); err != nil {
 			encodePool.Put(buf)
 			req.Err = formatPrepareErr(prepareErrEncode, err)
@@ -170,7 +173,8 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 		ownedPayload = buf
 		att.ownedPayloads = append(att.ownedPayloads, buf)
-		payload = buf.Bytes()
+		physical = buf.Bytes()
+		payload = physical[payloadOff:]
 	}
 
 	if len(req.beforeStore) == 0 {
@@ -180,18 +184,27 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 	}
 
-	if b.indexed {
-		b.ensureIdx(state, req.id, true)
+	if b.strKey || b.indexed {
+		if err = b.ensureIdx(att, state, req.id, true); err != nil {
+			req.Err = err
+			return
+		}
+	}
+	idxNew := state.idxNew
+	if b.strKey && !state.exists {
+		idxNew = true
+		state.idxNew = true
 	}
 
 	att.prepared = append(att.prepared, prepared{
-		req:     req,
-		key:     state.key,
-		payload: payload,
-		idx:     state.idx,
-		idxNew:  state.idxNew,
-		oldVal:  oldVal,
-		newVal:  newVal,
+		req:      req,
+		key:      state.key,
+		payload:  payload,
+		physical: physical,
+		idx:      state.idx,
+		idxNew:   idxNew,
+		oldVal:   oldVal,
+		newVal:   newVal,
 	})
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
@@ -201,15 +214,16 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		})
 	}
 	state.value = newVal
+	state.exists = true
 	if ownedPayload != nil {
-		state.setOwnedPayload(ownedPayload)
+		state.setOwnedPayload(ownedPayload, payloadOff)
 	} else {
 		state.setBorrowedPayload(payload)
 	}
 }
 
 func (b *Batcher) preparePatch(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req, true)
+	state, err := b.loadState(att, req, true, true)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecodeExistingValue, err)
 		return
@@ -258,6 +272,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	}
 
 	buf := encodePool.Get()
+	payloadOff := reserveStringValuePrefix(buf, b.strKey)
 	if err = b.ops.Encode(newVal, buf); err != nil {
 		encodePool.Put(buf)
 		req.Err = formatPrepareErr(prepareErrEncode, err)
@@ -265,18 +280,22 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	}
 	att.ownedPayloads = append(att.ownedPayloads, buf)
 
-	if b.indexed {
-		b.ensureIdx(state, req.id, false)
+	if b.strKey || b.indexed {
+		if err = b.ensureIdx(att, state, req.id, false); err != nil {
+			req.Err = err
+			return
+		}
 	}
 
 	att.prepared = append(att.prepared, prepared{
-		req:     req,
-		key:     state.key,
-		payload: buf.Bytes(),
-		idx:     state.idx,
-		idxNew:  state.idxNew,
-		oldVal:  oldVal,
-		newVal:  newVal,
+		req:      req,
+		key:      state.key,
+		payload:  buf.Bytes()[payloadOff:],
+		physical: buf.Bytes(),
+		idx:      state.idx,
+		idxNew:   state.idxNew,
+		oldVal:   oldVal,
+		newVal:   newVal,
 	})
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
@@ -288,11 +307,12 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 		})
 	}
 	state.value = newVal
-	state.setOwnedPayload(buf)
+	state.exists = true
+	state.setOwnedPayload(buf, payloadOff)
 }
 
 func (b *Batcher) prepareDelete(att *attemptState, req *request) {
-	state, err := att.loadState(b.strKey, b.ops, req, true)
+	state, err := b.loadState(att, req, true, true)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -302,8 +322,11 @@ func (b *Batcher) prepareDelete(att *attemptState, req *request) {
 	}
 
 	oldVal := state.value
-	if b.indexed {
-		b.ensureIdx(state, req.id, false)
+	if b.strKey || b.indexed {
+		if err = b.ensureIdx(att, state, req.id, false); err != nil {
+			req.Err = err
+			return
+		}
 	}
 
 	att.prepared = append(att.prepared, prepared{
@@ -321,6 +344,7 @@ func (b *Batcher) prepareDelete(att *attemptState, req *request) {
 		})
 	}
 	state.value = nil
+	state.exists = false
 	state.clearPayload()
 }
 
@@ -366,50 +390,84 @@ func (st *attemptState) setStatePos(strKey bool, key keycodec.DataKey, pos int) 
 	st.stateByUintID[key.Uint()] = pos
 }
 
-func (st *attemptState) loadState(strKey bool, ops *RecordOps, req *request, read bool) (*recordState, error) {
+func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld bool) (*recordState, error) {
 	if st.singleState {
 		state := &st.state
-		state.key = req.id.Bytes(strKey, &state.keyBuf)
+		state.key = req.id.Bytes(b.strKey, &state.keyBuf)
 		if read {
-			if prev := st.bucket.Get(state.key); prev != nil {
-				oldVal, err := ops.Decode(prev)
-				if err != nil {
-					return nil, err
+			if prev := st.dataBucket.Get(state.key); prev != nil {
+				state.exists = true
+				payload := prev
+				if b.strKey {
+					if len(prev) < stringValuePrefixLen {
+						return nil, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
+					}
+					idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
+					if idx == 0 {
+						return nil, fmt.Errorf("string storage format: zero string id")
+					}
+					state.idx = idx
+					state.idxKnown = true
+					payload = prev[stringValuePrefixLen:]
 				}
-				state.value = oldVal
-				st.decodedValues = append(st.decodedValues, oldVal)
-				state.setBorrowedPayload(prev)
+				if decodeOld {
+					oldVal, err := b.ops.Decode(payload)
+					if err != nil {
+						return nil, err
+					}
+					state.value = oldVal
+					st.decodedValues = append(st.decodedValues, oldVal)
+				}
+				state.setBorrowedPayload(payload)
 			}
 		}
 		return state, nil
 	}
 
-	if pos, ok := st.statePos(strKey, req.id); ok {
+	if pos, ok := st.statePos(b.strKey, req.id); ok {
 		return &st.states[pos], nil
 	}
 
 	pos := len(st.states)
 	st.states = append(st.states, recordState{})
 	state := &st.states[pos]
-	state.key = req.id.Bytes(strKey, &state.keyBuf)
+	state.key = req.id.Bytes(b.strKey, &state.keyBuf)
 	if read {
-		if prev := st.bucket.Get(state.key); prev != nil {
-			oldVal, err := ops.Decode(prev)
-			if err != nil {
-				st.states = st.states[:pos]
-				return nil, err
+		if prev := st.dataBucket.Get(state.key); prev != nil {
+			state.exists = true
+			payload := prev
+			if b.strKey {
+				if len(prev) < stringValuePrefixLen {
+					st.states = st.states[:pos]
+					return nil, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
+				}
+				idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
+				if idx == 0 {
+					st.states = st.states[:pos]
+					return nil, fmt.Errorf("string storage format: zero string id")
+				}
+				state.idx = idx
+				state.idxKnown = true
+				payload = prev[stringValuePrefixLen:]
 			}
-			state.value = oldVal
-			st.decodedValues = append(st.decodedValues, oldVal)
-			state.setBorrowedPayload(prev)
+			if decodeOld {
+				oldVal, err := b.ops.Decode(payload)
+				if err != nil {
+					st.states = st.states[:pos]
+					return nil, err
+				}
+				state.value = oldVal
+				st.decodedValues = append(st.decodedValues, oldVal)
+			}
+			state.setBorrowedPayload(payload)
 		}
 	}
 
-	st.setStatePos(strKey, req.id, pos)
+	st.setStatePos(b.strKey, req.id, pos)
 	return state, nil
 }
 
-func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, accepted []prepared, atomicAll bool, rejectEmptyPayload bool) (*request, error) {
+func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, att *attemptState, accepted []prepared, atomicAll bool, rejectEmptyPayload bool) (*request, error) {
 	stats := b.sched.stats.Enabled
 	var callbackFailedReq *request
 
@@ -419,11 +477,25 @@ func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, accepted []p
 		case opSet, opPatch:
 			if rejectEmptyPayload && len(op.payload) == 0 {
 				err = errEmptyPayload
+			} else if b.strKey {
+				if op.idxNew {
+					var mapKey [8]byte
+					err = att.strmapBucket.Put(keycodec.U64BytesWithBuf(op.idx, &mapKey), op.key)
+				}
+				if err == nil {
+					var idxBuf [8]byte
+					copy(op.physical, keycodec.U64BytesWithBuf(op.idx, &idxBuf))
+					err = bucket.Put(op.key, op.physical)
+				}
 			} else {
-				err = bucket.Put(op.key, op.payload)
+				err = bucket.Put(op.key, op.physical)
 			}
 		case opDelete:
 			err = bucket.Delete(op.key)
+			if err == nil && b.strKey {
+				var mapKey [8]byte
+				err = att.strmapBucket.Delete(keycodec.U64BytesWithBuf(op.idx, &mapKey))
+			}
 		default:
 			err = errUnknownOp
 		}
@@ -478,12 +550,6 @@ func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, accepted []p
 }
 
 func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, error) {
-	var firstOp Op
-	if len(active) != 0 {
-		firstOp = active[0].op
-	}
-	name := opName(firstOp, len(active), atomicAll, b.sched.maxOps)
-
 	tx, err := b.bolt.Begin(true)
 	if err != nil {
 		if b.sched.stats.Enabled {
@@ -491,7 +557,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		}
 		return nil, true, fmt.Errorf("tx error: %w", err)
 	}
-	bucket := tx.Bucket(b.bucket)
+	bucket := tx.Bucket(b.dataBucket)
 	if bucket == nil {
 		if b.sched.stats.Enabled {
 			b.sched.stats.TxOpErrors.Add(1)
@@ -500,6 +566,17 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return nil, true, fmt.Errorf("bucket does not exist")
 	}
 	bucket.FillPercent = b.bucketFillPercent
+	var stringMap *bbolt.Bucket
+	if b.strKey {
+		stringMap = tx.Bucket(b.strmapBucket)
+		if stringMap == nil {
+			if b.sched.stats.Enabled {
+				b.sched.stats.TxOpErrors.Add(1)
+			}
+			_ = tx.Rollback()
+			return nil, true, fmt.Errorf("string map bucket does not exist")
+		}
+	}
 	defer func() { _ = tx.Rollback() }()
 
 	capHint := len(active)
@@ -518,6 +595,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	}
 	withSnapshots := b.indexed && b.snapshotOps.Manager != nil
 	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, withSnapshots, uniqueFields)
+	att.strmapBucket = stringMap
 	if cap(att.prepared) < capHint {
 		att.prepared = slices.Grow(att.prepared, capHint)
 	}
@@ -534,7 +612,6 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 
 	if atomicAll {
 		if reqErr := firstRequestErr(active); reqErr != nil {
-			b.rollbackCreatedPrepared(att.prepared)
 			return nil, true, reqErr
 		}
 	}
@@ -547,13 +624,11 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	defer b.publishMu.Unlock()
 
 	if err = b.unavailable(); err != nil {
-		b.rollbackCreatedPrepared(att.prepared)
 		assignPreparedErr(att.prepared, err)
 		return nil, true, nil
 	}
 
 	if err = b.filterAccepted(att, atomicAll); err != nil {
-		b.rollbackCreatedPrepared(att.prepared)
 		return nil, true, err
 	}
 
@@ -561,13 +636,11 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return nil, true, nil
 	}
 
-	retryWithoutReq, err := b.applyAccepted(tx, bucket, att.accepted, atomicAll, b.rejectEmptyPayload)
+	retryWithoutReq, err := b.applyAccepted(tx, bucket, att, att.accepted, atomicAll, b.rejectEmptyPayload)
 	if err != nil {
-		b.rollbackCreatedPrepared(att.accepted)
 		return nil, true, err
 	}
 	if retryWithoutReq != nil {
-		b.rollbackCreatedPrepared(att.accepted)
 		return retryWithoutReq, false, nil
 	}
 
@@ -576,10 +649,9 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 			if b.sched.stats.Enabled {
 				b.sched.stats.TxOpErrors.Add(1)
 			}
-			b.rollbackCreatedPrepared(att.accepted)
 			return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 		}
-		if err = b.commit(tx, name); err != nil {
+		if err = b.commit(tx); err != nil {
 			if b.sched.stats.Enabled {
 				b.sched.stats.TxCommitErrors.Add(1)
 			}
@@ -593,7 +665,6 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		if b.sched.stats.Enabled {
 			b.sched.stats.TxOpErrors.Add(1)
 		}
-		b.rollbackCreatedPrepared(att.accepted)
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
@@ -601,24 +672,23 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		seq,
 		b.snapshotOps.Manager.Current(),
 		b.snapshotOps.Schema,
-		b.snapshotOps.CacheConfig(),
-		b.snapshotOps.StrMap,
+		b.snapshotOps.CacheConfig,
 		b.snapshotOps.PatchFields,
 		att.acceptedSnapshots,
 	)
 	b.snapshotOps.Manager.Stage(snap)
 
-	if err = b.commit(tx, name); err != nil {
+	if err = b.commit(tx); err != nil {
 		if b.sched.stats.Enabled {
 			b.sched.stats.TxCommitErrors.Add(1)
 		}
 		b.snapshotOps.Manager.DropStaged(seq)
-		b.rollbackCreatedPrepared(att.accepted)
 		assignPreparedErr(att.accepted, err)
 		return nil, true, nil
 	}
 
-	err = b.indexPublishOps.PublishCommitted(seq, name, snap)
+	name := opName(active[0].op, len(active), atomicAll, b.sched.maxOps)
+	err = b.publishCommitted(seq, name, snap)
 	if err != nil {
 		assignPreparedErr(att.accepted, err)
 	}
@@ -627,7 +697,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 }
 
 func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, singleState bool, withSnapshots bool, uniqueFields int) {
-	st.bucket = bucket
+	st.dataBucket = bucket
 	st.statsEnabled = statsEnabled
 	st.release = release
 	st.singleState = singleState
@@ -689,7 +759,8 @@ func (st *attemptState) cleanup() {
 
 	st.uniqueState.cleanup()
 
-	st.bucket = nil
+	st.dataBucket = nil
+	st.strmapBucket = nil
 	st.statsEnabled = false
 	st.release = nil
 	st.singleState = false
@@ -698,22 +769,34 @@ func (st *attemptState) cleanup() {
 
 func (st *recordState) payloadBytes() []byte {
 	if st.ownedPayload != nil {
-		return st.ownedPayload.Bytes()
+		return st.ownedPayload.Bytes()[st.payloadOff:]
 	}
 	return st.borrowedPayload
 }
 
-func (st *recordState) setOwnedPayload(buf *bytes.Buffer) {
+func (st *recordState) setOwnedPayload(buf *bytes.Buffer, payloadOff uint8) {
 	st.ownedPayload = buf
+	st.payloadOff = payloadOff
 	st.borrowedPayload = nil
 }
 
 func (st *recordState) setBorrowedPayload(payload []byte) {
 	st.ownedPayload = nil
+	st.payloadOff = 0
 	st.borrowedPayload = payload
 }
 
 func (st *recordState) clearPayload() {
 	st.ownedPayload = nil
+	st.payloadOff = 0
 	st.borrowedPayload = nil
+}
+
+func reserveStringValuePrefix(buf *bytes.Buffer, strKey bool) uint8 {
+	if !strKey {
+		return 0
+	}
+	var prefix [stringValuePrefixLen]byte
+	buf.Write(prefix[:])
+	return stringValuePrefixLen
 }

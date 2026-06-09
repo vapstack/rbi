@@ -5,7 +5,9 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerNoOrderLimitCandidateKind uint8
@@ -116,8 +118,8 @@ func (d plannerNoOrderLimitDecision) selectedKind() plannerNoOrderLimitCandidate
 	return d.selected.kind
 }
 
-func (d plannerNoOrderLimitDecision) traceRoute() TraceNoOrderLimitRoute {
-	return TraceNoOrderLimitRoute{
+func (d plannerNoOrderLimitDecision) traceRoute() rbitrace.NoOrderLimitRoute {
+	return rbitrace.NoOrderLimitRoute{
 		Selected:     d.selected.kind.String(),
 		Rejected:     d.rejected.kind.String(),
 		SelectedCost: d.selected.cost,
@@ -131,51 +133,51 @@ func (d plannerNoOrderLimitDecision) traceRoute() TraceNoOrderLimitRoute {
 	}
 }
 
-func (c plannerNoOrderLimitCandidate) traceWork() TraceRouteWork {
+func (c plannerNoOrderLimitCandidate) traceWork() rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	switch c.kind {
 	case plannerNoOrderLimitCandidateEmpty, plannerNoOrderLimitCandidateNoFilter:
-		return TraceRouteWork{CandidateScan: c.cost}
+		return rbitrace.RouteWork{CandidateScan: c.cost}
 	case plannerNoOrderLimitCandidateUniqueEq:
-		return TraceRouteWork{PostingContains: c.cost}
+		return rbitrace.RouteWork{PostingContains: c.cost}
 	case plannerNoOrderLimitCandidateDirectPrefix, plannerNoOrderLimitCandidateDirectRange, plannerNoOrderLimitCandidateSameFieldBounds:
 		if c.checks == 0 {
-			return TraceRouteWork{RangeProbe: c.cost}
+			return rbitrace.RouteWork{RangeProbe: c.cost}
 		}
 		scan := float64(c.expectedRows)
 		if scan > c.cost {
 			scan = c.cost
 		}
-		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+		return rbitrace.RouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
 	case plannerNoOrderLimitCandidateLeadScan, plannerNoOrderLimitCandidateUniverseScan:
 		scan := float64(c.expectedRows)
 		if scan > c.cost {
 			scan = c.cost
 		}
-		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+		return rbitrace.RouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
 	case plannerNoOrderLimitCandidateMaterializedFallback:
 		build := float64(c.buildWork)
 		if build <= 0 || build > c.cost {
 			build = c.cost
 		}
-		return TraceRouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
+		return rbitrace.RouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
 	default:
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 }
 
-func (qv *View) traceNoOrderLimitRoute(q *qir.Shape, facts *noOrderLimitFacts, d plannerNoOrderLimitDecision) TraceNoOrderLimitRoute {
+func (qv *View) traceNoOrderLimitRoute(q *qir.Shape, facts *noOrderLimitFacts, d plannerNoOrderLimitDecision) rbitrace.NoOrderLimitRoute {
 	route := d.traceRoute()
 	route.SelectedWork = qv.noOrderLimitCandidateTraceWork(q, facts, d.selected)
 	route.RejectedWork = qv.noOrderLimitCandidateTraceWork(q, facts, d.rejected)
 	return route
 }
 
-func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimitFacts, c plannerNoOrderLimitCandidate) TraceRouteWork {
+func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimitFacts, c plannerNoOrderLimitCandidate) rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	if c.kind != plannerNoOrderLimitCandidateDirectRange &&
 		c.kind != plannerNoOrderLimitCandidateSameFieldBounds {
@@ -200,7 +202,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 	residuals := float64(c.checks)
 	expected := float64(c.expectedRows)
 
-	best := TraceRouteWork{
+	best := rbitrace.RouteWork{
 		CandidateScan:   expected * 0.75,
 		PostingContains: expected*residuals*0.35 + residuals*16.0,
 	}
@@ -211,7 +213,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 	}
 
 	if hasPrefixBoundForFieldOrdinal(facts.leaves, facts.directOrdinal) && qv.shouldPreferExecutionNoOrderPrefix(q, facts.leaves) {
-		work := TraceRouteWork{
+		work := rbitrace.RouteWork{
 			CandidateScan:   float64(needWindow) * 0.70,
 			PostingContains: float64(needWindow) * residuals * 0.15,
 			RangeProbe:      width * 0.0001,
@@ -227,7 +229,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 		}
 	}
 
-	work := TraceRouteWork{
+	work := rbitrace.RouteWork{
 		CandidateScan:   expected,
 		PostingContains: expected * residuals * 0.70,
 		RangeProbe:      width * 0.20,
@@ -244,7 +246,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 
 	rows := float64(c.leadRows)
 	if rows > 0 {
-		work = TraceRouteWork{
+		work = rbitrace.RouteWork{
 			CandidateScan:   rows,
 			PostingContains: rows * residuals * 0.45,
 			RangeProbe:      width * 0.20,
@@ -332,11 +334,11 @@ func (d plannerNoOrderLimitDecision) runtimeGuard(q *qir.Shape) plannerNoOrderLi
 	}
 
 	minExamined := d.runtimeFallback.expectedRows
-	needMin := satMulUint64(q.Limit, 4)
+	needMin := mathutil.SatMulUint64(q.Limit, 4)
 	if minExamined < needMin {
 		minExamined = needMin
 	}
-	needMax := satMulUint64(q.Limit, 64)
+	needMax := mathutil.SatMulUint64(q.Limit, 64)
 	if minExamined > needMax {
 		minExamined = needMax
 	}
@@ -795,7 +797,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 			cost := float64(expected) * 0.72
 			if residuals > 0 {
 				cost = float64(expected)*(0.75+float64(residuals)*0.35) + float64(residuals)*16.0
-				broadMin := satMulUint64(needWindow, uint64(limitRangeNoOrderBroadResidualRowsPerNeed))
+				broadMin := mathutil.SatMulUint64(needWindow, uint64(limitRangeNoOrderBroadResidualRowsPerNeed))
 				closeToLead := leadExpectedRows > 0 && expected >= leadExpectedRows
 				if leadExpectedRows > 0 && !closeToLead {
 					closeToLead = expected >= leadExpectedRows-leadExpectedRows/4
@@ -908,7 +910,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	return plannerNoOrderLimitPick(candidates[:n])
 }
 
-func (qv *View) executeNoOrderLimit(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanName, error) {
+func (qv *View) executeNoOrderLimit(q *qir.Shape, trace *Trace) ([]uint64, bool, rbitrace.PlanName, error) {
 	facts := noOrderLimitFactsPool.Get()
 	defer facts.Release()
 
@@ -938,7 +940,7 @@ func (qv *View) executeNoOrderLimit(q *qir.Shape, trace *Trace) ([]uint64, bool,
 func (qv *View) dispatchNoOrderLimitFallback(
 	q *qir.Shape,
 	decision plannerNoOrderLimitDecision,
-) ([]uint64, bool, PlanName, error) {
+) ([]uint64, bool, rbitrace.PlanName, error) {
 	if decision.materializedFallback.kind == plannerNoOrderLimitCandidateMaterializedFallback {
 		return qv.dispatchLimitMaterialized(q)
 	}
@@ -951,7 +953,7 @@ func (qv *View) dispatchNoOrderLimit(
 	decision plannerNoOrderLimitDecision,
 	guard plannerNoOrderLimitRuntimeGuard,
 	trace *Trace,
-) ([]uint64, bool, PlanName, error) {
+) ([]uint64, bool, rbitrace.PlanName, error) {
 	leaves := facts.leaves
 
 	selected := decision.selected
@@ -959,7 +961,7 @@ func (qv *View) dispatchNoOrderLimit(
 DISPATCH:
 	switch selected.kind {
 	case plannerNoOrderLimitCandidateEmpty:
-		return nil, true, PlanCandidateNoOrder, nil
+		return nil, true, rbitrace.PlanCandidateNoOrder, nil
 
 	case plannerNoOrderLimitCandidateNoFilter:
 		out, used, err := qv.execSelectedNoOrderNoFilter(q, trace)
@@ -969,7 +971,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanLimit, err
+		return out, true, rbitrace.PlanLimit, err
 
 	case plannerNoOrderLimitCandidateUniqueEq:
 		out, used, err := qv.execSelectedNoOrderUniqueEq(q, leaves, trace)
@@ -979,7 +981,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanUniqueEq, err
+		return out, true, rbitrace.PlanUniqueEq, err
 
 	case plannerNoOrderLimitCandidateDirectPrefix:
 		out, used, err := qv.execSelectedNoOrderDirectPrefix(q, trace)
@@ -989,7 +991,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanLimitPrefixNoOrder, err
+		return out, true, rbitrace.PlanLimitPrefixNoOrder, err
 
 	case plannerNoOrderLimitCandidateDirectRange:
 		if facts.singleRange && len(leaves) == 1 {
@@ -1000,7 +1002,7 @@ DISPATCH:
 				}
 				return qv.dispatchNoOrderLimitFallback(q, decision)
 			}
-			return out, true, PlanLimitRangeNoOrder, err
+			return out, true, rbitrace.PlanLimitRangeNoOrder, err
 		}
 		if !facts.directBoundsOK {
 			return qv.dispatchNoOrderLimitFallback(q, decision)
@@ -1017,7 +1019,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanLimitRangeNoOrder, err
+		return out, true, rbitrace.PlanLimitRangeNoOrder, err
 
 	case plannerNoOrderLimitCandidateSameFieldBounds:
 		if !facts.directBoundsOK {
@@ -1035,7 +1037,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanLimitRangeNoOrder, err
+		return out, true, rbitrace.PlanLimitRangeNoOrder, err
 
 	case plannerNoOrderLimitCandidateLeadScan:
 		out, used, err := qv.execSelectedNoOrderLeadScan(q, facts, selected.leadIdx, trace)
@@ -1045,7 +1047,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanCandidateNoOrder, err
+		return out, true, rbitrace.PlanCandidateNoOrder, err
 
 	case plannerNoOrderLimitCandidateUniverseScan:
 		out, used, err := qv.execSelectedNoOrderUniverseScan(q, leaves, selected.expectedRows, trace)
@@ -1055,7 +1057,7 @@ DISPATCH:
 			}
 			return qv.dispatchNoOrderLimitFallback(q, decision)
 		}
-		return out, true, PlanCandidateNoOrder, err
+		return out, true, rbitrace.PlanCandidateNoOrder, err
 
 	case plannerNoOrderLimitCandidateMaterializedFallback:
 		return qv.dispatchLimitMaterialized(q)

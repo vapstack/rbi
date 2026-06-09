@@ -12,7 +12,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -135,6 +134,13 @@ func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *b
 		if e != nil {
 			return e
 		}
+		var mapBkt *bbolt.Bucket
+		if strKey {
+			mapBkt, e = tx.CreateBucket(rebuildStringMapBucket(bucket))
+			if e != nil {
+				return e
+			}
+		}
 		var key [8]byte
 		for i := 1; i <= rows; i++ {
 			rec := rebuildTestRec{
@@ -152,7 +158,18 @@ func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *b
 				return e
 			}
 			if strKey {
-				if e = bkt.Put(keycodec.StringBytes(fmt.Sprintf("key_%08d", i)), data); e != nil {
+				skey := keycodec.StringBytes(fmt.Sprintf("key_%08d", i))
+				idx, e := mapBkt.NextSequence()
+				if e != nil {
+					return e
+				}
+				var mapKey [8]byte
+				if e = mapBkt.Put(keycodec.U64BytesWithBuf(idx, &mapKey), skey); e != nil {
+					return e
+				}
+				value := keycodec.AppendU64Bytes(nil, idx)
+				value = append(value, data...)
+				if e = bkt.Put(skey, value); e != nil {
 					return e
 				}
 			} else if e = bkt.Put(keycodec.U64BytesWithBuf(uint64(i), &key), data); e != nil {
@@ -302,11 +319,11 @@ func compileRebuildBenchSchemaFor[T any](b *testing.B) *schema.Schema {
 
 func baseRebuildBenchConfig(db *bbolt.DB, bucket []byte, s *schema.Schema, decode DecodeFunc, release ReleaseFunc) Config {
 	return Config{
-		Bolt:    db,
-		Bucket:  bucket,
-		Schema:  s,
-		Decode:  decode,
-		Release: release,
+		Bolt:       db,
+		DataBucket: bucket,
+		Schema:     s,
+		Decode:     decode,
+		Release:    release,
 	}
 }
 
@@ -521,12 +538,12 @@ func BenchmarkBuildStringKeys(b *testing.B) {
 	rt := compileRebuildBenchSchema(b)
 	cfg := baseRebuildTestConfig(db, bucket, rt)
 	cfg.StrKey = true
+	cfg.StrMapBucket = rebuildStringMapBucket(bucket)
 
 	var metrics rebuildBenchStorageMetrics
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cfg.StrMap = strmap.New(0, 256)
 		result, err := Build(cfg, newRebuildTestState(rt))
 		if err != nil {
 			b.Fatalf("Build: %v", err)

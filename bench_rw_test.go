@@ -16,6 +16,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbistats"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -241,7 +242,7 @@ func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserB
 	}
 
 	return raw.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
+		bucket := tx.Bucket(db.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -256,7 +257,7 @@ func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserB
 
 func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []schema.PatchItem) error {
 	return raw.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
+		bucket := tx.Bucket(db.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -770,13 +771,13 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 
 /**/
 
-func currentBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) SnapshotStats {
+func currentBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) rbistats.Snapshot {
 	b.Helper()
 	b.StopTimer()
 	return db.SnapshotStats()
 }
 
-func requireBenchSnapshotPublished(b *testing.B, st SnapshotStats) {
+func requireBenchSnapshotPublished(b *testing.B, st rbistats.Snapshot) {
 	b.Helper()
 	if st.Sequence == 0 || st.RegistrySize == 0 {
 		b.Fatalf("expected published snapshot, got %+v", st)

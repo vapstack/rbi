@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
@@ -28,7 +28,7 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 	defer worker.close()
 
 	done := worker.begin("read_discovery_explore_keys")
-	collector.observe(rbi.TraceEvent{
+	collector.observe(rbitrace.Event{
 		Timestamp:           time.Unix(1700000000, 0),
 		Duration:            1250 * time.Millisecond,
 		Plan:                "plan_or_order_merge_fallback",
@@ -44,9 +44,9 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 		OrderIndexScanWidth: 640,
 		DedupeCount:         512,
 		EarlyStopReason:     "limit_reached",
-		ORRoute: rbi.TraceORRoute{
-			Route:                    "fallback",
-			Reason:                   "cost",
+		ORRoute: rbitrace.ORRoute{
+			Selected:                 "fallback",
+			Rejected:                 "kway",
 			PlannerAnalysisTime:      240 * time.Microsecond,
 			PlannerPredicates:        6,
 			PlannerCacheHits:         2,
@@ -56,7 +56,7 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 			RuntimeFallbackTriggered: true,
 			RuntimeFallbackReason:    "projected_examined",
 		},
-		ORBranches: []rbi.TraceORBranch{
+		ORBranches: []rbitrace.ORBranch{
 			{Index: 0, RowsExamined: 40000, RowsEmitted: 70},
 			{Index: 1, RowsExamined: 85000, RowsEmitted: 80},
 		},
@@ -64,7 +64,7 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 	done()
 
 	done = worker.begin("read_dormant_archive_page_keys")
-	collector.observe(rbi.TraceEvent{
+	collector.observe(rbitrace.Event{
 		Timestamp:           time.Unix(1700000001, 0),
 		Duration:            2200 * time.Millisecond,
 		Plan:                "plan_ordered_scan",
@@ -108,8 +108,8 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 	if queryReport == nil || queryReport.Sampled != 1 {
 		t.Fatalf("query sampled = %#v, want 1", queryReport)
 	}
-	if got := queryReport.ORRouteCounts["fallback:cost"]; got != 1 {
-		t.Fatalf("OR route count = %d, want 1", got)
+	if got := queryReport.ORSelectionCounts["fallback:kway"]; got != 1 {
+		t.Fatalf("OR selection count = %d, want 1", got)
 	}
 	if queryReport.AvgPlannerUs <= 0 {
 		t.Fatalf("planner analysis avg = %v, want > 0", queryReport.AvgPlannerUs)

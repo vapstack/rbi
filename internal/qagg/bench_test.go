@@ -138,7 +138,7 @@ func qaggBenchCachedDB(b testing.TB, scale qaggBenchScale, layout qaggBenchIDLay
 		db.snap = snapshot.Build(uint64(base/qaggBenchSeedBatchRows+1), db.snap, rt, snapshot.CacheConfig{
 			MatPredMaxEntries: 256,
 			MatPredMaxCard:    512 << 10,
-		}, nil, nil, entries)
+		}, nil, entries)
 	}
 
 	qaggBenchDBsMu.Lock()
@@ -772,7 +772,7 @@ func BenchmarkAggregateNullHeavyLeafGroup(b *testing.B) {
 		}
 		entries[i] = snapshot.BatchEntry{ID: row, New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 
 	cases := []struct {
 		name string

@@ -3,6 +3,7 @@ package wexec
 import (
 	"bytes"
 	"errors"
+	"github.com/vapstack/rbi/rbierrors"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -18,8 +19,8 @@ import (
 
 func TestSingleRequestBatchesUseConfiguredExecutor(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
-		events = append(events, "commit:"+op)
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		events = append(events, "commit")
 		return tx.Commit()
 	})
 
@@ -75,7 +76,7 @@ func TestSingleRequestBatchesUseConfiguredExecutor(t *testing.T) {
 
 func TestBatchAPISubmitAndCancel(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, _ string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -122,7 +123,7 @@ func TestDirectSubmitDrainsConcurrentQueuedJob(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var first atomic.Bool
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, _ string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		if first.CompareAndSwap(false, true) {
 			close(firstStarted)
 			<-releaseFirst
@@ -206,7 +207,7 @@ func TestDirectSubmitDrainsConcurrentQueuedJob(t *testing.T) {
 
 func TestExecuteJobsCoalescedSetDeleteUsesTerminalWrite(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -258,13 +259,12 @@ func TestExecuteJobsCoalescedSetDeleteUsesTerminalWrite(t *testing.T) {
 }
 
 func TestExecuteJobsCoalescedChainPropagatesTerminalError(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -299,13 +299,13 @@ func TestExecuteJobsCoalescedChainPropagatesTerminalError(t *testing.T) {
 
 	ex.executeJobs(batch)
 
-	if err := <-req1.Done; !errors.Is(err, uniqueErr) {
+	if err := <-req1.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("req1 error = %v, want unique error", err)
 	}
-	if err := <-req2.Done; !errors.Is(err, uniqueErr) {
+	if err := <-req2.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("req2 error = %v, want unique error", err)
 	}
-	if err := <-req3.Done; !errors.Is(err, uniqueErr) {
+	if err := <-req3.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("req3 error = %v, want unique error", err)
 	}
 	if err := <-req4.Done; err != nil {
@@ -322,7 +322,7 @@ func TestExecuteJobsCoalescedChainPropagatesTerminalError(t *testing.T) {
 func TestExecuteJobsCoalescedChainsPropagateCommitError(t *testing.T) {
 	commitErr := errors.New("commit failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(*bbolt.Tx, string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(*bbolt.Tx) error {
 		return commitErr
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -371,7 +371,7 @@ func TestExecuteJobsCoalescedChainsPropagateCommitError(t *testing.T) {
 func TestExecuteJobsCoalescedChainSurvivesNeighborCallbackFailure(t *testing.T) {
 	callbackErr := errors.New("neighbor callback failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -425,13 +425,12 @@ func TestExecuteJobsCoalescedChainSurvivesNeighborCallbackFailure(t *testing.T) 
 }
 
 func TestExecuteJobsCoalescedInterleavedChainsPreserveFinalStateAndIndex(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -501,7 +500,7 @@ func TestExecuteJobsCoalescedInterleavedChainsPreserveFinalStateAndIndex(t *test
 
 func TestExecuteJobsRepeatedPatchAppliesSequentialState(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -546,7 +545,7 @@ func TestExecuteJobsRepeatedPatchAppliesSequentialState(t *testing.T) {
 func TestExecuteJobsRepeatedPatchFirstBeforeCommitErrorRetriesFollowerFromOriginalState(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -600,7 +599,7 @@ func TestExecuteJobsRepeatedPatchFirstBeforeCommitErrorRetriesFollowerFromOrigin
 func TestExecuteJobsRepeatedPatchMiddleBeforeCommitErrorRetriesNeighborsSequentially(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -660,7 +659,7 @@ func TestExecuteJobsRepeatedPatchMiddleBeforeCommitErrorRetriesNeighborsSequenti
 func TestExecuteJobsRepeatedPatchValidateIndexFailureIsolatesOnlyBadRequest(t *testing.T) {
 	validateErr := errors.New("validate index failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.ops.ValidateIndex = func(ptr unsafe.Pointer) error {
@@ -714,7 +713,7 @@ func TestExecuteJobsRepeatedPatchValidateIndexFailureIsolatesOnlyBadRequest(t *t
 
 func TestExecuteJobsRepeatedPatchBeforeStoreSeesSteppedState(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -759,7 +758,7 @@ func TestExecuteJobsRepeatedPatchBeforeStoreSeesSteppedState(t *testing.T) {
 
 func TestExecuteJobsRepeatedPatchBeforeCommitSeesSteppedState(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -809,7 +808,7 @@ func TestExecuteJobsRepeatedPatchBeforeCommitSeesSteppedState(t *testing.T) {
 
 func TestExecuteJobsRepeatedPatchBeforeProcessMutationsAreSequential(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10, 0})
@@ -870,7 +869,7 @@ func TestExecuteJobsRepeatedPatchBeforeProcessMutationsAreSequential(t *testing.
 
 func TestExecuteJobsInterleavedIsolatedSameIDPreservesSequentialState(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10, 15})
@@ -938,7 +937,7 @@ func TestExecuteJobsInterleavedIsolatedSameIDPreservesSequentialState(t *testing
 
 func TestExecuteJobsGroupedJobBetweenSharedRequestsStaysIsolatedAndOrdered(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPairAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10, 15})
@@ -1018,7 +1017,7 @@ func TestExecuteJobsGroupedJobBetweenSharedRequestsStaysIsolatedAndOrdered(t *te
 
 func TestExecuteJobsRepeatedDeleteRunsBeforeCommitOnce(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -1067,7 +1066,7 @@ func TestExecuteJobsRepeatedDeleteRunsBeforeCommitOnce(t *testing.T) {
 
 func TestRunAtomicEmptyPayloadFailsWholeBatch(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -1106,7 +1105,7 @@ func TestRunAtomicEmptyPayloadFailsWholeBatch(t *testing.T) {
 func TestRunAtomicBeforeCommitFailureRollsBackWholeBatch(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -1139,7 +1138,7 @@ func TestRunAtomicBeforeCommitFailureRollsBackWholeBatch(t *testing.T) {
 
 func TestExecuteBatchCleansCompletedRequest(t *testing.T) {
 	var events []string
-	ex, _, _ := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, _, _ := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -1169,7 +1168,7 @@ func TestExecuteBatchCleansCompletedRequest(t *testing.T) {
 
 func TestSubmitQueueFullWaitsAndEnqueuesAfterDrain(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -1218,7 +1217,7 @@ func TestSubmitQueueFullWaitsAndEnqueuesAfterDrain(t *testing.T) {
 func TestRunLoopUnavailableFailsQueuedJobsWithoutExecuting(t *testing.T) {
 	closedErr := errors.New("closed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}

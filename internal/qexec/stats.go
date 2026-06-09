@@ -7,16 +7,17 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 func (r *Runtime) RefreshPlannerStatsOnSnapshot(snap *snapshot.View) {
 	fieldNames := r.sortedPlannerFieldNames()
 	universeCardinality := snap.UniverseCardinality()
 
-	out := PlannerStatsSnapshot{
+	out := rbistats.PlannerSnapshot{
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: universeCardinality,
-		Fields:              make(map[string]PlannerFieldStats, len(fieldNames)),
+		Fields:              make(map[string]rbistats.PlannerField, len(fieldNames)),
 	}
 
 	for _, fieldName := range fieldNames {
@@ -27,12 +28,12 @@ func (r *Runtime) RefreshPlannerStatsOnSnapshot(snap *snapshot.View) {
 	r.Stats.Store(&out)
 }
 
-func (r *Runtime) PlannerStatsSnapshotForPersist(snap *snapshot.View, version uint64) *PlannerStatsSnapshot {
+func (r *Runtime) PlannerStatsSnapshotForPersist(snap *snapshot.View, version uint64) *rbistats.PlannerSnapshot {
 	current := r.Stats.Load()
 	if current == nil {
 		return r.BuildPlannerStatsSnapshot(snap, version)
 	}
-	return &PlannerStatsSnapshot{
+	return &rbistats.PlannerSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: snap.UniverseCardinality(),
@@ -40,13 +41,13 @@ func (r *Runtime) PlannerStatsSnapshotForPersist(snap *snapshot.View, version ui
 	}
 }
 
-func (r *Runtime) BuildPlannerStatsSnapshot(snap *snapshot.View, version uint64) *PlannerStatsSnapshot {
+func (r *Runtime) BuildPlannerStatsSnapshot(snap *snapshot.View, version uint64) *rbistats.PlannerSnapshot {
 	fields := r.sortedPlannerFieldNames()
-	out := &PlannerStatsSnapshot{
+	out := &rbistats.PlannerSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: snap.UniverseCardinality(),
-		Fields:              make(map[string]PlannerFieldStats, len(fields)),
+		Fields:              make(map[string]rbistats.PlannerField, len(fields)),
 	}
 
 	for _, fieldName := range fields {
@@ -56,12 +57,12 @@ func (r *Runtime) BuildPlannerStatsSnapshot(snap *snapshot.View, version uint64)
 	return out
 }
 
-func (r *Runtime) PublishLoadedPlannerStats(s *PlannerStatsSnapshot, snap *snapshot.View) {
-	out := &PlannerStatsSnapshot{
+func (r *Runtime) PublishLoadedPlannerStats(s *rbistats.PlannerSnapshot, snap *snapshot.View) {
+	out := &rbistats.PlannerSnapshot{
 		Version:             s.Version,
 		GeneratedAt:         s.GeneratedAt,
 		UniverseCardinality: snap.UniverseCardinality(),
-		Fields:              make(map[string]PlannerFieldStats, len(r.Schema.Indexed)),
+		Fields:              make(map[string]rbistats.PlannerField, len(r.Schema.Indexed)),
 	}
 	if out.Version == 0 {
 		out.Version = 1
@@ -76,25 +77,25 @@ func (r *Runtime) PublishLoadedPlannerStats(s *PlannerStatsSnapshot, snap *snaps
 	r.Stats.Store(out)
 }
 
-func (r *Runtime) collectPlannerFieldStatsFromIndexView(s *snapshot.View, fieldName string) PlannerFieldStats {
+func (r *Runtime) collectPlannerFieldStatsFromIndexView(s *snapshot.View, fieldName string) rbistats.PlannerField {
 	acc, ok := r.Schema.IndexedByName[fieldName]
 	if !ok || s.Index == nil || acc.Ordinal >= len(s.Index) {
-		return PlannerFieldStats{}
+		return rbistats.PlannerField{}
 	}
 	ov := indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal])
 	if !ov.HasData() {
-		return PlannerFieldStats{}
+		return rbistats.PlannerField{}
 	}
 	return plannerFieldIndexViewStats(ov)
 }
 
-func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
+func plannerFieldIndexViewStats(o indexdata.FieldIndexView) rbistats.PlannerField {
 	keyCount := uint64(o.KeyCount())
 	if keyCount == 0 {
-		return PlannerFieldStats{}
+		return rbistats.PlannerField{}
 	}
 	if o.Rows() == keyCount {
-		return PlannerFieldStats{
+		return rbistats.PlannerField{
 			DistinctKeys:    keyCount,
 			NonEmptyKeys:    keyCount,
 			TotalBucketCard: keyCount,
@@ -113,7 +114,7 @@ func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
 	)
 	br := o.RangeForBounds(indexdata.Bounds{Has: true})
 	if br.BaseStart >= br.BaseEnd {
-		return PlannerFieldStats{}
+		return rbistats.PlannerField{}
 	}
 
 	q50 := newP2Quantile(0.50)
@@ -141,10 +142,10 @@ func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
 	}
 
 	if distinct == 0 {
-		return PlannerFieldStats{}
+		return rbistats.PlannerField{}
 	}
 
-	return PlannerFieldStats{
+	return rbistats.PlannerField{
 		DistinctKeys:    distinct,
 		NonEmptyKeys:    nonEmpty,
 		TotalBucketCard: total,

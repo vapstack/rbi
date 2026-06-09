@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/internal/mathutil"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 var (
@@ -605,8 +607,8 @@ func (a *stressApp) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
 		return
 	}
 	memory := CaptureMemorySnapshot(a.handle)
-	var snapRaw rbi.SnapshotStats
-	var batchRaw rbi.AutoBatchStats
+	var snapRaw rbistats.Snapshot
+	var batchRaw rbistats.AutoBatch
 	if a.handle != nil && a.handle.DB != nil {
 		snapRaw = a.handle.DB.SnapshotStats()
 		batchRaw = a.handle.DB.AutoBatchStats()
@@ -711,7 +713,7 @@ func (c *classController) setWorkers(target int) {
 				startedAt: time.Now(),
 				stop:      make(chan struct{}),
 			}
-			handle.metrics.Store(newWorkerMetrics(96, 48, uint64(handle.id)*0x9e3779b97f4a7c15, c.app.queryBreakdown, c.app.queryLatency))
+			handle.metrics.Store(newWorkerMetrics(96, 48, mathutil.Mix64(uint64(handle.id)), c.app.queryBreakdown, c.app.queryLatency))
 			c.workers = append(c.workers, handle)
 			added = append(added, handle)
 		}
@@ -744,7 +746,7 @@ func (c *classController) resetMetrics() {
 		queryCap = 32
 	}
 	for i, worker := range workers {
-		seed := uint64(worker.id) + uint64(i+1)*0x94d049bb133111eb
+		seed := mathutil.Mix64(uint64(worker.id)) ^ mathutil.Mix64(uint64(i+1))
 		worker.metrics.Store(newWorkerMetrics(totalCap, queryCap, seed, c.app.queryBreakdown, c.app.queryLatency))
 	}
 }
@@ -837,7 +839,7 @@ func (a *stressApp) runWorker(class *classController, worker *workerHandle) {
 	}
 
 	seed := time.Now().UnixNano() + worker.id*811 + int64(class.desc.Info.ID)*104729
-	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0x9e3779b97f4a7c15))
+	rng := mathutil.NewRand(seed)
 
 	for {
 		select {
@@ -881,8 +883,8 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string) *runEpoch {
 	now := time.Now()
 	memory := CaptureMemorySnapshot(handle)
-	var snapshotRaw rbi.SnapshotStats
-	var batchRaw rbi.AutoBatchStats
+	var snapshotRaw rbistats.Snapshot
+	var batchRaw rbistats.AutoBatch
 	if handle != nil && handle.DB != nil {
 		snapshotRaw = handle.DB.SnapshotStats()
 		batchRaw = handle.DB.AutoBatchStats()
@@ -1168,14 +1170,14 @@ func currentRecordCount(db *rbi.DB[uint64, UserBench]) uint64 {
 	return count
 }
 
-func makeSnapshotSample(now time.Time, baseline, current rbi.SnapshotStats) snapshotSample {
+func makeSnapshotSample(now time.Time, baseline, current rbistats.Snapshot) snapshotSample {
 	return snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,
 	}
 }
 
-func makeBatchSample(now time.Time, baseline, current rbi.AutoBatchStats) batchSample {
+func makeBatchSample(now time.Time, baseline, current rbistats.AutoBatch) batchSample {
 	return batchSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,

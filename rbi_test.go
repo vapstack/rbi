@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -138,8 +139,8 @@ func TestWrap_InvalidBucketName_RejectsUnsafeCharacters(t *testing.T) {
 		"1bucket",
 	} {
 		_, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: bucket}))
-		if !errors.Is(err, ErrInvalidBucketName) {
-			t.Fatalf("bucket=%q: expected ErrInvalidBucketName, got=%v", bucket, err)
+		if !errors.Is(err, rbierrors.ErrInvalidBucketName) {
+			t.Fatalf("bucket=%q: expected rbierrors.ErrInvalidBucketName, got=%v", bucket, err)
 		}
 	}
 
@@ -402,7 +403,7 @@ func TestMultiWrap_CloseBehavior(t *testing.T) {
 	}
 
 	// db1 must not
-	if err = db1.Set(3, &Rec{}); !errors.Is(err, ErrClosed) {
+	if err = db1.Set(3, &Rec{}); !errors.Is(err, rbierrors.ErrClosed) {
 		t.Fatalf("db1 should be closed, got: %v", err)
 	}
 
@@ -492,7 +493,7 @@ func TestTruncate(t *testing.T) {
 			_, _ = db.BatchGet(1, 2, 999)
 
 			_ = db.SeqScan(0, func(_ uint64, _ *UniqueTestRec) (bool, error) { return true, nil })
-			_ = db.SeqScanRaw(0, func(_ uint64, _ []byte) (bool, error) { return true, nil })
+			_ = scanRawBolt(t, db, 0, func(_ uint64, _ []byte) (bool, error) { return true, nil })
 
 			_, _ = db.QueryKeys(qx.Query())
 			_, _ = db.Count()
@@ -547,7 +548,10 @@ func TestTruncate(t *testing.T) {
 		t.Fatalf("expected no keys after truncate, got %v", ids)
 	}
 
-	st := db.Stats()
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	if st.KeyCount != 0 {
 		t.Fatalf("expected Stats.KeyCount=0 after truncate, got %d", st.KeyCount)
 	}
@@ -559,8 +563,8 @@ func TestTruncate(t *testing.T) {
 	if err := db.Set(10, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("expected unique values reusable after truncate, got: %v", err)
 	}
-	if err := db.Set(11, &UniqueTestRec{Email: "a@x", Code: 2}); err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation after truncate+reuse, got: %v", err)
+	if err := db.Set(11, &UniqueTestRec{Email: "a@x", Code: 2}); err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation after truncate+reuse, got: %v", err)
 	}
 
 	if ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x"))); err != nil {
@@ -679,13 +683,13 @@ func TestAPI_QueryKeysQueryCountReturnErrClosedAfterClose(t *testing.T) {
 
 	q := qx.Query(qx.EQ("age", 30))
 
-	if _, err := db.QueryKeys(q); !errors.Is(err, ErrClosed) {
-		t.Fatalf("QueryKeys after Close: expected ErrClosed, got %v", err)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("QueryKeys after Close: expected rbierrors.ErrClosed, got %v", err)
 	}
-	if _, err := db.Query(q); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Query after Close: expected ErrClosed, got %v", err)
+	if _, err := db.Query(q); !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("Query after Close: expected rbierrors.ErrClosed, got %v", err)
 	}
-	if _, err := db.Count(q.Filter); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Count after Close: expected ErrClosed, got %v", err)
+	if _, err := db.Count(q.Filter); !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("Count after Close: expected rbierrors.ErrClosed, got %v", err)
 	}
 }

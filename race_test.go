@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"math/rand/v2"
 	"path/filepath"
 	"runtime"
@@ -121,7 +122,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 
 				items, err := db.Query(q)
 				if err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("query error: %w", err))
@@ -144,7 +145,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 				}
 
 				if _, err = db.Count(q.Filter); err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("count error: %w", err))
@@ -245,7 +246,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				q := qs[r.IntN(len(qs))]
 				items, err := db.Query(q)
 				if err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("query items error: %w", err))
@@ -268,7 +269,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 
 				ids, err := db.QueryKeys(q)
 				if err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("query keys error: %w", err))
@@ -277,7 +278,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				_ = ids
 
 				if _, err = db.Count(q.Filter); err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("count error: %w", err))
@@ -289,7 +290,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 					seen++
 					return seen < 64, nil
 				}); err != nil {
-					if errors.Is(err, ErrClosed) {
+					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
 					reportErr(fmt.Errorf("scan keys error: %w", err))
@@ -1194,7 +1195,9 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 							return
 						}
 					} else {
-						_ = db.Stats()
+						if _, err := db.Stats(); !checkErr("Stats", err) {
+							return
+						}
 						_ = db.IndexStats()
 						_ = db.AutoBatchStats()
 						_ = db.SnapshotStats()

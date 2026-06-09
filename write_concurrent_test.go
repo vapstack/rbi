@@ -120,7 +120,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				if err := db.SeqScanRaw(0, func(id uint64, raw []byte) (bool, error) {
+				if err := scanRawBolt(t, db, 0, func(id uint64, raw []byte) (bool, error) {
 					cp := append([]byte(nil), raw...)
 					v, err := db.decode(cp)
 					if err != nil {
@@ -132,7 +132,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					}
 					return true, nil
 				}); err != nil {
-					errCh <- fmt.Errorf("reader=%d SeqScanRaw: %w", r, err)
+					errCh <- fmt.Errorf("reader=%d raw bbolt scan: %w", r, err)
 					return
 				}
 
@@ -266,8 +266,12 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				if err := db.SeqScanRaw("", func(id string, raw []byte) (bool, error) {
-					cp := append([]byte(nil), raw...)
+				if err := scanRawBolt(t, db, "", func(id string, raw []byte) (bool, error) {
+					payload, err := rawPayloadForTest(db, raw)
+					if err != nil {
+						return false, fmt.Errorf("parse raw id=%q: %w", id, err)
+					}
+					cp := append([]byte(nil), payload...)
 					v, err := db.decode(cp)
 					if err != nil {
 						return false, fmt.Errorf("decode raw id=%q: %w", id, err)
@@ -278,18 +282,20 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					}
 					return true, nil
 				}); err != nil {
-					errCh <- fmt.Errorf("reader=%d SeqScanRaw: %w", r, err)
+					errCh <- fmt.Errorf("reader=%d raw bbolt scan: %w", r, err)
 					return
 				}
 
-				if err := db.ScanKeys("", func(id string) (bool, error) {
-					if id == "" {
-						return false, fmt.Errorf("empty key")
-					}
-					return true, nil
-				}); err != nil {
-					errCh <- fmt.Errorf("reader=%d ScanKeys: %w", r, err)
+				ids, err := db.QueryKeys(qx.Query())
+				if err != nil {
+					errCh <- fmt.Errorf("reader=%d QueryKeys(all): %w", r, err)
 					return
+				}
+				for _, id := range ids {
+					if id == "" {
+						errCh <- fmt.Errorf("reader=%d empty key", r)
+						return
+					}
 				}
 			}
 		}()
@@ -312,7 +318,11 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 			t.Fatalf("invalid final scanned product: key=%q value=%#v", key, v)
 		}
 		raw := ioExtMustReadStringRaw(t, db, key)
-		decoded, err := db.decode(raw)
+		payload, err := rawPayloadForTest(db, raw)
+		if err != nil {
+			t.Fatalf("final raw payload(%q): %v", key, err)
+		}
+		decoded, err := db.decode(payload)
 		if err != nil {
 			t.Fatalf("final decode(%q): %v", key, err)
 		}

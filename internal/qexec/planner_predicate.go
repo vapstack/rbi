@@ -7,10 +7,12 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type predicate struct {
@@ -1869,10 +1871,7 @@ func rangeProbeMaterializeWork(probeLen int, est uint64) uint64 {
 		}
 	}
 	structuralWork := uint64(probeLen) * uint64(max(bits.Len64(avgPerBucket+1), 1))
-	if ^uint64(0)-buildWork < structuralWork {
-		return ^uint64(0)
-	}
-	return buildWork + structuralWork
+	return mathutil.SatAddUint64(buildWork, structuralWork)
 }
 
 func rangeProbeContainsWork(probeLen int, est uint64) uint64 {
@@ -1976,7 +1975,7 @@ func rangeHashSetBuildWork(est uint64) uint64 {
 	if est == 0 {
 		return 0
 	}
-	return satMulUint64(est, 2)
+	return mathutil.SatMulUint64(est, 2)
 }
 
 func rangeHashSetLookupWork() uint64 {
@@ -2023,7 +2022,7 @@ func rangeLinearContainsTotalWork(probeLen int, est uint64, calls int) uint64 {
 	if calls <= 0 {
 		return 0
 	}
-	return satMulUint64(uint64(calls), rangeProbeContainsWork(probeLen, est))
+	return mathutil.SatMulUint64(uint64(calls), rangeProbeContainsWork(probeLen, est))
 }
 
 func rangeHashSetTotalWork(probeLen int, est uint64, calls int) uint64 {
@@ -2033,9 +2032,9 @@ func rangeHashSetTotalWork(probeLen int, est uint64, calls int) uint64 {
 	if rangeHashSetAfterForProbe(probeLen, est) == 0 {
 		return ^uint64(0)
 	}
-	return satAddUint64(
+	return mathutil.SatAddUint64(
 		rangeHashSetBuildWork(est),
-		satMulUint64(uint64(calls), rangeHashSetLookupWork()),
+		mathutil.SatMulUint64(uint64(calls), rangeHashSetLookupWork()),
 	)
 }
 
@@ -2043,9 +2042,9 @@ func rangeMaterializedContainsTotalWork(probeLen int, est uint64, calls int) uin
 	if calls <= 0 {
 		return 0
 	}
-	return satAddUint64(
+	return mathutil.SatAddUint64(
 		rangeProbeMaterializeWork(probeLen, est),
-		satMulUint64(uint64(calls), postingContainsLookupWork(est)),
+		mathutil.SatMulUint64(uint64(calls), postingContainsLookupWork(est)),
 	)
 }
 
@@ -2092,7 +2091,7 @@ func rangeProbeCountBucketWork(probeLen int, est, bucketCard uint64) uint64 {
 	if bucketCard < avgPerBucket {
 		avgPerBucket = bucketCard
 	}
-	return satMulUint64(uint64(probeLen), avgPerBucket)
+	return mathutil.SatMulUint64(uint64(probeLen), avgPerBucket)
 }
 
 func rangeCountBucketUseful(probeLen int, est, bucketCard uint64) bool {
@@ -2100,7 +2099,7 @@ func rangeCountBucketUseful(probeLen int, est, bucketCard uint64) bool {
 		return true
 	}
 	countWork := rangeProbeCountBucketWork(probeLen, est, bucketCard)
-	rowWork := satMulUint64(bucketCard, rangeProbeContainsWork(probeLen, est))
+	rowWork := mathutil.SatMulUint64(bucketCard, rangeProbeContainsWork(probeLen, est))
 	return countWork <= rowWork
 }
 
@@ -2154,10 +2153,7 @@ func rangeProbeTotalWorkForRows(rows, probeLen int, est uint64) uint64 {
 	if perRow == 0 {
 		return 0
 	}
-	if ^uint64(0)/perRow < uint64(rows) {
-		return ^uint64(0)
-	}
-	return uint64(rows) * perRow
+	return mathutil.SatMulUint64(uint64(rows), perRow)
 }
 
 func rangeAdaptiveProbeWorkForRows(rows uint64, probeLen int, est uint64) uint64 {
@@ -2167,16 +2163,16 @@ func rangeAdaptiveProbeWorkForRows(rows uint64, probeLen int, est uint64) uint64
 	perCall := rangeProbeContainsWork(probeLen, est)
 	materializeAt := rangeAdaptiveProbeMaterializeAt(probeLen, est)
 	if materializeAt == 0 || rows < materializeAt {
-		return satMulUint64(rows, perCall)
+		return mathutil.SatMulUint64(rows, perCall)
 	}
 	lookupWork := postingContainsLookupWork(est)
 	buildWork := rangeProbeMaterializeWork(probeLen, est)
 	linearCalls := materializeAt - 1
-	work := satMulUint64(linearCalls, perCall)
-	work = satAddUint64(work, buildWork)
-	return satAddUint64(
+	work := mathutil.SatMulUint64(linearCalls, perCall)
+	work = mathutil.SatAddUint64(work, buildWork)
+	return mathutil.SatAddUint64(
 		work,
-		satMulUint64(rows-linearCalls, lookupWork),
+		mathutil.SatMulUint64(rows-linearCalls, lookupWork),
 	)
 }
 
@@ -2212,10 +2208,7 @@ func postingUnionLinearWork(probeLen int, est uint64) uint64 {
 	}
 	work := rangeProbeMaterializeWork(probeLen, est)
 	mergeCalls := uint64(probeLen) * uint64(max(bits.Len64(uint64(probeLen)+1), 1))
-	if ^uint64(0)-work < mergeCalls {
-		return ^uint64(0)
-	}
-	return work + mergeCalls
+	return mathutil.SatAddUint64(work, mergeCalls)
 }
 
 func postingUnionFastSinglesWork(probeLen, singletonCount int, est uint64) uint64 {
@@ -2231,18 +2224,12 @@ func postingUnionFastSinglesWork(probeLen, singletonCount int, est uint64) uint6
 		multiEst = 0
 	}
 	work := singles * uint64(max(bits.Len64(singles+1), 1))
-	if ^uint64(0)-work < singles {
-		return ^uint64(0)
-	}
-	work += singles
+	work = mathutil.SatAddUint64(work, singles)
 	if multiCount == 0 {
 		return work
 	}
 	multiWork := rangeProbeMaterializeWork(multiCount, multiEst)
-	if ^uint64(0)-work < multiWork {
-		return ^uint64(0)
-	}
-	return work + multiWork
+	return mathutil.SatAddUint64(work, multiWork)
 }
 
 func shouldUseFastSinglesUnion(probeLen, singletonCount int, est uint64) bool {
@@ -2325,8 +2312,8 @@ func predicateOrderLess(preds predicateReader, a, b int) bool {
 	cb := pb.checkCost()
 	ea := predicateOrderEstimate(preds, a)
 	eb := predicateOrderEstimate(preds, b)
-	sa := satMulUint64(ca, ea)
-	sb := satMulUint64(cb, eb)
+	sa := mathutil.SatMulUint64(ca, ea)
+	sb := mathutil.SatMulUint64(cb, eb)
 	if sa != sb {
 		return sa < sb
 	}
@@ -2910,7 +2897,7 @@ func (qv *View) orderedPredicateScalarRangeRouting(
 
 	expectedRows := orderedPredicateExpectedRows(orderedWindow, candidate.plan.est, universe)
 	if orderedOffset == 0 && expectedRows > 0 && expectedRows < candidate.plan.est {
-		route.requirePromotion = satMulUint64(expectedRows, 2) < candidate.plan.est
+		route.requirePromotion = mathutil.SatMulUint64(expectedRows, 2) < candidate.plan.est
 	}
 
 	route.broadComplement = candidate.broadComplementCardinality(universe)
@@ -3018,7 +3005,7 @@ func (qv *View) tryMaterializeBroadRangeComplementPredicateForOrdered(
 	}
 
 	buildWork := postingUnionLinearWork(plan.buckets, plan.est)
-	materializedWork := satAddUint64(buildWork, satMulUint64(expectedRows, postingContainsLookupWork(plan.est)))
+	materializedWork := mathutil.SatAddUint64(buildWork, mathutil.SatMulUint64(expectedRows, postingContainsLookupWork(plan.est)))
 
 	probeWork := rangeProbeTotalWorkForRows(
 		int(expectedRows),
@@ -3695,11 +3682,7 @@ func (p *fieldIndexRangeProbe) scanStats() {
 				card = ids.Cardinality()
 			}
 			p.probeLen++
-			if ^uint64(0)-p.probeEst < card {
-				p.probeEst = ^uint64(0)
-			} else {
-				p.probeEst += card
-			}
+			p.probeEst = mathutil.SatAddUint64(p.probeEst, card)
 		}
 	}
 }
@@ -3862,11 +3845,7 @@ func isSingletonHeavyPostingBuf(probe []posting.List) bool {
 		if card == 1 {
 			singletons++
 		}
-		if ^uint64(0)-est < card {
-			est = ^uint64(0)
-		} else {
-			est += card
-		}
+		est = mathutil.SatAddUint64(est, card)
 	}
 	return shouldUseFastSinglesUnion(probeLen, singletons, est)
 }
@@ -4470,7 +4449,7 @@ func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateR
 				deferredChecksBuf,
 			); ok {
 				if trace != nil {
-					trace.SetPlan(PlanOrderedAnchor)
+					trace.SetPlan(rbitrace.PlanOrderedAnchor)
 				}
 				return out, true
 			}
@@ -4512,7 +4491,7 @@ func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateR
 			deferredChecksInline[:0],
 		); ok {
 			if trace != nil {
-				trace.SetPlan(PlanOrderedAnchor)
+				trace.SetPlan(rbitrace.PlanOrderedAnchor)
 			}
 			return out, true
 		}

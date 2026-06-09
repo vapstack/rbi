@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"math"
 	"math/rand/v2"
 	"path/filepath"
@@ -112,14 +113,15 @@ func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
 func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
 	if db.strKey {
 		var out uint64
-		pos := uint64(0)
-		err := db.ScanKeys(*new(K), func(key K) (bool, error) {
-			pos++
-			if key == id {
-				out = pos
-				return false, nil
+		err := db.bolt.View(func(tx *bbolt.Tx) error {
+			var keyBuf [8]byte
+			v := tx.Bucket(db.dataBucket).Get(keycodec.UserKeyBytesWithBuf(id, true, &keyBuf))
+			if v == nil {
+				return nil
 			}
-			return true, nil
+			idx := keycodec.U64FromBytes(v[:8])
+			out = idx
+			return nil
 		})
 		if err != nil {
 			panic(err)
@@ -687,7 +689,7 @@ func evalPreparedExprBool(rec *Rec, e qir.Expr) (bool, error) {
 
 	if e.Op == qir.OpAND || e.Op == qir.OpOR {
 		if len(e.Operands) == 0 {
-			return false, ErrInvalidQuery
+			return false, rbierrors.ErrInvalidQuery
 		}
 		if e.Op == qir.OpAND {
 			out := true

@@ -1,25 +1,22 @@
-package qexec
+// Package rbitrace defines public query trace event payloads.
+package rbitrace
 
-import (
-	"errors"
-	"time"
-)
+import "time"
 
-var ErrInvalidQuery = errors.New("invalid query")
-
-// PlanName is a stable plan identifier used by tracing.
+// PlanName is a stable planner route identifier emitted in trace events.
 type PlanName string
 
 const (
 	PlanMaterialized PlanName = "plan_materialized"
 
-	planFilterCardinalityMaterialized  PlanName = "plan_count_materialized"
-	planFilterCardinalityUniqueEq      PlanName = "plan_count_unique_eq"
-	planFilterCardinalityScalarLookup  PlanName = "plan_count_scalar_lookup"
-	planFilterCardinalityScalarInSplit PlanName = "plan_count_scalar_in_split"
-	planFilterCardinalityPredicates    PlanName = "plan_count_predicates"
-	planFilterCardinalityORPredicates  PlanName = "plan_count_or_predicates"
-	planFilterCardinalityORHybrid      PlanName = "plan_count_or_hybrid"
+	PlanAggregate          PlanName = "plan_aggregate"
+	PlanCountMaterialized  PlanName = "plan_count_materialized"
+	PlanCountUniqueEq      PlanName = "plan_count_unique_eq"
+	PlanCountScalarLookup  PlanName = "plan_count_scalar_lookup"
+	PlanCountScalarInSplit PlanName = "plan_count_scalar_in_split"
+	PlanCountPredicates    PlanName = "plan_count_predicates"
+	PlanCountORPredicates  PlanName = "plan_count_or_predicates"
+	PlanCountORHybrid      PlanName = "plan_count_or_hybrid"
 
 	PlanCandidateNoOrder PlanName = "plan_candidate_no_order"
 	PlanCandidateOrder   PlanName = "plan_candidate_order"
@@ -41,13 +38,12 @@ const (
 	PlanUniqueEq           PlanName = "plan_unique_eq"
 )
 
-// TraceEvent is an optional per-query planner execution trace.
-// It is emitted only when TraceSink is configured.
-type TraceEvent struct {
+// Event is an optional per-query planner execution trace.
+type Event struct {
 	Timestamp time.Time
 	Duration  time.Duration
 
-	Plan string
+	Plan PlanName
 
 	HasOrder   bool
 	OrderField string
@@ -94,17 +90,17 @@ type TraceEvent struct {
 	CountRangeComplementRows uint64
 
 	// ORBranches contains per-branch runtime metrics for OR plans.
-	ORBranches []TraceORBranch
+	ORBranches []ORBranch
 	// ORRoute contains route/cost diagnostics for OR selectors and runtime guards.
-	ORRoute TraceORRoute
+	ORRoute ORRoute
 	// OrderedLimitRoute contains route/cost diagnostics for ordered LIMIT selectors.
-	OrderedLimitRoute TraceOrderedLimitRoute
+	OrderedLimitRoute OrderedLimitRoute
 	// NoOrderLimitRoute contains route/cost diagnostics for no-order LIMIT selectors.
-	NoOrderLimitRoute TraceNoOrderLimitRoute
+	NoOrderLimitRoute NoOrderLimitRoute
 	// ArrayPosOrderRoute contains route diagnostics for ArrayPos order selectors.
-	ArrayPosOrderRoute TraceArrayPosOrderRoute
+	ArrayPosOrderRoute ArrayPosOrderRoute
 	// AggregateRoute contains route diagnostics for aggregate selectors.
-	AggregateRoute TraceAggregateRoute
+	AggregateRoute AggregateRoute
 
 	// OrderIndexScanWidth is the number of non-empty order-index buckets
 	// traversed while producing query output.
@@ -120,27 +116,22 @@ type TraceEvent struct {
 	Error string
 }
 
-// TraceORRoute carries route diagnostics for ordered OR merge decisions.
-type TraceORRoute struct {
-	Route  string
-	Reason string
-
+// ORRoute carries route diagnostics for OR selector decisions.
+type ORRoute struct {
 	Selected     string
 	Rejected     string
 	SelectedCost float64
 	RejectedCost float64
-	SelectedWork TraceRouteWork
-	RejectedWork TraceRouteWork
+	SelectedWork RouteWork
+	RejectedWork RouteWork
 	ExpectedRows uint64
 	UnionRows    uint64
 	SumRows      uint64
 	CacheState   string
 	PostingBuild uint64
 
-	KWayCost     float64
-	FallbackCost float64
-	Overlap      float64
-	AvgChecks    float64
+	Overlap   float64
+	AvgChecks float64
 
 	HasPrefixNonOrder   bool
 	HasSelectiveLead    bool
@@ -169,8 +160,8 @@ type TraceORRoute struct {
 	RuntimeProjectedExaminedMax float64
 }
 
-// TraceRouteWork decomposes a selector's scalar cost into planner-visible work classes.
-type TraceRouteWork struct {
+// RouteWork decomposes a selector's scalar cost into planner-visible work classes.
+type RouteWork struct {
 	CandidateScan            float64
 	PostingContains          float64
 	RangeProbe               float64
@@ -182,15 +173,16 @@ type TraceRouteWork struct {
 	TailRiskPenalty          float64
 }
 
-type TraceOrderedLimitRoute struct {
+// OrderedLimitRoute carries route diagnostics for ordered LIMIT selectors.
+type OrderedLimitRoute struct {
 	Selected   string
 	Rejected   string
 	CacheState string
 
 	SelectedCost float64
 	RejectedCost float64
-	SelectedWork TraceRouteWork
-	RejectedWork TraceRouteWork
+	SelectedWork RouteWork
+	RejectedWork RouteWork
 
 	ExpectedRows    uint64
 	OrderBuckets    uint64
@@ -204,14 +196,15 @@ type TraceOrderedLimitRoute struct {
 	RuntimeFallbackReason    string
 }
 
-type TraceNoOrderLimitRoute struct {
+// NoOrderLimitRoute carries route diagnostics for no-order LIMIT selectors.
+type NoOrderLimitRoute struct {
 	Selected string
 	Rejected string
 
 	SelectedCost float64
 	RejectedCost float64
-	SelectedWork TraceRouteWork
-	RejectedWork TraceRouteWork
+	SelectedWork RouteWork
+	RejectedWork RouteWork
 
 	ExpectedRows uint64
 	LeadRows     uint64
@@ -224,7 +217,8 @@ type TraceNoOrderLimitRoute struct {
 	RuntimeFallbackReason    string
 }
 
-type TraceArrayPosOrderRoute struct {
+// ArrayPosOrderRoute carries route diagnostics for ArrayPos order selectors.
+type ArrayPosOrderRoute struct {
 	Selected string
 	Rejected string
 
@@ -234,7 +228,8 @@ type TraceArrayPosOrderRoute struct {
 	ExpectedRows uint64
 }
 
-type TraceAggregateRoute struct {
+// AggregateRoute carries route diagnostics for aggregate selectors.
+type AggregateRoute struct {
 	Selected    string
 	Rejected    string
 	FilterInput string
@@ -254,7 +249,8 @@ type TraceAggregateRoute struct {
 	GroupMapLen         uint64
 }
 
-type TraceORBranch struct {
+// ORBranch carries per-branch runtime metrics for OR plans.
+type ORBranch struct {
 	Index int
 
 	RowsExamined uint64
@@ -262,37 +258,4 @@ type TraceORBranch struct {
 
 	Skipped    bool
 	SkipReason string
-}
-
-// PlannerFieldStats contains per-field cardinality distribution metrics.
-type PlannerFieldStats struct {
-	// DistinctKeys is number of distinct keys in field index.
-	DistinctKeys uint64
-	// NonEmptyKeys is number of keys with non-empty posting bitmap.
-	NonEmptyKeys uint64
-	// TotalBucketCard is total cardinality summed across all field buckets.
-	TotalBucketCard uint64
-	// AvgBucketCard is average bucket cardinality.
-	AvgBucketCard float64
-	// MaxBucketCard is maximum bucket cardinality.
-	MaxBucketCard uint64
-	// P50BucketCard is median bucket cardinality.
-	P50BucketCard uint64
-	// P95BucketCard is 95th percentile bucket cardinality.
-	P95BucketCard uint64
-}
-
-// PlannerStatsSnapshot is an immutable snapshot used by planner heuristics.
-type PlannerStatsSnapshot struct {
-	Version             uint64
-	GeneratedAt         time.Time
-	UniverseCardinality uint64
-	Fields              map[string]PlannerFieldStats
-}
-
-func (s *PlannerStatsSnapshot) UniverseOr(fallback uint64) uint64 {
-	if s != nil && s.UniverseCardinality > 0 {
-		return s.UniverseCardinality
-	}
-	return fallback
 }

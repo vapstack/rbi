@@ -11,11 +11,16 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbistats"
 )
 
-const persistedIndexVersion byte = 26
+const persistedIndexVersion byte = 28
+
+const (
+	keyStorageNumeric byte = iota
+	keyStorageStringDurableID
+)
 
 func writeFields(writer *bufio.Writer, fields map[string]*schema.Field) error {
 	names := make([]string, 0, len(fields))
@@ -266,7 +271,7 @@ func readMeasureIndexSections(reader *bufio.Reader, compatible map[string]bool) 
 	return out, nil
 }
 
-func sortedMapPlannerFieldNames(m map[string]qexec.PlannerFieldStats) []string {
+func sortedMapPlannerFieldNames(m map[string]rbistats.PlannerField) []string {
 	if len(m) == 0 {
 		return nil
 	}

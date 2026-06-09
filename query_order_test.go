@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/rbierrors"
 	"slices"
 	"strings"
 	"testing"
@@ -463,23 +464,25 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndFieldIndexView(t *test
 
 func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) []uint64 {
 	t.Helper()
-	out := make([]uint64, 0, 64)
+	ids := make([]uint64, 0, 64)
 	err := db.ScanKeys(0, func(id uint64) (bool, error) {
-		rec, err := db.Get(id)
-		if err != nil {
-			return false, err
-		}
-		if rec == nil {
-			return true, nil
-		}
-		if countDistinct(rec.Tags) == wantLen {
-			out = append(out, id)
-		}
-		db.ReleaseRecords(rec)
+		ids = append(ids, id)
 		return true, nil
 	})
 	if err != nil {
 		t.Fatalf("collectIDsByTagDistinctLen scan: %v", err)
+	}
+
+	out := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		rec, err := db.Get(id)
+		if err != nil {
+			t.Fatalf("collectIDsByTagDistinctLen Get(%d): %v", id, err)
+		}
+		if rec != nil && countDistinct(rec.Tags) == wantLen {
+			out = append(out, id)
+		}
+		db.ReleaseRecords(rec)
 	}
 	return out
 }
@@ -1494,8 +1497,8 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := db.QueryKeys(tc.q)
-			if !errors.Is(err, ErrInvalidQuery) {
-				t.Fatalf("QueryKeys(%+v) err=%v, want ErrInvalidQuery", tc.q, err)
+			if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+				t.Fatalf("QueryKeys(%+v) err=%v, want rbierrors.ErrInvalidQuery", tc.q, err)
 			}
 		})
 	}

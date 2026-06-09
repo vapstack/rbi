@@ -7,7 +7,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -25,18 +24,9 @@ type RecordOps struct {
 	ValidateIndex func(unsafe.Pointer) error
 }
 
-type ErrorSet struct {
-	UniqueViolation error
-}
-
 type SnapshotOps struct {
 	Manager     *snapshot.Registry
 	Schema      *schema.Schema
-	CacheConfig func() snapshot.CacheConfig
-	StrMap      *strmap.Mapper
+	CacheConfig snapshot.CacheConfig
 	PatchFields map[string]*schema.Field
-}
-
-type IndexPublishOps struct {
-	PublishCommitted func(uint64, string, *snapshot.View) error
 }

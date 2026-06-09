@@ -15,6 +15,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -60,18 +61,32 @@ func putRuntimeTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec
 	}
 }
 
-func putRuntimeTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, key string, rec runtimeTestRec) {
+func putRuntimeTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec runtimeTestRec) uint64 {
 	t.Helper()
 
 	data, err := msgpack.Marshal(&rec)
 	if err != nil {
 		t.Fatalf("msgpack.Marshal: %v", err)
 	}
+	var idx uint64
 	if err = db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucket).Put(keycodec.StringBytes(key), data)
+		m := tx.Bucket(mapBucket)
+		var err error
+		idx, err = m.NextSequence()
+		if err != nil {
+			return err
+		}
+		var mapKey [8]byte
+		if err = m.Put(keycodec.U64BytesWithBuf(idx, &mapKey), keycodec.StringBytes(key)); err != nil {
+			return err
+		}
+		value := keycodec.AppendU64Bytes(nil, idx)
+		value = append(value, data...)
+		return tx.Bucket(bucket).Put(keycodec.StringBytes(key), value)
 	}); err != nil {
 		t.Fatalf("put string record: %v", err)
 	}
+	return idx
 }
 
 func setRuntimeTestSequence(t *testing.T, db *bbolt.DB, bucket []byte, seq uint64) {
@@ -82,6 +97,19 @@ func setRuntimeTestSequence(t *testing.T, db *bbolt.DB, bucket []byte, seq uint6
 	}); err != nil {
 		t.Fatalf("set sequence: %v", err)
 	}
+}
+
+func createRuntimeStringMap(t *testing.T, db *bbolt.DB, bucket []byte) []byte {
+	t.Helper()
+
+	mapBucket := append(append([]byte(nil), bucket...), ".rbimap"...)
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucket(mapBucket)
+		return err
+	}); err != nil {
+		t.Fatalf("create string map: %v", err)
+	}
+	return mapBucket
 }
 
 func newRuntimeTestRuntime(t *testing.T, strKey bool, snapshotStats bool) *Index {
@@ -116,7 +144,7 @@ func releaseRuntimeTestRec(ptr unsafe.Pointer) {
 func buildRuntimeTestIndex(t *testing.T, r *Index, db *bbolt.DB, bucket []byte) {
 	t.Helper()
 
-	result, err := r.BuildIndex(db, bucket, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec)
+	result, err := r.BuildIndex(db, bucket, nil, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec)
 	if err != nil {
 		t.Fatalf("BuildIndex: %v", err)
 	}
@@ -136,15 +164,15 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	r := newRuntimeTestRuntime(t, false, true)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
-	var keys KeySet
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+	var keys []uint64
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	if !slices.Equal(keys.IDs, []uint64{1, 3}) {
-		t.Fatalf("QueryKeys IDs=%v want [1 3]", keys.IDs)
+	if !slices.Equal(keys, []uint64{1, 3}) {
+		t.Fatalf("QueryKeys IDs=%v want [1 3]", keys)
 	}
 
 	count, err := r.Count(qx.EQ("active", true))
@@ -171,13 +199,13 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	unavailableErr := errors.New("unavailable")
 	err = r.Query(qx.Query(qx.EQ("name", "alice")), db, bucket, func() error {
 		return unavailableErr
-	}, func(tx *bbolt.Tx, keys KeySet) error {
+	}, func(tx *bbolt.Tx, ids []uint64) error {
 		called = true
-		if !slices.Equal(keys.IDs, []uint64{1, 3}) {
-			t.Fatalf("Query callback IDs=%v want [1 3]", keys.IDs)
+		if !slices.Equal(ids, []uint64{1, 3}) {
+			t.Fatalf("Query callback IDs=%v want [1 3]", ids)
 		}
 		var key [8]byte
-		raw := tx.Bucket(bucket).Get(keycodec.U64BytesWithBuf(keys.IDs[0], &key))
+		raw := tx.Bucket(bucket).Get(keycodec.U64BytesWithBuf(ids[0], &key))
 		if raw == nil {
 			t.Fatal("Query callback did not receive sequence-aligned bolt tx")
 		}
@@ -190,8 +218,11 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatal("Query callback was not called")
 	}
 
-	dbStats := r.DBStats()
-	if dbStats.Sequence != 3 || dbStats.KeyCount != 3 || !dbStats.HasLast || dbStats.LastID != 3 {
+	dbStats, err := r.DBStats(db, bucket)
+	if err != nil {
+		t.Fatalf("DBStats: %v", err)
+	}
+	if dbStats.Sequence != 3 || dbStats.KeyCount != 3 || !dbStats.HasLast || keycodec.UserKeyFromDataKey[uint64](dbStats.LastKey, false) != 3 {
 		t.Fatalf("DBStats=%+v", dbStats)
 	}
 	snapshotStats := r.SnapshotStats()
@@ -212,41 +243,41 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	}
 }
 
-func TestRuntimeStringQueryKeysAndScanKeysUsePublishedStrMap(t *testing.T) {
+func TestRuntimeStringQueryKeysReturnIDs(t *testing.T) {
 	bucket := []byte("runtime_string")
 	db := openRuntimeTestBolt(t, bucket)
-	putRuntimeTestStringRec(t, db, bucket, "b", runtimeTestRec{Name: "alice", Active: true})
-	putRuntimeTestStringRec(t, db, bucket, "a", runtimeTestRec{Name: "bob"})
-	putRuntimeTestStringRec(t, db, bucket, "c", runtimeTestRec{Name: "alice", Active: true})
+	mapBucket := createRuntimeStringMap(t, db, bucket)
+	putRuntimeTestStringRec(t, db, bucket, mapBucket, "b", runtimeTestRec{Name: "alice", Active: true})
+	putRuntimeTestStringRec(t, db, bucket, mapBucket, "a", runtimeTestRec{Name: "bob"})
+	putRuntimeTestStringRec(t, db, bucket, mapBucket, "c", runtimeTestRec{Name: "alice", Active: true})
 	setRuntimeTestSequence(t, db, bucket, 3)
 
 	r := newRuntimeTestRuntime(t, true, true)
-	buildRuntimeTestIndex(t, r, db, bucket)
+	result, err := r.BuildIndex(db, bucket, mapBucket, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec)
+	if err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+	if !result.Stats {
+		t.Fatal("BuildIndex did not report stats")
+	}
 
-	var got []string
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(keys KeySet) error {
-		got = make([]string, len(keys.IDs))
-		for i := range keys.IDs {
-			got[i] = keys.StringAt(i)
-		}
+	var got []uint64
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(ids []uint64) error {
+		got = ids
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	if !slices.Equal(got, []string{"b", "c"}) {
-		t.Fatalf("QueryKeys strings=%v want [b c]", got)
+	if !slices.Equal(got, []uint64{1, 3}) {
+		t.Fatalf("QueryKeys IDs=%v want [1 3]", got)
 	}
 
-	var scanned []string
-	err := r.ScanStringKeys("b", errors.New("invalid key"), func(key string) (bool, error) {
-		scanned = append(scanned, key)
-		return true, nil
-	})
+	st, err := r.DBStats(db, bucket)
 	if err != nil {
-		t.Fatalf("ScanKeys: %v", err)
+		t.Fatalf("DBStats: %v", err)
 	}
-	if !slices.Equal(scanned, []string{"b", "c"}) {
-		t.Fatalf("ScanKeys=%v want [b c]", scanned)
+	if st.Sequence != 3 || st.KeyCount != 3 || !st.HasLast || keycodec.UserKeyFromDataKey[string](st.LastKey, true) != "c" {
+		t.Fatalf("string DBStats=%+v", st)
 	}
 }
 
@@ -273,8 +304,21 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 		r.snapshot.Unpin(seq, ref)
 	}
 
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		if err := tx.DeleteBucket(bucket); err != nil {
+			return err
+		}
+		b, err := tx.CreateBucket(bucket)
+		if err != nil {
+			return err
+		}
+		return b.SetSequence(4)
+	}); err != nil {
+		t.Fatalf("truncate bucket: %v", err)
+	}
+
 	var broken atomic.Bool
-	err := r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), errors.New("broken"), 4, "truncate", staged)
+	err := r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), 4, "truncate", staged)
 	if err != nil {
 		t.Fatalf("PublishCommittedStaged: %v", err)
 	}
@@ -282,17 +326,21 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 		t.Fatalf("current snapshot after truncate=%v", got)
 	}
 
-	var keys KeySet
-	if err := r.QueryKeys(qx.Query(), func(k KeySet) error {
+	var keys []uint64
+	if err := r.QueryKeys(qx.Query(), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys after truncate: %v", err)
 	}
-	if len(keys.IDs) != 0 {
-		t.Fatalf("QueryKeys after truncate=%v want empty", keys.IDs)
+	if len(keys) != 0 {
+		t.Fatalf("QueryKeys after truncate=%v want empty", keys)
 	}
-	if stats := r.DBStats(); stats.Sequence != 4 || stats.KeyCount != 0 || stats.HasLast {
+	stats, err := r.DBStats(db, bucket)
+	if err != nil {
+		t.Fatalf("DBStats after truncate: %v", err)
+	}
+	if stats.Sequence != 4 || stats.KeyCount != 0 || stats.HasLast {
 		t.Fatalf("DBStats after truncate=%+v", stats)
 	}
 }
@@ -324,7 +372,7 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 		t.Fatal("StageTruncate returned empty staged snapshot")
 	}
 	var broken atomic.Bool
-	if err = r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), errors.New("broken"), 4, "truncate", staged); err != nil {
+	if err = r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), 4, "truncate", staged); err != nil {
 		t.Fatalf("PublishCommittedStaged: %v", err)
 	}
 	if got := r.snapshot.Current(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
@@ -335,19 +383,19 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query old snapshot: %v", err)
 	}
-	if !slices.Equal(keys.IDs, []uint64{1}) {
-		t.Fatalf("old snapshot query IDs=%v want [1]", keys.IDs)
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("old snapshot query IDs=%v want [1]", keys)
 	}
 
-	var currentKeys KeySet
-	if err = r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+	var currentKeys []uint64
+	if err = r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		currentKeys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys current after truncate: %v", err)
 	}
-	if len(currentKeys.IDs) != 0 {
-		t.Fatalf("current snapshot query IDs=%v want empty", currentKeys.IDs)
+	if len(currentKeys) != 0 {
+		t.Fatalf("current snapshot query IDs=%v want empty", currentKeys)
 	}
 }
 
@@ -374,15 +422,15 @@ func TestRuntimeDropStagedKeepsCurrentSnapshotQueryable(t *testing.T) {
 		t.Fatalf("current snapshot after DropStaged=%v", got)
 	}
 
-	var keys KeySet
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+	var keys []uint64
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys after DropStaged: %v", err)
 	}
-	if !slices.Equal(keys.IDs, []uint64{1}) {
-		t.Fatalf("QueryKeys after DropStaged IDs=%v want [1]", keys.IDs)
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("QueryKeys after DropStaged IDs=%v want [1]", keys)
 	}
 }
 
@@ -403,22 +451,22 @@ func TestRuntimeFailedBuildIndexKeepsCurrentSnapshotQueryable(t *testing.T) {
 	}
 	setRuntimeTestSequence(t, db, bucket, 2)
 
-	if _, err := r.BuildIndex(db, bucket, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec); err == nil {
+	if _, err := r.BuildIndex(db, bucket, nil, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec); err == nil {
 		t.Fatal("BuildIndex succeeded with corrupt record")
 	}
 	if got := r.snapshot.Current(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
 		t.Fatalf("current snapshot after failed BuildIndex=%v", got)
 	}
 
-	var keys KeySet
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+	var keys []uint64
+	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("QueryKeys after failed BuildIndex: %v", err)
 	}
-	if !slices.Equal(keys.IDs, []uint64{1}) {
-		t.Fatalf("QueryKeys after failed BuildIndex IDs=%v want [1]", keys.IDs)
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("QueryKeys after failed BuildIndex IDs=%v want [1]", keys)
 	}
 }
 
@@ -426,25 +474,26 @@ func TestRuntimeConfigureWriteWiresSnapshotPublish(t *testing.T) {
 	r := newRuntimeTestRuntime(t, false, true)
 	var cfg wexec.Config
 	var broken atomic.Bool
-	uniqueErr := errors.New("unique")
-	brokenErr := errors.New("broken")
 
-	r.ConfigureWrite(&cfg, &broken, log.New(io.Discard, "", 0), uniqueErr, brokenErr)
+	r.ConfigureWrite(&cfg, &broken, log.New(io.Discard, "", 0))
 	if !cfg.Indexed {
 		t.Fatal("ConfigureWrite did not enable indexed writes")
 	}
-	if cfg.Unique.Schema != r.schema || cfg.Unique.Current == nil || cfg.Unique.UniqueViolation != uniqueErr {
+	if cfg.Unique.Schema != r.schema || cfg.Unique.Current == nil {
 		t.Fatalf("Unique wiring=%+v", cfg.Unique)
 	}
-	if cfg.SnapshotOps.Manager != r.snapshot || cfg.SnapshotOps.Schema != r.schema || cfg.SnapshotOps.CacheConfig == nil {
+	if cfg.SnapshotOps.Manager != r.snapshot || cfg.SnapshotOps.Schema != r.schema {
 		t.Fatalf("SnapshotOps wiring=%+v", cfg.SnapshotOps)
 	}
-	if cfg.IndexPublishOps.PublishCommitted == nil {
+	if cfg.SnapshotOps.CacheConfig != r.SnapshotCacheConfig() {
+		t.Fatalf("SnapshotOps CacheConfig=%+v want %+v", cfg.SnapshotOps.CacheConfig, r.SnapshotCacheConfig())
+	}
+	if cfg.PublishCommitted == nil {
 		t.Fatal("ConfigureWrite did not install publish callback")
 	}
 
 	staged := r.StageTruncate(11)
-	if err := cfg.IndexPublishOps.PublishCommitted(11, "set", staged.view); err != nil {
+	if err := cfg.PublishCommitted(11, "set", staged.view); err != nil {
 		t.Fatalf("PublishCommitted callback: %v", err)
 	}
 	if got := r.snapshot.Current(); got == nil || got.Seq != 11 {
@@ -468,12 +517,11 @@ func TestRuntimeCommittedPublishPanicBreaksAndDropsStaged(t *testing.T) {
 	}
 
 	var broken atomic.Bool
-	brokenErr := errors.New("broken")
 	err := func() (err error) {
-		defer r.recoverCommittedPublishPanic(&broken, log.New(io.Discard, "", 0), brokenErr, 7, "truncate", &err)
+		defer r.recoverCommittedPublishPanic(&broken, log.New(io.Discard, "", 0), 7, "truncate", &err)
 		panic("failpoint: publish truncate")
 	}()
-	if !errors.Is(err, brokenErr) {
+	if !errors.Is(err, rbierrors.ErrBroken) {
 		t.Fatalf("recover err=%v want broken", err)
 	}
 	if !broken.Load() {
@@ -509,24 +557,21 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}
-	result, err := loaded.LoadIndex(file, db.Path(), bucket, seq, 0, LoadErrors{
-		Stale:   errors.New("stale"),
-		Invalid: errors.New("invalid"),
-	})
+	result, err := loaded.LoadIndex(file, db.Path(), bucket, seq)
 	if err != nil {
 		t.Fatalf("LoadIndex: %v", err)
 	}
 	loaded.PublishLoadedPlannerStats(result.PlannerStats)
 
-	var keys KeySet
-	if err := loaded.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k KeySet) error {
+	var keys []uint64
+	if err := loaded.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
 		t.Fatalf("loaded QueryKeys: %v", err)
 	}
-	if !slices.Equal(keys.IDs, []uint64{1}) {
-		t.Fatalf("loaded QueryKeys IDs=%v want [1]", keys.IDs)
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("loaded QueryKeys IDs=%v want [1]", keys)
 	}
 	count, err := loaded.Count(qx.EQ("active", true))
 	if err != nil {

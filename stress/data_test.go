@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/rbitrace"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -38,7 +38,7 @@ func TestBuildRBIOptions(t *testing.T) {
 	opts := buildRBIOptions(DBConfig{
 		AnalyzeInterval:      -1,
 		DisableRuntimeCaches: true,
-		TraceSink:            func(rbi.TraceEvent) {},
+		TraceSink:            func(rbitrace.Event) {},
 		TraceSampleEvery:     17,
 	})
 

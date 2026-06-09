@@ -18,7 +18,7 @@ import (
 func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
 	t.Helper()
 
-	seq, err := currentBucketSequence(db.bolt, db.bucket)
+	seq, err := currentBucketSequence(db.bolt, db.dataBucket)
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 	}
 }
 
-func TestSnapshotFromEmptyBase_ScanKeysStringStaysStableAcrossPatches(t *testing.T) {
+func TestSnapshotFromEmptyBase_StringScanKeysReadsDataBucket(t *testing.T) {
 	db, _ := openTempDBString(t, Options{
 		AnalyzeInterval: -1,
 		AutoBatchMax:    1,
@@ -203,34 +203,16 @@ func TestSnapshotFromEmptyBase_ScanKeysStringStaysStableAcrossPatches(t *testing
 		t.Fatalf("BatchSet(seed): %v", err)
 	}
 
-	expect := slices.Clone(keys)
-	got := make([]string, 0, len(expect))
-	patched := false
-	if err := db.ScanKeys("", func(id string) (bool, error) {
+	var got []string
+	if err := db.ScanKeys("k0254", func(id string) (bool, error) {
 		got = append(got, id)
-		if patched {
-			return true, nil
-		}
-		patched = true
-		for i := 0; i < 32; i++ {
-			key := keys[i%len(keys)]
-			if err := db.Patch(key, []Field{
-				{Name: "active", Value: i%2 == 0},
-				{Name: "country", Value: "DE"},
-				{Name: "name", Value: fmt.Sprintf("patched-%03d", i)},
-			}); err != nil {
-				return false, err
-			}
-		}
 		return true, nil
 	}); err != nil {
 		t.Fatalf("ScanKeys: %v", err)
 	}
-	if !patched {
-		t.Fatalf("ScanKeys callback was not called")
-	}
-	if !slices.Equal(got, expect) {
-		t.Fatalf("scan changed while newer snapshots were published: got=%v want=%v", got, expect)
+	want := []string{"k0254", "k0255", "k0256"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ScanKeys=%v want %v", got, want)
 	}
 }
 
@@ -243,45 +225,39 @@ func snapshotExtOptions() Options {
 	}
 }
 
-func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
+func TestSnapshotExt_ScanKeysPinsRuntimeSnapshotDuringScan(t *testing.T) {
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
 
-	var oldSeq uint64
-	if err := db.ScanKeys(0, func(uint64) (bool, error) {
-		before := db.SnapshotStats()
-		oldSeq = before.Sequence
-		if oldSeq == 0 || before.RegistrySize != 1 || before.PinnedRefs != 1 {
-			return false, fmt.Errorf("unexpected stats before publish: %+v", before)
-		}
+	before := db.SnapshotStats()
+	if before.RegistrySize != 1 || before.PinnedRefs != 0 {
+		t.Fatalf("unexpected stats before ScanKeys: %+v", before)
+	}
 
-		if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
-			return false, fmt.Errorf("Set(2): %w", err)
+	var got []uint64
+	if err := db.ScanKeys(0, func(id uint64) (bool, error) {
+		during := db.SnapshotStats()
+		if during.PinnedRefs != 1 {
+			t.Fatalf("expected ScanKeys runtime snapshot pin during callback, stats=%+v", during)
 		}
-
-		mid := db.SnapshotStats()
-		if mid.Sequence <= oldSeq {
-			return false, fmt.Errorf("expected stats sequence to advance after publish: %+v", mid)
-		}
-		if mid.RegistrySize != 2 || mid.PinnedRefs != 1 {
-			return false, fmt.Errorf("unexpected stats with pinned retired snapshot: %+v", mid)
-		}
-
-		return false, nil
+		got = append(got, id)
+		return true, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	if oldSeq == 0 {
-		t.Fatalf("ScanKeys callback was not called")
+	if !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("ScanKeys=%v want [1 2]", got)
 	}
 
 	after := db.SnapshotStats()
 	if after.RegistrySize != 1 || after.PinnedRefs != 0 {
-		t.Fatalf("unexpected stats after scan pin release: %+v", after)
+		t.Fatalf("unexpected stats after ScanKeys: %+v", after)
 	}
 }
 
@@ -340,7 +316,7 @@ func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) 
 	}
 }
 
-func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testing.T) {
+func TestSnapshotExt_TruncatePublishesEmptySnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
@@ -351,33 +327,12 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 	}
 
 	oldStats := db.SnapshotStats()
-	var got []uint64
-	truncated := false
-	if err := db.ScanKeys(0, func(id uint64) (bool, error) {
-		got = append(got, id)
-		if truncated {
-			return true, nil
-		}
-		truncated = true
-		if err := db.Truncate(); err != nil {
-			return false, err
-		}
-		mid := db.SnapshotStats()
-		if mid.Sequence <= oldStats.Sequence {
-			return false, fmt.Errorf("expected truncate to publish newer snapshot: old=%d new=%d", oldStats.Sequence, mid.Sequence)
-		}
-		if mid.RegistrySize != 2 || mid.PinnedRefs != 1 {
-			return false, fmt.Errorf("unexpected stats while scan pins pre-truncate snapshot: %+v", mid)
-		}
-		return true, nil
-	}); err != nil {
-		t.Fatalf("ScanKeys: %v", err)
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
 	}
-	if !truncated {
-		t.Fatalf("ScanKeys callback was not called")
-	}
-	if !slices.Equal(got, []uint64{1, 2}) {
-		t.Fatalf("scan did not stay on pre-truncate snapshot: got=%v want=[1 2]", got)
+	mid := db.SnapshotStats()
+	if mid.Sequence <= oldStats.Sequence {
+		t.Fatalf("expected truncate to publish newer snapshot: old=%d new=%d", oldStats.Sequence, mid.Sequence)
 	}
 
 	keys, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
@@ -388,44 +343,13 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 		t.Fatalf("expected current snapshot to be empty after truncate, got=%v", keys)
 	}
 
-	registrySize := db.SnapshotStats().RegistrySize
-	if registrySize != 1 {
-		t.Fatalf("expected registry to retain only latest snapshot after truncate prune, got=%d", registrySize)
+	stats := db.SnapshotStats()
+	if stats.RegistrySize != 1 || stats.PinnedRefs != 0 {
+		t.Fatalf("unexpected snapshot stats after truncate: %+v", stats)
 	}
 }
 
-func TestSnapshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *testing.T) {
-	db, _ := openTempDBString(t, snapshotExtOptions())
-
-	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
-		t.Fatalf("Set(k1): %v", err)
-	}
-	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
-		t.Fatalf("Set(k2): %v", err)
-	}
-
-	want := []string{"k1", "k2"}
-	var got []string
-	truncated := false
-	err := db.ScanKeys("", func(id string) (bool, error) {
-		got = append(got, id)
-		if !truncated {
-			truncated = true
-			if err := db.Truncate(); err != nil {
-				return false, err
-			}
-		}
-		return true, nil
-	})
-	if err != nil {
-		t.Fatalf("string ScanKeys split snapshot across truncate: err=%v want=%v got=%v", err, want, got)
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("string ScanKeys mixed snapshots: got=%v want=%v", got, want)
-	}
-}
-
-func TestSnapshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTruncateReuse(t *testing.T) {
+func TestSnapshotExt_StringScanKeysAcrossTruncate(t *testing.T) {
 	db, _ := openTempDBString(t, snapshotExtOptions())
 
 	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
@@ -436,28 +360,61 @@ func TestSnapshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 	}
 
 	var got []string
-	reused := false
 	err := db.ScanKeys("", func(id string) (bool, error) {
 		got = append(got, id)
-		if !reused {
-			reused = true
-			if err := db.Truncate(); err != nil {
-				return false, err
-			}
-			if err := db.Set("future", &Rec{Name: "future"}); err != nil {
-				return false, err
-			}
-		}
 		return true, nil
 	})
 	if err != nil {
-		t.Fatalf("split snapshot emitted inconsistent string scan state: err=%v got=%v", err, got)
-	}
-	if slices.Contains(got, "future") {
-		t.Fatalf("string scan leaked future key from newer snapshot: got=%v", got)
+		t.Fatalf("ScanKeys: %v", err)
 	}
 	if !slices.Equal(got, []string{"k1", "k2"}) {
-		t.Fatalf("unexpected string scan result from old snapshot: got=%v", got)
+		t.Fatalf("ScanKeys=%v want [k1 k2]", got)
+	}
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	got = got[:0]
+	err = db.ScanKeys("", func(id string) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys after truncate: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ScanKeys after truncate=%v want []", got)
+	}
+}
+
+func TestSnapshotExt_StringScanKeysAfterTruncateReuse(t *testing.T) {
+	db, _ := openTempDBString(t, snapshotExtOptions())
+
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
+	}
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if err := db.Set("a", &Rec{Name: "a"}); err != nil {
+		t.Fatalf("Set(a): %v", err)
+	}
+	if err := db.Set("z", &Rec{Name: "z"}); err != nil {
+		t.Fatalf("Set(z): %v", err)
+	}
+
+	var got []string
+	err := db.ScanKeys("b", func(id string) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+	if !slices.Equal(got, []string{"z"}) {
+		t.Fatalf("ScanKeys=%v want [z]", got)
 	}
 }
 
@@ -499,7 +456,7 @@ func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
 	}
 }
 
-func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testing.T) {
+func TestSnapshotExt_ScanKeysCallbackErrorReleasesRuntimeSnapshotPin(t *testing.T) {
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
@@ -508,6 +465,10 @@ func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testin
 
 	wantErr := errors.New("stop")
 	err := db.ScanKeys(0, func(uint64) (bool, error) {
+		stats := db.SnapshotStats()
+		if stats.PinnedRefs != 1 {
+			t.Fatalf("expected ScanKeys runtime snapshot pin during callback, stats=%+v", stats)
+		}
 		return false, wantErr
 	})
 	if !errors.Is(err, wantErr) {
@@ -515,10 +476,10 @@ func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testin
 	}
 	stats := db.SnapshotStats()
 	if stats.RegistrySize != 1 {
-		t.Fatalf("expected ScanKeys snapshot ref to remain registered")
+		t.Fatalf("expected current snapshot ref to remain registered")
 	}
 	if stats.PinnedRefs != 0 {
-		t.Fatalf("expected ScanKeys pin release on callback error, stats=%+v", stats)
+		t.Fatalf("expected ScanKeys to release runtime snapshot pin, stats=%+v", stats)
 	}
 }
 
@@ -1682,7 +1643,7 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 	}
 }
 
-func TestSnapshotExtra_StringScanKeysStaySingleSnapshotAcrossConcurrentTruncateRebuilds(t *testing.T) {
+func TestSnapshotExtra_StringQueryKeysStaySingleSnapshotAcrossConcurrentTruncateRebuilds(t *testing.T) {
 	db, _ := snapshotExtraOpenTempDBString(t, snapshotExtraOptions())
 
 	const seedN = 128
@@ -1702,17 +1663,10 @@ func TestSnapshotExtra_StringScanKeysStaySingleSnapshotAcrossConcurrentTruncateR
 	}
 
 	wantOld := slices.Clone(keys)
-	scanKeys := func() ([]string, error) {
-		var out []string
-		if err := db.ScanKeys("", func(id string) (bool, error) {
-			out = append(out, id)
-			return true, nil
-		}); err != nil {
-			return nil, err
-		}
-		return out, nil
+	queryKeys := func() ([]string, error) {
+		return db.QueryKeys(qx.Query())
 	}
-	validScan := func(got []string) bool {
+	validKeys := func(got []string) bool {
 		if len(got) == 0 || slices.Equal(got, wantOld) {
 			return true
 		}
@@ -1784,13 +1738,13 @@ func TestSnapshotExtra_StringScanKeysStaySingleSnapshotAcrossConcurrentTruncateR
 			if failed.Load() != nil {
 				return
 			}
-			got, err := scanKeys()
+			got, err := queryKeys()
 			if err != nil {
-				setFailed(fmt.Sprintf("ScanKeys failed: %v", err))
+				setFailed(fmt.Sprintf("QueryKeys failed: %v", err))
 				return
 			}
-			if !validScan(got) {
-				setFailed(fmt.Sprintf("ScanKeys returned hybrid snapshot: got=%v", got))
+			if !validKeys(got) {
+				setFailed(fmt.Sprintf("QueryKeys returned hybrid snapshot: got=%v", got))
 				return
 			}
 		}

@@ -9,15 +9,17 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func TestTracer_EmitsAndSamples(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -46,7 +48,7 @@ func TestTracer_EmitsAndSamples(t *testing.T) {
 	}
 
 	mu.Lock()
-	got := append([]TraceEvent(nil), events...)
+	got := append([]rbitrace.Event(nil), events...)
 	mu.Unlock()
 
 	// sampleEvery=2 emits for query #2 and #4.
@@ -75,7 +77,7 @@ func TestTracer_BeginTraceCollectsWideANDLeafMetadata(t *testing.T) {
 	ops[1].Not = true
 	ops[2].Op = qir.OpPREFIX
 
-	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{
+	trace := NewRuntime(Config{TraceSink: func(rbitrace.Event) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{
 		Expr: qir.Expr{
 			Op:           qir.OpAND,
 			FieldOrdinal: qir.NoFieldOrdinal,
@@ -98,10 +100,10 @@ func TestTracer_BeginTraceCollectsWideANDLeafMetadata(t *testing.T) {
 func TestTracer_ORDecisionEstimates(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -136,7 +138,7 @@ func TestTracer_ORDecisionEstimates(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if !strings.HasPrefix(ev.Plan, "plan_or_merge_") {
+	if !strings.HasPrefix(string(ev.Plan), "plan_or_merge_") {
 		t.Fatalf("expected OR planner plan, got %q", ev.Plan)
 	}
 	if ev.ORRoute.Selected == "" {
@@ -180,10 +182,10 @@ func TestTracer_ORDecisionEstimates(t *testing.T) {
 func TestTracer_OROrderMetrics(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -218,7 +220,7 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if !strings.HasPrefix(ev.Plan, "plan_or_merge_order_") {
+	if !strings.HasPrefix(string(ev.Plan), "plan_or_merge_order_") {
 		t.Fatalf("expected ordered OR planner plan, got %q", ev.Plan)
 	}
 	if ev.ORRoute.Selected == "" {
@@ -250,9 +252,9 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 }
 
 func TestTracer_OrderedLimitRouteWorkSeparatesExactBucketFilter(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db := newTestDB(t, testOptions{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -310,7 +312,7 @@ func TestTracer_OROrderRouteWorkSeparatesExactBucketPenalty(t *testing.T) {
 		sumCard:       75_000,
 		branchCount:   2,
 		orderDistinct: 1_000,
-		orderStats: PlannerFieldStats{
+		orderStats: rbistats.PlannerField{
 			DistinctKeys:    1_000,
 			NonEmptyKeys:    1_000,
 			TotalBucketCard: 100_000,
@@ -446,7 +448,7 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 		}
 	}
 
-	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
+	trace := NewRuntime(Config{TraceSink: func(rbitrace.Event) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
 	if !view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, false, trace) {
 		t.Fatalf("expected warm ordered-OR materialization to rewrite predicates")
 	}
@@ -535,7 +537,7 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 	}
 	defer analysis.release()
 
-	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
+	trace := NewRuntime(Config{TraceSink: func(rbitrace.Event) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
 	view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, false, trace)
 	view.maybeEagerMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, trace)
 
@@ -548,31 +550,25 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 	}
 }
 
-func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
-	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{Limit: 1}, "")
+func TestTracer_ORSelectionRoutePreservesPlannerAnalysis(t *testing.T) {
+	trace := NewRuntime(Config{TraceSink: func(rbitrace.Event) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{Limit: 1}, "")
 	trace.AddOROrderPlannerAnalysis(10*time.Microsecond, 3, 2, 1, 4, 5)
-	trace.SetORSelectionRoute(TraceORRoute{
+	trace.SetORSelectionRoute(rbitrace.ORRoute{
 		Selected:     "stream",
 		Rejected:     "materialized_fallback",
 		SelectedCost: 12,
 		RejectedCost: 34,
-		SelectedWork: TraceRouteWork{
+		SelectedWork: rbitrace.RouteWork{
 			CandidateScan:   8,
 			PostingContains: 4,
 		},
-		RejectedWork: TraceRouteWork{
+		RejectedWork: rbitrace.RouteWork{
 			MaterializedBuild: 30,
 			BranchMerge:       4,
 		},
-		ExpectedRows: 8,
-		UnionRows:    13,
-		SumRows:      21,
-	})
-	trace.SetORRoute(TraceORRoute{
-		Route:               "kway_first",
-		Reason:              "cost",
-		KWayCost:            12,
-		FallbackCost:        34,
+		ExpectedRows:        8,
+		UnionRows:           13,
+		SumRows:             21,
 		Overlap:             1.25,
 		AvgChecks:           2.5,
 		HasPrefixNonOrder:   true,
@@ -602,11 +598,7 @@ func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 		ev.ORRoute.SumRows != 21 {
 		t.Fatalf("selector fields were not preserved: %+v", ev.ORRoute)
 	}
-	if ev.ORRoute.Route != "kway_first" ||
-		ev.ORRoute.Reason != "cost" ||
-		ev.ORRoute.KWayCost != 12 ||
-		ev.ORRoute.FallbackCost != 34 ||
-		ev.ORRoute.Overlap != 1.25 ||
+	if ev.ORRoute.Overlap != 1.25 ||
 		ev.ORRoute.AvgChecks != 2.5 ||
 		!ev.ORRoute.HasPrefixNonOrder ||
 		!ev.ORRoute.HasSelectiveLead ||
@@ -618,10 +610,10 @@ func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 func TestTracer_QueryValuesPathEmitsTrace(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -655,8 +647,8 @@ func TestTracer_QueryValuesPathEmitsTrace(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("expected %q plan, got %q", PlanLimitOrderBasic, ev.Plan)
+	if ev.Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("expected %q plan, got %q", rbitrace.PlanLimitOrderBasic, ev.Plan)
 	}
 	if ev.RowsReturned != uint64(len(items)) {
 		t.Fatalf("rows returned mismatch: ev=%d items=%d", ev.RowsReturned, len(items))

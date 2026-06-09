@@ -4,6 +4,7 @@ import (
 	"math/bits"
 
 	"github.com/vapstack/pooled"
+	"github.com/vapstack/rbi/internal/mathutil"
 )
 
 const (
@@ -91,7 +92,7 @@ func (s *u64set) Add(x uint64) bool {
 	if s.n*2 >= len(s.keys) {
 		s.grow()
 	}
-	i := mix64(x) & s.mask
+	i := mathutil.Mix64(x) & s.mask
 	for {
 		if s.used[i] == 0 {
 			s.used[i] = 1
@@ -127,11 +128,4 @@ func (s *u64set) grow() {
 		}
 	}
 	releaseU64Set(&old)
-}
-
-func mix64(x uint64) uint64 {
-	x += 0x9e3779b97f4a7c15
-	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
-	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
-	return x ^ (x >> 31)
 }

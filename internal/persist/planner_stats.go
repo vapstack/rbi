@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/rbistats"
 )
 
-func writePlannerStatsSnapshot(writer *bufio.Writer, s *qexec.PlannerStatsSnapshot) error {
+func writePlannerStatsSnapshot(writer *bufio.Writer, s *rbistats.PlannerSnapshot) error {
 	if s == nil {
 		if err := writeSidecarUvarint(writer, 0); err != nil {
 			return fmt.Errorf("encode: writing planner stats version: %w", err)
@@ -53,7 +53,7 @@ func writePlannerStatsSnapshot(writer *bufio.Writer, s *qexec.PlannerStatsSnapsh
 	return nil
 }
 
-func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) (*qexec.PlannerStatsSnapshot, error) {
+func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) (*rbistats.PlannerSnapshot, error) {
 	version, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, fmt.Errorf("decode: reading planner stats version: %w", err)
@@ -77,7 +77,7 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 		return nil, nil
 	}
 
-	fields := make(map[string]qexec.PlannerFieldStats, min(int(fieldCount), len(compatible)))
+	fields := make(map[string]rbistats.PlannerField, min(int(fieldCount), len(compatible)))
 	for i := uint64(0); i < fieldCount; i++ {
 		f, err := readSidecarString(reader)
 		if err != nil {
@@ -103,7 +103,7 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 		}
 	}
 
-	out := &qexec.PlannerStatsSnapshot{
+	out := &rbistats.PlannerSnapshot{
 		Version:             version,
 		UniverseCardinality: universe,
 		Fields:              fields,
@@ -114,7 +114,7 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 	return out, nil
 }
 
-func writePlannerFieldStats(writer *bufio.Writer, s qexec.PlannerFieldStats) error {
+func writePlannerFieldStats(writer *bufio.Writer, s rbistats.PlannerField) error {
 	if err := writeSidecarUvarint(writer, s.DistinctKeys); err != nil {
 		return err
 	}
@@ -136,33 +136,33 @@ func writePlannerFieldStats(writer *bufio.Writer, s qexec.PlannerFieldStats) err
 	return nil
 }
 
-func readPlannerFieldStats(reader *bufio.Reader) (qexec.PlannerFieldStats, error) {
+func readPlannerFieldStats(reader *bufio.Reader) (rbistats.PlannerField, error) {
 	distinct, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 	nonEmpty, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 	total, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 	maxCard, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 	p50, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 	p95, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return qexec.PlannerFieldStats{}, err
+		return rbistats.PlannerField{}, err
 	}
 
-	out := qexec.PlannerFieldStats{
+	out := rbistats.PlannerField{
 		DistinctKeys:    distinct,
 		NonEmptyKeys:    nonEmpty,
 		TotalBucketCard: total,

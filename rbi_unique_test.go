@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbitrace"
+
 	"github.com/vapstack/qx"
 	"go.etcd.io/bbolt"
 )
@@ -64,9 +67,9 @@ func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
 }
 
 func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -126,8 +129,8 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 				t.Fatalf("expected trace event for query")
 			}
 			last := events[len(events)-1]
-			if last.Plan != string(PlanUniqueEq) {
-				t.Fatalf("expected plan %q, got %q", PlanUniqueEq, last.Plan)
+			if last.Plan != rbitrace.PlanUniqueEq {
+				t.Fatalf("expected plan %q, got %q", rbitrace.PlanUniqueEq, last.Plan)
 			}
 		})
 	}
@@ -176,9 +179,9 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 }
 
 func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -203,8 +206,8 @@ func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanUniqueEq) {
-		t.Fatalf("expected plan %q, got %q", PlanUniqueEq, last.Plan)
+	if last.Plan != rbitrace.PlanUniqueEq {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanUniqueEq, last.Plan)
 	}
 	if last.RowsExamined != 1 {
 		t.Fatalf("expected RowsExamined=1, got trace=%+v", last)
@@ -260,8 +263,8 @@ func TestUnique_Set_DuplicateRejected(t *testing.T) {
 	}
 
 	err := db.Set(2, &UniqueTestRec{Email: "a@x", Code: 2})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
@@ -290,8 +293,8 @@ func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected unique violation")
 	}
-	if !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
@@ -316,8 +319,8 @@ func TestUnique_OptDuplicateRejected(t *testing.T) {
 	}
 
 	err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &v})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
@@ -331,8 +334,8 @@ func TestUnique_BatchSet_DuplicateWithinBatchRejected(t *testing.T) {
 	}
 
 	err := db.BatchSet(ids, vals)
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
@@ -350,8 +353,8 @@ func TestUnique_BatchSet_DuplicateAgainstDBRejected(t *testing.T) {
 	}
 
 	err := db.BatchSet(ids, vals)
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
@@ -442,8 +445,8 @@ func TestUnique_BatchSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
 			{Email: "u2@x", Code: 1}, // final state conflicts with id=2
 		},
 	)
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
 	v1, err := db.Get(1)
@@ -497,8 +500,8 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 				{Email: "u2@x", Code: 1}, // final value conflicts
 			},
 		)
-		if err == nil || !errors.Is(err, ErrUniqueViolation) {
-			t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+		if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+			t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 		}
 
 		v1, err := db.Get(1)
@@ -672,8 +675,8 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			})
 
 			if wantUniqueErr {
-				if err == nil || !errors.Is(err, ErrUniqueViolation) {
-					t.Fatalf("step=%d Set expected ErrUniqueViolation, got: %v", step, err)
+				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+					t.Fatalf("step=%d Set expected rbierrors.ErrUniqueViolation, got: %v", step, err)
 				}
 			} else {
 				if err != nil {
@@ -703,8 +706,8 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 
 			err := db.BatchSet(ids, vals)
 			if wantUniqueErr {
-				if err == nil || !errors.Is(err, ErrUniqueViolation) {
-					t.Fatalf("step=%d BatchSet expected ErrUniqueViolation, got: %v", step, err)
+				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+					t.Fatalf("step=%d BatchSet expected rbierrors.ErrUniqueViolation, got: %v", step, err)
 				}
 			} else {
 				if err != nil {
@@ -724,8 +727,8 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 
 			err := db.Patch(id, patch)
 			if wantUniqueErr {
-				if err == nil || !errors.Is(err, ErrUniqueViolation) {
-					t.Fatalf("step=%d Patch expected ErrUniqueViolation, got: %v patch=%v", step, err, patch)
+				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+					t.Fatalf("step=%d Patch expected rbierrors.ErrUniqueViolation, got: %v patch=%v", step, err, patch)
 				}
 			} else {
 				if err != nil {
@@ -751,8 +754,8 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 
 			err := db.BatchPatch(ids, patch)
 			if wantUniqueErr {
-				if err == nil || !errors.Is(err, ErrUniqueViolation) {
-					t.Fatalf("step=%d BatchPatch expected ErrUniqueViolation, got: %v patch=%v ids=%v", step, err, patch, ids)
+				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+					t.Fatalf("step=%d BatchPatch expected rbierrors.ErrUniqueViolation, got: %v patch=%v ids=%v", step, err, patch, ids)
 				}
 			} else {
 				if err != nil {
@@ -914,7 +917,7 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 			default:
 				err = db.Delete(op.id, BeforeCommit(recordCommit))
 			}
-			if err != nil && !errors.Is(err, ErrUniqueViolation) {
+			if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 				errCh <- fmt.Errorf("kind=%d id=%d: %w", op.kind, op.id, err)
 			}
 		}()
@@ -1055,7 +1058,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 				winner.Store(id)
 				return
 			}
-			if !errors.Is(err, ErrUniqueViolation) {
+			if !errors.Is(err, rbierrors.ErrUniqueViolation) {
 				errCh <- fmt.Errorf("unexpected set error for id=%d: %w", id, err)
 			}
 		}(id, code)
@@ -1116,8 +1119,8 @@ func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
 
 	ids := []uint64{1, 2}
 	err := db.BatchPatch(ids, []Field{{Name: "email", Value: "dup@x"}}, PatchStrict)
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
 	v1, err := db.Get(1)
@@ -1150,8 +1153,8 @@ func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
 	}
 	ids := []uint64{2, 3}
 	err := db.BatchPatch(ids, []Field{{Name: "code", Value: 1}}, PatchStrict)
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
 	v2, err := db.Get(2)
@@ -1219,7 +1222,7 @@ func TestUnique_OptNilReleasesAndReuseAllowed(t *testing.T) {
 	}
 
 	err = db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected unique violation on Opt duplicate, got: %v", err)
 	}
 	if err = db.Patch(1, []Field{{Name: "opt", Value: nil}}, PatchStrict); err != nil {

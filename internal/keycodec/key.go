@@ -360,6 +360,13 @@ func DataKeyFromUserKey[K ~string | ~uint64](id K, strKey bool) DataKey {
 	return DataKey{u: *(*uint64)(unsafe.Pointer(&id))}
 }
 
+func DataKeyFromBytes(b []byte, strKey bool) DataKey {
+	if strKey {
+		return DataKey{s: string(b)}
+	}
+	return DataKey{u: U64FromBytes(b)}
+}
+
 func UserKeyFromDataKey[K ~string | ~uint64](key DataKey, strKey bool) K {
 	if strKey {
 		s := key.s

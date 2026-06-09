@@ -7,10 +7,13 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 const (
@@ -764,7 +767,7 @@ func (b plannerORBranch) noOrderLeadScore(leadIdx, need int) uint64 {
 		if p.hasEffectiveBounds && p.effectiveBounds.HasLo && !p.effectiveBounds.HasHi && p.fieldIndexRangeState != nil {
 			keyCount := p.fieldIndexRangeState.ov.KeyCount()
 			if keyCount > 0 && p.fieldIndexRangeState.br.BaseStart > 0 {
-				skip = satAddUint64(skip, satMulUint64(leadEst, uint64(p.fieldIndexRangeState.br.BaseStart))/uint64(keyCount))
+				skip = mathutil.SatAddUint64(skip, mathutil.SatMulUint64(leadEst, uint64(p.fieldIndexRangeState.br.BaseStart))/uint64(keyCount))
 			}
 		}
 	}
@@ -773,13 +776,13 @@ func (b plannerORBranch) noOrderLeadScore(leadIdx, need int) uint64 {
 		scan = 1
 	}
 	if outEst < leadEst {
-		scan = satMulUint64(scan, leadEst)
-		scan = satAddUint64(scan, outEst-1) / outEst
+		scan = mathutil.SatMulUint64(scan, leadEst)
+		scan = mathutil.SatAddUint64(scan, outEst-1) / outEst
 	}
 	if scan > leadEst {
 		scan = leadEst
 	}
-	return satMulUint64(satAddUint64(scan, skip), checks)
+	return mathutil.SatMulUint64(mathutil.SatAddUint64(scan, skip), checks)
 }
 
 func (b plannerORBranch) noOrderLeadIndex(need int) int {
@@ -795,7 +798,7 @@ func (b plannerORBranch) noOrderLeadIndex(need int) int {
 		}
 		if best >= 0 && p.expr.Op.IsNumericRange() && !b.preds.owner[best].expr.Op.IsNumericRange() {
 			bestEst := b.preds.owner[best].estCard
-			if bestEst > 0 && p.estCard < satMulUint64(bestEst, 4) {
+			if bestEst > 0 && p.estCard < mathutil.SatMulUint64(bestEst, 4) {
 				continue
 			}
 		}
@@ -1380,7 +1383,7 @@ type plannerORFacts struct {
 	orderField    string
 	orderDistinct uint64
 	orderView     indexdata.FieldIndexView
-	orderStats    PlannerFieldStats
+	orderStats    rbistats.PlannerField
 }
 
 func (facts *plannerORFacts) Release() {
@@ -1485,7 +1488,7 @@ func (qv *View) collectORFacts(q *qir.Shape, facts *plannerORFacts) bool {
 	return qv.collectORBranchFacts(q, facts, snap)
 }
 
-func (qv *View) collectORBranchFacts(q *qir.Shape, facts *plannerORFacts, snap *PlannerStatsSnapshot) bool {
+func (qv *View) collectORBranchFacts(q *qir.Shape, facts *plannerORFacts, snap *rbistats.PlannerSnapshot) bool {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
 	for i := 0; i < len(q.Expr.Operands); i++ {
 		fact, keep, ok := qv.collectORBranchFact(q.Expr.Operands[i], facts, snap, leavesBuf[:0])
@@ -1528,7 +1531,7 @@ func collectORBranchLeaves(op qir.Expr, leavesBuf []qir.Expr) ([]qir.Expr, []qir
 func (qv *View) collectORBranchFact(
 	op qir.Expr,
 	facts *plannerORFacts,
-	snap *PlannerStatsSnapshot,
+	snap *rbistats.PlannerSnapshot,
 	leavesBuf []qir.Expr,
 ) (plannerORBranchFact, bool, bool) {
 	leaves, leavesHeap, ok := collectORBranchLeaves(op, leavesBuf)
@@ -1776,7 +1779,7 @@ func (qv *View) selectORNoOrder(q *qir.Shape, facts *plannerORFacts) plannerORNo
 		if lead == 0 {
 			lead = facts.branchCards[i]
 		}
-		leadRows = satAddUint64(leadRows, lead)
+		leadRows = mathutil.SatAddUint64(leadRows, lead)
 	}
 	if leadRows > 0 && leadRows < runRows {
 		runRows = leadRows
@@ -1995,7 +1998,7 @@ func (qv *View) selectOROrder(q *qir.Shape, facts *plannerORFacts) plannerOROrde
 	return plannerOROrderPick(candidates[:n], forceMaterialized)
 }
 
-func (qv *View) traceOROrderRoute(q *qir.Shape, facts *plannerORFacts, d plannerOROrderDecision) TraceORRoute {
+func (qv *View) traceOROrderRoute(q *qir.Shape, facts *plannerORFacts, d plannerOROrderDecision) rbitrace.ORRoute {
 	route := d.traceRoute()
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 || facts == nil || facts.universe == 0 {
@@ -2006,7 +2009,7 @@ func (qv *View) traceOROrderRoute(q *qir.Shape, facts *plannerORFacts, d planner
 	return route
 }
 
-func plannerOROrderTraceWorkCost(work TraceRouteWork) float64 {
+func plannerOROrderTraceWorkCost(work rbitrace.RouteWork) float64 {
 	return work.CandidateScan +
 		work.PostingContains +
 		work.ExactBucketFilter +
@@ -2017,13 +2020,13 @@ func plannerOROrderTraceWorkCost(work TraceRouteWork) float64 {
 		work.RetainedCacheBenefit
 }
 
-func (qv *View) orderedORCandidateTraceWork(q *qir.Shape, facts *plannerORFacts, c plannerOROrderCandidate, need int) TraceRouteWork {
+func (qv *View) orderedORCandidateTraceWork(q *qir.Shape, facts *plannerORFacts, c plannerOROrderCandidate, need int) rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	switch c.kind {
 	case plannerOROrderCandidateMaterializedFallback:
-		work := TraceRouteWork{
+		work := rbitrace.RouteWork{
 			CandidateScan:     float64(c.expectedRows),
 			MaterializedBuild: float64(c.sumRows),
 		}
@@ -2036,7 +2039,7 @@ func (qv *View) orderedORCandidateTraceWork(q *qir.Shape, facts *plannerORFacts,
 		return work
 	case plannerOROrderCandidateStream:
 		scan := float64(c.expectedRows) * plannerFieldStatsSkew(facts.orderStats)
-		work := TraceRouteWork{CandidateScan: scan}
+		work := rbitrace.RouteWork{CandidateScan: scan}
 		if c.avgChecks > 1 {
 			work.PostingContains = scan * (c.avgChecks - 1)
 		}
@@ -2066,7 +2069,7 @@ func (qv *View) orderedORCandidateTraceWork(q *qir.Shape, facts *plannerORFacts,
 	}
 }
 
-func (qv *View) orderedORKWayCandidateTraceWork(q *qir.Shape, facts *plannerORFacts, c plannerOROrderCandidate, need int) TraceRouteWork {
+func (qv *View) orderedORKWayCandidateTraceWork(q *qir.Shape, facts *plannerORFacts, c plannerOROrderCandidate, need int) rbitrace.RouteWork {
 	routeCost, routeOK := qv.estimateOROrderMergeRouteCostFacts(q, facts, need)
 	mergeWork := facts.orderMergeTraceWork(uint64(need))
 	costMerge := plannerOROrderTraceWorkCost(mergeWork)
@@ -2434,12 +2437,12 @@ func (facts *plannerORFacts) orderMergeCost(need uint64) float64 {
 	return subRows + float64(rankRows)
 }
 
-func (facts *plannerORFacts) orderMergeTraceWork(need uint64) TraceRouteWork {
+func (facts *plannerORFacts) orderMergeTraceWork(need uint64) rbitrace.RouteWork {
 	if need == 0 || facts.universe == 0 {
-		return TraceRouteWork{TailRiskPenalty: math.Inf(1)}
+		return rbitrace.RouteWork{TailRiskPenalty: math.Inf(1)}
 	}
 
-	var work TraceRouteWork
+	var work rbitrace.RouteWork
 	candidateUpper := uint64(0)
 	for i := 0; i < facts.branchCount; i++ {
 		card := facts.branchCards[i]
@@ -2577,10 +2580,10 @@ func (qv *View) estimateOROrderMergeRouteCostFacts(q *qir.Shape, facts *plannerO
 	}, true
 }
 
-func (qv *View) estimateOROrderMergeRouteTraceWorkFacts(q *qir.Shape, facts *plannerORFacts, need int) (TraceRouteWork, TraceRouteWork, bool) {
+func (qv *View) estimateOROrderMergeRouteTraceWorkFacts(q *qir.Shape, facts *plannerORFacts, need int) (rbitrace.RouteWork, rbitrace.RouteWork, bool) {
 	routeCost, ok := qv.estimateOROrderMergeRouteCostFacts(q, facts, need)
 	if !ok {
-		return TraceRouteWork{}, TraceRouteWork{}, false
+		return rbitrace.RouteWork{}, rbitrace.RouteWork{}, false
 	}
 
 	expectedRows := estimateRowsForNeed(uint64(need), facts.unionCard, facts.universe)
@@ -2605,7 +2608,7 @@ func (qv *View) estimateOROrderMergeRouteTraceWorkFacts(q *qir.Shape, facts *pla
 		headBucketAmp := ClampFloat((avgBucket/float64(max(need, 1))-1.0)*0.12, 0, 3.0)
 		kWayRows *= 1.0 + headBucketAmp
 	}
-	kWayWork := TraceRouteWork{
+	kWayWork := rbitrace.RouteWork{
 		CandidateScan:   kWayBaseRows,
 		PostingContains: kWayBaseRows * routeCost.avgChecks * 0.55,
 	}
@@ -2654,7 +2657,7 @@ func (qv *View) estimateOROrderMergeRouteTraceWorkFacts(q *qir.Shape, facts *pla
 			fallbackFactor *= 0.90
 		}
 	}
-	fallbackWork := TraceRouteWork{
+	fallbackWork := rbitrace.RouteWork{
 		CandidateScan:   fallbackCollectRows * fallbackFactor,
 		PostingContains: fallbackCollectRows * routeCost.avgChecks * 0.22 * fallbackFactor,
 		BranchMerge:     fallbackCandidates * (1.0 + routeCost.overlap*0.08) * fallbackFactor,
@@ -2665,7 +2668,7 @@ func (qv *View) estimateOROrderMergeRouteTraceWorkFacts(q *qir.Shape, facts *pla
 func (qv *View) dispatchORMaterialized(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 	out, err := qv.queryMaterialized(q)
 	if trace != nil {
-		trace.SetPlan(PlanMaterialized)
+		trace.SetPlan(rbitrace.PlanMaterialized)
 	}
 	return out, true, err
 }
@@ -2741,7 +2744,7 @@ func (qv *View) dispatchOR(
 		case plannerORNoOrderCandidateUniverse:
 			out := qv.execPlanORUniverseNoOrder(q, trace)
 			if trace != nil {
-				trace.SetPlan(PlanORMergeNoOrder)
+				trace.SetPlan(rbitrace.PlanORMergeNoOrder)
 			}
 			return out, true, nil
 
@@ -2751,7 +2754,7 @@ func (qv *View) dispatchOR(
 				return qv.dispatchORFallback(q, decision, trace)
 			}
 			if trace != nil {
-				trace.SetPlan(PlanORMergeNoOrder)
+				trace.SetPlan(rbitrace.PlanORMergeNoOrder)
 			}
 			return out, true, nil
 
@@ -2761,7 +2764,7 @@ func (qv *View) dispatchOR(
 				return qv.dispatchORFallback(q, decision, trace)
 			}
 			if trace != nil {
-				trace.SetPlan(PlanORMergeNoOrder)
+				trace.SetPlan(rbitrace.PlanORMergeNoOrder)
 			}
 			return out, true, nil
 
@@ -2830,7 +2833,7 @@ func (qv *View) dispatchOR(
 		out, ok, err := qv.execPlanOROrderKWayWithFallback(q, branches, analysis, decision.order.rejected, trace)
 		if ok || err != nil {
 			if ok && trace != nil {
-				trace.SetPlan(PlanORMergeOrderMerge)
+				trace.SetPlan(rbitrace.PlanORMergeOrderMerge)
 			}
 			return out, ok, err
 		}
@@ -2842,7 +2845,7 @@ func (qv *View) dispatchOR(
 			}
 			out, ok, err = qv.execPlanOROrderMergeFallback(q, branches, trace)
 			if ok && trace != nil {
-				trace.SetPlan(PlanORMergeOrderMerge)
+				trace.SetPlan(rbitrace.PlanORMergeOrderMerge)
 			}
 			if ok || err != nil {
 				return out, ok, err
@@ -2865,7 +2868,7 @@ func (qv *View) dispatchOR(
 				observed.release()
 			}
 			if ok && trace != nil {
-				trace.SetPlan(PlanORMergeOrderStream)
+				trace.SetPlan(rbitrace.PlanORMergeOrderStream)
 			}
 			if ok {
 				return out, true, nil
@@ -2880,7 +2883,7 @@ func (qv *View) dispatchOR(
 		out, ok, err := qv.execPlanOROrderMergeFallback(q, branches, trace)
 		if ok {
 			if trace != nil {
-				trace.SetPlan(PlanORMergeOrderMerge)
+				trace.SetPlan(rbitrace.PlanORMergeOrderMerge)
 			}
 			return out, true, err
 		}
@@ -2909,7 +2912,7 @@ func (qv *View) dispatchOR(
 			return qv.dispatchORFallback(q, decision, trace)
 		}
 		if trace != nil {
-			trace.SetPlan(PlanORMergeOrderStream)
+			trace.SetPlan(rbitrace.PlanORMergeOrderStream)
 		}
 		return out, true, nil
 
@@ -3097,7 +3100,7 @@ func plannerOROrderBasicMatchWithMetrics(
 	branches plannerORBranches,
 	branchStart, branchEnd *[plannerORBranchLimit]int,
 	branchChecks *[plannerORBranchLimit][]int,
-	branchMetrics []TraceORBranch,
+	branchMetrics []rbitrace.ORBranch,
 	idx uint64,
 	bucket int,
 	alwaysTrue bool,
@@ -3125,7 +3128,7 @@ func plannerOROrderBasicMatchWithMetrics(
 	return matchedCount
 }
 
-func setOROrderMergeFallbackTrace(trace *Trace, examined, scanWidth uint64, branchMetrics []TraceORBranch, stopReason string) {
+func setOROrderMergeFallbackTrace(trace *Trace, examined, scanWidth uint64, branchMetrics []rbitrace.ORBranch, stopReason string) {
 	if trace == nil {
 		return
 	}
@@ -3266,7 +3269,7 @@ func (qv *View) sampleOROrderStream(
 		return plannerOROrderStreamSample{}, true
 	}
 
-	var branchMetrics [plannerORBranchLimit]TraceORBranch
+	var branchMetrics [plannerORBranchLimit]rbitrace.ORBranch
 	br := ov.RangeByRanks(scanStart, scanEnd)
 	cur := ov.NewCursor(br, o.Desc)
 	bucket := br.BaseStart
@@ -3717,7 +3720,7 @@ func (qv *View) initOrderedORBranchEstimates(branches plannerORBranches, branchU
 			card:     card,
 			universe: universe,
 		}
-		totalCard = satAddUint64(totalCard, card)
+		totalCard = mathutil.SatAddUint64(totalCard, card)
 	}
 	if totalCard == 0 {
 		return
@@ -3783,25 +3786,25 @@ func (qv *View) orderedORMaterializedPredicateRequiresPromotion(p predicate, bra
 	expectedRows := orderedPredicateExpectedRows(clampUint64ToInt(branchNeed), candidate.plan.est, branchUniverse)
 	return expectedRows > 0 &&
 		expectedRows < candidate.plan.est &&
-		satMulUint64(expectedRows, 2) < candidate.plan.est
+		mathutil.SatMulUint64(expectedRows, 2) < candidate.plan.est
 }
 
 func orderedORMaterializedPredicateColdBuildWorth(buildWork, cachedCheckWork, leafChecks, savedWork uint64) bool {
 	if savedWork <= buildWork {
 		return false
 	}
-	margin := satMulUint64(leafChecks, cachedCheckWork)
+	margin := mathutil.SatMulUint64(leafChecks, cachedCheckWork)
 	if margin < buildWork {
 		margin = buildWork
 	}
-	return savedWork >= satAddUint64(buildWork, margin)
+	return savedWork >= mathutil.SatAddUint64(buildWork, margin)
 }
 
 func orderedORMaterializedPredicateWarmHitWorth(leafChecks, checkWork, cachedCheckWork uint64) bool {
 	if leafChecks == 0 || checkWork <= cachedCheckWork {
 		return false
 	}
-	savedWork := satMulUint64(leafChecks, checkWork-cachedCheckWork)
+	savedWork := mathutil.SatMulUint64(leafChecks, checkWork-cachedCheckWork)
 	return savedWork >= cachedCheckWork
 }
 
@@ -3826,7 +3829,7 @@ func (qv *View) shouldEagerMaterializeOrderedORPredicate(
 	if info.isPrefix || leafChecks == 0 || info.checkWork <= info.cachedCheckWork {
 		return false, false
 	}
-	savedWork := satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork)
+	savedWork := mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork)
 	if savedWork < info.buildWork {
 		return false, false
 	}
@@ -4258,9 +4261,9 @@ func (qv *View) promoteOrderedORMaterializedBaseOps(
 			for slot := 0; slot < len(cacheKeysBuf); slot++ {
 				if cacheKeysBuf[slot] == info.cacheKey {
 					if info.isPrefix {
-						observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], leafChecks)
+						observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], leafChecks)
 					} else if info.checkWork > info.cachedCheckWork {
-						observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
+						observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
 					}
 					found = true
 					break
@@ -4276,7 +4279,7 @@ func (qv *View) promoteOrderedORMaterializedBaseOps(
 			if info.isPrefix {
 				observedWorksBuf = append(observedWorksBuf, leafChecks)
 			} else if info.checkWork > info.cachedCheckWork {
-				observedWorksBuf = append(observedWorksBuf, satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
+				observedWorksBuf = append(observedWorksBuf, mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
 			} else {
 				observedWorksBuf = append(observedWorksBuf, 0)
 			}
@@ -4375,13 +4378,13 @@ func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
 				if info.isPrefix {
 					observedWork = rows
 				} else if info.checkWork > info.cachedCheckWork {
-					observedWork = satMulUint64(rows, info.checkWork-info.cachedCheckWork)
+					observedWork = mathutil.SatMulUint64(rows, info.checkWork-info.cachedCheckWork)
 				}
 				if observedWork != 0 {
 					found := false
 					for slot := 0; slot < len(cacheKeysBuf); slot++ {
 						if cacheKeysBuf[slot] == info.cacheKey {
-							observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], observedWork)
+							observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], observedWork)
 							found = true
 							break
 						}
@@ -4990,7 +4993,7 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 		return out, true
 	}
 
-	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
+	var branchMetricsInline [plannerORBranchLimit]rbitrace.ORBranch
 	branchMetrics := branchMetricsInline[:branches.Len()]
 	for i := range branchMetrics {
 		branchMetrics[i].Index = i
@@ -5969,8 +5972,8 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 
 	fullTrace := trace != nil && trace.Full()
 	var (
-		branchMetrics       []TraceORBranch
-		branchMetricsInline [plannerORBranchLimit]TraceORBranch
+		branchMetrics       []rbitrace.ORBranch
+		branchMetricsInline [plannerORBranchLimit]rbitrace.ORBranch
 		examined            uint64
 		scanWidth           uint64
 		dedupe              uint64
@@ -6117,7 +6120,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 
 		examined += examinedDelta
 		if allowRuntimeFallback {
-			branchExaminedRows[i] = satAddUint64(branchExaminedRows[i], examinedDelta)
+			branchExaminedRows[i] = mathutil.SatAddUint64(branchExaminedRows[i], examinedDelta)
 		}
 
 		observedDelta := residualExaminedDelta
@@ -6125,7 +6128,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 			observedDelta = examinedDelta
 		}
 
-		observedCheckRows[i] = satAddUint64(observedCheckRows[i], observedDelta)
+		observedCheckRows[i] = mathutil.SatAddUint64(observedCheckRows[i], observedDelta)
 		if fullTrace {
 			branchMetrics[i].RowsExamined += examinedDelta
 			branchMetrics[i].RowsEmitted += emittedDelta
@@ -6187,13 +6190,13 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance()
 		examined += examinedDelta
 		if allowRuntimeFallback {
-			branchExaminedRows[bi] = satAddUint64(branchExaminedRows[bi], examinedDelta)
+			branchExaminedRows[bi] = mathutil.SatAddUint64(branchExaminedRows[bi], examinedDelta)
 		}
 		observedDelta := residualExaminedDelta
 		if len(iter.residualChecks) == 0 && len(iter.exactChecks) > 0 {
 			observedDelta = examinedDelta
 		}
-		observedCheckRows[bi] = satAddUint64(observedCheckRows[bi], observedDelta)
+		observedCheckRows[bi] = mathutil.SatAddUint64(observedCheckRows[bi], observedDelta)
 		if fullTrace {
 			branchMetrics[bi].RowsExamined += examinedDelta
 			branchMetrics[bi].RowsEmitted += emittedDelta
@@ -6302,11 +6305,11 @@ func (qv *View) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBra
 		return nil, false, nil
 	}
 
-	candidateSet := newPostingLazySetBuilder(satMulUint64(uint64(need), uint64(branches.Len())))
+	candidateSet := newPostingLazySetBuilder(mathutil.SatMulUint64(uint64(need), uint64(branches.Len())))
 
 	fullTrace := trace != nil && trace.Full()
-	var branchMetrics []TraceORBranch
-	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
+	var branchMetrics []rbitrace.ORBranch
+	var branchMetricsInline [plannerORBranchLimit]rbitrace.ORBranch
 	if fullTrace {
 		branchMetrics = branchMetricsInline[:branches.Len()]
 		for i := range branchMetrics {
@@ -7100,8 +7103,8 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 
 	fullTrace := trace != nil && trace.Full()
 	examined := uint64(0)
-	var branchMetrics []TraceORBranch
-	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
+	var branchMetrics []rbitrace.ORBranch
+	var branchMetricsInline [plannerORBranchLimit]rbitrace.ORBranch
 	if trace != nil {
 		if fullTrace {
 			branchMetrics = branchMetricsInline[:branches.Len()]
@@ -7232,8 +7235,8 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 func (qv *View) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
 	fullTrace := trace != nil && trace.Full()
 	examined := uint64(0)
-	var branchMetrics []TraceORBranch
-	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
+	var branchMetrics []rbitrace.ORBranch
+	var branchMetricsInline [plannerORBranchLimit]rbitrace.ORBranch
 	if trace != nil {
 		if fullTrace {
 			branchMetrics = branchMetricsInline[:branches.Len()]

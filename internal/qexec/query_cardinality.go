@@ -4,11 +4,13 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 const (
@@ -53,7 +55,7 @@ func (qv *View) FilterCardinalityByMaterializedExpr(expr qir.Expr, trace *Trace)
 	defer b.ids.Release()
 
 	if trace != nil {
-		trace.SetPlan(planFilterCardinalityMaterialized)
+		trace.SetPlan(rbitrace.PlanCountMaterialized)
 		if b.neg {
 			trace.AddExamined(qv.snap.Universe.Cardinality())
 		} else if !b.ids.IsEmpty() {
@@ -92,7 +94,7 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 			hit = lookupScalarCardinality(ov, key)
 		}
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityScalarLookup)
+			trace.SetPlan(rbitrace.PlanCountScalarLookup)
 			trace.AddExamined(hit)
 		}
 		return cardinalityLookupComplement(qv.snap.Universe.Cardinality(), hit, expr.Not), true, nil
@@ -115,7 +117,7 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 			sum += qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, expr).LookupCardinality(indexdata.NilIndexEntryKey)
 		}
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityScalarLookup)
+			trace.SetPlan(rbitrace.PlanCountScalarLookup)
 			trace.AddExamined(sum)
 		}
 		return cardinalityLookupComplement(qv.snap.Universe.Cardinality(), sum, expr.Not), true, nil
@@ -141,7 +143,7 @@ func postingUnionCardinality2(a, b posting.List) uint64 {
 	if b.IsEmpty() {
 		return a.Cardinality()
 	}
-	return satAddUint64(a.Cardinality(), b.Cardinality()) - a.AndCardinality(b)
+	return mathutil.SatAddUint64(a.Cardinality(), b.Cardinality()) - a.AndCardinality(b)
 }
 
 func postingAllMatchesCardinality(posts []posting.List) uint64 {
@@ -245,7 +247,7 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 		switch len(postsBuf) {
 		case 0:
 			if trace != nil {
-				trace.SetPlan(planFilterCardinalityScalarLookup)
+				trace.SetPlan(rbitrace.PlanCountScalarLookup)
 				trace.AddExamined(0)
 			}
 			return cardinalityLookupComplement(universe, 0, expr.Not), true, nil
@@ -253,7 +255,7 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 		case 1:
 			hit := postsBuf[0].Cardinality()
 			if trace != nil {
-				trace.SetPlan(planFilterCardinalityScalarLookup)
+				trace.SetPlan(rbitrace.PlanCountScalarLookup)
 				trace.AddExamined(hit)
 			}
 			return cardinalityLookupComplement(universe, hit, expr.Not), true, nil
@@ -263,8 +265,8 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 			b := postsBuf[1]
 			hit := postingUnionCardinality2(a, b)
 			if trace != nil {
-				trace.SetPlan(planFilterCardinalityScalarLookup)
-				trace.AddExamined(satAddUint64(a.Cardinality(), b.Cardinality()))
+				trace.SetPlan(rbitrace.PlanCountScalarLookup)
+				trace.AddExamined(mathutil.SatAddUint64(a.Cardinality(), b.Cardinality()))
 			}
 			return cardinalityLookupComplement(universe, hit, expr.Not), true, nil
 
@@ -281,10 +283,10 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 		for i := 0; i < valCount; i++ {
 			ids := lookupScalarPostingRetained(ov, valsBuf[i])
 			card := ids.Cardinality()
-			examined = satAddUint64(examined, card)
+			examined = mathutil.SatAddUint64(examined, card)
 			if ids.IsEmpty() {
 				if trace != nil {
-					trace.SetPlan(planFilterCardinalityScalarLookup)
+					trace.SetPlan(rbitrace.PlanCountScalarLookup)
 					trace.AddExamined(examined)
 				}
 				return cardinalityLookupComplement(universe, 0, expr.Not), true, nil
@@ -294,7 +296,7 @@ func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (
 
 		hit := postingAllMatchesCardinality(postsBuf)
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityScalarLookup)
+			trace.SetPlan(rbitrace.PlanCountScalarLookup)
 			trace.AddExamined(examined)
 		}
 		return cardinalityLookupComplement(universe, hit, expr.Not), true, nil
@@ -955,7 +957,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		if filter.ids.IsEmpty() {
 			if filter.neg {
 				if trace != nil {
-					trace.SetPlan(planFilterCardinalityScalarInSplit)
+					trace.SetPlan(rbitrace.PlanCountScalarInSplit)
 					trace.AddExamined(0)
 				}
 				return 0, true, nil
@@ -993,7 +995,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	}
 
 	if trace != nil {
-		trace.SetPlan(planFilterCardinalityScalarInSplit)
+		trace.SetPlan(rbitrace.PlanCountScalarInSplit)
 		trace.AddExamined(examined)
 	}
 
@@ -1131,7 +1133,7 @@ func (qv *View) TryFilterCardinalityByUniqueEq(expr qir.Expr, trace *Trace) (uin
 	}
 
 	if trace != nil {
-		trace.SetPlan(planFilterCardinalityUniqueEq)
+		trace.SetPlan(rbitrace.PlanCountUniqueEq)
 		trace.AddExamined(examined)
 	}
 
@@ -1240,7 +1242,7 @@ func cardinalityBroadLeadResidualScoreLimit(leadEst, universe uint64) uint64 {
 	// Broad leads must still keep residual check work near a small multiple of
 	// the universe scan. As the lead narrows within the broad regime, allow more
 	// residual score before falling back to postingResult materialization.
-	return satAddUint64(satMulUint64(universe, 2), satMulUint64(universe-leadEst, 2))
+	return mathutil.SatAddUint64(mathutil.SatMulUint64(universe, 2), mathutil.SatMulUint64(universe-leadEst, 2))
 }
 
 func (qv *View) shouldRejectBroadLeadPredicateScan(preds predicateReader, active []int, leadEst, universe uint64) bool {
@@ -1250,7 +1252,7 @@ func (qv *View) shouldRejectBroadLeadPredicateScan(preds predicateReader, active
 	}
 	var residualScore uint64
 	for _, pi := range active {
-		residualScore = satAddUint64(residualScore, qv.cardinalityLeadResidualScore(preds[pi], leadEst, universe))
+		residualScore = mathutil.SatAddUint64(residualScore, qv.cardinalityLeadResidualScore(preds[pi], leadEst, universe))
 		if residualScore > limit {
 			return true
 		}
@@ -1364,8 +1366,8 @@ func cardinalityORBranchDupOrderLess(branches []cardinalityORBranch, a, b int) b
 	if bw == 0 {
 		bw = 1
 	}
-	left := satMulUint64(ba.est, bw)
-	right := satMulUint64(bb.est, aw)
+	left := mathutil.SatMulUint64(ba.est, bw)
+	right := mathutil.SatMulUint64(bb.est, aw)
 	if left != right {
 		return left > right
 	}
@@ -1538,7 +1540,7 @@ func cardinalityORBranchEstimateSet(preds predicateSet, active []int, leadEst ui
 }
 
 func appendCardinalityORMaterializedBranch(
-	branchTrace []TraceORBranch,
+	branchTrace []rbitrace.ORBranch,
 	materializedBranches []cardinalityORMaterializedBranch,
 	materializedBranchEst uint64,
 	branchIdx int,
@@ -1558,7 +1560,7 @@ func appendCardinalityORMaterializedBranch(
 		est:   branchEst,
 	})
 
-	return materializedBranches, satAddUint64(materializedBranchEst, branchEst)
+	return materializedBranches, mathutil.SatAddUint64(materializedBranchEst, branchEst)
 }
 
 func shouldTryCardinalityORHybridMaterializedSpill(totalBranches int, scanBranches int, spillBranches int, expectedProbes uint64, spillEst uint64, universe uint64) bool {
@@ -1574,14 +1576,14 @@ func shouldTryCardinalityORHybridMaterializedSpill(totalBranches int, scanBranch
 	if spillBranches >= scanBranches && expectedProbes > universe {
 		return false
 	}
-	if spillBranches > 1 && spillEst > universe && expectedProbes > satMulUint64(universe, 3)/2 {
+	if spillBranches > 1 && spillEst > universe && expectedProbes > mathutil.SatMulUint64(universe, 3)/2 {
 		return false
 	}
 
-	budget := satAddUint64(expectedProbes, spillEst)
-	limit := satMulUint64(universe, 5) / 2
+	budget := mathutil.SatAddUint64(expectedProbes, spillEst)
+	limit := mathutil.SatMulUint64(universe, 5) / 2
 	if spillBranches == 1 || scanBranches >= spillBranches+1 {
-		limit = satMulUint64(universe, 11) / 4
+		limit = mathutil.SatMulUint64(universe, 11) / 4
 	}
 	if limit < universe {
 		limit = universe
@@ -1669,7 +1671,7 @@ func cardinalityORBranchesMatchWorkBuf(branches []cardinalityORBranch) uint64 {
 		if weight == 0 {
 			weight = 1
 		}
-		work = satAddUint64(work, satMulUint64(br.est, weight))
+		work = mathutil.SatAddUint64(work, mathutil.SatMulUint64(br.est, weight))
 	}
 	return work
 }
@@ -1741,7 +1743,7 @@ func cardinalityORBranchesShouldUseSeenDedupBuf(branches []cardinalityORBranch, 
 }
 
 func cardinalityORSeenCapHintBuf(branches []cardinalityORBranch, spillEst uint64, universe uint64) int {
-	hint := satAddUint64(cardinalityORBranchesUnionEstimateBuf(branches, universe), spillEst)
+	hint := mathutil.SatAddUint64(cardinalityORBranchesUnionEstimateBuf(branches, universe), spillEst)
 	if universe > 0 && hint > universe {
 		hint = universe
 	}
@@ -1862,7 +1864,7 @@ func (qv *View) cardinalityORMaterializedSpillUnion(
 	branches []cardinalityORMaterializedBranch,
 	seen *cardinalityORSeen,
 	trace *Trace,
-	branchTrace []TraceORBranch,
+	branchTrace []rbitrace.ORBranch,
 ) (uint64, uint64, bool, error) {
 
 	if len(branches) == 0 {
@@ -1933,7 +1935,7 @@ func (qv *View) tryFilterCardinalityORBranchLeadPostingsBuf(
 	branchIdx int,
 	useSeenDedup bool,
 	seen *cardinalityORSeen,
-	trace *TraceORBranch,
+	trace *rbitrace.ORBranch,
 ) (uint64, uint64, bool) {
 
 	if branchIdx < 0 || branchIdx >= len(branches) {
@@ -2675,7 +2677,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	// many buckets can be skipped (or fully counted) via bucketCount hooks.
 	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesLeadBuckets(predSet, leadIdx, active); ok {
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityPredicates)
+			trace.SetPlan(rbitrace.PlanCountPredicates)
 			trace.AddExamined(examined)
 		}
 		return cnt, true, nil
@@ -2685,7 +2687,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	// residual predicates prune whole posting bitmaps before row fallback.
 	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesLeadPostings(predSet, leadIdx, active); ok {
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityPredicates)
+			trace.SetPlan(rbitrace.PlanCountPredicates)
 			trace.AddExamined(examined)
 		}
 		return cnt, true, nil
@@ -2715,7 +2717,7 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	}
 
 	if trace != nil {
-		trace.SetPlan(planFilterCardinalityPredicates)
+		trace.SetPlan(rbitrace.PlanCountPredicates)
 		trace.AddExamined(examined)
 	}
 
@@ -3708,7 +3710,7 @@ func cardinalityPredicateLeadScanWeight(p predicate) uint64 {
 		return weight
 	}
 	if p.expr.Op.IsScalarRangeOrPrefix() {
-		return satMulUint64(weight, 3)
+		return mathutil.SatMulUint64(weight, 3)
 	}
 	return weight
 }
@@ -3820,7 +3822,7 @@ func (qv *View) cardinalityLeadResidualScore(p predicate, leadEst, universe uint
 	if p.estCard > 0 && p.estCard < effectiveRows {
 		effectiveRows = p.estCard
 	}
-	return satMulUint64(effectiveRows, weight)
+	return mathutil.SatMulUint64(effectiveRows, weight)
 }
 
 func (qv *View) cardinalityORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
@@ -3831,7 +3833,7 @@ func (qv *View) cardinalityORLeadResidualScore(p predicate, leadEst, universe ui
 	if weight == 0 {
 		return 0
 	}
-	return satMulUint64(leadEst, weight)
+	return mathutil.SatMulUint64(leadEst, weight)
 }
 
 func (qv *View) pickCardinalityLeadPredicate(preds predicateReader, universe uint64) (int, uint64, uint64) {
@@ -3848,15 +3850,15 @@ func (qv *View) pickCardinalityLeadPredicate(preds predicateReader, universe uin
 			continue
 		}
 
-		score := satMulUint64(p.estCard, cardinalityPredicateLeadScanWeight(p))
+		score := mathutil.SatMulUint64(p.estCard, cardinalityPredicateLeadScanWeight(p))
 		if p.leadIterNeedsContainsCheck() {
-			score = satAddUint64(score, qv.cardinalityLeadResidualScore(p, p.estCard, universe))
+			score = mathutil.SatAddUint64(score, qv.cardinalityLeadResidualScore(p, p.estCard, universe))
 		}
 		for j := 0; j < len(preds); j++ {
 			if j == i {
 				continue
 			}
-			score = satAddUint64(score, qv.cardinalityLeadResidualScore(preds[j], p.estCard, universe))
+			score = mathutil.SatAddUint64(score, qv.cardinalityLeadResidualScore(preds[j], p.estCard, universe))
 		}
 
 		if leadIdx == -1 || score < leadScore {
@@ -3882,15 +3884,15 @@ func (qv *View) pickCardinalityORLeadPredicate(preds predicateSet, universe uint
 			continue
 		}
 
-		score := satMulUint64(p.estCard, cardinalityPredicateLeadScanWeight(p))
+		score := mathutil.SatMulUint64(p.estCard, cardinalityPredicateLeadScanWeight(p))
 		if p.leadIterNeedsContainsCheck() {
-			score = satAddUint64(score, qv.cardinalityORLeadResidualScore(p, p.estCard, universe))
+			score = mathutil.SatAddUint64(score, qv.cardinalityORLeadResidualScore(p, p.estCard, universe))
 		}
 		for j := 0; j < len(preds.owner); j++ {
 			if j == i {
 				continue
 			}
-			score = satAddUint64(score, qv.cardinalityORLeadResidualScore(preds.owner[j], p.estCard, universe))
+			score = mathutil.SatAddUint64(score, qv.cardinalityORLeadResidualScore(preds.owner[j], p.estCard, universe))
 		}
 
 		if leadIdx == -1 || score < leadScore {
@@ -3927,10 +3929,10 @@ func (qv *View) TryFilterCardinalityORByPredicates(expr qir.Expr, trace *Trace) 
 			if err != nil {
 				return 0, true, err
 			}
-			cnt = satAddUint64(cnt, branchCnt)
+			cnt = mathutil.SatAddUint64(cnt, branchCnt)
 		}
 		if trace != nil {
-			trace.SetPlan(planFilterCardinalityORPredicates)
+			trace.SetPlan(rbitrace.PlanCountORPredicates)
 			trace.AddExamined(cnt)
 		}
 		return cnt, true, nil
@@ -3942,9 +3944,9 @@ func (qv *View) TryFilterCardinalityORByPredicates(expr qir.Expr, trace *Trace) 
 	strictWide := branchCount > 3
 	fullTrace := trace != nil && trace.Full()
 
-	var branchTrace []TraceORBranch
+	var branchTrace []rbitrace.ORBranch
 	if fullTrace {
-		var branchTraceInline [cardinalityORPredicateMaxBranchesBase + 1]TraceORBranch
+		var branchTraceInline [cardinalityORPredicateMaxBranchesBase + 1]rbitrace.ORBranch
 		branchTrace = branchTraceInline[:branchCount]
 		for i := range branchTrace {
 			branchTrace[i].Index = i
@@ -4196,7 +4198,7 @@ LOOP:
 			matchWeight = qv.cardinalityORPredicateResidualCheckWeight(predSet.owner[leadIdx], leadEst, uc)
 		}
 		for _, pi := range checks {
-			matchWeight = satAddUint64(matchWeight, qv.cardinalityORPredicateResidualCheckWeight(predSet.owner[pi], leadEst, uc))
+			matchWeight = mathutil.SatAddUint64(matchWeight, qv.cardinalityORPredicateResidualCheckWeight(predSet.owner[pi], leadEst, uc))
 		}
 		if matchWeight == 0 {
 			matchWeight = 1
@@ -4250,9 +4252,9 @@ LOOP:
 	var examined uint64
 	if trace != nil {
 		if useMaterializedSpill {
-			trace.SetPlan(planFilterCardinalityORHybrid)
+			trace.SetPlan(rbitrace.PlanCountORHybrid)
 		} else {
-			trace.SetPlan(planFilterCardinalityORPredicates)
+			trace.SetPlan(rbitrace.PlanCountORPredicates)
 		}
 	}
 
@@ -4276,7 +4278,7 @@ LOOP:
 
 	for i := 0; i < len(branchesBuf); i++ {
 		br := branchesBuf[i]
-		var brTrace *TraceORBranch
+		var brTrace *rbitrace.ORBranch
 		if branchTrace != nil {
 			brTrace = &branchTrace[br.index]
 		}
@@ -4578,7 +4580,7 @@ func (qv *View) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr
 							} else if state.probePostingFilter && !state.keepProbeHits {
 								applyWork := postingUnionLinearWork(state.probe.probeLen, state.probe.probeEst)
 								materializeWork := postingUnionLinearWork(state.bucketCount, p.estCard)
-								if satMulUint64(applyWork, evalAndComplementRangeApplyMinWorkGain) >= materializeWork {
+								if mathutil.SatMulUint64(applyWork, evalAndComplementRangeApplyMinWorkGain) >= materializeWork {
 									usePostingApply = false
 								}
 							}

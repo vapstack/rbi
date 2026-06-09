@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 )
 
@@ -19,7 +20,7 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	}
 	defer rollback(tx)
 
-	bucket := tx.Bucket(db.bucket)
+	bucket := tx.Bucket(db.dataBucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
 	}
@@ -29,7 +30,7 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	if v == nil {
 		return nil, nil
 	}
-	r, err := db.decode(v)
+	r, err := db.decodeStoredValue(v)
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
@@ -60,7 +61,7 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 
 // batchGetTx retrieves multiple values by IDs using an existing read transaction.
 func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
-	bucket := tx.Bucket(db.bucket)
+	bucket := tx.Bucket(db.dataBucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
 	}
@@ -72,7 +73,7 @@ func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 		if v == nil {
 			continue
 		}
-		value, err := db.decode(v)
+		value, err := db.decodeStoredValue(v)
 		if err != nil {
 			return s, fmt.Errorf("decode: %w", err)
 		}
@@ -81,46 +82,61 @@ func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 	return s, nil
 }
 
-// ScanKeys iterates over keys in the in-memory index snapshot and calls fn for
-// each key greater than or equal to seek.
+// ScanKeys iterates over live keys greater than or equal to seek and calls fn
+// for each key. Scan stops when fn returns false or a non-nil error.
 //
-// In transparent mode it returns ErrNoIndex.
+// Numeric indexed DB iterates the current runtime universe snapshot.
+// Other modes scan the data bucket inside a read-only transaction which remains
+// open for the duration of the scan.
 //
-// The scan stops when fn returns false or a non-nil error. ScanKeys pins one
-// index snapshot for the whole operation. The scan does not open a Bolt
-// transaction and does not reflect concurrent writes.
+// The callback must not call methods on the DB instance.
 //
-// Other DB operations may technically be called from fn, but they run as
-// independent operations. They are not tied to the pinned index snapshot used
-// by ScanKeys and may observe a different database state.
-//
-// For string keys, iteration order follows internal key-index order, not
-// lexicographic order. In that mode, seek is still applied as a plain
-// `key >= seek` value filter, but not as a lexicographic seek in traversal
-// order. As a result, string-key ScanKeys is not suitable for prefix scans,
-// resume/pagination cursors, or ordered iteration. Use QueryKeys(PREFIX(...))
-// for prefix matching or SeqScan/SeqScanRaw for ordered key traversal.
+// Numeric keys are returned in numeric order,
+// string keys are returned in bbolt lexicographic byte order.
 func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
 
-	if db.index == nil {
-		return ErrNoIndex
+	if !db.strKey && db.index != nil {
+		return db.index.ScanKeys(keycodec.UserKeyUint(seek), keycodec.UserKeyUintScanFunc(fn))
 	}
 
+	tx, err := db.bolt.Begin(false)
+	if err != nil {
+		return fmt.Errorf("tx error: %w", err)
+	}
+	defer rollback(tx)
+
+	b := tx.Bucket(db.dataBucket)
+	if b == nil {
+		return fmt.Errorf("bucket does not exist")
+	}
+
+	c := b.Cursor()
+	var keyBuf [8]byte
 	if db.strKey {
-		return db.index.ScanStringKeys(
-			keycodec.UserKeyString(seek),
-			ErrNoValidKeyIndex,
-			keycodec.UserKeyStringScanFunc(fn),
-		)
+		call := keycodec.UserKeyStringScanFunc(fn)
+		for key, _ := c.Seek(keycodec.UserKeyBytesWithBuf(seek, true, &keyBuf)); key != nil; key, _ = c.Next() {
+			more, err := call(string(key))
+			if err != nil || !more {
+				return err
+			}
+		}
+		return nil
 	}
 
-	return db.index.ScanUintKeys(
-		keycodec.UserKeyUint(seek),
-		keycodec.UserKeyUintScanFunc(fn),
-	)
+	call := keycodec.UserKeyUintScanFunc(fn)
+	for key, _ := c.Seek(keycodec.UserKeyBytesWithBuf(seek, false, &keyBuf)); key != nil; key, _ = c.Next() {
+		if len(key) != 8 {
+			return fmt.Errorf("invalid numeric data key length: %d", len(key))
+		}
+		more, err := call(keycodec.U64FromBytes(key))
+		if err != nil || !more {
+			return err
+		}
+	}
+	return nil
 }
 
 // SeqScan performs a sequential scan over all records starting at the given
@@ -146,7 +162,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	}
 	defer rollback(tx)
 
-	b := tx.Bucket(db.bucket)
+	b := tx.Bucket(db.dataBucket)
 	if b == nil {
 		return fmt.Errorf("bucket does not exist")
 	}
@@ -157,7 +173,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	if key == nil {
 		return nil
 	}
-	val, err := db.decode(value)
+	val, err := db.decodeStoredValue(value)
 	if err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
@@ -171,7 +187,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		if key == nil {
 			return nil
 		}
-		if val, err = db.decode(value); err != nil {
+		if val, err = db.decodeStoredValue(value); err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
 		if more, err = fn(keycodec.UserKeyFromBytes[K](key, db.strKey), val); err != nil {
@@ -181,54 +197,15 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	return nil
 }
 
-// SeqScanRaw performs a sequential scan over all records starting at the
-// given key (inclusive), passing raw bytes to the provided fn.
-// These bytes are encoded representation of the values.
-//
-// SeqScanRaw stops reading when the provided fn returns false or a non-nil error.
-// The scan runs inside a read-only transaction which remains open for the
-// duration of the scan.
-//
-// The callback must not call methods on the DB instance. SeqScanRaw keeps the
-// read transaction open while fn runs, and re-entering DB from the callback can
-// deadlock.
-//
-// Bytes passed to fn must not be modified.
-func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	b := tx.Bucket(db.bucket)
-	if b == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	c := b.Cursor()
-
-	var keyBuf [8]byte
-	key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf))
-	if key == nil {
-		return nil
-	}
-
-	more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value)
-	if err != nil {
-		return err
-	}
-	for more {
-		key, value = c.Next()
-		if key == nil {
-			return nil
+func (db *DB[K, V]) decodeStoredValue(data []byte) (*V, error) {
+	if db.strKey {
+		if len(data) < 8 {
+			return nil, fmt.Errorf("%w: value shorter than 8 bytes", rbierrors.ErrInvalidStringStorageFormat)
 		}
-		if more, err = fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value); err != nil {
-			return err
+		if keycodec.U64FromBytes(data[:8]) == 0 {
+			return nil, fmt.Errorf("%w: zero string id", rbierrors.ErrInvalidStringStorageFormat)
 		}
+		data = data[8:]
 	}
-	return nil
+	return db.decode(data)
 }

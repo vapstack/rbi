@@ -5,9 +5,11 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerMaterializedCacheState byte
@@ -164,8 +166,8 @@ func (d plannerOrderedLimitDecision) selectedKind() plannerOrderedLimitCandidate
 	return d.selected.kind
 }
 
-func (d plannerOrderedLimitDecision) traceRoute() TraceOrderedLimitRoute {
-	return TraceOrderedLimitRoute{
+func (d plannerOrderedLimitDecision) traceRoute() rbitrace.OrderedLimitRoute {
+	return rbitrace.OrderedLimitRoute{
 		Selected:        d.selected.kind.String(),
 		Rejected:        d.rejected.kind.String(),
 		CacheState:      d.selected.cacheState.String(),
@@ -181,21 +183,21 @@ func (d plannerOrderedLimitDecision) traceRoute() TraceOrderedLimitRoute {
 	}
 }
 
-func (c plannerOrderedLimitCandidate) traceWork() TraceRouteWork {
+func (c plannerOrderedLimitCandidate) traceWork() rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	switch c.kind {
 	case plannerOrderedLimitCandidateEmpty:
-		return TraceRouteWork{CandidateScan: c.cost}
+		return rbitrace.RouteWork{CandidateScan: c.cost}
 	case plannerOrderedLimitCandidateMaterializedFallback:
-		return TraceRouteWork{MaterializedBuild: c.cost}
+		return rbitrace.RouteWork{MaterializedBuild: c.cost}
 	case plannerOrderedLimitCandidateWarmBaseCore,
 		plannerOrderedLimitCandidateColdRetainedBaseCore,
 		plannerOrderedLimitCandidateColdUnretainedBaseCore:
 		scan := float64(c.expectedRows) * (0.60 + float64(c.checks)*0.16)
 		build := float64(c.buildWork)
-		work := TraceRouteWork{CandidateScan: scan, MaterializedBuild: build}
+		work := rbitrace.RouteWork{CandidateScan: scan, MaterializedBuild: build}
 		total := scan + build
 		if total > c.cost {
 			work.RetainedCacheBenefit = total - c.cost
@@ -215,18 +217,18 @@ func (c plannerOrderedLimitCandidate) traceWork() TraceRouteWork {
 		if scan > c.cost {
 			scan = c.cost
 		}
-		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+		return rbitrace.RouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
 	}
 }
 
-func (qv *View) traceOrderedLimitRoute(q *qir.Shape, facts *orderedLimitFacts, d plannerOrderedLimitDecision) TraceOrderedLimitRoute {
+func (qv *View) traceOrderedLimitRoute(q *qir.Shape, facts *orderedLimitFacts, d plannerOrderedLimitDecision) rbitrace.OrderedLimitRoute {
 	route := d.traceRoute()
 	route.SelectedWork = qv.orderedLimitCandidateTraceWork(q, facts, d.selected)
 	route.RejectedWork = qv.orderedLimitCandidateTraceWork(q, facts, d.rejected)
 	return route
 }
 
-func (qv *View) orderedLimitCandidateTraceWork(q *qir.Shape, facts *orderedLimitFacts, c plannerOrderedLimitCandidate) TraceRouteWork {
+func (qv *View) orderedLimitCandidateTraceWork(q *qir.Shape, facts *orderedLimitFacts, c plannerOrderedLimitCandidate) rbitrace.RouteWork {
 	if c.cost <= 0 || q == nil || facts == nil {
 		return c.traceWork()
 	}
@@ -238,7 +240,7 @@ func (qv *View) orderedLimitCandidateTraceWork(q *qir.Shape, facts *orderedLimit
 	}
 }
 
-func (qv *View) orderedLimitScanTraceWork(facts *orderedLimitFacts, c plannerOrderedLimitCandidate) TraceRouteWork {
+func (qv *View) orderedLimitScanTraceWork(facts *orderedLimitFacts, c plannerOrderedLimitCandidate) rbitrace.RouteWork {
 	scan := float64(c.expectedRows)
 	if scan <= 0 {
 		scan = c.cost
@@ -247,7 +249,7 @@ func (qv *View) orderedLimitScanTraceWork(facts *orderedLimitFacts, c plannerOrd
 		scan = c.cost
 	}
 	remaining := c.cost - scan
-	work := TraceRouteWork{CandidateScan: scan}
+	work := rbitrace.RouteWork{CandidateScan: scan}
 	if remaining <= 0 {
 		return work
 	}
@@ -568,7 +570,7 @@ func (qv *View) orderedLimitBaseCoreStats(
 
 	expectedRows := orderedPredicateExpectedRows(needWindow, stats.probeEst, universe)
 	probeWork := rangeProbeTotalWorkForRows(clampUint64ToInt(expectedRows), stats.probeBuckets, stats.probeEst)
-	retainedPenalty := satMulUint64(stats.buildEst, postingContainsLookupWork(stats.buildEst))
+	retainedPenalty := mathutil.SatMulUint64(stats.buildEst, postingContainsLookupWork(stats.buildEst))
 	routeWork := qv.snap.ObservedMaterializedPredWork(stats.cacheKey)
 	if routeWork >= buildWork {
 		requiresSecondHit = false
@@ -577,9 +579,9 @@ func (qv *View) orderedLimitBaseCoreStats(
 		}
 	}
 
-	useful := probeWork >= satAddUint64(buildWork, retainedPenalty)
+	useful := probeWork >= mathutil.SatAddUint64(buildWork, retainedPenalty)
 	if !useful && hasOrderBounds {
-		minRows := satMulUint64(uint64(needWindow), orderBasicBoundedRangeBaseMinRowsPerNeed)
+		minRows := mathutil.SatMulUint64(uint64(needWindow), orderBasicBoundedRangeBaseMinRowsPerNeed)
 		useful = stats.probeBuckets <= rangePostingFilterKeepProbeMaxBuckets && stats.probeEst >= minRows
 	}
 	if routeWork >= buildWork {
@@ -1149,11 +1151,11 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 		if st.warm {
 			hasWarm = true
 		} else {
-			buildWork = satAddUint64(buildWork, st.buildWork)
+			buildWork = mathutil.SatAddUint64(buildWork, st.buildWork)
 		}
-		probeWork = satAddUint64(probeWork, st.probeWork)
+		probeWork = mathutil.SatAddUint64(probeWork, st.probeWork)
 		if !st.warm && st.routeWork >= st.buildWork {
-			routeWork = satAddUint64(routeWork, st.routeWork)
+			routeWork = mathutil.SatAddUint64(routeWork, st.routeWork)
 		}
 		if st.useful {
 			useful = true

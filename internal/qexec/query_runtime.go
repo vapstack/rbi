@@ -4,6 +4,7 @@ import (
 	"math/bits"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/mathutil"
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/posting"
@@ -134,7 +135,7 @@ func postsAnyContainsWork(posts []posting.List) (uint64, uint64, uint64, bool) {
 
 	directWork := uint64(0)
 	for i := 0; i < len(posts); i++ {
-		directWork = satAddUint64(directWork, postingContainsLookupWork(posts[i].Cardinality()))
+		directWork = mathutil.SatAddUint64(directWork, postingContainsLookupWork(posts[i].Cardinality()))
 	}
 
 	return buildWork, directWork, postingContainsLookupWork(unionCard), true
@@ -150,10 +151,10 @@ func (state *postsAnyFilterState) setExpectedContainsCalls(expectedCalls int) {
 		return
 	}
 
-	directTotal := satMulUint64(uint64(expectedCalls), directPerCall)
-	materializedTotal := satAddUint64(
-		satMulUint64(buildWork, materializedShareStructuralFactor(len(state.postsBuf))),
-		satMulUint64(uint64(expectedCalls), materializedPerCall),
+	directTotal := mathutil.SatMulUint64(uint64(expectedCalls), directPerCall)
+	materializedTotal := mathutil.SatAddUint64(
+		mathutil.SatMulUint64(buildWork, materializedShareStructuralFactor(len(state.postsBuf))),
+		mathutil.SatMulUint64(uint64(expectedCalls), materializedPerCall),
 	)
 
 	if materializedTotal < directTotal {
@@ -278,7 +279,7 @@ func postsAnyEstimatedUnionCardinality(posts []posting.List) (uint64, int) {
 	singletons := 0
 	for i := 0; i < len(posts); i++ {
 		card := posts[i].Cardinality()
-		est = satAddUint64(est, card)
+		est = mathutil.SatAddUint64(est, card)
 		if card == 1 {
 			singletons++
 		}
@@ -299,14 +300,14 @@ func postsAnyDirectIntersectWork(posts []posting.List, dstCard uint64) uint64 {
 			iterRows = dstCard
 			otherCard = card
 		}
-		work = satAddUint64(work, satMulUint64(iterRows, postingContainsLookupWork(otherCard)))
+		work = mathutil.SatAddUint64(work, mathutil.SatMulUint64(iterRows, postingContainsLookupWork(otherCard)))
 	}
 	return work
 }
 
 func postsAnyMaterializedApplyWork(dstCard, unionCard uint64) uint64 {
 	if dstCard <= posting.MidCap || unionCard <= posting.MidCap {
-		return satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+		return mathutil.SatMulUint64(dstCard, postingContainsLookupWork(unionCard))
 	}
 	// Large posting intersection is container-oriented; pricing it as per-row Contains
 	// makes broad HASANY filters stay on the much slower direct-intersect path.
@@ -454,7 +455,7 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 				if state.ids.IsEmpty() {
 					if directWork > materializedCheckWork {
 						savings := directWork - materializedCheckWork
-						if satAddUint64(state.applyObservedSavings, savings) >= buildWork {
+						if mathutil.SatAddUint64(state.applyObservedSavings, savings) >= buildWork {
 							union := state.materialize()
 							if union.IsEmpty() {
 								dst.Release()
@@ -462,9 +463,9 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 							}
 							return dst.BuildAnd(union), true
 						}
-						state.applyObservedSavings = satAddUint64(state.applyObservedSavings, savings)
+						state.applyObservedSavings = mathutil.SatAddUint64(state.applyObservedSavings, savings)
 					}
-					canDirect = directWork < satAddUint64(buildWork, materializedCheckWork)
+					canDirect = directWork < mathutil.SatAddUint64(buildWork, materializedCheckWork)
 
 				} else {
 					if directWork >= materializedCheckWork {

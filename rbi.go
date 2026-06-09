@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,9 +18,12 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/engine"
-	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -69,21 +71,6 @@ type Codec interface {
 
 var codecType = reflect.TypeFor[Codec]()
 
-var (
-	ErrNotStructType     = errors.New("value is not a struct")
-	ErrClosed            = errors.New("database closed")
-	ErrBroken            = errors.New("index is broken")
-	ErrNoIndex           = errors.New("index is disabled (transparent mode)")
-	ErrInvalidQuery      = qexec.ErrInvalidQuery
-	ErrInvalidBucketName = errors.New("invalid bucket name")
-	ErrUniqueViolation   = errors.New("unique constraint violation")
-	ErrNoValidKeyIndex   = errors.New("no valid key for index")
-	ErrNilValue          = errors.New("value is nil")
-
-	errPersistedIndexStale   = errors.New("persisted index is stale")
-	errPersistedIndexInvalid = errors.New("persisted index is invalid")
-)
-
 // Options configures indexer and how it works with a bbolt database.
 //
 // Zero-valued option fields use defaults.
@@ -128,7 +115,7 @@ type Options struct {
 	// If nil, planner tracing is disabled.
 	//
 	// Synchronous or heavy sinks can significantly increase query latency.
-	TraceSink func(TraceEvent)
+	TraceSink func(rbitrace.Event)
 
 	// TraceSampleEvery controls trace sampling:
 	//   - 0: when sink is set, sample every query (equivalent to 1)
@@ -261,7 +248,6 @@ const (
 	defaultAutoBatchWindow                         = 50 * time.Microsecond
 	defaultAutoBatchMax                            = 64
 	defaultAutoBatchMaxQueue                       = 512
-	defaultSnapshotStrMapCompactDepth              = 256
 	defaultNumericRangeBucketSize                  = 512
 	defaultNumericRangeBucketMinFieldKeys          = 8192
 	defaultNumericRangeBucketMinSpanKeys           = 1024
@@ -326,233 +312,7 @@ type Field struct {
 	Value any
 }
 
-type (
-
-	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
-	PlannerStats struct {
-		// Version is the current planner statistics version.
-		Version uint64
-		// GeneratedAt is the timestamp when planner stats were generated.
-		GeneratedAt time.Time
-		// UniverseCardinality is the universe cardinality used by planner stats.
-		UniverseCardinality uint64
-		// FieldCount is the number of fields represented in planner stats.
-		FieldCount int
-		// Fields contains per-field planner cardinality distribution metrics.
-		// The map is deep-copied and safe for caller mutation.
-		Fields map[string]PlannerFieldStats
-
-		// AnalyzeInterval is the configured periodic planner analyze interval.
-		AnalyzeInterval time.Duration
-		// TraceSampleEvery controls trace sampling frequency (every Nth query).
-		TraceSampleEvery uint64
-	}
-
-	// Stats is a lightweight database status snapshot.
-	Stats[K ~uint64 | ~string] struct {
-		// BuildTime is the duration of the startup index build.
-		BuildTime time.Duration
-		// BuildRPS is an approximate throughput (records per second) of the startup index build.
-		BuildRPS int
-		// LoadTime is the time spent loading a persisted index from disk on the last successful load.
-		LoadTime time.Duration
-
-		// LastKey is the largest live key according to the current universe bitmap.
-		// For string keys this is resolved through the internal string mapping, so
-		// it reflects the highest live internal string index rather than the
-		// lexicographically greatest key.
-		LastKey K
-		// KeyCount is the total number of keys currently present in the database.
-		KeyCount uint64
-
-		// FieldCount is the number of indexed fields configured for this DB.
-		FieldCount int
-
-		// AutoBatchQueueLen is the current pending request count.
-		AutoBatchQueueLen int
-		// AutoBatchQueueMax is the maximum observed queue length.
-		AutoBatchQueueMax uint64
-		// AutoBatchCount is the total executed auto-batcher transaction count.
-		AutoBatchCount uint64
-		// AutoBatchAvgSize is the average requests per executed batch.
-		AutoBatchAvgSize float64
-
-		// SnapshotSequence is the bucket sequence of the published snapshot.
-		SnapshotSequence uint64
-	}
-
-	// IndexStats contains expensive index shape and memory diagnostics.
-	IndexStats struct {
-		// UniqueFieldKeys contains distinct logical value keys per field in the
-		// regular value index.
-		//
-		// It excludes the synthetic nil-family entry and excludes slice-length
-		// helper indexes. On multivalue fields it counts distinct field values,
-		// not records.
-		UniqueFieldKeys map[string]uint64
-		// Size contains posting payload bytes across all covered field index
-		// families.
-		//
-		// It is the sum of FieldSize and includes nil-family postings when a
-		// field has indexed nils. It excludes raw key storage and structural
-		// layout overhead.
-		Size uint64
-		// FieldSize contains posting payload bytes per field across the covered
-		// field index families.
-		//
-		// This includes nil-family postings for the field, but excludes raw key
-		// storage and structural layout overhead.
-		FieldSize map[string]uint64
-		// FieldKeyBytes contains raw retained key bytes per field in the regular
-		// value index.
-		//
-		// String keys contribute their byte length. Numeric keys contribute 8
-		// bytes each. Synthetic nil-family entries are excluded.
-		FieldKeyBytes map[string]uint64
-		// FieldTotalCardinality contains the sum of posting-list cardinalities
-		// per field across the covered field index families.
-		//
-		// This includes nil-family postings. Multivalue fields can exceed the
-		// number of records because one record may appear in multiple postings.
-		FieldTotalCardinality map[string]uint64
-		// FieldApproxStructBytes contains approximate structural/layout overhead
-		// per field.
-		//
-		// It includes roots, pages, chunk metadata, owner arrays, and a share of
-		// the top-level field-storage slot owners so that the map sums to
-		// ApproxStructBytes. It excludes posting payload bytes and raw key bytes.
-		FieldApproxStructBytes map[string]uint64
-		// FieldApproxHeapBytes contains approximate total heap per field for the
-		// same covered storage as the other per-field maps.
-		//
-		// For each field it is FieldSize + FieldKeyBytes +
-		// FieldApproxStructBytes, and the map sums to ApproxHeapBytes.
-		FieldApproxHeapBytes map[string]uint64
-
-		// EntryCount is the total number of non-empty index entries across the
-		// covered field index families.
-		//
-		// This includes synthetic nil-family entries.
-		EntryCount uint64
-		// KeyBytes is the total raw key bytes across regular value-index entries.
-		//
-		// It is the sum of FieldKeyBytes.
-		KeyBytes uint64
-		// PostingCardinality is the sum of posting cardinalities across the
-		// covered field index families.
-		//
-		// It is the sum of FieldTotalCardinality.
-		PostingCardinality uint64
-
-		// ApproxStructBytes is approximate layout overhead from roots, pages,
-		// chunk metadata, and pooled owner arrays.
-		//
-		// It excludes posting payload bytes and raw key bytes, and is the sum of
-		// FieldApproxStructBytes.
-		ApproxStructBytes uint64
-		// ApproxHeapBytes is the approximate total heap for the covered field
-		// index storage.
-		//
-		// It is Size + KeyBytes + ApproxStructBytes, and also the sum of
-		// FieldApproxHeapBytes.
-		//
-		// Coverage is limited to regular field value indexes plus synthetic
-		// nil-family indexes. It excludes slice-length helper indexes, universe
-		// bitmap state, string-key mapping state, and runtime query caches.
-		ApproxHeapBytes uint64
-	}
-
-	// AutoBatchStats contains write-batcher queue, batch, and error diagnostics.
-	AutoBatchStats struct {
-		// Window is current coalescing window duration.
-		Window time.Duration
-		// MaxBatch is configured maximum auto-batch size.
-		MaxBatch int
-		// MaxQueue is configured maximum queue size (0 means unbounded).
-		MaxQueue int
-
-		// QueueLen is current pending requests in queue.
-		QueueLen int
-		// QueueCap is current allocated queue capacity.
-		QueueCap int
-		// WorkerRunning reports whether auto-batcher worker goroutine is active.
-		WorkerRunning bool
-		// HotWindowActive reports whether adaptive hot coalescing window is active.
-		HotWindowActive bool
-
-		// Submitted is number of submit attempts from eligible write calls.
-		Submitted uint64
-		// Enqueued is number of requests accepted into auto-batcher queue.
-		Enqueued uint64
-		// Dequeued is number of requests popped from queue for execution.
-		Dequeued uint64
-		// QueueHighWater is maximum observed queue length.
-		QueueHighWater uint64
-
-		// ExecutedBatches is total executed auto-batcher transactions.
-		ExecutedBatches uint64
-		// MultiRequestBatches is number of executed batches containing more than one request.
-		MultiRequestBatches uint64
-		// MultiRequestOps is total requests executed inside multi-request batches.
-		MultiRequestOps uint64
-		// BatchSize1 is number of executed single-request batches.
-		BatchSize1 uint64
-		// BatchSize2To4 is number of executed batches sized 2..4.
-		BatchSize2To4 uint64
-		// BatchSize5To8 is number of executed batches sized 5..8.
-		BatchSize5To8 uint64
-		// BatchSize9Plus is number of executed batches sized 9+.
-		BatchSize9Plus uint64
-		// AvgBatchSize is average requests per executed batch.
-		AvgBatchSize float64
-		// MaxBatchSeen is maximum observed executed batch size.
-		MaxBatchSeen uint64
-
-		// CallbackOps is number of requests with BeforeStore or BeforeCommit hooks
-		// executed by auto-batcher.
-		CallbackOps uint64
-		// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
-		CoalescedSetDelete uint64
-
-		// CoalesceWaits is number of coalescing sleeps performed by worker.
-		CoalesceWaits uint64
-		// CoalesceWaitTime is total time spent sleeping for coalescing.
-		CoalesceWaitTime time.Duration
-		// QueueWaitTime is aggregate request wait time from enqueue to dequeue.
-		QueueWaitTime time.Duration
-		// ExecuteTime is aggregate batch execution wall time after dequeue.
-		ExecuteTime time.Duration
-
-		// FallbackClosed is number of write calls rejected by auto-batcher because DB is closed.
-		FallbackClosed uint64
-
-		// UniqueRejected is number of queued requests rejected by unique checks before commit.
-		UniqueRejected uint64
-		// TxBeginErrors is number of write tx begin failures inside auto-batcher.
-		TxBeginErrors uint64
-		// TxOpErrors is number of write tx operation failures before commit.
-		TxOpErrors uint64
-		// TxCommitErrors is number of write tx commit failures.
-		TxCommitErrors uint64
-		// CallbackErrors is number of hook failures returned by BeforeStore or
-		// BeforeCommit hooks inside auto-batched execution.
-		CallbackErrors uint64
-	}
-
-	// SnapshotStats contains published snapshot diagnostics.
-	SnapshotStats struct {
-		// Sequence is the bucket sequence of the published snapshot.
-		Sequence uint64
-
-		// UniverseCard is cardinality of the published universe bitmap.
-		UniverseCard uint64
-
-		// RegistrySize is number of snapshot entries tracked in registry map.
-		RegistrySize int
-		// PinnedRefs is number of registry snapshots with active pins.
-		PinnedRefs int
-	}
-)
+const stringMapBucketSuffix = ".rbimap"
 
 // DB wraps a bbolt database and maintains secondary indexes over values of type *V
 // stored in a single bucket. It supports efficient equality and range queries,
@@ -563,8 +323,9 @@ type DB[K ~string | ~uint64, V any] struct {
 	vtype  reflect.Type
 	strKey bool
 
-	bolt   *bbolt.DB
-	bucket []byte
+	bolt         *bbolt.DB
+	dataBucket   []byte
+	strmapBucket []byte
 
 	options     *Options
 	execOptions execOptions[K, V]
@@ -586,20 +347,20 @@ type DB[K ~string | ~uint64, V any] struct {
 
 	publishMu sync.RWMutex
 
-	stats Stats[K]
+	stats rbistats.DB[K]
 }
 
 // New creates a new indexed DB that uses the provided bbolt database.
 //
-// The generic type V must be a struct; otherwise ErrNotStructType is returned.
+// The generic type V must be a struct; otherwise rbierrors.ErrNotStructType is returned.
 //
 // Zero-valued option fields use defaults.
 //
 // If options.BucketName is empty,
 // the name of the value type V is used as the bucket name.
 // New ensures the bucket exists, optionally loads a persisted index from disk,
-// builds missing or incompatible startup index data from bbolt, and sets up
-// field metadata and accessors.
+// builds missing or incompatible index data from bbolt, and sets up field
+// metadata and accessors.
 //
 // Any ExecOptions passed to New become defaults applied to subsequent write
 // operations on the returned DB.
@@ -609,10 +370,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var v V
 	vtype := reflect.TypeOf(v)
 	if vtype == nil {
-		return nil, ErrNotStructType
+		return nil, rbierrors.ErrNotStructType
 	}
 	if vtype.Kind() != reflect.Struct {
-		return nil, ErrNotStructType
+		return nil, rbierrors.ErrNotStructType
 	}
 	if err = options.validate(); err != nil {
 		return nil, err
@@ -648,11 +409,11 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	defer unregInstanceOnError(&err, boltPath, vname)
 
 	db = &DB[K, V]{
-		vtype:   vtype,
-		bolt:    bolt,
-		bucket:  []byte(vname),
-		options: &options,
-		logger:  options.Logger,
+		vtype:      vtype,
+		bolt:       bolt,
+		dataBucket: []byte(vname),
+		options:    &options,
+		logger:     options.Logger,
 
 		rbiFile: bolt.Path() + "." + vname + ".rbi",
 
@@ -664,6 +425,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
 		db.strKey = true
+		db.strmapBucket = append(db.dataBucket, stringMapBucketSuffix...)
 	}
 
 	var schemaIndex map[string]schema.IndexKind
@@ -679,33 +441,50 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	db.index, err = engine.NewIndex(engine.Config{
-		Schema:                                  db.schema,
-		StrKey:                                  db.strKey,
-		SnapshotStats:                           db.options.EnableSnapshotStats,
-		SnapshotMaterializedPredCacheMaxEntries: db.options.SnapshotMaterializedPredCacheMaxEntries,
+		Schema: db.schema,
+		StrKey: db.strKey,
+
+		SnapshotStats:                               db.options.EnableSnapshotStats,
+		SnapshotMaterializedPredCacheMaxEntries:     db.options.SnapshotMaterializedPredCacheMaxEntries,
 		SnapshotMaterializedPredCacheMaxCardinality: db.options.SnapshotMaterializedPredCacheMaxCardinality,
-		NumericRangeBucketSize:                      db.options.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys:              db.options.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:               db.options.NumericRangeBucketMinSpanKeys,
-		AnalyzeInterval:                             plannerAnalyzeInterval(db.options.AnalyzeInterval),
-		TraceSink:                                   db.options.TraceSink,
-		TraceSampleEvery:                            db.options.TraceSampleEvery,
-		StrMapCompactAt:                             defaultSnapshotStrMapCompactDepth,
+
+		NumericRangeBucketSize:         db.options.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys: db.options.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:  db.options.NumericRangeBucketMinSpanKeys,
+
+		AnalyzeInterval: plannerAnalyzeInterval(db.options.AnalyzeInterval),
+
+		TraceSink:        db.options.TraceSink,
+		TraceSampleEvery: db.options.TraceSampleEvery,
 	})
 	if err != nil {
 		return nil, err
 	}
+	db.stats.Mode = rbistats.ModeIndexed
+	if db.index == nil {
+		db.stats.Mode = rbistats.ModeTransparent
+	}
+	db.stats.StringKeys = db.strKey
+	db.stats.IndexFieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
+	db.stats.MeasureFieldCount = len(db.schema.MeasureFields)
+	db.stats.UniqueFieldCount = len(db.schema.Unique)
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
-		_, e := tx.CreateBucketIfNotExists(db.bucket)
-		return e
+		if _, e := tx.CreateBucketIfNotExists(db.dataBucket); e != nil {
+			return e
+		}
+		if db.strKey {
+			_, e := createStrMapBucket(tx, db.dataBucket)
+			return e
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	var (
-		loadedPlannerStats       *qexec.PlannerStatsSnapshot
+		loadedPlannerStats       *rbistats.PlannerSnapshot
 		loadedFieldCount         int
 		loadedOrdinaryFieldCount int
 		buildMode                string
@@ -770,8 +549,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	db.initBatcher()
 
 	if db.index != nil {
-		db.stats.FieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
-		if err = db.index.PublishCurrentSequenceSnapshot(db.bolt, db.bucket); err != nil {
+		if err = db.index.PublishCurrentSnapshot(db.bolt, db.dataBucket); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
@@ -788,6 +566,30 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	return db, nil
+}
+
+func createStrMapBucket(tx *bbolt.Tx, dataBucket []byte) (*bbolt.Bucket, error) {
+	data := tx.Bucket(dataBucket)
+	if data == nil {
+		return nil, fmt.Errorf("data bucket %q does not exist", dataBucket)
+	}
+
+	mapName := append(append([]byte(nil), dataBucket...), stringMapBucketSuffix...)
+	m := tx.Bucket(mapName)
+	if m != nil {
+		return m, nil
+	}
+
+	k, _ := data.Cursor().First()
+	if k != nil {
+		return nil, fmt.Errorf("%w: missing string map bucket %q for non-empty data bucket", rbierrors.ErrInvalidStringStorageFormat, mapName)
+	}
+
+	m, err := tx.CreateBucket(mapName)
+	if err != nil {
+		return nil, fmt.Errorf("create string map bucket %q: %w", mapName, err)
+	}
+	return m, nil
 }
 
 func (db *DB[K, V]) initBatcher() {
@@ -810,29 +612,17 @@ func (db *DB[K, V]) initBatcher() {
 		},
 	}
 	cfg := wexec.Config{
-		MaxOps:       db.options.AutoBatchMax,
-		Window:       db.options.AutoBatchWindow,
-		MaxQueue:     db.options.AutoBatchMaxQueue,
-		StatsEnabled: db.options.EnableAutoBatchStats,
-		Unavailable: func() error {
-			if db.closed.Load() {
-				return ErrClosed
-			}
-			if db.broken.Load() {
-				return ErrBroken
-			}
-			return nil
-		},
-		Errors: wexec.ErrorSet{
-			UniqueViolation: ErrUniqueViolation,
-		},
-
+		MaxOps:             db.options.AutoBatchMax,
+		Window:             db.options.AutoBatchWindow,
+		MaxQueue:           db.options.AutoBatchMaxQueue,
+		StatsEnabled:       db.options.EnableAutoBatchStats,
+		Unavailable:        db.unavailableErr,
 		Bolt:               db.bolt,
-		Bucket:             db.bucket,
+		DataBucket:         db.dataBucket,
+		StrMapBucket:       db.strmapBucket,
 		BucketFillPercent:  db.options.BucketFillPercent,
 		RejectEmptyPayload: db.decodeFn == nil,
 		PublishMu:          &db.publishMu,
-		Commit:             commitTx,
 		StrKey:             db.strKey,
 		Indexed:            db.index != nil,
 		Ops:                &ops,
@@ -840,13 +630,21 @@ func (db *DB[K, V]) initBatcher() {
 	}
 
 	if db.index != nil {
-		db.index.ConfigureWrite(&cfg, &db.broken, db.logger, ErrUniqueViolation, ErrBroken)
+		db.index.ConfigureWrite(&cfg, &db.broken, db.logger)
 	}
 	db.batcher = wexec.NewBatcher(cfg)
 }
 
 func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
-	result, err := db.index.BuildIndex(db.bolt, db.bucket, skipFields, skipMeasureFields, db.decodeBuildIndexRecord, db.releaseBuildIndexRecord)
+	result, err := db.index.BuildIndex(
+		db.bolt,
+		db.dataBucket,
+		db.strmapBucket,
+		skipFields,
+		skipMeasureFields,
+		db.decodeBuildIndexRecord,
+		db.releaseBuildIndexRecord,
+	)
 	if err != nil {
 		return err
 	}
@@ -882,18 +680,15 @@ func (db *DB[K, V]) validateIndexedStringValues(ptr unsafe.Pointer) error {
 func (db *DB[K, V]) loadIndex() (
 	skipFields map[string]struct{},
 	skipMeasureFields map[string]struct{},
-	plannerStats *qexec.PlannerStatsSnapshot,
+	plannerStats *rbistats.PlannerSnapshot,
 	err error,
 ) {
-	currentSeq, err := currentBucketSequence(db.bolt, db.bucket)
+	currentSeq, err := currentBucketSequence(db.bolt, db.dataBucket)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
 	}
 	start := time.Now()
-	result, err := db.index.LoadIndex(db.rbiFile, db.bolt.Path(), db.bucket, currentSeq, defaultSnapshotStrMapCompactDepth, engine.LoadErrors{
-		Stale:   errPersistedIndexStale,
-		Invalid: errPersistedIndexInvalid,
-	})
+	result, err := db.index.LoadIndex(db.rbiFile, db.bolt.Path(), db.dataBucket, currentSeq)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -903,7 +698,7 @@ func (db *DB[K, V]) loadIndex() (
 }
 
 func (db *DB[K, V]) storeIndex() error {
-	return db.index.StoreIndex(db.rbiFile, db.bolt, db.bucket)
+	return db.index.StoreIndex(db.rbiFile, db.bolt, db.dataBucket)
 }
 
 // disableSync disables fsync for bolt writes. Can help with batch inserts.
@@ -923,10 +718,10 @@ func (db *DB[K, V]) enableSync() {
 
 func (db *DB[K, V]) unavailableErr() error {
 	if db.closed.Load() {
-		return ErrClosed
+		return rbierrors.ErrClosed
 	}
 	if db.broken.Load() {
-		return ErrBroken
+		return rbierrors.ErrBroken
 	}
 	return nil
 }
@@ -946,10 +741,6 @@ func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 	return seq, nil
 }
 
-func commitTx(tx *bbolt.Tx, _ string) error {
-	return tx.Commit()
-}
-
 // Stats returns a lightweight database status snapshot.
 //
 // In indexed mode it reports startup build/load timings together with the
@@ -957,32 +748,54 @@ func commitTx(tx *bbolt.Tx, _ string) error {
 //
 // In transparent mode no runtime index snapshot is maintained, so fields that
 // depend on indexed state remain zero-valued: BuildTime, BuildRPS, LoadTime,
-// KeyCount, LastKey, and SnapshotSequence. FieldCount also stays zero because
-// no indexed fields exist in that mode. Auto-batcher fields remain meaningful
-// in both modes.
+// and KeyCount.
 //
-// If DB is closed or broken, Stats returns a zero value.
-func (db *DB[K, V]) Stats() Stats[K] {
+// LastKey, SnapshotSequence, and auto-batcher fields are populated in both modes.
+func (db *DB[K, V]) Stats() (rbistats.DB[K], error) {
 	if err := db.unavailableErr(); err != nil {
-		return Stats[K]{}
+		return rbistats.DB[K]{}, err
 	}
 
+	// do not hold a bbolt read transaction while taking publishMu: writers open
+	// a write transaction before publishing and commit while holding publishMu
 	db.publishMu.RLock()
 	out := db.stats
 	db.publishMu.RUnlock()
 
+	var seq uint64
 	if db.index != nil {
-		st := db.index.DBStats()
+		st, err := db.index.DBStats(db.bolt, db.dataBucket)
+		if err != nil {
+			return rbistats.DB[K]{}, err
+		}
+		seq = st.Sequence
 		out.KeyCount = st.KeyCount
-		out.SnapshotSequence = st.Sequence
 		if st.HasLast {
-			if db.strKey {
-				out.LastKey = *(*K)(unsafe.Pointer(&st.LastKey))
-			} else {
-				out.LastKey = *(*K)(unsafe.Pointer(&st.LastID))
+			out.LastKey = keycodec.UserKeyFromDataKey[K](st.LastKey, db.strKey)
+		}
+
+	} else {
+		tx, err := db.bolt.Begin(false)
+		if err != nil {
+			return rbistats.DB[K]{}, fmt.Errorf("tx error: %w", err)
+		}
+		defer rollback(tx)
+
+		b := tx.Bucket(db.dataBucket)
+		if b == nil {
+			return rbistats.DB[K]{}, fmt.Errorf("bucket does not exist")
+		}
+		seq = b.Sequence()
+		key, _ := b.Cursor().Last()
+		if key != nil {
+			if !db.strKey && len(key) != 8 {
+				return rbistats.DB[K]{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
 			}
+			out.LastKey = keycodec.UserKeyFromDataKey[K](keycodec.DataKeyFromBytes(key, db.strKey), db.strKey)
 		}
 	}
+
+	out.SnapshotSequence = seq
 
 	queueLen, queueMax, executed, dequeued := db.batcher.BasicStats()
 	out.AutoBatchQueueLen = queueLen
@@ -993,7 +806,7 @@ func (db *DB[K, V]) Stats() Stats[K] {
 		out.AutoBatchAvgSize = float64(dequeued) / float64(out.AutoBatchCount)
 	}
 
-	return out
+	return out, nil
 }
 
 // IndexStats returns current expensive index shape and memory diagnostics.
@@ -1007,30 +820,16 @@ func (db *DB[K, V]) Stats() Stats[K] {
 // indexes, universe bitmap, or string-key runtime mapping are maintained.
 //
 // If DB is closed or broken, IndexStats returns a zero value.
-func (db *DB[K, V]) IndexStats() IndexStats {
+func (db *DB[K, V]) IndexStats() rbistats.Index {
 	if err := db.unavailableErr(); err != nil {
-		return IndexStats{}
+		return rbistats.Index{}
 	}
 
 	if db.index == nil {
-		return IndexStats{}
+		return rbistats.Index{}
 	}
 
-	st := db.index.IndexStats()
-	return IndexStats{
-		UniqueFieldKeys:        st.UniqueFieldKeys,
-		Size:                   st.Size,
-		FieldSize:              st.FieldSize,
-		FieldKeyBytes:          st.FieldKeyBytes,
-		FieldTotalCardinality:  st.FieldTotalCardinality,
-		FieldApproxStructBytes: st.FieldApproxStructBytes,
-		FieldApproxHeapBytes:   st.FieldApproxHeapBytes,
-		EntryCount:             st.EntryCount,
-		KeyBytes:               st.KeyBytes,
-		PostingCardinality:     st.PostingCardinality,
-		ApproxStructBytes:      st.ApproxStructBytes,
-		ApproxHeapBytes:        st.ApproxHeapBytes,
-	}
+	return db.index.IndexStats()
 }
 
 func unregInstanceOnError(err *error, boltPath string, vname string) {
@@ -1047,8 +846,8 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 // The method is independent of indexed versus transparent mode. Write-path
 // batching remains active in both modes, so when stats collection is enabled
 // the returned counters and queue state reflect the current write workload.
-func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
-	return AutoBatchStats(db.batcher.Stats())
+func (db *DB[K, V]) AutoBatchStats() rbistats.AutoBatch {
+	return db.batcher.Stats()
 }
 
 // PlannerStats returns the last published planner statistics snapshot together
@@ -1060,26 +859,17 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 //
 // In transparent mode no query engine and no runtime planner exist, so the
 // returned planner payload is zero-valued.
-func (db *DB[K, V]) PlannerStats() PlannerStats {
-	var out PlannerStats
+func (db *DB[K, V]) PlannerStats() rbistats.Planner {
 	if db.index == nil {
-		return out
+		return rbistats.Planner{}
 	}
-	st := db.index.PlannerStats()
-	out.Version = st.Version
-	out.GeneratedAt = st.GeneratedAt
-	out.UniverseCardinality = st.UniverseCardinality
-	out.FieldCount = st.FieldCount
-	out.Fields = st.Fields
-	out.AnalyzeInterval = st.AnalyzeInterval
-	out.TraceSampleEvery = st.TraceSampleEvery
-	return out
+	return db.index.PlannerStats()
 }
 
 // Close closes the indexer and persists the current index state
 // to the .rbi file unless index persistence is disabled.
 //
-// After Close, all other methods return ErrClosed.
+// After Close, all other methods return rbierrors.ErrClosed.
 // Subsequent calls to Close are no-op.
 //
 // It does not close the underlying *bbolt.DB.
@@ -1087,7 +877,7 @@ func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer unregInstance(db.bolt.Path(), string(db.bucket))
+	defer unregInstance(db.bolt.Path(), string(db.dataBucket))
 
 	db.stopAnalyzeLoop()
 
@@ -1103,7 +893,7 @@ func (db *DB[K, V]) Close() error {
 	}
 
 	if err == nil && db.broken.Load() {
-		err = ErrBroken
+		err = rbierrors.ErrBroken
 	}
 
 	return err
@@ -1133,25 +923,35 @@ func (db *DB[K, V]) Truncate() error {
 	}
 
 	prevSeq := uint64(0)
-	if bucket := tx.Bucket(db.bucket); bucket != nil {
+	if bucket := tx.Bucket(db.dataBucket); bucket != nil {
 		prevSeq = bucket.Sequence()
-		if err = tx.DeleteBucket(db.bucket); err != nil {
+		if err = tx.DeleteBucket(db.dataBucket); err != nil {
 			return fmt.Errorf("error deleting bucket: %w", err)
 		}
 	}
+	if db.strKey && tx.Bucket(db.strmapBucket) != nil {
+		if err = tx.DeleteBucket(db.strmapBucket); err != nil {
+			return fmt.Errorf("error deleting string map bucket: %w", err)
+		}
+	}
 
-	bucket, err := tx.CreateBucketIfNotExists(db.bucket)
+	bucket, err := tx.CreateBucketIfNotExists(db.dataBucket)
 	if err != nil {
 		return fmt.Errorf("error creating bucket: %w", err)
 	}
 	if err = bucket.SetSequence(prevSeq); err != nil {
 		return fmt.Errorf("restore bucket sequence: %w", err)
 	}
+	if db.strKey {
+		if _, err = createStrMapBucket(tx, db.dataBucket); err != nil {
+			return err
+		}
+	}
 	if db.index == nil {
 		if _, err = bucket.NextSequence(); err != nil {
 			return fmt.Errorf("advance bucket sequence: %w", err)
 		}
-		if err = commitTx(tx, "truncate"); err != nil {
+		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit error: %w", err)
 		}
 		return nil
@@ -1162,12 +962,12 @@ func (db *DB[K, V]) Truncate() error {
 	}
 
 	staged := db.index.StageTruncate(seq)
-	if err = commitTx(tx, "truncate"); err != nil {
+	if err = tx.Commit(); err != nil {
 		db.index.DropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
-	if err = db.index.PublishCommittedStaged(&db.broken, db.logger, ErrBroken, seq, "truncate", staged); err != nil {
+	if err = db.index.PublishCommittedStaged(&db.broken, db.logger, seq, "truncate", staged); err != nil {
 		return err
 	}
 
@@ -1191,15 +991,16 @@ func (db *DB[K, V]) ReleaseRecords(v ...*V) {
 }
 
 // Bolt returns the underlying *bbolt.DB instance used by this DB.
-// Should be used with caution; callers must not mutate the bucket managed by
-// this DB instance, including its sequence counter.
+//
+// Should be used with caution; callers must not mutate buckets managed by RBI,
+// including sequence counters.
 func (db *DB[K, V]) Bolt() *bbolt.DB {
 	return db.bolt
 }
 
 // BucketName returns a name of the bucket at which the data is stored.
 func (db *DB[K, V]) BucketName() []byte {
-	return slices.Clone(db.bucket)
+	return slices.Clone(db.dataBucket)
 }
 
 var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
@@ -1292,7 +1093,7 @@ func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func validateBucketName(name string) error {
 	if name == "" {
-		return fmt.Errorf("%w: empty", ErrInvalidBucketName)
+		return fmt.Errorf("%w: empty", rbierrors.ErrInvalidBucketName)
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]
@@ -1302,7 +1103,7 @@ func validateBucketName(name string) error {
 			}
 			return fmt.Errorf(
 				"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
-				ErrInvalidBucketName,
+				rbierrors.ErrInvalidBucketName,
 				name,
 			)
 		}
@@ -1311,7 +1112,7 @@ func validateBucketName(name string) error {
 		}
 		return fmt.Errorf(
 			"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
-			ErrInvalidBucketName,
+			rbierrors.ErrInvalidBucketName,
 			name,
 		)
 	}

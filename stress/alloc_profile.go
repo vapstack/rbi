@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"time"
+
+	"github.com/vapstack/rbi/internal/mathutil"
 )
 
 const (
@@ -52,7 +54,7 @@ func selectFocusedAllocWorkloadTarget(classFilter, queryFilter []string) (focuse
 				MaxIDPtr:     &handle.MaxID,
 				EmailSamples: handle.EmailSamples,
 			}
-			rng := NewRand(1)
+			rng := mathutil.NewRand(1)
 			return focusedAllocRunner{
 				run: func() error {
 					queryName, runErr := query.run(workCtx, rng)

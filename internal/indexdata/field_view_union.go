@@ -2,6 +2,7 @@ package indexdata
 
 import (
 	"github.com/vapstack/pooled"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -139,14 +140,7 @@ func (o FieldIndexView) unionRangePostingsBatchSinglesEnabled(first, second Fiel
 	_, estFirst := o.RangeStats(first)
 	_, estSecond := o.RangeStats(second)
 
-	return fieldIndexPostingBatchSinglesEnabled(satAddUint64(estFirst, estSecond))
-}
-
-func satAddUint64(total, add uint64) uint64 {
-	if ^uint64(0)-total < add {
-		return ^uint64(0)
-	}
-	return total + add
+	return fieldIndexPostingBatchSinglesEnabled(mathutil.SatAddUint64(estFirst, estSecond))
 }
 
 func (o FieldIndexView) UnionRangePostings(first, second FieldIndexRange) posting.List {

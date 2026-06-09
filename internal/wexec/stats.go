@@ -3,48 +3,9 @@ package wexec
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/vapstack/rbi/rbistats"
 )
-
-type Stats struct {
-	Window          time.Duration
-	MaxBatch        int
-	MaxQueue        int
-	QueueLen        int
-	QueueCap        int
-	WorkerRunning   bool
-	HotWindowActive bool
-
-	Submitted      uint64
-	Enqueued       uint64
-	Dequeued       uint64
-	QueueHighWater uint64
-
-	ExecutedBatches     uint64
-	MultiRequestBatches uint64
-	MultiRequestOps     uint64
-	BatchSize1          uint64
-	BatchSize2To4       uint64
-	BatchSize5To8       uint64
-	BatchSize9Plus      uint64
-	AvgBatchSize        float64
-	MaxBatchSeen        uint64
-
-	CallbackOps        uint64
-	CoalescedSetDelete uint64
-
-	CoalesceWaits    uint64
-	CoalesceWaitTime time.Duration
-	QueueWaitTime    time.Duration
-	ExecuteTime      time.Duration
-
-	FallbackClosed uint64
-
-	UniqueRejected uint64
-	TxBeginErrors  uint64
-	TxOpErrors     uint64
-	TxCommitErrors uint64
-	CallbackErrors uint64
-}
 
 type statsCounters struct {
 	Enabled bool
@@ -99,11 +60,11 @@ func (c *statsCounters) recordExecuted(size int) {
 	atomicSetMax(&c.MaxBatchSeen, uint64(size))
 }
 
-func (c *statsCounters) snapshot(window time.Duration, maxOps, maxQ, queueLen, queueCap int, running, hotActive bool) Stats {
+func (c *statsCounters) snapshot(window time.Duration, maxOps, maxQ, queueLen, queueCap int, running, hotActive bool) rbistats.AutoBatch {
 	if !c.Enabled {
-		return Stats{}
+		return rbistats.AutoBatch{}
 	}
-	out := Stats{
+	out := rbistats.AutoBatch{
 		Window:              window,
 		MaxBatch:            maxOps,
 		MaxQueue:            maxQ,

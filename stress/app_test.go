@@ -13,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/internal/mathutil"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 func TestParseWorkerCommand(t *testing.T) {
@@ -52,12 +53,12 @@ func TestParseWorkerCommand(t *testing.T) {
 }
 
 func TestMakeBatchSampleDelta(t *testing.T) {
-	baseline := rbi.AutoBatchStats{
+	baseline := rbistats.AutoBatch{
 		Submitted:        10,
 		ExecutedBatches:  5,
 		CoalesceWaitTime: 2 * time.Millisecond,
 	}
-	current := rbi.AutoBatchStats{
+	current := rbistats.AutoBatch{
 		Submitted:        19,
 		ExecutedBatches:  8,
 		CoalesceWaitTime: 7 * time.Millisecond,
@@ -243,7 +244,7 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 		}
 	})
 
-	if err := handle.DB.Set(1, generateUser(NewRand(1), 1)); err != nil {
+	if err := handle.DB.Set(1, generateUser(mathutil.NewRand(1), 1)); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 

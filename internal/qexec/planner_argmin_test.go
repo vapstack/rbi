@@ -7,6 +7,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerOrderedArgminCandidates struct {
@@ -519,7 +520,7 @@ func TestPlannerArgmin_NoOrderLimitRuntimeGuard(t *testing.T) {
 
 func TestPlannerNoOrderLimitRuntimeGuard_DirectRangeFallback(t *testing.T) {
 	db := newTestDB(t, testOptions{
-		TraceSink:        func(TraceEvent) {},
+		TraceSink:        func(rbitrace.Event) {},
 		TraceSampleEvery: 1,
 	})
 	db.seedGeneratedData(t, 3_000, func(id uint64) testRec {

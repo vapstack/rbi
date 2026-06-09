@@ -7,30 +7,32 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
 	"go.etcd.io/bbolt"
 )
 
 type Batcher struct {
 	sched scheduler
 
-	bolt               *bbolt.DB
-	bucket             []byte
+	bolt         *bbolt.DB
+	dataBucket   []byte
+	strmapBucket []byte
+
 	bucketFillPercent  float64
 	rejectEmptyPayload bool
 
-	strKey          bool
-	strMap          *strmap.Mapper
-	unavailable     func() error
-	publishMu       *sync.RWMutex
-	commit          func(*bbolt.Tx, string) error
-	indexed         bool
-	ops             *RecordOps
-	schema          *schema.Schema
-	unique          UniqueContext
-	snapshotOps     SnapshotOps
-	indexPublishOps IndexPublishOps
-	errs            ErrorSet
+	strKey           bool
+	unavailable      func() error
+	publishMu        *sync.RWMutex
+	commit           func(*bbolt.Tx) error
+	indexed          bool
+	ops              *RecordOps
+	schema           *schema.Schema
+	unique           UniqueContext
+	snapshotOps      SnapshotOps
+	publishCommitted func(uint64, string, *snapshot.View) error
 }
 
 type Config struct {
@@ -39,23 +41,22 @@ type Config struct {
 	MaxQueue     int
 	StatsEnabled bool
 	Unavailable  func() error
-	Errors       ErrorSet
 
-	Bolt               *bbolt.DB
-	Bucket             []byte
+	Bolt         *bbolt.DB
+	DataBucket   []byte
+	StrMapBucket []byte
+	StrKey       bool
+
 	BucketFillPercent  float64
 	RejectEmptyPayload bool
 
-	PublishMu       *sync.RWMutex
-	Commit          func(*bbolt.Tx, string) error
-	StrKey          bool
-	StrMap          *strmap.Mapper
-	Indexed         bool
-	Ops             *RecordOps
-	Schema          *schema.Schema
-	Unique          UniqueContext
-	SnapshotOps     SnapshotOps
-	IndexPublishOps IndexPublishOps
+	PublishMu        *sync.RWMutex
+	Indexed          bool
+	Ops              *RecordOps
+	Schema           *schema.Schema
+	Unique           UniqueContext
+	SnapshotOps      SnapshotOps
+	PublishCommitted func(uint64, string, *snapshot.View) error
 }
 
 func NewBatcher(cfg Config) *Batcher {
@@ -63,24 +64,30 @@ func NewBatcher(cfg Config) *Batcher {
 		sched: newScheduler(cfg.MaxOps, cfg.Window, cfg.MaxQueue, cfg.StatsEnabled),
 
 		bolt:               cfg.Bolt,
-		bucket:             cfg.Bucket,
+		dataBucket:         cfg.DataBucket,
 		bucketFillPercent:  cfg.BucketFillPercent,
 		rejectEmptyPayload: cfg.RejectEmptyPayload,
 		strKey:             cfg.StrKey,
-		strMap:             cfg.StrMap,
+		strmapBucket:       cfg.StrMapBucket,
 		unavailable:        cfg.Unavailable,
 		publishMu:          cfg.PublishMu,
-		commit:             cfg.Commit,
+		commit:             (*bbolt.Tx).Commit,
 		indexed:            cfg.Indexed,
 		ops:                cfg.Ops,
 		schema:             cfg.Schema,
 		unique:             cfg.Unique,
 		snapshotOps:        cfg.SnapshotOps,
-		indexPublishOps:    cfg.IndexPublishOps,
-		errs:               cfg.Errors,
+		publishCommitted:   cfg.PublishCommitted,
 	}
 	ex.sched.cond = sync.NewCond(&ex.sched.mu)
 	return ex
+}
+
+// OverridePublishCommittedForTest exposes the publish hook to cross-package tests without reflection.
+func OverridePublishCommittedForTest(b *Batcher, fn func(uint64, string, *snapshot.View) error) func(uint64, string, *snapshot.View) error {
+	old := b.publishCommitted
+	b.publishCommitted = fn
+	return old
 }
 
 func (b *Batcher) BasicStats() (queueLen int, queueMax uint64, executed uint64, dequeued uint64) {
@@ -90,7 +97,7 @@ func (b *Batcher) BasicStats() (queueLen int, queueMax uint64, executed uint64, 
 	return queueLen, b.sched.stats.QueueHighWater.Load(), b.sched.stats.ExecutedBatches.Load(), b.sched.stats.Dequeued.Load()
 }
 
-func (b *Batcher) Stats() Stats {
+func (b *Batcher) Stats() rbistats.AutoBatch {
 	return b.sched.getStats()
 }
 
@@ -361,7 +368,7 @@ func (b *Batcher) runShared(batch []*request) {
 		}
 		for i := 0; i < len(activeScratch); i++ {
 			req := activeScratch[i]
-			if errors.Is(req.Err, b.errs.UniqueViolation) {
+			if errors.Is(req.Err, rbierrors.ErrUniqueViolation) {
 				req.Err = nil
 			}
 		}

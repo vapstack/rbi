@@ -50,7 +50,7 @@ type View struct {
 func newView(snap *snapshot.View, exec *Runtime) View {
 	return View{
 		snap:              snap,
-		strKey:            snap.StrMap != nil,
+		strKey:            exec.StrKey,
 		exec:              exec,
 		lenZeroComplement: snap.LenZeroComplement,
 	}

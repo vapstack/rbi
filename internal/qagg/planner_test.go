@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func TestAggregateSelectorsChooseRouteContracts(t *testing.T) {
@@ -325,8 +325,8 @@ func TestExecuteAggregateEmitsSelectedRouteTrace(t *testing.T) {
 	seen := make(map[string]bool, len(tests))
 	for i := range tests {
 		tc := tests[i]
-		var events []qexec.TraceEvent
-		db := newQaggTestDB(t, func(ev qexec.TraceEvent) {
+		var events []rbitrace.Event
+		db := newQaggTestDB(t, func(ev rbitrace.Event) {
 			events = append(events, ev)
 		})
 
@@ -345,8 +345,8 @@ func TestExecuteAggregateEmitsSelectedRouteTrace(t *testing.T) {
 			t.Fatalf("%s trace events=%d, want 1", tc.name, len(events))
 		}
 		ev := events[0]
-		if ev.Plan != string(PlanAggregate) {
-			t.Fatalf("%s plan=%q, want %q", tc.name, ev.Plan, PlanAggregate)
+		if ev.Plan != rbitrace.PlanAggregate {
+			t.Fatalf("%s plan=%q, want %q", tc.name, ev.Plan, rbitrace.PlanAggregate)
 		}
 		if ev.AggregateRoute.Selected != tc.wantRoute {
 			t.Fatalf("%s route=%+v, want selected %q", tc.name, ev.AggregateRoute, tc.wantRoute)
@@ -405,8 +405,8 @@ func TestExecuteAggregateEmitsSelectedRouteTrace(t *testing.T) {
 }
 
 func TestExecuteGroupedRecursiveTraceIncludesRejectedByID(t *testing.T) {
-	var events []qexec.TraceEvent
-	db := newQaggSparseIDTestDB(t, func(ev qexec.TraceEvent) {
+	var events []rbitrace.Event
+	db := newQaggSparseIDTestDB(t, func(ev rbitrace.Event) {
 		events = append(events, ev)
 	})
 	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt)
@@ -458,8 +458,8 @@ func TestExecuteAggregateMeasureTraceIncludesAccessMode(t *testing.T) {
 
 	for i := range tests {
 		tc := tests[i]
-		var events []qexec.TraceEvent
-		db := newQaggTestDB(t, func(ev qexec.TraceEvent) {
+		var events []rbitrace.Event
+		db := newQaggTestDB(t, func(ev rbitrace.Event) {
 			events = append(events, ev)
 		})
 		prepared, err := Prepare(tc.q, db.rt)

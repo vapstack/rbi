@@ -13,6 +13,8 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 const (
@@ -271,7 +273,6 @@ func newQexecBenchDBWithSharedDataAndOptions(base *testDB, opts testOptions) *te
 		LenZeroComplement: base.snap.LenZeroComplement,
 		Measure:           base.snap.Measure,
 		Universe:          base.snap.Universe,
-		StrMap:            base.snap.StrMap,
 	})
 	return &testDB{
 		rt:   base.rt,
@@ -434,7 +435,7 @@ func seedQexecBenchData(b *testing.B, db *testDB, rows int, gen func(uint64) tes
 			entries[i] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i])}
 		}
 		db.seq++
-		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, entries)
 	}
 }
 
@@ -964,7 +965,7 @@ func BenchmarkQueryPreparedShapeOrderBoundMissingResidual(b *testing.B) {
 func BenchmarkPlannerStats(b *testing.B) {
 	qexecBenchRunScales(b, func(b *testing.B, db *testDB, _ qexecBenchScale) {
 		b.Run("BuildPlannerStatsSnapshot", func(b *testing.B) {
-			var out *PlannerStatsSnapshot
+			var out *rbistats.PlannerSnapshot
 			snap := db.snap
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -995,7 +996,7 @@ func BenchmarkPlannerStats(b *testing.B) {
 		if !ov.HasData() {
 			b.Fatal("missing age index")
 		}
-		var stats PlannerFieldStats
+		var stats rbistats.PlannerField
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -1011,7 +1012,7 @@ func BenchmarkPlannerStats(b *testing.B) {
 		if !ov.HasData() {
 			b.Fatal("missing country index")
 		}
-		var stats PlannerFieldStats
+		var stats rbistats.PlannerField
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -3021,7 +3022,7 @@ func BenchmarkQueryCacheModes(b *testing.B) {
 	}
 }
 
-func qexecBenchTraceSink(TraceEvent) {
+func qexecBenchTraceSink(rbitrace.Event) {
 	qexecBenchTraceEvents++
 }
 

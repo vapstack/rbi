@@ -11,6 +11,7 @@ import (
 	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type qaggTestRec struct {
@@ -33,7 +34,7 @@ type qaggTestDB struct {
 	snap *snapshot.View
 }
 
-func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
+func newQaggTestDB(t testing.TB, traceSink func(rbitrace.Event)) *qaggTestDB {
 	t.Helper()
 
 	rt, err := schema.Compile(reflect.TypeFor[qaggTestRec](), schema.Config{})
@@ -54,7 +55,7 @@ func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
 	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{
 		MatPredMaxEntries: 32,
 		MatPredMaxCard:    64 << 10,
-	}, nil, nil, entries)
+	}, nil, entries)
 
 	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
 }
@@ -118,8 +119,8 @@ func TestCountDirectFastPathsReturnExactCardinality(t *testing.T) {
 }
 
 func TestCountDirectTraceFinishesCountEvent(t *testing.T) {
-	var events []qexec.TraceEvent
-	db := newQaggTestDB(t, func(ev qexec.TraceEvent) {
+	var events []rbitrace.Event
+	db := newQaggTestDB(t, func(ev rbitrace.Event) {
 		events = append(events, ev)
 	})
 
@@ -141,7 +142,7 @@ func TestCountDirectTraceFinishesCountEvent(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("trace events=%d, want 1", len(events))
 	}
-	if events[0].Plan != string(PlanCountMaterialized) || events[0].RowsReturned != 6 || events[0].RowsExamined != 6 {
+	if events[0].Plan != rbitrace.PlanCountMaterialized || events[0].RowsReturned != 6 || events[0].RowsExamined != 6 {
 		t.Fatalf("trace event=%+v", events[0])
 	}
 }
@@ -458,11 +459,11 @@ func TestExecutePinnedSnapshotIsolation(t *testing.T) {
 	exec := qexec.NewRuntime(qexec.Config{Schema: rt})
 
 	oldRec := qaggPinnedSnapshotRec{Amount: 10}
-	oldSnap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
+	oldSnap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&oldRec)},
 	})
 	newRec := qaggPinnedSnapshotRec{Amount: 99}
-	newSnap := snapshot.Build(2, oldSnap, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{
+	newSnap := snapshot.Build(2, oldSnap, rt, snapshot.CacheConfig{}, nil, []snapshot.BatchEntry{
 		{ID: 1, Old: unsafe.Pointer(&oldRec), New: unsafe.Pointer(&newRec)},
 	})
 

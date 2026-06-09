@@ -3,6 +3,7 @@ package qexec
 import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -1119,7 +1120,7 @@ func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (sc
 
 	if !nilPosting.IsEmpty() {
 		plan.buckets++
-		plan.est = satAddUint64(plan.est, nilPosting.Cardinality())
+		plan.est = mathutil.SatAddUint64(plan.est, nilPosting.Cardinality())
 	}
 
 	return plan, true
@@ -1131,7 +1132,7 @@ func addScalarComplementPlanSpan(plan *scalarComplementMaterializationPlan, ov i
 	}
 	buckets, est := ov.RangeStats(span)
 	plan.buckets += buckets
-	plan.est = satAddUint64(plan.est, est)
+	plan.est = mathutil.SatAddUint64(plan.est, est)
 }
 
 func (core *preparedScalarRangePredicate) loadComplementMaterialization() (scalarComplementMaterializationPlan, posting.List, bool, bool, bool) {
@@ -1212,6 +1213,6 @@ func (plan preparedFieldIndexRangePredicatePlan) orderedEagerMaterializeUseful(o
 	if probeWork < buildWork {
 		return false
 	}
-	retainedPenalty := satMulUint64(plan.est, postingContainsLookupWork(plan.est))
-	return probeWork >= satAddUint64(buildWork, retainedPenalty)
+	retainedPenalty := mathutil.SatMulUint64(plan.est, postingContainsLookupWork(plan.est))
+	return probeWork >= mathutil.SatAddUint64(buildWork, retainedPenalty)
 }

@@ -6,6 +6,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func (qv *View) TryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
@@ -208,7 +209,7 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool) (out []uint64, err error) {
 	}
 
 	if trace != nil {
-		trace.SetPlan(PlanMaterialized)
+		trace.SetPlan(rbitrace.PlanMaterialized)
 	}
 
 	return qv.queryMaterialized(q)

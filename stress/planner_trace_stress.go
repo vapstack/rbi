@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerTraceCollector struct {
@@ -82,7 +82,7 @@ type plannerTraceStats struct {
 	totalPlannerReused   uint64
 	planCounts           map[string]uint64
 	earlyStopCounts      map[string]uint64
-	orRouteCounts        map[string]uint64
+	orSelectionCounts    map[string]uint64
 	runtimeFallbackCause map[string]uint64
 }
 
@@ -138,7 +138,7 @@ type plannerTraceScopeReport struct {
 	AvgPlannerReused  float64           `json:"avg_planner_reused_ranges"`
 	PlanCounts        map[string]uint64 `json:"plan_counts,omitempty"`
 	EarlyStopCounts   map[string]uint64 `json:"early_stop_counts,omitempty"`
-	ORRouteCounts     map[string]uint64 `json:"or_route_counts,omitempty"`
+	ORSelectionCounts map[string]uint64 `json:"or_selection_counts,omitempty"`
 	RuntimeFallbackBy map[string]uint64 `json:"runtime_fallback_by,omitempty"`
 }
 
@@ -175,8 +175,8 @@ type plannerTraceSample struct {
 	DedupeCount         uint64 `json:"dedupe_count,omitempty"`
 	EarlyStopReason     string `json:"early_stop_reason,omitempty"`
 
-	ORRoute           string                     `json:"or_route,omitempty"`
-	ORRouteReason     string                     `json:"or_route_reason,omitempty"`
+	ORSelected        string                     `json:"or_selected,omitempty"`
+	ORRejected        string                     `json:"or_rejected,omitempty"`
 	ORRuntimeGuard    bool                       `json:"or_runtime_guard,omitempty"`
 	ORRuntimeReason   string                     `json:"or_runtime_reason,omitempty"`
 	ORRuntimeFallback bool                       `json:"or_runtime_fallback,omitempty"`
@@ -207,7 +207,7 @@ func newPlannerTraceCollector(_ []*classDescriptor, sampleEvery, topN int) *plan
 	}
 }
 
-func (c *plannerTraceCollector) traceSink() func(rbi.TraceEvent) {
+func (c *plannerTraceCollector) traceSink() func(rbitrace.Event) {
 	if c == nil {
 		return nil
 	}
@@ -279,7 +279,7 @@ func traceQuery(ctx *WorkloadContext, query string) func() {
 	return ctx.Trace.begin(query)
 }
 
-func (c *plannerTraceCollector) observe(ev rbi.TraceEvent) {
+func (c *plannerTraceCollector) observe(ev rbitrace.Event) {
 	if c == nil {
 		return
 	}
@@ -306,7 +306,7 @@ func (c *plannerTraceCollector) observe(ev rbi.TraceEvent) {
 	epoch.observe(worker.info, query, ev)
 }
 
-func (e *plannerTraceEpoch) observe(info plannerTraceScopeInfo, query string, ev rbi.TraceEvent) {
+func (e *plannerTraceEpoch) observe(info plannerTraceScopeInfo, query string, ev rbitrace.Event) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -333,7 +333,7 @@ func (e *plannerTraceEpoch) observe(info plannerTraceScopeInfo, query string, ev
 	e.top = insertPlannerTraceSample(e.top, plannerTraceSampleFromEvent(info, query, ev), e.topN)
 }
 
-func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
+func (s *plannerTraceStats) observe(ev rbitrace.Event) {
 	s.sampled++
 	if ev.Error != "" {
 		s.errors++
@@ -341,7 +341,7 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	if ev.HasOrder {
 		s.ordered++
 	}
-	if len(ev.ORBranches) > 0 || ev.ORRoute.Route != "" {
+	if len(ev.ORBranches) > 0 || ev.ORRoute.Selected != "" {
 		s.orSamples++
 	}
 	if ev.ORRoute.RuntimeFallbackTriggered {
@@ -398,7 +398,7 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 		if s.planCounts == nil {
 			s.planCounts = make(map[string]uint64, 4)
 		}
-		s.planCounts[ev.Plan]++
+		s.planCounts[string(ev.Plan)]++
 	}
 	if ev.EarlyStopReason != "" {
 		if s.earlyStopCounts == nil {
@@ -406,15 +406,15 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 		}
 		s.earlyStopCounts[ev.EarlyStopReason]++
 	}
-	if ev.ORRoute.Route != "" {
-		if s.orRouteCounts == nil {
-			s.orRouteCounts = make(map[string]uint64, 4)
+	if ev.ORRoute.Selected != "" {
+		if s.orSelectionCounts == nil {
+			s.orSelectionCounts = make(map[string]uint64, 4)
 		}
-		key := ev.ORRoute.Route
-		if ev.ORRoute.Reason != "" {
-			key += ":" + ev.ORRoute.Reason
+		key := ev.ORRoute.Selected
+		if ev.ORRoute.Rejected != "" {
+			key += ":" + ev.ORRoute.Rejected
 		}
-		s.orRouteCounts[key]++
+		s.orSelectionCounts[key]++
 	}
 	if ev.ORRoute.RuntimeFallbackTriggered && ev.ORRoute.RuntimeFallbackReason != "" {
 		if s.runtimeFallbackCause == nil {
@@ -491,7 +491,7 @@ func (s *plannerTraceStats) report() plannerTraceScopeReport {
 		AvgPlannerReused:  float64(s.totalPlannerReused) / n,
 		PlanCounts:        cloneStringCounts(s.planCounts),
 		EarlyStopCounts:   cloneStringCounts(s.earlyStopCounts),
-		ORRouteCounts:     cloneStringCounts(s.orRouteCounts),
+		ORSelectionCounts: cloneStringCounts(s.orSelectionCounts),
 		RuntimeFallbackBy: cloneStringCounts(s.runtimeFallbackCause),
 	}
 }
@@ -534,7 +534,7 @@ func (s plannerTraceSnapshot) queryReport(className, query string) *plannerTrace
 	return &report
 }
 
-func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rbi.TraceEvent) plannerTraceSample {
+func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rbitrace.Event) plannerTraceSample {
 	out := plannerTraceSample{
 		CapturedAt:          ev.Timestamp.Format(time.RFC3339Nano),
 		ClassID:             info.ClassID,
@@ -542,7 +542,7 @@ func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rb
 		ClassName:           info.ClassName,
 		Role:                info.Role,
 		Query:               query,
-		Plan:                ev.Plan,
+		Plan:                string(ev.Plan),
 		DurationUs:          nsToUs(float64(ev.Duration.Nanoseconds())),
 		HasOrder:            ev.HasOrder,
 		OrderField:          ev.OrderField,
@@ -563,8 +563,8 @@ func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rb
 		OrderIndexScanWidth: ev.OrderIndexScanWidth,
 		DedupeCount:         ev.DedupeCount,
 		EarlyStopReason:     ev.EarlyStopReason,
-		ORRoute:             ev.ORRoute.Route,
-		ORRouteReason:       ev.ORRoute.Reason,
+		ORSelected:          ev.ORRoute.Selected,
+		ORRejected:          ev.ORRoute.Rejected,
 		ORRuntimeGuard:      ev.ORRoute.RuntimeGuardEnabled,
 		ORRuntimeReason:     ev.ORRoute.RuntimeGuardReason,
 		ORRuntimeFallback:   ev.ORRoute.RuntimeFallbackTriggered,

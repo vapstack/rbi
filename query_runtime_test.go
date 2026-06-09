@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func TestRegression_NotInOrderOffset_QueryMatchesReference(t *testing.T) {
@@ -382,12 +384,12 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 func TestQueryExt_OrderedORNegativeResidualPlannerTrace_MatchesExpected(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
+		TraceSink:        func(ev rbitrace.Event) { mu.Lock(); events = append(events, ev); mu.Unlock() },
 		TraceSampleEvery: 1,
 	})
 
@@ -414,9 +416,9 @@ func TestQueryExt_OrderedORNegativeResidualPlannerTrace_MatchesExpected(t *testi
 	ev := events[len(events)-1]
 	mu.Unlock()
 
-	if ev.Plan != string(PlanMaterialized) &&
-		ev.Plan != string(PlanORMergeOrderMerge) &&
-		ev.Plan != string(PlanORMergeOrderStream) {
+	if ev.Plan != rbitrace.PlanMaterialized &&
+		ev.Plan != rbitrace.PlanORMergeOrderMerge &&
+		ev.Plan != rbitrace.PlanORMergeOrderStream {
 		t.Fatalf("unexpected planner route for ordered OR fixture: got %q", ev.Plan)
 	}
 	if ev.RowsReturned != uint64(len(want)) {
@@ -834,7 +836,7 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 		for i := 0; i < 200; i++ {
 			s := db.PlannerStats()
 			if s.Fields != nil {
-				s.Fields["country"] = PlannerFieldStats{}
+				s.Fields["country"] = rbistats.PlannerField{}
 				delete(s.Fields, "age")
 			}
 		}
@@ -1059,7 +1061,7 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 		for i := 0; i < 120; i++ {
 			s := db.PlannerStats()
 			if s.Fields != nil {
-				s.Fields["country"] = PlannerFieldStats{}
+				s.Fields["country"] = rbistats.PlannerField{}
 				delete(s.Fields, "age")
 			}
 		}

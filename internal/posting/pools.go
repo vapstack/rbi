@@ -295,7 +295,7 @@ func getArrayIter(ids []uint64) *arrayIter {
 	return &arrayIter{ids: ids}
 }
 
-func getSingletonIter(v uint64) Iterator {
+func getSingletonIter(v uint64) *singletonIter {
 	var it *singletonIter
 	if pv := singletonIterPool.Get(); pv != nil {
 		it = pv.(*singletonIter)

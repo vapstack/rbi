@@ -9,10 +9,13 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type Config struct {
 	Schema *schema.Schema
+	StrKey bool
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -20,19 +23,20 @@ type Config struct {
 
 	AnalyzeInterval time.Duration
 
-	TraceSink        func(TraceEvent)
+	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
 }
 
 type Runtime struct {
 	Schema *schema.Schema
+	StrKey bool
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
 	NumericRangeBucketMinSpanKeys  int
 
 	StatsVersion atomic.Uint64
-	Stats        atomic.Pointer[PlannerStatsSnapshot]
+	Stats        atomic.Pointer[rbistats.PlannerSnapshot]
 
 	Analyzer *Analyzer
 	Tracer   *Tracer
@@ -43,6 +47,7 @@ type Runtime struct {
 func NewRuntime(cfg Config) *Runtime {
 	return &Runtime{
 		Schema:                         cfg.Schema,
+		StrKey:                         cfg.StrKey,
 		NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
 		NumericRangeBucketMinSpanKeys:  cfg.NumericRangeBucketMinSpanKeys,
@@ -82,19 +87,19 @@ type Analyzer struct {
 }
 
 type Tracer struct {
-	sink        func(TraceEvent)
+	sink        func(rbitrace.Event)
 	sampleEvery uint64
 	seq         atomic.Uint64
 }
 
-func NewTracer(sink func(TraceEvent), sampleEvery int) *Tracer {
+func NewTracer(sink func(rbitrace.Event), sampleEvery int) *Tracer {
 	return &Tracer{
 		sink:        sink,
 		sampleEvery: TraceSampleEvery(sampleEvery, sink),
 	}
 }
 
-func TraceSampleEvery(sampleEvery int, sink func(TraceEvent)) uint64 {
+func TraceSampleEvery(sampleEvery int, sink func(rbitrace.Event)) uint64 {
 	if sink == nil {
 		return 0
 	}
@@ -115,7 +120,7 @@ func (t *Tracer) SampleEvery() uint64 {
 	return t.sampleEvery
 }
 
-func (t *Tracer) SampleSink() func(TraceEvent) {
+func (t *Tracer) SampleSink() func(rbitrace.Event) {
 	sink := t.sink
 	every := t.sampleEvery
 	if sink == nil || every == 0 {

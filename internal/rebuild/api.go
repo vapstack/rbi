@@ -8,7 +8,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -28,11 +27,11 @@ type State struct {
 
 type Config struct {
 	Bolt              *bbolt.DB
-	Bucket            []byte
+	DataBucket        []byte
+	StrMapBucket      []byte
 	Schema            *schema.Schema
 	Current           *snapshot.View
 	StrKey            bool
-	StrMap            *strmap.Mapper
 	SkipFields        map[string]struct{}
 	SkipMeasureFields map[string]struct{}
 	Decode            DecodeFunc

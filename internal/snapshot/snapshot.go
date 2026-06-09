@@ -6,7 +6,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/strmap"
 )
 
 // View is an immutable read-view published atomically for query paths.
@@ -21,7 +20,6 @@ type View struct {
 	IndexedFieldByName schema.IndexedFieldMap
 	Universe           posting.List
 	universeOwner      *universeOwner
-	StrMap             *strmap.Snapshot
 
 	numericRangeBucketCache *qcache.NumericRangeBucketCache
 
@@ -43,7 +41,6 @@ type Storage struct {
 	LenZeroComplement []bool
 	Measure           []indexdata.MeasureStorage
 	Universe          posting.List
-	StrMap            *strmap.Snapshot
 }
 
 func (st *Storage) Release() {
@@ -68,7 +65,6 @@ func NewView(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, st Stora
 		Measure:            st.Measure,
 		IndexedFieldByName: s.IndexedByName,
 		Universe:           st.Universe,
-		StrMap:             st.StrMap,
 	}
 	v.initRuntimeCaches(s, cfg)
 	v.retainSharedOwnedStorageFrom(prev)

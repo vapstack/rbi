@@ -3,7 +3,6 @@ package wexec
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -17,7 +16,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/rbistats"
 	"go.etcd.io/bbolt"
 )
 
@@ -39,8 +38,7 @@ type benchmarkExecutorConfig struct {
 
 var (
 	benchmarkWexecRecPool = pooled.Pointers[benchmarkWexecRec]{Clear: true}
-	benchmarkUniqueErr    = errors.New("unique violation") // nolint:staticcheck
-	benchmarkStatsSink    Stats
+	benchmarkStatsSink    rbistats.AutoBatch
 	benchmarkUintSink     uint64
 	benchmarkRecordOps    = RecordOps{
 		Encode:        benchmarkEncodeRec,
@@ -78,14 +76,6 @@ func benchmarkValidateRec(unsafe.Pointer) error {
 
 func benchmarkUnavailable() error {
 	return nil
-}
-
-func benchmarkCommit(tx *bbolt.Tx, _ string) error {
-	return tx.Commit()
-}
-
-func benchmarkSnapshotCacheConfig() snapshot.CacheConfig {
-	return snapshot.CacheConfig{}
 }
 
 func benchmarkBeforeProcess(keycodec.DataKey, unsafe.Pointer) error {
@@ -145,49 +135,34 @@ func newBenchmarkExecutor(tb testing.TB, cfg benchmarkExecutorConfig) *Batcher {
 	}
 
 	var rootMu sync.RWMutex
-	var sm *strmap.Mapper
+	var mapBucket []byte
 	if cfg.strKey {
-		sm = strmap.New(0, 64)
+		mapBucket = createStringAttemptMap(tb, raw, bucket)
 	}
 
 	var snapOps SnapshotOps
-	var publishOps IndexPublishOps
+	var publishCommitted func(uint64, string, *snapshot.View) error
 	var unique UniqueContext
-	errs := ErrorSet{}
 	if cfg.indexed {
 		manager := snapshot.NewRegistry(false)
 		storage := snapshot.Storage{}
-		if sm != nil {
-			storage.StrMap = sm.Snapshot()
-		}
 		current := snapshot.NewView(0, nil, rt, snapshot.CacheConfig{}, storage)
 		manager.Publish(current)
-		if sm != nil {
-			sm.MarkCommittedPublished(current.StrMap)
-		}
 
 		snapOps = SnapshotOps{
 			Manager:     manager,
 			Schema:      rt,
-			CacheConfig: benchmarkSnapshotCacheConfig,
-			StrMap:      sm,
+			CacheConfig: snapshot.CacheConfig{},
 			PatchFields: rt.Patch.Fields,
 		}
-		publishOps = IndexPublishOps{
-			PublishCommitted: func(_ uint64, _ string, snap *snapshot.View) error {
-				manager.Publish(snap)
-				if sm != nil {
-					sm.MarkCommittedPublished(snap.StrMap)
-				}
-				return nil
-			},
+		publishCommitted = func(_ uint64, _ string, snap *snapshot.View) error {
+			manager.Publish(snap)
+			return nil
 		}
 		if cfg.unique {
-			errs.UniqueViolation = benchmarkUniqueErr
 			unique = UniqueContext{
-				Schema:          rt,
-				Current:         manager.Current,
-				UniqueViolation: benchmarkUniqueErr,
+				Schema:  rt,
+				Current: manager.Current,
 			}
 		}
 	}
@@ -198,21 +173,19 @@ func newBenchmarkExecutor(tb testing.TB, cfg benchmarkExecutorConfig) *Batcher {
 		MaxQueue:           cfg.maxQueue,
 		StatsEnabled:       cfg.stats,
 		Unavailable:        benchmarkUnavailable,
-		Errors:             errs,
 		Bolt:               raw,
-		Bucket:             bucket,
+		DataBucket:         bucket,
 		BucketFillPercent:  0.8,
 		RejectEmptyPayload: true,
 		PublishMu:          &rootMu,
-		Commit:             benchmarkCommit,
 		StrKey:             cfg.strKey,
-		StrMap:             sm,
+		StrMapBucket:       mapBucket,
 		Indexed:            cfg.indexed,
 		Ops:                &benchmarkRecordOps,
 		Schema:             rt,
 		Unique:             unique,
 		SnapshotOps:        snapOps,
-		IndexPublishOps:    publishOps,
+		PublishCommitted:   publishCommitted,
 	})
 }
 

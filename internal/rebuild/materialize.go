@@ -155,7 +155,7 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 					continue
 				}
 				if cfg.StrKey && len(buf) > 1 {
-					// Bolt scans string keys lexicographically; StrMap IDs can follow an older assignment order.
+					// Bolt scans string keys lexicographically; durable string ids can follow older assignment order.
 					slices.SortFunc(buf, func(a, b indexdata.MeasureEntry) int {
 						return cmp.Compare(a.ID, b.ID)
 					})

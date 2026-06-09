@@ -4,6 +4,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/vapstack/rbi/internal/mathutil"
 )
 
 const maxLatencySampleSize = MaxLatencySampleSize
@@ -60,11 +62,7 @@ func (r *latencyReservoir) add(v float64) {
 }
 
 func (r *latencyReservoir) next() uint64 {
-	r.state += 0x9e3779b97f4a7c15
-	z := r.state
-	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
-	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-	return z ^ (z >> 31)
+	return mathutil.NextSplitMix64(&r.state)
 }
 
 func newWorkerMetrics(totalCap, queryCap int, seed uint64, trackQueries, trackQueryLatency bool) *workerMetrics {
@@ -106,7 +104,7 @@ func (m *workerMetrics) observe(kind string, latencyNS float64, errCount uint64)
 	if query == nil {
 		query = &queryMetrics{}
 		if m.trackQueryLatency {
-			query.lat = newLatencyReservoir(m.queryCap, uint64(len(m.queries)+1)*0x94d049bb133111eb)
+			query.lat = newLatencyReservoir(m.queryCap, mathutil.Mix64(uint64(len(m.queries)+1)))
 		}
 		m.queries[kind] = query
 	}

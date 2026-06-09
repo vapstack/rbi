@@ -7,7 +7,6 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/strmap"
 )
 
 type BatchEntry struct {
@@ -19,11 +18,11 @@ type BatchEntry struct {
 }
 
 // Build treats entries as caller-owned and does not mutate them.
-func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
-	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, strMap, entries); ok {
+func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, entries); ok {
 		return snap
 	}
-	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, strMap, entries); ok {
+	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, entries); ok {
 		return snap
 	}
 	var normalized []BatchEntry
@@ -33,7 +32,7 @@ func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *st
 		copy(scratch, entries)
 		normalized = normalizePreparedBatchForSnapshotInPlace(scratch)
 	}
-	snap := buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, strMap, patchFields, normalized)
+	snap := buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalized)
 	if scratch != nil {
 		batchEntrySlicePool.Put(scratch)
 	}
@@ -41,14 +40,14 @@ func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *st
 }
 
 // BuildInPlace consumes entries and may compact or rewrite them.
-func BuildInPlace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
-	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, strMap, entries); ok {
+func BuildInPlace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, entries); ok {
 		return snap
 	}
-	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, strMap, entries); ok {
+	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, entries); ok {
 		return snap
 	}
-	return buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, strMap, patchFields, normalizePreparedBatchForSnapshotInPlace(entries))
+	return buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalizePreparedBatchForSnapshotInPlace(entries))
 }
 
 func cloneFieldIndexBoolSlots(src []bool, size int) []bool {
@@ -231,7 +230,7 @@ func collectSnapshotBatchEntryDiffs(
 	}
 }
 
-func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
+func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, entries []BatchEntry) (*View, bool) {
 	if prev != nil && !prev.Universe.IsEmpty() {
 		return nil, false
 	}
@@ -329,10 +328,6 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema
 		measureStates[i] = nil
 	}
 
-	var sm *strmap.Snapshot
-	if strMap != nil {
-		sm = strMap.Snapshot()
-	}
 	snap := &View{
 		Seq:                seq,
 		Index:              nextIndex,
@@ -342,7 +337,6 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema
 		Measure:            nextMeasure,
 		IndexedFieldByName: s.IndexedByName,
 		Universe:           universe,
-		StrMap:             sm,
 	}
 	snap.initRuntimeCaches(s, cfg)
 	inheritNumericRangeBucketCache(snap, prev)
@@ -368,7 +362,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema
 	return snap, true
 }
 
-func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) (*View, bool) {
+func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, entries []BatchEntry) (*View, bool) {
 	if len(entries) == 0 {
 		return nil, false
 	}
@@ -387,10 +381,6 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 		}
 	}
 
-	var sm *strmap.Snapshot
-	if strMap != nil {
-		sm = strMap.Snapshot()
-	}
 	next := &View{
 		Seq: seq,
 
@@ -401,7 +391,6 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 		Measure:            indexdata.CloneMeasureStorageSlots(prev.Measure, len(s.Measures)),
 		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe.Clone(),
-		StrMap:             sm,
 	}
 	next.Universe = next.Universe.BuildMergedOwned(addedUniverse)
 	next.initRuntimeCaches(s, cfg)
@@ -476,7 +465,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 	return next, true
 }
 
-func buildPreparedSnapshotDeletedAll(seq uint64, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper) *View {
+func buildPreparedSnapshotDeletedAll(seq uint64, s *schema.Schema, cfg CacheConfig) *View {
 	slotCount := len(s.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
@@ -487,10 +476,6 @@ func buildPreparedSnapshotDeletedAll(seq uint64, s *schema.Schema, cfg CacheConf
 	measureSlotCount := len(s.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 
-	var sm *strmap.Snapshot
-	if strMap != nil {
-		sm = strMap.Snapshot()
-	}
 	next := &View{
 		Seq:                seq,
 		Index:              nextIndex,
@@ -499,14 +484,13 @@ func buildPreparedSnapshotDeletedAll(seq uint64, s *schema.Schema, cfg CacheConf
 		LenZeroComplement:  nextLenZeroComplement,
 		Measure:            nextMeasure,
 		IndexedFieldByName: s.IndexedByName,
-		StrMap:             sm,
 	}
 	next.initRuntimeCaches(s, cfg)
 	next.ensureUniverseOwner()
 	return next
 }
 
-func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) *View {
+func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, entries []BatchEntry) *View {
 	fieldStates := schema.GetIndexStates(len(s.Indexed))
 	measureStates := indexdata.GetMeasureEntrySlots(len(s.Measures))
 
@@ -569,10 +553,6 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, 
 		measureStates[i] = nil
 	}
 
-	var sm *strmap.Snapshot
-	if strMap != nil {
-		sm = strMap.Snapshot()
-	}
 	next := &View{
 		Seq: seq,
 
@@ -584,7 +564,6 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, 
 		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe,
 		universeOwner:      prev.universeOwner,
-		StrMap:             sm,
 	}
 	next.initRuntimeCaches(s, cfg)
 	schema.ReleaseIndexStates(fieldStates)
@@ -598,7 +577,6 @@ func buildPreparedSnapshotAggregatedNormalized(
 	prev *View,
 	s *schema.Schema,
 	cfg CacheConfig,
-	strMap *strmap.Mapper,
 	patchFields map[string]*schema.Field,
 	normalized []BatchEntry,
 ) *View {
@@ -623,22 +601,18 @@ func buildPreparedSnapshotAggregatedNormalized(
 			if ids.Cardinality() == prevCard && prev.Universe.AndCardinality(ids) == prevCard {
 				if allDelete {
 					ids.Release()
-					return buildPreparedSnapshotDeletedAll(seq, s, cfg, strMap)
+					return buildPreparedSnapshotDeletedAll(seq, s, cfg)
 				}
 				if (prev.matPredCache == nil || prev.matPredCache.EntryCount() == 0) &&
 					(prev.numericRangeBucketCache == nil || prev.numericRangeBucketCache.EntryCount() == 0) {
 					ids.Release()
-					return buildPreparedSnapshotFullReplace(seq, prev, s, cfg, strMap, normalized)
+					return buildPreparedSnapshotFullReplace(seq, prev, s, cfg, normalized)
 				}
 			}
 		}
 		ids.Release()
 	}
 
-	var sm *strmap.Snapshot
-	if strMap != nil {
-		sm = strMap.Snapshot()
-	}
 	next := &View{
 		Seq: seq,
 
@@ -650,7 +624,6 @@ func buildPreparedSnapshotAggregatedNormalized(
 		IndexedFieldByName: s.IndexedByName,
 		Universe:           prev.Universe,
 		universeOwner:      prev.universeOwner,
-		StrMap:             sm,
 	}
 	next.initRuntimeCaches(s, cfg)
 

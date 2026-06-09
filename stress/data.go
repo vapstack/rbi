@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/internal/mathutil"
+	"github.com/vapstack/rbi/rbitrace"
 	bolt "go.etcd.io/bbolt"
 	bolterrors "go.etcd.io/bbolt/errors"
 )
@@ -28,8 +30,6 @@ var (
 	AllRoles = []string{"member", "trusted", "moderator", "admin", "staff", "bot"}
 )
 
-const randStreamMix uint64 = 0x9e3779b97f4a7c15
-
 const stressBoltOpenTimeout = 500 * time.Millisecond
 
 // Keep this timeout fixed and short in stress.
@@ -46,7 +46,7 @@ type DBConfig struct {
 	BoltNoSync           bool
 	AnalyzeInterval      time.Duration
 	DisableRuntimeCaches bool
-	TraceSink            func(rbi.TraceEvent)
+	TraceSink            func(rbitrace.Event)
 	TraceSampleEvery     int
 }
 
@@ -155,7 +155,10 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedReco
 	}
 	var maxID uint64
 	if count > 0 {
-		stats := db.Stats()
+		stats, err := db.Stats()
+		if err != nil {
+			return 0, 0, fmt.Errorf("stats: %w", err)
+		}
 		maxID = stats.LastKey
 		if maxID == 0 {
 			maxID = scanMaxID(db)
@@ -203,7 +206,7 @@ func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []s
 
 	seen := make(map[string]struct{}, size)
 	emails := make([]string, 0, size)
-	rng := NewRand(1)
+	rng := mathutil.NewRand(1)
 
 	attempts := size * 40
 	if attempts < 5000 {
@@ -236,7 +239,7 @@ func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []s
 }
 
 func seedData(db *rbi.DB[uint64, UserBench], maxID *uint64, count int) {
-	rng := NewRand(time.Now().UnixNano())
+	rng := mathutil.NewRand(time.Now().UnixNano())
 	batchSize := 50_000
 
 	for i := 0; i < count; i += batchSize {
@@ -305,11 +308,6 @@ func generateUser(rng *rand.Rand, id uint64) *UserBench {
 		Roles:      sampleRoleSet(rng),
 		Blob:       make([]byte, 96+rng.IntN(96)),
 	}
-}
-
-func NewRand(seed int64) *rand.Rand {
-	s := uint64(seed)
-	return rand.New(rand.NewPCG(s, s^randStreamMix))
 }
 
 func pickSampleEmail(rng *rand.Rand, emails []string) string {

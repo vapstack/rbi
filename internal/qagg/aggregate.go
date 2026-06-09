@@ -16,6 +16,8 @@ import (
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type aggregateMetricOp uint8
@@ -188,7 +190,7 @@ func Execute(view *qexec.View, snap *snapshot.View, prepared *Query) (result Res
 	if view.TraceSamplingEnabled() {
 		trace = view.BeginTrace(qir.NewShape(prepared.filter).WithWindow(prepared.offset, prepared.limit))
 		if trace != nil {
-			trace.SetPlan(PlanAggregate)
+			trace.SetPlan(rbitrace.PlanAggregate)
 			defer func() {
 				trace.Finish(uint64(len(result.Rows)), err)
 			}()
@@ -228,10 +230,10 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 		return nil, fmt.Errorf("QX is nil")
 	}
 	if src.Reduction == nil || src.Reduction.IsEmpty() {
-		return nil, fmt.Errorf("%w: aggregate query requires reduction", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate query requires reduction", rbierrors.ErrInvalidQuery)
 	}
 	if len(src.Projection) > 0 {
-		return nil, fmt.Errorf("%w: aggregate projection is not supported", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate projection is not supported", rbierrors.ErrInvalidQuery)
 	}
 
 	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, s.IndexedByName)
@@ -284,13 +286,13 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 		}
 		if len(out.groups) != 0 || len(out.metrics) != 1 {
 			out.Release()
-			return nil, fmt.Errorf("%w: DISTINCT is supported only as a single ungrouped metric", qexec.ErrInvalidQuery)
+			return nil, fmt.Errorf("%w: DISTINCT is supported only as a single ungrouped metric", rbierrors.ErrInvalidQuery)
 		}
 	}
 
 	if len(out.metrics) == 0 && len(out.groups) == 0 {
 		out.Release()
-		return nil, fmt.Errorf("%w: aggregate query has no groups or metrics", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate query has no groups or metrics", rbierrors.ErrInvalidQuery)
 	}
 
 	if !src.Reduction.Having.IsZero() {
@@ -322,12 +324,12 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 			by := src.Order[i].By
 			if by.Kind != qx.KindOUT || by.Name == "" {
 				out.Release()
-				return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", qexec.ErrInvalidQuery)
+				return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", rbierrors.ErrInvalidQuery)
 			}
 			pos, ok := outputPositions[by.Name]
 			if !ok {
 				out.Release()
-				return nil, fmt.Errorf("%w: unknown aggregate output %q in ORDER", qexec.ErrInvalidQuery, by.Name)
+				return nil, fmt.Errorf("%w: unknown aggregate output %q in ORDER", rbierrors.ErrInvalidQuery, by.Name)
 			}
 			out.order = append(out.order, aggregateOrder{index: pos, desc: src.Order[i].Desc})
 		}
@@ -357,7 +359,7 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 
 func reserveAggregateOutputName(seen map[string]int, name string, pos int) error {
 	if _, ok := seen[name]; ok {
-		return fmt.Errorf("%w: duplicate aggregate output %q", qexec.ErrInvalidQuery, name)
+		return fmt.Errorf("%w: duplicate aggregate output %q", rbierrors.ErrInvalidQuery, name)
 	}
 	seen[name] = pos
 	return nil
@@ -365,7 +367,7 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 
 func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int, error) {
 	if expr.Kind != qx.KindOP {
-		return 0, 0, fmt.Errorf("%w: aggregate HAVING root must be a predicate", qexec.ErrInvalidQuery)
+		return 0, 0, fmt.Errorf("%w: aggregate HAVING root must be a predicate", rbierrors.ErrInvalidQuery)
 	}
 	args := 0
 	values := 0
@@ -382,7 +384,7 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 		}
 	case qx.OpNOT:
 		if len(expr.Args) != 1 {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", rbierrors.ErrInvalidQuery)
 		}
 		args++
 		childArgs, childValues, err := aggregateHavingStorageSize(expr.Args[0], outputs)
@@ -393,52 +395,52 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 		values += childValues
 	case qx.OpEXISTS, qx.OpISNULL:
 		if len(expr.Args) != 1 {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", qexec.ErrInvalidQuery, expr.Name)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", rbierrors.ErrInvalidQuery, expr.Name)
 		}
 		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
 			return 0, 0, err
 		}
 	case qx.OpEQ, qx.OpNE, qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
 		if len(expr.Args) != 2 {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", qexec.ErrInvalidQuery, expr.Name)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", rbierrors.ErrInvalidQuery, expr.Name)
 		}
 		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
 			return 0, 0, err
 		}
 		if expr.Args[1].Kind != qx.KindLIT {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING right side supports only literals", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING right side supports only literals", rbierrors.ErrInvalidQuery)
 		}
 	case qx.OpIN:
 		if len(expr.Args) != 2 {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", rbierrors.ErrInvalidQuery)
 		}
 		if _, err := prepareAggregateHavingOutput(expr.Args[0], outputs); err != nil {
 			return 0, 0, err
 		}
 		if expr.Args[1].Kind != qx.KindLIT {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 		}
 		raw := reflect.ValueOf(expr.Args[1].Value)
 		if !raw.IsValid() {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 		}
 		raw, isNil := schema.UnwrapQueryValue(raw)
 		if isNil || raw.Kind() != reflect.Slice {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 		}
 		if raw.Len() == 0 {
-			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN: no values provided", qexec.ErrInvalidQuery)
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN: no values provided", rbierrors.ErrInvalidQuery)
 		}
 		values += raw.Len()
 	default:
-		return 0, 0, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", qexec.ErrInvalidQuery)
+		return 0, 0, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", rbierrors.ErrInvalidQuery)
 	}
 	return args, values, nil
 }
 
 func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
 	if expr.Kind != qx.KindOP {
-		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING root must be a predicate", qexec.ErrInvalidQuery)
+		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING root must be a predicate", rbierrors.ErrInvalidQuery)
 	}
 	switch expr.Name {
 
@@ -461,7 +463,7 @@ func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (ag
 
 	case qx.OpNOT:
 		if len(expr.Args) != 1 {
-			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", qexec.ErrInvalidQuery)
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", rbierrors.ErrInvalidQuery)
 		}
 		start := len(q.havingArgs)
 		q.havingArgs = q.havingArgs[:start+1]
@@ -475,7 +477,7 @@ func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (ag
 
 	case qx.OpEXISTS, qx.OpISNULL:
 		if len(expr.Args) != 1 {
-			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", qexec.ErrInvalidQuery, expr.Name)
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", rbierrors.ErrInvalidQuery, expr.Name)
 		}
 		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
 		if err != nil {
@@ -489,7 +491,7 @@ func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (ag
 
 	case qx.OpEQ, qx.OpNE, qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
 		if len(expr.Args) != 2 {
-			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", qexec.ErrInvalidQuery, expr.Name)
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", rbierrors.ErrInvalidQuery, expr.Name)
 		}
 		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
 		if err != nil {
@@ -503,7 +505,7 @@ func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (ag
 
 	case qx.OpIN:
 		if len(expr.Args) != 2 {
-			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", qexec.ErrInvalidQuery)
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", rbierrors.ErrInvalidQuery)
 		}
 		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
 		if err != nil {
@@ -516,17 +518,17 @@ func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (ag
 		return aggregateHavingExpr{op: aggregateHavingIN, index: pos, values: values}, nil
 
 	default:
-		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", qexec.ErrInvalidQuery)
+		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", rbierrors.ErrInvalidQuery)
 	}
 }
 
 func prepareAggregateHavingOutput(expr qx.Expr, outputs map[string]int) (int, error) {
 	if expr.Kind != qx.KindOUT || expr.Name == "" {
-		return 0, fmt.Errorf("%w: aggregate HAVING left side supports only OUT references", qexec.ErrInvalidQuery)
+		return 0, fmt.Errorf("%w: aggregate HAVING left side supports only OUT references", rbierrors.ErrInvalidQuery)
 	}
 	pos, ok := outputs[expr.Name]
 	if !ok {
-		return 0, fmt.Errorf("%w: unknown aggregate output %q in HAVING", qexec.ErrInvalidQuery, expr.Name)
+		return 0, fmt.Errorf("%w: unknown aggregate output %q in HAVING", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 	return pos, nil
 }
@@ -550,7 +552,7 @@ func aggregateHavingPredicateOp(name string) aggregateHavingOp {
 
 func aggregateLiteralValue(expr qx.Expr) (Value, error) {
 	if expr.Kind != qx.KindLIT {
-		return Value{}, fmt.Errorf("%w: aggregate HAVING right side supports only literals", qexec.ErrInvalidQuery)
+		return Value{}, fmt.Errorf("%w: aggregate HAVING right side supports only literals", rbierrors.ErrInvalidQuery)
 	}
 	return aggregateLiteralRawValue(expr.Value)
 }
@@ -587,24 +589,24 @@ func aggregateLiteralRawValue(raw any) (Value, error) {
 		return Value{num: math.Float64bits(v.Float()), any: ValueKindFloat}, nil
 
 	default:
-		return Value{}, fmt.Errorf("%w: unsupported aggregate HAVING literal type %T", qexec.ErrInvalidQuery, raw)
+		return Value{}, fmt.Errorf("%w: unsupported aggregate HAVING literal type %T", rbierrors.ErrInvalidQuery, raw)
 	}
 }
 
 func (q *Query) aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 	if expr.Kind != qx.KindLIT {
-		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 	}
 	raw := reflect.ValueOf(expr.Value)
 	if !raw.IsValid() {
-		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 	}
 	raw, isNil := schema.UnwrapQueryValue(raw)
 	if isNil || raw.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 	}
 	if raw.Len() == 0 {
-		return nil, fmt.Errorf("%w: aggregate HAVING IN: no values provided", qexec.ErrInvalidQuery)
+		return nil, fmt.Errorf("%w: aggregate HAVING IN: no values provided", rbierrors.ErrInvalidQuery)
 	}
 
 	start := len(q.havingValues)
@@ -622,19 +624,19 @@ func (q *Query) aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 
 func prepareAggregateGroup(s *schema.Schema, expr qx.Expr) (aggregateFieldRef, error) {
 	if expr.Kind != qx.KindREF || expr.Name == "" {
-		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", qexec.ErrInvalidQuery)
+		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", rbierrors.ErrInvalidQuery)
 	}
 
 	acc, ok := s.IndexedByName[expr.Name]
 	if !ok {
 		if _, measure := s.MeasuresByName[expr.Name]; measure {
-			return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY measure field %q is not supported", qexec.ErrInvalidQuery, expr.Name)
+			return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY measure field %q is not supported", rbierrors.ErrInvalidQuery, expr.Name)
 		}
-		return aggregateFieldRef{}, fmt.Errorf("%w: no index for group field %q", qexec.ErrInvalidQuery, expr.Name)
+		return aggregateFieldRef{}, fmt.Errorf("%w: no index for group field %q", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 
 	if acc.Field.Slice {
-		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY slice field %q is not supported", qexec.ErrInvalidQuery, expr.Name)
+		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY slice field %q is not supported", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 
 	out := expr.Alias
@@ -647,7 +649,7 @@ func prepareAggregateGroup(s *schema.Schema, expr qx.Expr) (aggregateFieldRef, e
 
 func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, error) {
 	if expr.Kind != qx.KindOP {
-		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric must be an operation", qexec.ErrInvalidQuery)
+		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric must be an operation", rbierrors.ErrInvalidQuery)
 	}
 	metric := aggregateMetric{out: expr.Alias}
 	switch expr.Name {
@@ -664,7 +666,7 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 		if len(expr.Args) == 1 && expr.Args[0].Kind == qx.KindOP && expr.Args[0].Name == qx.OpDISTINCT {
 			metric.op = aggregateMetricCountDistinct
 			if len(expr.Args[0].Args) != 1 || expr.Args[0].Args[0].Kind != qx.KindREF || expr.Args[0].Args[0].Name == "" {
-				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) supports only direct field reference", qexec.ErrInvalidQuery)
+				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) supports only direct field reference", rbierrors.ErrInvalidQuery)
 			}
 			field, err := prepareAggregateMetricField(s, expr.Args[0].Args[0].Name, metric.op)
 			if err != nil {
@@ -688,11 +690,11 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 	case qx.OpDISTINCT:
 		metric.op = aggregateMetricDistinct
 	default:
-		return aggregateMetric{}, fmt.Errorf("%w: unsupported aggregate metric %q", qexec.ErrInvalidQuery, expr.Name)
+		return aggregateMetric{}, fmt.Errorf("%w: unsupported aggregate metric %q", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 
 	if len(expr.Args) != 1 || expr.Args[0].Kind != qx.KindREF || expr.Args[0].Name == "" {
-		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q supports only direct field reference", qexec.ErrInvalidQuery, expr.Name)
+		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q supports only direct field reference", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 
 	f, err := prepareAggregateMetricField(s, expr.Args[0].Name, metric.op)
@@ -710,16 +712,16 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 func prepareAggregateMetricField(s *schema.Schema, name string, op aggregateMetricOp) (aggregateFieldRef, error) {
 	if acc, ok := s.MeasuresByName[name]; ok {
 		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
-			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", qexec.ErrInvalidQuery, name)
+			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", rbierrors.ErrInvalidQuery, name)
 		}
 		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.Kind)}, nil
 	}
 	acc, ok := s.IndexedByName[name]
 	if !ok {
-		return aggregateFieldRef{}, fmt.Errorf("%w: no index for aggregate field %q", qexec.ErrInvalidQuery, name)
+		return aggregateFieldRef{}, fmt.Errorf("%w: no index for aggregate field %q", rbierrors.ErrInvalidQuery, name)
 	}
 	if acc.Field.Slice {
-		return aggregateFieldRef{}, fmt.Errorf("%w: aggregate over slice field %q is not supported", qexec.ErrInvalidQuery, name)
+		return aggregateFieldRef{}, fmt.Errorf("%w: aggregate over slice field %q is not supported", rbierrors.ErrInvalidQuery, name)
 	}
 
 	kind := aggregateFieldValueKind(acc.Field)
@@ -728,7 +730,7 @@ func prepareAggregateMetricField(s *schema.Schema, name string, op aggregateMetr
 			(!isAggregateSignedKind(acc.Field.Kind) &&
 				!isAggregateUnsignedKind(acc.Field.Kind) &&
 				!isAggregateFloatKind(acc.Field.Kind)) {
-			return aggregateFieldRef{}, fmt.Errorf("%w: %s requires numeric field %q", qexec.ErrInvalidQuery, aggregateMetricOpName(op), name)
+			return aggregateFieldRef{}, fmt.Errorf("%w: %s requires numeric field %q", rbierrors.ErrInvalidQuery, aggregateMetricOpName(op), name)
 		}
 	}
 
@@ -1148,7 +1150,7 @@ func (ae *aggregateExecutor) buildGroupedIDMap(
 	if level == len(q.groups) {
 		rowIndex := len(*rows)
 		if uint64(rowIndex) >= uint64(^uint32(0)) {
-			return fmt.Errorf("%w: aggregate group count exceeds runtime limit", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: aggregate group count exceeds runtime limit", rbierrors.ErrInvalidQuery)
 		}
 		row := make(Row, len(groupValues)+len(q.metrics))
 		copy(row, groupValues)
@@ -1277,7 +1279,7 @@ func appendGroupedIDSliceLeaf(
 		return false
 	})
 	if overflow {
-		return fmt.Errorf("%w: aggregate group count exceeds runtime limit", qexec.ErrInvalidQuery)
+		return fmt.Errorf("%w: aggregate group count exceeds runtime limit", rbierrors.ErrInvalidQuery)
 	}
 	if rowIndex >= 0 {
 		row := (*rows)[rowIndex]
@@ -2344,7 +2346,7 @@ func (state *aggregateMetricState) addRawMeasure(raw uint64, kind schema.Measure
 	case schema.MeasureValueFloat:
 		return state.addFloat(math.Float64frombits(raw), n)
 	default:
-		return fmt.Errorf("%w: unsupported measure value kind", qexec.ErrInvalidQuery)
+		return fmt.Errorf("%w: unsupported measure value kind", rbierrors.ErrInvalidQuery)
 	}
 }
 
@@ -2359,7 +2361,7 @@ func (state *aggregateMetricState) addMeasureSumValues(values []uint64, kind sch
 		for i := range values {
 			v := int64(values[i])
 			if (v > 0 && sum > math.MaxInt64-v) || (v < 0 && sum < math.MinInt64-v) {
-				return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+				return fmt.Errorf("%w: integer SUM overflow", rbierrors.ErrInvalidQuery)
 			}
 			sum += v
 		}
@@ -2370,7 +2372,7 @@ func (state *aggregateMetricState) addMeasureSumValues(values []uint64, kind sch
 		for i := range values {
 			v := values[i]
 			if sum > math.MaxUint64-v {
-				return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+				return fmt.Errorf("%w: unsigned SUM overflow", rbierrors.ErrInvalidQuery)
 			}
 			sum += v
 		}
@@ -2384,7 +2386,7 @@ func (state *aggregateMetricState) addMeasureSumValues(values []uint64, kind sch
 		state.floatSum = sum
 
 	default:
-		return fmt.Errorf("%w: unsupported measure value kind", qexec.ErrInvalidQuery)
+		return fmt.Errorf("%w: unsupported measure value kind", rbierrors.ErrInvalidQuery)
 	}
 
 	state.seen = true
@@ -2397,13 +2399,13 @@ func (state *aggregateMetricState) addMeasureSumRaw(raw uint64, kind schema.Meas
 	case schema.MeasureValueSigned:
 		v := int64(raw)
 		if (v > 0 && state.intSum > math.MaxInt64-v) || (v < 0 && state.intSum < math.MinInt64-v) {
-			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: integer SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		state.intSum += v
 
 	case schema.MeasureValueUnsigned:
 		if state.uintSum > math.MaxUint64-raw {
-			return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: unsigned SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		state.uintSum += raw
 
@@ -2411,7 +2413,7 @@ func (state *aggregateMetricState) addMeasureSumRaw(raw uint64, kind schema.Meas
 		state.floatSum += math.Float64frombits(raw)
 
 	default:
-		return fmt.Errorf("%w: unsupported measure value kind", qexec.ErrInvalidQuery)
+		return fmt.Errorf("%w: unsupported measure value kind", rbierrors.ErrInvalidQuery)
 	}
 
 	state.seen = true
@@ -2428,7 +2430,7 @@ func (state *aggregateMetricState) addIndexKey(key keycodec.IndexKey, n uint64) 
 	case aggregateValueFloat:
 		return state.addFloat(keycodec.Float64FromOrderedKey(raw), n)
 	default:
-		return fmt.Errorf("%w: aggregate requires numeric field %q", qexec.ErrInvalidQuery, state.metric.field.name)
+		return fmt.Errorf("%w: aggregate requires numeric field %q", rbierrors.ErrInvalidQuery, state.metric.field.name)
 	}
 }
 
@@ -2443,21 +2445,21 @@ func (state *aggregateMetricState) addValue(value Value, n uint64) error {
 	case aggregateValueSigned:
 		v, ok := value.Int()
 		if !ok {
-			return fmt.Errorf("%w: aggregate field %q has non-signed index value", qexec.ErrInvalidQuery, state.metric.field.name)
+			return fmt.Errorf("%w: aggregate field %q has non-signed index value", rbierrors.ErrInvalidQuery, state.metric.field.name)
 		}
 		return state.addSigned(v, n)
 
 	case aggregateValueUnsigned:
 		v, ok := value.Uint()
 		if !ok {
-			return fmt.Errorf("%w: aggregate field %q has non-unsigned index value", qexec.ErrInvalidQuery, state.metric.field.name)
+			return fmt.Errorf("%w: aggregate field %q has non-unsigned index value", rbierrors.ErrInvalidQuery, state.metric.field.name)
 		}
 		return state.addUnsigned(v, n)
 
 	case aggregateValueFloat:
 		v, ok := value.Float()
 		if !ok {
-			return fmt.Errorf("%w: aggregate field %q has non-float index value", qexec.ErrInvalidQuery, state.metric.field.name)
+			return fmt.Errorf("%w: aggregate field %q has non-float index value", rbierrors.ErrInvalidQuery, state.metric.field.name)
 		}
 		return state.addFloat(v, n)
 
@@ -2466,7 +2468,7 @@ func (state *aggregateMetricState) addValue(value Value, n uint64) error {
 			state.addBest(value)
 			return nil
 		}
-		return fmt.Errorf("%w: aggregate requires numeric field %q", qexec.ErrInvalidQuery, state.metric.field.name)
+		return fmt.Errorf("%w: aggregate requires numeric field %q", rbierrors.ErrInvalidQuery, state.metric.field.name)
 	}
 }
 
@@ -2486,14 +2488,14 @@ func (state *aggregateMetricState) addSigned(v int64, n uint64) error {
 		state.floatSum += float64(v) * float64(n)
 	} else {
 		if n > uint64(math.MaxInt64) {
-			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: integer SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		add := int64(n) * v
 		if v != 0 && add/v != int64(n) {
-			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: integer SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		if (add > 0 && state.intSum > math.MaxInt64-add) || (add < 0 && state.intSum < math.MinInt64-add) {
-			return fmt.Errorf("%w: integer SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: integer SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		state.intSum += add
 	}
@@ -2518,11 +2520,11 @@ func (state *aggregateMetricState) addUnsigned(v uint64, n uint64) error {
 		state.floatSum += float64(v) * float64(n)
 	} else {
 		if n != 0 && v > math.MaxUint64/n {
-			return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: unsigned SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		add := v * n
 		if state.uintSum > math.MaxUint64-add {
-			return fmt.Errorf("%w: unsigned SUM overflow", qexec.ErrInvalidQuery)
+			return fmt.Errorf("%w: unsigned SUM overflow", rbierrors.ErrInvalidQuery)
 		}
 		state.uintSum += add
 	}

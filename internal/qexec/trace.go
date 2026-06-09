@@ -4,12 +4,13 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type Trace struct {
-	sink  func(TraceEvent)
+	sink  func(rbitrace.Event)
 	start time.Time
-	ev    TraceEvent
+	ev    rbitrace.Event
 }
 
 func (r *Runtime) TraceSamplingEnabled() bool {
@@ -23,7 +24,7 @@ func (r *Runtime) BeginTrace(q qir.Shape, orderField string) *Trace {
 	}
 
 	tr := new(Trace)
-	tr.ev = TraceEvent{
+	tr.ev = rbitrace.Event{
 		Timestamp: time.Now(),
 		Offset:    q.Offset,
 		Limit:     q.Limit,
@@ -60,9 +61,9 @@ func (t *Trace) Full() bool {
 	return t != nil && t.sink != nil
 }
 
-func (t *Trace) Event() TraceEvent {
+func (t *Trace) Event() rbitrace.Event {
 	if t == nil {
-		return TraceEvent{}
+		return rbitrace.Event{}
 	}
 	return t.ev
 }
@@ -74,11 +75,11 @@ func (t *Trace) RowsExamined() uint64 {
 	return t.ev.RowsExamined
 }
 
-func (t *Trace) SetPlan(plan PlanName) {
+func (t *Trace) SetPlan(plan rbitrace.PlanName) {
 	if t == nil {
 		return
 	}
-	t.ev.Plan = string(plan)
+	t.ev.Plan = plan
 }
 
 func (t *Trace) AddExamined(n uint64) {
@@ -158,7 +159,7 @@ func (t *Trace) SetEarlyStopReason(reason string) {
 	t.ev.EarlyStopReason = reason
 }
 
-func (t *Trace) SetORBranches(branches []TraceORBranch) {
+func (t *Trace) SetORBranches(branches []rbitrace.ORBranch) {
 	if !t.Full() {
 		return
 	}
@@ -181,35 +182,7 @@ func (t *Trace) SetEstimated(rows uint64, estCost, fallbackCost float64) {
 	t.ev.FallbackCost = fallbackCost
 }
 
-func (t *Trace) SetORRoute(route TraceORRoute) {
-	if !t.Full() {
-		return
-	}
-	t.ev.ORRoute.Route = route.Route
-	t.ev.ORRoute.Reason = route.Reason
-	if route.Selected != "" {
-		t.ev.ORRoute.Selected = route.Selected
-		t.ev.ORRoute.Rejected = route.Rejected
-		t.ev.ORRoute.SelectedCost = route.SelectedCost
-		t.ev.ORRoute.RejectedCost = route.RejectedCost
-		t.ev.ORRoute.SelectedWork = route.SelectedWork
-		t.ev.ORRoute.RejectedWork = route.RejectedWork
-		t.ev.ORRoute.ExpectedRows = route.ExpectedRows
-		t.ev.ORRoute.UnionRows = route.UnionRows
-		t.ev.ORRoute.SumRows = route.SumRows
-		t.ev.ORRoute.CacheState = route.CacheState
-		t.ev.ORRoute.PostingBuild = route.PostingBuild
-	}
-	t.ev.ORRoute.KWayCost = route.KWayCost
-	t.ev.ORRoute.FallbackCost = route.FallbackCost
-	t.ev.ORRoute.Overlap = route.Overlap
-	t.ev.ORRoute.AvgChecks = route.AvgChecks
-	t.ev.ORRoute.HasPrefixNonOrder = route.HasPrefixNonOrder
-	t.ev.ORRoute.HasSelectiveLead = route.HasSelectiveLead
-	t.ev.ORRoute.FallbackCollectFast = route.FallbackCollectFast
-}
-
-func (t *Trace) SetORSelectionRoute(route TraceORRoute) {
+func (t *Trace) SetORSelectionRoute(route rbitrace.ORRoute) {
 	if !t.Full() {
 		return
 	}
@@ -231,7 +204,7 @@ func (t *Trace) SetORSelectionRoute(route TraceORRoute) {
 	t.ev.ORRoute.FallbackCollectFast = route.FallbackCollectFast
 }
 
-func (t *Trace) SetOrderedLimitRoute(route TraceOrderedLimitRoute) {
+func (t *Trace) SetOrderedLimitRoute(route rbitrace.OrderedLimitRoute) {
 	if !t.Full() {
 		return
 	}
@@ -254,7 +227,7 @@ func (t *Trace) SetOrderedLimitRuntimeFallback(reason string) {
 	t.ev.OrderedLimitRoute.RuntimeFallbackReason = reason
 }
 
-func (t *Trace) SetNoOrderLimitRoute(route TraceNoOrderLimitRoute) {
+func (t *Trace) SetNoOrderLimitRoute(route rbitrace.NoOrderLimitRoute) {
 	if !t.Full() {
 		return
 	}
@@ -277,14 +250,14 @@ func (t *Trace) SetNoOrderLimitRuntimeFallback(reason string) {
 	t.ev.NoOrderLimitRoute.RuntimeFallbackReason = reason
 }
 
-func (t *Trace) SetArrayPosOrderRoute(route TraceArrayPosOrderRoute) {
+func (t *Trace) SetArrayPosOrderRoute(route rbitrace.ArrayPosOrderRoute) {
 	if !t.Full() {
 		return
 	}
 	t.ev.ArrayPosOrderRoute = route
 }
 
-func (t *Trace) SetAggregateRoute(route TraceAggregateRoute) {
+func (t *Trace) SetAggregateRoute(route rbitrace.AggregateRoute) {
 	if !t.Full() {
 		return
 	}

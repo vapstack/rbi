@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type aggregateTestRec struct {
@@ -1692,9 +1693,9 @@ func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec]
 }
 
 func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -1719,15 +1720,15 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanCountScalarLookup) {
-		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	if last.Plan != rbitrace.PlanCountScalarLookup {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanCountScalarLookup, last.Plan)
 	}
 }
 
 func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -1754,8 +1755,8 @@ func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanAggregate) {
-		t.Fatalf("expected plan %q, got %q", PlanAggregate, last.Plan)
+	if last.Plan != rbitrace.PlanAggregate {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanAggregate, last.Plan)
 	}
 	if last.AggregateRoute.Selected != "row_count" || last.AggregateRoute.FilterInput != "cardinality" {
 		t.Fatalf("expected aggregate row-count route, got %+v", last.AggregateRoute)
@@ -1763,10 +1764,10 @@ func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
 }
 
 func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -1803,8 +1804,8 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanAggregate) {
-		t.Fatalf("expected plan %q, got %q", PlanAggregate, last.Plan)
+	if last.Plan != rbitrace.PlanAggregate {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanAggregate, last.Plan)
 	}
 	if last.AggregateRoute.Selected != "row_count" || last.AggregateRoute.FilterInput != "cardinality" {
 		t.Fatalf("expected aggregate row-count route, got %+v", last.AggregateRoute)
@@ -1812,10 +1813,10 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 }
 
 func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db := countOpenORBenchSharedDB(t, "test_count_and_set_range_materialized.db", Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -1840,16 +1841,16 @@ func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
-	if last.Plan != string(PlanCountMaterialized) {
-		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	if last.Plan != rbitrace.PlanCountMaterialized {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanCountMaterialized, last.Plan)
 	}
 }
 
 func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db := countOpenORBenchSharedDB(t, "test_count_or_materialized_promotes.db", Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -1880,8 +1881,8 @@ func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatalf("expected first trace event")
 	}
-	if plan := events[len(events)-1].Plan; plan != string(PlanCountORPredicates) {
-		t.Fatalf("expected first plan %q, got %q", PlanCountORPredicates, plan)
+	if plan := events[len(events)-1].Plan; plan != rbitrace.PlanCountORPredicates {
+		t.Fatalf("expected first plan %q, got %q", rbitrace.PlanCountORPredicates, plan)
 	}
 
 	second, err := db.Count(expr)
@@ -1891,8 +1892,8 @@ func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 	if second != first {
 		t.Fatalf("count mismatch between repeated runs: first=%d second=%d", first, second)
 	}
-	if plan := events[len(events)-1].Plan; plan != string(PlanCountMaterialized) {
-		t.Fatalf("expected second plan %q, got %q", PlanCountMaterialized, plan)
+	if plan := events[len(events)-1].Plan; plan != rbitrace.PlanCountMaterialized {
+		t.Fatalf("expected second plan %q, got %q", rbitrace.PlanCountMaterialized, plan)
 	}
 
 	want := countByExprBitmapCountORBench(t, db, expr)
@@ -2217,10 +2218,10 @@ func countOpenORBenchSharedDB(t *testing.T, name string, opts Options) *DB[uint6
 func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -2255,18 +2256,18 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
-	if ev.Plan != string(PlanCountScalarInSplit) {
-		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	if ev.Plan != rbitrace.PlanCountScalarInSplit {
+		t.Fatalf("expected %q, got %q", rbitrace.PlanCountScalarInSplit, ev.Plan)
 	}
 }
 
 func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -2337,7 +2338,7 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
-	if ev.Plan != string(PlanCountScalarInSplit) {
-		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	if ev.Plan != rbitrace.PlanCountScalarInSplit {
+		t.Fatalf("expected %q, got %q", rbitrace.PlanCountScalarInSplit, ev.Plan)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type qaggGroupedOrdinaryMapRec struct {
@@ -122,7 +123,7 @@ func TestGroupedOrdinaryMapRouteMatchesRecursive(t *testing.T) {
 		}
 		entries[i] = snapshot.BatchEntry{ID: row * 1_000_000, New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -174,7 +175,7 @@ func TestGroupedOrdinaryByIDSharedFieldOverflowReturnsError(t *testing.T) {
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -226,7 +227,7 @@ func TestGroupedOrdinaryByIDMapSharedFieldOverflowReturnsError(t *testing.T) {
 		rows[i] = qaggGroupedOrdinaryOverflowRec{Group: group, Value: value}
 		entries[i] = snapshot.BatchEntry{ID: uint64(i+1) * 1_000_000, New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
@@ -501,7 +502,7 @@ func TestCountDistinctUniqueFieldUsesNonNullFilterCardinality(t *testing.T) {
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 	execRuntime := qexec.NewRuntime(qexec.Config{Schema: rt})
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
@@ -994,14 +995,14 @@ func qaggSparseRows() ([]qaggTestRec, []uint64) {
 	}, []uint64{1, 20_000_000, 40_000_000, 60_000_000}
 }
 
-func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *qaggTestDB {
+func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(rbitrace.Event)) *qaggTestDB {
 	t.Helper()
 
 	rt, err := schema.Compile(reflect.TypeFor[qaggTestRec](), schema.Config{})
 	if err != nil {
 		t.Fatalf("schema.Compile: %v", err)
 	}
-	var sink func(qexec.TraceEvent)
+	var sink func(rbitrace.Event)
 	if len(traceSink) > 0 {
 		sink = traceSink[0]
 	}
@@ -1015,7 +1016,7 @@ func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *q
 	for i := range rows {
 		entries[i] = snapshot.BatchEntry{ID: ids[i], New: unsafe.Pointer(&rows[i])}
 	}
-	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, nil, entries)
+	snap := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, entries)
 	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
 }
 

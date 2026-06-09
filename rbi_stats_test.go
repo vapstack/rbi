@@ -1,14 +1,26 @@
 package rbi
 
 import (
+	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
+
 	"github.com/vapstack/qx"
+	"go.etcd.io/bbolt"
 )
+
+type statsShapeRec struct {
+	Name   string `db:"name" rbi:"index"`
+	Email  string `db:"email" rbi:"unique"`
+	Amount int64  `db:"amount" rbi:"measure"`
+}
 
 func TestAPI_Stats_ZeroAfterClose(t *testing.T) {
 	db, _ := openTempDBUint64(t)
@@ -18,8 +30,12 @@ func TestAPI_Stats_ZeroAfterClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	var zero Stats[uint64]
-	if got := db.Stats(); got != zero {
+	var zero rbistats.DB[uint64]
+	got, err := db.Stats()
+	if !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("expected rbierrors.ErrClosed after Close, got %v", err)
+	}
+	if got != zero {
 		t.Fatalf("expected zero Stats after Close, got %+v", got)
 	}
 }
@@ -32,7 +48,7 @@ func TestAPI_IndexStats_ZeroAfterClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if got := db.IndexStats(); !reflect.DeepEqual(got, IndexStats{}) {
+	if got := db.IndexStats(); !reflect.DeepEqual(got, rbistats.Index{}) {
 		t.Fatalf("expected zero IndexStats after Close, got %+v", got)
 	}
 }
@@ -45,9 +61,39 @@ func TestAPI_SnapshotStats_ZeroAfterClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	var zero SnapshotStats
+	var zero rbistats.Snapshot
 	if got := db.SnapshotStats(); got != zero {
 		t.Fatalf("expected zero SnapshotStats after Close, got %+v", got)
+	}
+}
+
+func TestAPI_Stats_ReportsCheapSchemaAndModeFacts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shape.db")
+	db, raw := openBoltAndNew[uint64, statsShapeRec](t, path)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Mode != rbistats.ModeIndexed {
+		t.Fatalf("Mode=%d want indexed", st.Mode)
+	}
+	if st.StringKeys {
+		t.Fatalf("StringKeys=true for uint64 DB")
+	}
+	if st.IndexFieldCount != 3 {
+		t.Fatalf("IndexFieldCount=%d want indexed fields 3", st.IndexFieldCount)
+	}
+	if st.MeasureFieldCount != 1 {
+		t.Fatalf("MeasureFieldCount=%d want 1", st.MeasureFieldCount)
+	}
+	if st.UniqueFieldCount != 1 {
+		t.Fatalf("UniqueFieldCount=%d want 1", st.UniqueFieldCount)
 	}
 }
 
@@ -134,7 +180,10 @@ func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 80; i++ {
-				_ = db.Stats()
+				if _, err := db.Stats(); err != nil {
+					errCh <- err
+					return
+				}
 				_ = db.IndexStats()
 				_ = db.SnapshotStats()
 				_ = db.PlannerStats()
@@ -183,7 +232,7 @@ func TestAPI_PlannerStats_ReturnMapsAreCallerOwned(t *testing.T) {
 		t.Fatalf("expected age planner stats to exist: %+v", s1)
 	}
 
-	s1.Fields["age"] = PlannerFieldStats{}
+	s1.Fields["age"] = rbistats.PlannerField{}
 	delete(s1.Fields, "name")
 
 	s2 := db.PlannerStats()
@@ -207,15 +256,18 @@ func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	st := db.Stats()
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	if st.KeyCount != 2 {
 		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
 	if st.LastKey != 2 {
 		t.Fatalf("expected Stats.LastKey=2, got %d", st.LastKey)
 	}
-	if st.FieldCount == 0 {
-		t.Fatalf("expected Stats.FieldCount > 0")
+	if st.IndexFieldCount == 0 {
+		t.Fatalf("expected Stats.IndexFieldCount > 0")
 	}
 	if st.AutoBatchCount == 0 {
 		t.Fatalf("expected stats auto-batch count > 0")
@@ -273,7 +325,10 @@ func TestStats_PreservesIndexTimingFields(t *testing.T) {
 	db.stats.BuildRPS = 456
 	db.stats.LoadTime = 789 * time.Millisecond
 
-	st := db.Stats()
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 
 	if st.BuildTime != db.stats.BuildTime {
 		t.Fatalf("expected BuildTime=%v, got %v", db.stats.BuildTime, st.BuildTime)
@@ -283,6 +338,168 @@ func TestStats_PreservesIndexTimingFields(t *testing.T) {
 	}
 	if st.LoadTime != db.stats.LoadTime {
 		t.Fatalf("expected LoadTime=%v, got %v", db.stats.LoadTime, st.LoadTime)
+	}
+}
+
+func TestStats_IndexedSnapshotFactsNumeric(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	for _, id := range []uint64{7, 2, 4} {
+		mustSetAPIRec(t, db, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
+	}
+	if err := db.Delete(7); err != nil {
+		t.Fatalf("Delete(7): %v", err)
+	}
+
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.KeyCount != 2 || st.LastKey != 4 {
+		t.Fatalf("Stats=%+v want key_count=2 last_key=4", st)
+	}
+	if st.Mode != rbistats.ModeIndexed || st.StringKeys {
+		t.Fatalf("Stats mode/key kind=%+v want indexed uint64", st)
+	}
+	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
+	}
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	st, err = db.Stats()
+	if err != nil {
+		t.Fatalf("Stats after truncate: %v", err)
+	}
+	if st.KeyCount != 0 || st.LastKey != 0 {
+		t.Fatalf("Stats after truncate=%+v want empty key facts", st)
+	}
+	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+		t.Fatalf("SnapshotSequence after truncate=%d want %d", st.SnapshotSequence, want)
+	}
+}
+
+func TestStats_TransparentNumericLeavesKeyCountZero(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{Index: map[string]IndexKind{}, AutoBatchMax: 1})
+
+	for _, id := range []uint64{3, 9, 1} {
+		mustSetAPIRec(t, db, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
+	}
+
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.KeyCount != 0 || st.LastKey != 9 || st.IndexFieldCount != 0 {
+		t.Fatalf("Stats=%+v want key_count=0 last_key=9 index_field_count=0", st)
+	}
+	if st.Mode != rbistats.ModeTransparent || st.StringKeys {
+		t.Fatalf("Stats mode/key kind=%+v want transparent uint64", st)
+	}
+	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
+	}
+}
+
+func TestStats_IndexedStringReportsCountWithoutLastKey(t *testing.T) {
+	db, _ := openTempDBString(t)
+
+	for _, id := range []string{"b", "aa", "c"} {
+		if err := db.Set(id, &Rec{Name: id}); err != nil {
+			t.Fatalf("Set(%q): %v", id, err)
+		}
+	}
+	if err := db.Delete("c"); err != nil {
+		t.Fatalf("Delete(c): %v", err)
+	}
+
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.KeyCount != 2 || st.LastKey != "b" {
+		t.Fatalf("Stats=%+v want key_count=2 last_key=b", st)
+	}
+	if st.Mode != rbistats.ModeIndexed || !st.StringKeys {
+		t.Fatalf("Stats mode/key kind=%+v want indexed string", st)
+	}
+	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
+	}
+}
+
+func TestStats_TransparentStringLeavesKeyCountZero(t *testing.T) {
+	db, _ := openTempDBString(t, Options{Index: map[string]IndexKind{}, AutoBatchMax: 1})
+
+	for _, id := range []string{"b", "aa", "c"} {
+		if err := db.Set(id, &Rec{Name: id}); err != nil {
+			t.Fatalf("Set(%q): %v", id, err)
+		}
+	}
+
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.KeyCount != 0 || st.LastKey != "c" || st.IndexFieldCount != 0 {
+		t.Fatalf("Stats=%+v want key_count=0 last_key=c index_field_count=0", st)
+	}
+	if st.Mode != rbistats.ModeTransparent || !st.StringKeys {
+		t.Fatalf("Stats mode/key kind=%+v want transparent string", st)
+	}
+	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
+	}
+}
+
+func TestStats_ErrorReturnsZeroValue(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30})
+
+	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+		return tx.DeleteBucket(db.BucketName())
+	}); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+
+	var zero rbistats.DB[uint64]
+	st, err := db.Stats()
+	if err == nil {
+		t.Fatal("expected Stats error")
+	}
+	if st != zero {
+		t.Fatalf("Stats on missing bucket=%+v want zero", st)
+	}
+}
+
+func TestStats_BoltReadSetupFailureReturnsZeroValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats_bolt_closed.db")
+	raw, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	db, err := New[uint64, Rec](raw, testOptions(Options{
+		BucketName:        "stats_bolt_closed",
+		DisableIndexStore: true,
+	}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	var zero rbistats.DB[uint64]
+	st, err := db.Stats()
+	if err == nil {
+		t.Fatal("expected Stats error")
+	}
+	if st != zero {
+		t.Fatalf("Stats on closed bbolt=%+v want zero", st)
 	}
 }
 
@@ -298,7 +515,10 @@ func TestComponentAccessors(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	st := db.Stats()
+	st, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	if st.KeyCount != 2 {
 		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}

@@ -554,7 +554,7 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 		return nil, fmt.Errorf("alloc turnover ring has no sample ordinals")
 	}
 
-	entries := make([]allocTurnoverEntry, 0, len(ords))
+	ids := make([]uint64, 0, len(ords))
 	want := 0
 	pos := 0
 	err := handle.DB.ScanKeys(0, func(id uint64) (bool, error) {
@@ -565,13 +565,22 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 		if pos != ords[want] {
 			return true, nil
 		}
-		rec, getErr := handle.DB.Get(id)
-		if getErr != nil {
-			return false, getErr
+		ids = append(ids, id)
+		want++
+		return want < len(ords), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]allocTurnoverEntry, 0, len(ids))
+	for _, id := range ids {
+		rec, err := handle.DB.Get(id)
+		if err != nil {
+			return nil, err
 		}
 		if rec == nil {
-			want++
-			return true, nil
+			continue
 		}
 		entries = append(entries, allocTurnoverEntry{
 			id:        id,
@@ -579,11 +588,6 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 			altPatch:  allocAltPatch(rec),
 		})
 		handle.DB.ReleaseRecords(rec)
-		want++
-		return want < len(ords), nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("alloc turnover ring is empty")

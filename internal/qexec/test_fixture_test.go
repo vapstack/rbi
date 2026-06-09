@@ -15,11 +15,13 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 const (
@@ -28,14 +30,13 @@ const (
 	testNumericRangeBucketSize = 512
 	testNumericRangeMinKeys    = 8192
 	testNumericRangeMinSpan    = 1024
-	testRandStreamMix          = 0x9e3779b97f4a7c15
 	nilIndexEntryKey           = indexdata.NilIndexEntryKey
 )
 
 type Options struct {
 	AnalyzeInterval time.Duration
 
-	TraceSink        func(TraceEvent)
+	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
 
 	SnapshotMaterializedPredCacheMaxEntries     int
@@ -79,7 +80,7 @@ type PtrIntRec struct {
 }
 
 type testOptions struct {
-	TraceSink        func(TraceEvent)
+	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
 
 	NumericRangeBucketSize         int
@@ -349,7 +350,7 @@ func (db *DB[K, V]) Close() error {
 
 func (db *DB[K, V]) publish(entries []snapshot.BatchEntry) {
 	db.engine.seq++
-	next := snapshot.Build(db.engine.seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.cfg, nil, nil, entries)
+	next := snapshot.Build(db.engine.seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.cfg, nil, entries)
 	db.engine.snapshot.Publish(next)
 }
 
@@ -553,8 +554,7 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 }
 
 func newRand(seed int64) *rand.Rand {
-	s := uint64(seed)
-	return rand.New(rand.NewPCG(s, s^testRandStreamMix))
+	return mathutil.NewRand(seed)
 }
 
 func cardinalityByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
@@ -628,7 +628,7 @@ func (db *testDB) clearCurrentSnapshotCaches() {
 func (db *testDB) seedData(t testing.TB, n int) []uint64 {
 	t.Helper()
 
-	r := rand.New(rand.NewPCG(1, 1^testRandStreamMix))
+	r := mathutil.NewRand(1)
 	ids := make([]uint64, 0, n)
 	vals := make([]testRec, n)
 	entries := make([]snapshot.BatchEntry, n)
@@ -666,7 +666,7 @@ func (db *testDB) seedData(t testing.TB, n int) []uint64 {
 	}
 
 	db.seq++
-	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, entries)
 	return ids
 }
 
@@ -680,7 +680,7 @@ func (db *testDB) seedGeneratedData(t testing.TB, n int, gen func(uint64) testRe
 		entries[i-1] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i-1])}
 	}
 	db.seq++
-	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, nil, entries)
+	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, entries)
 }
 
 func (db *testDB) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
@@ -1023,7 +1023,7 @@ func (qe *queryEngine) tryCandidateLimitRoute(q *qx.QX, trace *Trace) ([]uint64,
 	view := qe.currentQueryViewForTests()
 	if viewQ.HasOrder {
 		out, ok, plan, err := view.executeOrderedLimit(&viewQ, trace)
-		if ok && plan == PlanCandidateOrder {
+		if ok && plan == rbitrace.PlanCandidateOrder {
 			if trace != nil {
 				trace.SetPlan(plan)
 			}
@@ -1032,7 +1032,7 @@ func (qe *queryEngine) tryCandidateLimitRoute(q *qx.QX, trace *Trace) ([]uint64,
 		return nil, false, err
 	}
 	out, ok, plan, err := view.executeNoOrderLimit(&viewQ, trace)
-	if ok && plan == PlanCandidateNoOrder {
+	if ok && plan == rbitrace.PlanCandidateNoOrder {
 		if trace != nil {
 			trace.SetPlan(plan)
 		}
@@ -1443,10 +1443,10 @@ func testValidateNoOrderPage(q *qx.QX, got []uint64, full []uint64) error {
 
 type traceContractRecorder struct {
 	mu     sync.Mutex
-	events []TraceEvent
+	events []rbitrace.Event
 }
 
-func (r *traceContractRecorder) sink(ev TraceEvent) {
+func (r *traceContractRecorder) sink(ev rbitrace.Event) {
 	r.mu.Lock()
 	r.events = append(r.events, ev)
 	r.mu.Unlock()
@@ -1459,7 +1459,7 @@ func (r *traceContractRecorder) mark() int {
 	return n
 }
 
-func (r *traceContractRecorder) lastSince(t testing.TB, mark int) TraceEvent {
+func (r *traceContractRecorder) lastSince(t testing.TB, mark int) rbitrace.Event {
 	t.Helper()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1469,7 +1469,7 @@ func (r *traceContractRecorder) lastSince(t testing.TB, mark int) TraceEvent {
 	return r.events[len(r.events)-1]
 }
 
-func traceContractAssertQueryResultTrace(t testing.TB, ev TraceEvent, rowsReturned uint64) {
+func traceContractAssertQueryResultTrace(t testing.TB, ev rbitrace.Event, rowsReturned uint64) {
 	t.Helper()
 	if ev.Timestamp.IsZero() {
 		t.Fatalf("expected trace timestamp, trace=%+v", ev)

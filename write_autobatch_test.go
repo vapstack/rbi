@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
+
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
@@ -18,7 +21,7 @@ import (
 func TestAutoBatchMissingBucketRollsBackWriteTx(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		return tx.DeleteBucket(db.bucket)
+		return tx.DeleteBucket(db.dataBucket)
 	}); err != nil {
 		t.Fatalf("delete bucket: %v", err)
 	}
@@ -495,7 +498,7 @@ func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 	}
 
 	err := db.Patch(1, []Field{{Name: "email", Value: "b@x"}})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected unique violation for conflicting email patch, got: %v", err)
 	}
 
@@ -516,7 +519,7 @@ func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *te
 	})
 
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -836,7 +839,7 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 						Code:  1 + r.IntN(6),
 						Tags:  []string{fmt.Sprintf("w%d", r.IntN(3))},
 					})
-					if err != nil && !errors.Is(err, ErrUniqueViolation) {
+					if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 						reportErr(fmt.Errorf("Set(%d): %w", id, err))
 						return
 					}
@@ -848,12 +851,12 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 						patch = []Field{{Name: "tags", Value: []string{fmt.Sprintf("p%d", r.IntN(4))}}}
 					}
 					err := db.Patch(id, patch)
-					if err != nil && !errors.Is(err, ErrUniqueViolation) {
+					if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 						reportErr(fmt.Errorf("Patch(%d): %w", id, err))
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil && !errors.Is(err, ErrUniqueViolation) {
+					if err := db.Delete(id); err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 						reportErr(fmt.Errorf("Delete(%d): %w", id, err))
 						return
 					}
@@ -1042,11 +1045,11 @@ func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 func waitAutoBatchExtraStats(
 	tb testing.TB,
 	db interface {
-		AutoBatchStats() AutoBatchStats
+		AutoBatchStats() rbistats.AutoBatch
 	},
 	desc string,
-	ok func(AutoBatchStats) bool,
-) AutoBatchStats {
+	ok func(rbistats.AutoBatch) bool,
+) rbistats.AutoBatch {
 	tb.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1067,7 +1070,7 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 
 	var got *V
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
+		bucket := tx.Bucket(db.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -1076,7 +1079,11 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 		if raw == nil {
 			return nil
 		}
-		value, err := db.decode(raw)
+		payload, err := rawPayloadForTest(db, raw)
+		if err != nil {
+			return err
+		}
+		value, err := db.decode(payload)
 		if err != nil {
 			return err
 		}
@@ -1102,8 +1109,8 @@ func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
 	}
 
 	err := db.Set(1, &Rec{Name: "closed", Age: 10})
-	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("Set after Close error = %v, want ErrClosed", err)
+	if !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("Set after Close error = %v, want rbierrors.ErrClosed", err)
 	}
 
 	after := db.AutoBatchStats()
@@ -1161,7 +1168,7 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 		)
 	}()
 
-	waitAutoBatchExtraStats(t, db, "in-flight+queued state", func(st AutoBatchStats) bool {
+	waitAutoBatchExtraStats(t, db, "in-flight+queued state", func(st rbistats.AutoBatch) bool {
 		return st.Submitted == before.Submitted+2 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+1 &&
@@ -1173,7 +1180,7 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 		waitingDone <- db.BatchDelete([]uint64{4, 5})
 	}()
 
-	waitAutoBatchExtraStats(t, db, "in-flight+queued+waiting state", func(st AutoBatchStats) bool {
+	waitAutoBatchExtraStats(t, db, "in-flight+queued+waiting state", func(st rbistats.AutoBatch) bool {
 		return st.Submitted == before.Submitted+3 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+1 &&
@@ -1195,8 +1202,8 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 
 	select {
 	case err := <-waitingDone:
-		if !errors.Is(err, ErrClosed) {
-			t.Fatalf("waiting writer error = %v, want ErrClosed", err)
+		if !errors.Is(err, rbierrors.ErrClosed) {
+			t.Fatalf("waiting writer error = %v, want rbierrors.ErrClosed", err)
 		}
 	case <-time.After(2 * time.Second):
 		releaseCommit()
@@ -1252,8 +1259,8 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 
 	select {
 	case err := <-queuedDone:
-		if !errors.Is(err, ErrClosed) {
-			t.Fatalf("queued grouped job error = %v, want ErrClosed", err)
+		if !errors.Is(err, rbierrors.ErrClosed) {
+			t.Fatalf("queued grouped job error = %v, want rbierrors.ErrClosed", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for queued grouped job")
@@ -1268,7 +1275,7 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 		t.Fatal("timeout waiting for Close")
 	}
 
-	after := waitAutoBatchExtraStats(t, db, "mixed close outcomes settled", func(st AutoBatchStats) bool {
+	after := waitAutoBatchExtraStats(t, db, "mixed close outcomes settled", func(st rbistats.AutoBatch) bool {
 		return st.Submitted == before.Submitted+3 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+2 &&
@@ -1399,7 +1406,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 					err = db.Delete(id)
 				}
 
-				if err != nil && !errors.Is(err, ErrUniqueViolation) {
+				if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 					reportErr(fmt.Errorf("writer id=%d: %w", id, err))
 					return
 				}
@@ -1577,11 +1584,11 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 		}
 	}
 
-	if err := awaitErr("first Set", firstDone); err != nil && !errors.Is(err, ErrClosed) {
-		t.Fatalf("first Set expected nil or ErrClosed, got: %v", err)
+	if err := awaitErr("first Set", firstDone); err != nil && !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("first Set expected nil or rbierrors.ErrClosed, got: %v", err)
 	}
-	if err := awaitErr("second Set", secondDone); !errors.Is(err, ErrClosed) {
-		t.Fatalf("second Set expected ErrClosed, got: %v", err)
+	if err := awaitErr("second Set", secondDone); !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("second Set expected rbierrors.ErrClosed, got: %v", err)
 	}
 	if err := awaitErr("Close", closeDone); err != nil {
 		t.Fatalf("Close: %v", err)

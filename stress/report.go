@@ -3,7 +3,7 @@ package main
 import (
 	"time"
 
-	"github.com/vapstack/rbi"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 const reportSchema = "rbi.stress_report/v8"
@@ -47,7 +47,7 @@ type stressReport struct {
 	BatchFinal    batchSample   `json:"batch_final"`
 	BatchSamples  []batchSample `json:"batch_samples,omitempty"`
 
-	IndexStats rbi.IndexStats `json:"index_stats"`
+	IndexStats rbistats.Index `json:"index_stats"`
 }
 
 type classReport struct {
@@ -127,12 +127,12 @@ type scopeReport struct {
 
 type snapshotSample struct {
 	CapturedAt string            `json:"captured_at"`
-	Stats      rbi.SnapshotStats `json:"stats"`
+	Stats      rbistats.Snapshot `json:"stats"`
 }
 
 type batchSample struct {
 	CapturedAt string             `json:"captured_at"`
-	Stats      rbi.AutoBatchStats `json:"stats"`
+	Stats      rbistats.AutoBatch `json:"stats"`
 	Delta      batchDelta         `json:"delta"`
 }
 

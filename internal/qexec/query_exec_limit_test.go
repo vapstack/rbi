@@ -10,10 +10,14 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbitrace"
+
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -192,9 +196,9 @@ func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
 }
 
 func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	opts := Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -226,8 +230,8 @@ func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanLimit) {
-		t.Fatalf("expected plan %q, got %q", PlanLimit, last.Plan)
+	if last.Plan != rbitrace.PlanLimit {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanLimit, last.Plan)
 	}
 	if got := last.NoOrderLimitRoute.Selected; got != plannerNoOrderLimitCandidateNoFilter.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerNoOrderLimitCandidateNoFilter.String(), last.NoOrderLimitRoute)
@@ -283,8 +287,8 @@ func TestQuery_NoOrderLimitUniverseScanCapsLargeLimitAllocation(t *testing.T) {
 			if !ok {
 				t.Fatalf("executeNoOrderLimit: ok=false")
 			}
-			if plan != PlanCandidateNoOrder {
-				t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+			if plan != rbitrace.PlanCandidateNoOrder {
+				t.Fatalf("plan=%s want %s", plan, rbitrace.PlanCandidateNoOrder)
 			}
 			if len(got) != rows {
 				t.Fatalf("len(got)=%d want %d: %v", len(got), rows, got)
@@ -418,8 +422,8 @@ func TestQuery_NoOrderLimitWideNotINUsesGenericPostsAnyState(t *testing.T) {
 	if !ok {
 		t.Fatalf("executeNoOrderLimit: ok=false")
 	}
-	if plan != PlanCandidateNoOrder {
-		t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+	if plan != rbitrace.PlanCandidateNoOrder {
+		t.Fatalf("plan=%s want %s", plan, rbitrace.PlanCandidateNoOrder)
 	}
 	if len(got) != 6 {
 		t.Fatalf("len(got)=%d want 6: %v", len(got), got)
@@ -427,10 +431,10 @@ func TestQuery_NoOrderLimitWideNotINUsesGenericPostsAnyState(t *testing.T) {
 }
 
 func TestQuery_UniqueEqNoOrder_UsesSelectorTrace(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, raw := openBoltAndNew[uint64, plannerPrecountRec](t, t.TempDir()+"/unique_eq_no_order.db", Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -461,8 +465,8 @@ func TestQuery_UniqueEqNoOrder_UsesSelectorTrace(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanUniqueEq) {
-		t.Fatalf("expected plan %q, got %q", PlanUniqueEq, last.Plan)
+	if last.Plan != rbitrace.PlanUniqueEq {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanUniqueEq, last.Plan)
 	}
 	if got := last.NoOrderLimitRoute.Selected; got != plannerNoOrderLimitCandidateUniqueEq.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerNoOrderLimitCandidateUniqueEq.String(), last.NoOrderLimitRoute)
@@ -470,10 +474,10 @@ func TestQuery_UniqueEqNoOrder_UsesSelectorTrace(t *testing.T) {
 }
 
 func TestQuery_DirectPrefixNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -501,8 +505,8 @@ func TestQuery_DirectPrefixNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanLimitPrefixNoOrder) {
-		t.Fatalf("expected plan %q, got %q", PlanLimitPrefixNoOrder, last.Plan)
+	if last.Plan != rbitrace.PlanLimitPrefixNoOrder {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanLimitPrefixNoOrder, last.Plan)
 	}
 	if got := last.NoOrderLimitRoute.Selected; got != plannerNoOrderLimitCandidateDirectPrefix.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerNoOrderLimitCandidateDirectPrefix.String(), last.NoOrderLimitRoute)
@@ -510,10 +514,10 @@ func TestQuery_DirectPrefixNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
 }
 
 func TestQuery_DirectRangeNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -531,8 +535,8 @@ func TestQuery_DirectRangeNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanLimitRangeNoOrder) {
-		t.Fatalf("expected plan %q, got %q", PlanLimitRangeNoOrder, last.Plan)
+	if last.Plan != rbitrace.PlanLimitRangeNoOrder {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanLimitRangeNoOrder, last.Plan)
 	}
 	if got := last.NoOrderLimitRoute.Selected; got != plannerNoOrderLimitCandidateDirectRange.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerNoOrderLimitCandidateDirectRange.String(), last.NoOrderLimitRoute)
@@ -597,10 +601,10 @@ func TestNoOrderLimitTraceWork_DirectRangeSeparatesRangeProbe(t *testing.T) {
 }
 
 func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -621,8 +625,8 @@ func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	if last.Plan != string(PlanMaterialized) {
-		t.Fatalf("expected plan %q, got %q", PlanMaterialized, last.Plan)
+	if last.Plan != rbitrace.PlanMaterialized {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanMaterialized, last.Plan)
 	}
 	if got := last.ArrayPosOrderRoute.Selected; got != plannerArrayPosOrderCandidateSingleHasAny.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerArrayPosOrderCandidateSingleHasAny.String(), last.ArrayPosOrderRoute)
@@ -706,10 +710,10 @@ func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilFieldIndexViewInEarlyRoute(t *
 func TestQuery_SingleExactOrderedLimit_PrefersPlannerLimitPath(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 	db, _ := openTempDBUint64(t, Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -744,8 +748,8 @@ func TestQuery_SingleExactOrderedLimit_PrefersPlannerLimitPath(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatalf("expected trace event")
 	}
-	if plan := events[len(events)-1].Plan; plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("expected %q, got %q", PlanLimitOrderBasic, plan)
+	if plan := events[len(events)-1].Plan; plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("expected %q, got %q", rbitrace.PlanLimitOrderBasic, plan)
 	}
 }
 
@@ -825,12 +829,12 @@ func TestQuery_OrderedLimitDirectShapesUseSelectorTrace(t *testing.T) {
 	cases := []struct {
 		name string
 		q    *qx.QX
-		plan PlanName
+		plan rbitrace.PlanName
 	}{
 		{
 			name: "NoFilter",
 			q:    qx.Query().Sort("age", qx.ASC).Limit(8),
-			plan: PlanLimitOrderBasic,
+			plan: rbitrace.PlanLimitOrderBasic,
 		},
 		{
 			name: "OrderFieldBounds",
@@ -838,7 +842,7 @@ func TestQuery_OrderedLimitDirectShapesUseSelectorTrace(t *testing.T) {
 				qx.GTE("age", 25),
 				qx.LT("age", 40),
 			).Sort("age", qx.ASC).Limit(8),
-			plan: PlanLimitOrderBasic,
+			plan: rbitrace.PlanLimitOrderBasic,
 		},
 	}
 
@@ -853,7 +857,7 @@ func TestQuery_OrderedLimitDirectShapesUseSelectorTrace(t *testing.T) {
 				t.Fatalf("expected non-empty result")
 			}
 			ev := recorder.lastSince(t, mark)
-			if ev.Plan != string(tc.plan) {
+			if ev.Plan != tc.plan {
 				t.Fatalf("plan=%q want %q", ev.Plan, tc.plan)
 			}
 			if ev.OrderedLimitRoute.Selected != plannerOrderedLimitCandidateOrderScan.String() {
@@ -866,12 +870,12 @@ func TestQuery_OrderedLimitDirectShapesUseSelectorTrace(t *testing.T) {
 func TestQuery_RangeNoOrderAndBoundsLimit_PrefersLimitRoute(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -898,8 +902,8 @@ func TestQuery_RangeNoOrderAndBoundsLimit_PrefersLimitRoute(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatalf("expected trace event")
 	}
-	if plan := events[len(events)-1].Plan; plan != string(PlanLimitRangeNoOrder) {
-		t.Fatalf("expected %q, got %q", PlanLimitRangeNoOrder, plan)
+	if plan := events[len(events)-1].Plan; plan != rbitrace.PlanLimitRangeNoOrder {
+		t.Fatalf("expected %q, got %q", rbitrace.PlanLimitRangeNoOrder, plan)
 	}
 	if got := events[len(events)-1].NoOrderLimitRoute.Selected; got != plannerNoOrderLimitCandidateSameFieldBounds.String() {
 		t.Fatalf("selected=%q want %q route=%+v", got, plannerNoOrderLimitCandidateSameFieldBounds.String(), events[len(events)-1].NoOrderLimitRoute)
@@ -909,12 +913,12 @@ func TestQuery_RangeNoOrderAndBoundsLimit_PrefersLimitRoute(t *testing.T) {
 func TestQuery_RangeNoOrderNegativeResidualLimit_PrefersLimitRoute(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -955,8 +959,8 @@ func TestQuery_RangeNoOrderNegativeResidualLimit_PrefersLimitRoute(t *testing.T)
 	if len(events) == 0 {
 		t.Fatalf("expected trace event")
 	}
-	if plan := events[len(events)-1].Plan; plan != string(PlanLimitRangeNoOrder) {
-		t.Fatalf("expected %q, got %q", PlanLimitRangeNoOrder, plan)
+	if plan := events[len(events)-1].Plan; plan != rbitrace.PlanLimitRangeNoOrder {
+		t.Fatalf("expected %q, got %q", rbitrace.PlanLimitRangeNoOrder, plan)
 	}
 }
 
@@ -1291,13 +1295,13 @@ func TestQuery_NoOrderLimit_EmptySnapshotValidatesPredicate(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	limitQ := qx.Query(qx.HASANY("tags", []string{})).Limit(5)
-	if _, err := db.QueryKeys(limitQ); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("limit QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(limitQ); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("limit QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 
 	noLimitQ := qx.Query(qx.HASANY("tags", []string{}))
-	if _, err := db.QueryKeys(noLimitQ); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("no-limit QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(noLimitQ); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("no-limit QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 }
 
@@ -1305,8 +1309,8 @@ func TestQuery_OrderBasicLimit_EmptySnapshotValidatesResidual(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	q := qx.Query(qx.HASANY("tags", []string{})).Sort("age", qx.ASC).Limit(5)
-	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 }
 
@@ -1325,13 +1329,13 @@ func TestQuery_ORLimit_InvalidSuffixContainsBranchReturnsError(t *testing.T) {
 		qx.CONTAINS("email", []string{"example"}),
 	} {
 		q := qx.Query(qx.OR(qx.EQ("active", true), invalid)).Limit(3)
-		if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-			t.Fatalf("no-order QueryKeys err=%v, want ErrInvalidQuery", err)
+		if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("no-order QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 		}
 
 		q = qx.Query(qx.OR(qx.EQ("active", true), invalid)).Sort("score", qx.ASC).Limit(3)
-		if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-			t.Fatalf("ordered QueryKeys err=%v, want ErrInvalidQuery", err)
+		if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("ordered QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 		}
 	}
 }
@@ -1350,8 +1354,8 @@ func TestQuery_NoOrderLimit_EmptyRangeValidatesResidual(t *testing.T) {
 		qx.LTE("score", 5.0),
 		qx.HASALL("name", []string{"u_1"}),
 	).Limit(5)
-	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 }
 
@@ -1368,8 +1372,8 @@ func TestQuery_NoOrderLimit_EmptyLeafValidatesUnsupportedResidual(t *testing.T) 
 		qx.HASANY("name", []string{"u_1"}),
 		qx.EQ("age", -1),
 	).Limit(5)
-	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 }
 
@@ -1387,8 +1391,8 @@ func TestQuery_OrderLimit_EmptyBaseLeafValidatesUnsupportedBaseOp(t *testing.T) 
 		qx.HASANY("name", []string{"u_1"}),
 		qx.EQ("age", -1),
 	).Sort("score", qx.ASC).Limit(5)
-	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
-		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
 	}
 }
 
@@ -1427,11 +1431,11 @@ func TestQuery_OrderLimit_NegatedBoolEQRespectsValueIndexer(t *testing.T) {
 }
 
 func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToLeafPredScan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -1535,8 +1539,8 @@ func TestQuery_NoOrderLimitRuntimeFallbackUsesFallbackLead(t *testing.T) {
 	if !used {
 		t.Fatalf("dispatchNoOrderLimit: used=false")
 	}
-	if plan != PlanCandidateNoOrder {
-		t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+	if plan != rbitrace.PlanCandidateNoOrder {
+		t.Fatalf("plan=%s want %s", plan, rbitrace.PlanCandidateNoOrder)
 	}
 	if !slices.Equal(out, []uint64{2_000}) {
 		t.Fatalf("out=%v want [2000]", out)
@@ -1576,17 +1580,17 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToPostingFilterScanNoTrace(t *
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("keys=%v want=%v", got, want)
 	}
-	if plan != PlanMaterialized {
-		t.Fatalf("plan=%s want %s", plan, PlanMaterialized)
+	if plan != rbitrace.PlanMaterialized {
+		t.Fatalf("plan=%s want %s", plan, rbitrace.PlanMaterialized)
 	}
 }
 
 func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardFallsBackToMaterialized(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -1621,17 +1625,17 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardFallsBackToMaterialized(t *te
 	if !ev.OrderedLimitRoute.RuntimeFallbackTriggered || ev.OrderedLimitRoute.RuntimeFallbackReason != "base_core_scan_guard" {
 		t.Fatalf("expected base-core runtime fallback, route=%+v", ev.OrderedLimitRoute)
 	}
-	if ev.Plan != string(PlanMaterialized) {
-		t.Fatalf("plan=%s want %s", ev.Plan, PlanMaterialized)
+	if ev.Plan != rbitrace.PlanMaterialized {
+		t.Fatalf("plan=%s want %s", ev.Plan, rbitrace.PlanMaterialized)
 	}
 }
 
 func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsGoodPlacement(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -1666,17 +1670,17 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsGoodPlacement(t *testing
 	if ev.OrderedLimitRoute.RuntimeFallbackTriggered {
 		t.Fatalf("unexpected base-core runtime fallback, route=%+v", ev.OrderedLimitRoute)
 	}
-	if ev.Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("plan=%s want %s", ev.Plan, PlanLimitOrderBasic)
+	if ev.Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", ev.Plan, rbitrace.PlanLimitOrderBasic)
 	}
 }
 
 func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsExpensiveMaterializedFallback(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -1727,8 +1731,8 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardKeepsExpensiveMaterializedFal
 	if route.RuntimeFallbackTriggered {
 		t.Fatalf("unexpected base-core runtime fallback, route=%+v", route)
 	}
-	if ev.Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("plan=%s want %s", ev.Plan, PlanLimitOrderBasic)
+	if ev.Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", ev.Plan, rbitrace.PlanLimitOrderBasic)
 	}
 }
 
@@ -1811,8 +1815,8 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceKeepsSmallBasePath(t *
 	if !ok {
 		t.Fatalf("executeOrderedLimit: ok=false")
 	}
-	if plan != PlanLimitOrderBasic {
-		t.Fatalf("plan=%s want %s", plan, PlanLimitOrderBasic)
+	if plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", plan, rbitrace.PlanLimitOrderBasic)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("keys=%v want=%v", got, want)
@@ -1885,8 +1889,8 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceSparseWarmMaterialized
 	if !ok {
 		t.Fatalf("executeOrderedLimit: ok=false")
 	}
-	if plan != PlanLimitOrderBasic {
-		t.Fatalf("plan=%s want %s", plan, PlanLimitOrderBasic)
+	if plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("plan=%s want %s", plan, rbitrace.PlanLimitOrderBasic)
 	}
 	want := []uint64{10_256, 10_255, 10_254, 10_253, 10_252, 10_251, 10_250, 10_249, 10_248, 10_247}
 	if !reflect.DeepEqual(got, want) {
@@ -1967,12 +1971,12 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceStopsAtCappedBaseNeed(
 }
 
 func TestQuery_OrderBasicLimit_OffsetPromotionUsesFullWindow(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
 		TraceSampleEvery:                        1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -2197,11 +2201,11 @@ func TestQuery_RangeNoOrderWithLimit_NilEQDeepOffset_ReturnsValidPage(t *testing
 func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -2285,11 +2289,11 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 func TestQuery_LimitRangeNoOrder_NoResidualDoesNotTraceOrderScanWidth(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -2360,11 +2364,11 @@ func TestQuery_LimitRangeNoOrder_NoResidualDoesNotTraceOrderScanWidth(t *testing
 func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
 	db, _ := openTempDBUint64(t, Options{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			mu.Lock()
 			events = append(events, ev)
 			mu.Unlock()
@@ -2618,8 +2622,8 @@ func TestQuery_OrderBasicLimit_ValidatesResidualBeforeEmptyOrderRange(t *testing
 		).Sort("age", qx.ASC).Offset(offset).Limit(5)
 
 		_, err := db.QueryKeys(q)
-		if !errors.Is(err, ErrInvalidQuery) {
-			t.Fatalf("offset=%d err=%v, want ErrInvalidQuery", offset, err)
+		if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("offset=%d err=%v, want rbierrors.ErrInvalidQuery", offset, err)
 		}
 	}
 }
@@ -3421,7 +3425,7 @@ func TestQuery_OrderBasic_BaseCoreObservedWorkAccumulatesBeforePromotion(t *test
 	buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
 	observedRows := uint64(100)
 	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, stats.probeBuckets, stats.probeEst)
-	if probeWork == 0 || satAddUint64(probeWork, probeWork) >= buildWork {
+	if probeWork == 0 || mathutil.SatAddUint64(probeWork, probeWork) >= buildWork {
 		t.Fatalf("fixture no longer exercises sub-half build work: probe=%d build=%d", probeWork, buildWork)
 	}
 
@@ -3517,11 +3521,11 @@ func TestQuery_OrderBasic_WarmComplementDoesNotPromoteSplitRangeHalves(t *testin
 }
 
 func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -3564,17 +3568,17 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	if len(events) < 2 {
 		t.Fatalf("expected at least two trace events, got %d", len(events))
 	}
-	if events[len(events)-1].Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("expected second query to use %q, got %q", PlanLimitOrderBasic, events[len(events)-1].Plan)
+	if events[len(events)-1].Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("expected second query to use %q, got %q", rbitrace.PlanLimitOrderBasic, events[len(events)-1].Plan)
 	}
 }
 
 func TestQuery_OrderBasic_WarmBroadExactAndRangeUsesLimitOrderBasicPlan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSampleEvery: 1,
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 	})
@@ -3604,8 +3608,8 @@ func TestQuery_OrderBasic_WarmBroadExactAndRangeUsesLimitOrderBasicPlan(t *testi
 	if len(events) < 2 {
 		t.Fatalf("expected at least two trace events, got %d", len(events))
 	}
-	if events[len(events)-1].Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("expected second query to use %q, got %q", PlanLimitOrderBasic, events[len(events)-1].Plan)
+	if events[len(events)-1].Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("expected second query to use %q, got %q", rbitrace.PlanLimitOrderBasic, events[len(events)-1].Plan)
 	}
 }
 

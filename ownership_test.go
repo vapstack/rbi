@@ -524,11 +524,11 @@ func ownershipE2EAssertStringScan(t *testing.T, db *DB[string, Rec], model map[s
 	t.Helper()
 
 	got := make([]string, 0, len(model))
-	if err := db.ScanKeys("", func(key string) (bool, error) {
+	if err := db.SeqScan("", func(key string, _ *Rec) (bool, error) {
 		got = append(got, key)
 		return true, nil
 	}); err != nil {
-		t.Fatalf("ScanKeys: %v", err)
+		t.Fatalf("SeqScan: %v", err)
 	}
 	slices.Sort(got)
 
@@ -538,7 +538,7 @@ func ownershipE2EAssertStringScan(t *testing.T, db *DB[string, Rec], model map[s
 	}
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
-		t.Fatalf("ScanKeys got=%v want=%v", got, want)
+		t.Fatalf("SeqScan got=%v want=%v", got, want)
 	}
 }
 

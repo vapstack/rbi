@@ -11,7 +11,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -161,22 +160,24 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 		defer wg.Wait()
 		defer close(jobs)
 
-		b := tx.Bucket(cfg.Bucket)
+		b := tx.Bucket(cfg.DataBucket)
 		if b == nil {
 			return nil
+		}
+		var stringMap *bbolt.Bucket
+		if cfg.StrKey {
+			stringMap = tx.Bucket(cfg.StrMapBucket)
+			if stringMap == nil {
+				return fmt.Errorf("string storage format: missing string map bucket %q", cfg.StrMapBucket)
+			}
 		}
 		done := ctx.Done()
 		c := b.Cursor()
 
-		var strWriter strmap.Writer
-		if cfg.StrKey {
-			strWriter = cfg.StrMap.LockWriter()
-			defer strWriter.Unlock()
-		}
-
 		nextGCAt := uint64(indexBuildGCStride)
 		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		scanned := uint64(0)
+		maxStringIdx := uint64(0)
 
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 
@@ -191,7 +192,33 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 
 			var idx uint64
 			if cfg.StrKey {
-				idx, _ = strWriter.Create(string(k))
+				physical := v
+				if len(v) < 8 {
+					return fmt.Errorf(
+						"invalid string value scan_pos=%d id=%q idx=%d value_len=%d value_prefix_hex=%s: string storage format: value shorter than %d bytes",
+						scanned+1,
+						string(k),
+						idx,
+						len(physical),
+						formatDiagnosticBytesPrefix(physical, 32),
+						8,
+					)
+				}
+				idx = keycodec.U64FromBytes(v[:8])
+				if idx == 0 {
+					return fmt.Errorf(
+						"invalid string value scan_pos=%d id=%q idx=%d value_len=%d value_prefix_hex=%s: string storage format: zero string id",
+						scanned+1,
+						string(k),
+						idx,
+						len(physical),
+						formatDiagnosticBytesPrefix(physical, 32),
+					)
+				}
+				v = v[8:]
+				if idx > maxStringIdx {
+					maxStringIdx = idx
+				}
 			} else {
 				idx = keycodec.U64FromBytes(k)
 			}
@@ -214,15 +241,18 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 				nextGCAt += indexBuildGCStride
 			}
 		}
+		if cfg.StrKey && stringMap.Sequence() < maxStringIdx {
+			return fmt.Errorf("string storage format: string map sequence %d lower than max live idx %d", stringMap.Sequence(), maxStringIdx)
+		}
 		return nil
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("scan error: db=%q bucket=%q: %w", cfg.Bolt.Path(), string(cfg.Bucket), err)
+		return nil, fmt.Errorf("scan error: db=%q bucket=%q: %w", cfg.Bolt.Path(), string(cfg.DataBucket), err)
 	}
 	for _, err = range data.workerErrs {
 		if err != nil {
-			return nil, fmt.Errorf("scan error: db=%q bucket=%q: %w", cfg.Bolt.Path(), string(cfg.Bucket), err)
+			return nil, fmt.Errorf("scan error: db=%q bucket=%q: %w", cfg.Bolt.Path(), string(cfg.DataBucket), err)
 		}
 	}
 

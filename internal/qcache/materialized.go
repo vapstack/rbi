@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -771,7 +772,7 @@ func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit 
 		slot := c.slots[idx]
 		hadWork = slot.work != 0
 		slot.stamp = c.nextStamp()
-		slot.work = addObservedWork(slot.work, delta)
+		slot.work = mathutil.SatAddUint64(slot.work, delta)
 		c.slots[idx] = slot
 		return slot.work >= threshold, hadWork
 	}
@@ -959,11 +960,4 @@ func (c *RecentKeyCache) selectVictimSlot() int {
 		}
 	}
 	return slotIdx
-}
-
-func addObservedWork(cur, delta uint64) uint64 {
-	if ^uint64(0)-cur < delta {
-		return ^uint64(0)
-	}
-	return cur + delta
 }

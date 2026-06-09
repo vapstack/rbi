@@ -1447,6 +1447,25 @@ func (p List) Iter() Iterator {
 	}
 }
 
+func (p List) AdvancingIter() AdvancingIterator {
+	if p.IsEmpty() {
+		return emptyIter{}
+	}
+	if p.ptr == singleValue {
+		return getSingletonIter(p.single)
+	}
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
+		return getArrayIter(sp.ids[:sp.n])
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
+		return getArrayIter(mp.ids[:mp.n])
+	default:
+		return (*largePosting)(p.ptr).iterator()
+	}
+}
+
 func (p List) andIntoLarge(dst *largePosting) {
 	if p.ptr == nil {
 		dst.clear()
@@ -2533,6 +2552,11 @@ type Iterator interface {
 	HasNext() bool
 	Next() uint64
 	Release()
+}
+
+type AdvancingIterator interface {
+	Iterator
+	AdvanceIfNeeded(uint64)
 }
 
 type emptyIter struct{}

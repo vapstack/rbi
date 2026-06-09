@@ -4,16 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
-	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -529,7 +528,7 @@ func TestIOExt_Set_BeforeCommit_CanAtomicallyWriteNeighborBucket(t *testing.T) {
 			return fmt.Errorf("unexpected callback values: old=%#v new=%#v", oldValue, newValue)
 		}
 
-		managed := tx.Bucket(db.bucket)
+		managed := tx.Bucket(db.dataBucket)
 		if managed == nil {
 			return fmt.Errorf("managed bucket missing")
 		}
@@ -695,7 +694,7 @@ func TestIOExt_Delete_BeforeCommit_SeesKeyRemovedAndRollbackKeepsNeighborBucketE
 			return fmt.Errorf("unexpected callback values: old=%#v new=%#v", oldValue, newValue)
 		}
 
-		managed := tx.Bucket(db.bucket)
+		managed := tx.Bucket(db.dataBucket)
 		if managed == nil {
 			return fmt.Errorf("managed bucket missing")
 		}
@@ -882,24 +881,19 @@ func TestBeforeCommit_SetRollsBackAndKeepsState(t *testing.T) {
 func TestPublishAfterCommitFailureBreaksDB(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
-	publishField := reflect.ValueOf(db.batcher).Elem().FieldByName("indexPublishOps")
-	publishOps := (*wexec.IndexPublishOps)(unsafe.Pointer(publishField.UnsafeAddr()))
-	oldPublish := publishOps.PublishCommitted
-	publishOps.PublishCommitted = func(seq uint64, op string, _ *snapshot.View) error {
-		return db.index.PublishCommittedView(&db.broken, db.logger, ErrBroken, seq, op, nil)
-	}
-	defer func() {
-		publishOps.PublishCommitted = oldPublish
-	}()
+	oldPublish := wexec.OverridePublishCommittedForTest(db.batcher, func(seq uint64, op string, _ *snapshot.View) error {
+		return db.index.PublishCommittedView(&db.broken, db.logger, seq, op, nil)
+	})
+	defer wexec.OverridePublishCommittedForTest(db.batcher, oldPublish)
 
 	err := db.Set(1, &Rec{Name: "alice", Age: 30})
-	if !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected Set to fail with ErrBroken after publish failure, got: %v", err)
+	if !errors.Is(err, rbierrors.ErrBroken) {
+		t.Fatalf("expected Set to fail with rbierrors.ErrBroken after publish failure, got: %v", err)
 	}
 
 	var got *Rec
 	if viewErr := db.bolt.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
+		bucket := tx.Bucket(db.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -918,15 +912,15 @@ func TestPublishAfterCommitFailureBreaksDB(t *testing.T) {
 		t.Fatalf("unexpected committed value after publish failure: %#v", got)
 	}
 
-	if err = db.Set(2, &Rec{Name: "bob", Age: 20}); !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected DB to reject subsequent writes with ErrBroken, got: %v", err)
+	if err = db.Set(2, &Rec{Name: "bob", Age: 20}); !errors.Is(err, rbierrors.ErrBroken) {
+		t.Fatalf("expected DB to reject subsequent writes with rbierrors.ErrBroken, got: %v", err)
 	}
-	if _, err := db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected Query to fail with ErrBroken after publish failure, got: %v", err)
+	if _, err := db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, rbierrors.ErrBroken) {
+		t.Fatalf("expected Query to fail with rbierrors.ErrBroken after publish failure, got: %v", err)
 	}
 
-	if err := db.Close(); !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected Close to return ErrBroken for broken db, got: %v", err)
+	if err := db.Close(); !errors.Is(err, rbierrors.ErrBroken) {
+		t.Fatalf("expected Close to return rbierrors.ErrBroken for broken db, got: %v", err)
 	}
 }
 
@@ -1193,7 +1187,7 @@ func TestBatchSet_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
 		},
 		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
 			var keyBuf [8]byte
-			raw := tx.Bucket(db.bucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
+			raw := tx.Bucket(db.dataBucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 			if raw == nil {
 				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
 			}
@@ -1236,7 +1230,7 @@ func TestBatchPatch_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
 		}),
 		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
 			var keyBuf [8]byte
-			raw := tx.Bucket(db.bucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
+			raw := tx.Bucket(db.dataBucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 			if raw == nil {
 				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
 			}

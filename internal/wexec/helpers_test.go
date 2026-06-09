@@ -2,6 +2,7 @@ package wexec
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -12,7 +13,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -80,6 +80,9 @@ func setAttemptReq(id uint64, v byte) *request {
 func stringSetAttemptReq(id string, v byte) *request {
 	req := setAttemptReq(0, v)
 	req.id = keycodec.DataKeyFromUserKey(id, true)
+	req.setPayload.Reset()
+	req.payloadOff = reserveStringValuePrefix(req.setPayload, true)
+	_ = req.setPayload.WriteByte(v)
 	return req
 }
 
@@ -114,7 +117,7 @@ func patchAttemptReq(id uint64, patch []schema.PatchItem, ignoreUnknown bool) *r
 	}
 }
 
-func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx, string) error) (*Batcher, *bbolt.DB, []byte) {
+func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -128,7 +131,7 @@ func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bb
 	return ex, raw, bucket
 }
 
-func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx, string) error) (*Batcher, *bbolt.DB, []byte) {
+func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -156,7 +159,7 @@ func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbo
 	return ex, raw, bucket
 }
 
-func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, uniqueErr error, seed []snapshot.BatchEntry, commit func(*bbolt.Tx, string) error) (*Batcher, *bbolt.DB, []byte) {
+func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, seed []snapshot.BatchEntry, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -166,34 +169,30 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, uniqueErr erro
 	}
 	current := snapshot.NewView(0, nil, rt, snapshot.CacheConfig{}, snapshot.Storage{})
 	if len(seed) != 0 {
-		current = snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, nil, rt.Patch.Fields, seed)
+		current = snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, seed)
 	}
 	manager := snapshot.NewRegistry(false)
 	manager.Publish(current)
 	ex.schema = rt
 	ex.indexed = true
 	ex.unique = UniqueContext{
-		Schema:          rt,
-		Current:         manager.Current,
-		UniqueViolation: uniqueErr,
+		Schema:  rt,
+		Current: manager.Current,
 	}
-	ex.errs = ErrorSet{UniqueViolation: uniqueErr}
 	ex.snapshotOps = SnapshotOps{
 		Manager:     manager,
 		Schema:      rt,
-		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
+		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	ex.indexPublishOps = IndexPublishOps{
-		PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
-			manager.Publish(snap)
-			return nil
-		},
+	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
+		manager.Publish(snap)
+		return nil
 	}
 	return ex, raw, bucket
 }
 
-func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string, seedValue byte, uniqueErr error, commit func(*bbolt.Tx, string) error) (*Batcher, *bbolt.DB, []byte, *strmap.Mapper) {
+func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string, seedValue byte, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -201,47 +200,37 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	sm := strmap.New(0, 64)
+	mapBucket := createStringAttemptMap(t, raw, bucket)
 	seed := attemptRec{V: seedValue}
-	seedIdx, _ := sm.Create(seedKey)
-	current := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, sm, rt.Patch.Fields, []snapshot.BatchEntry{
+	seedIdx := putStringAttemptPayload(t, raw, bucket, mapBucket, seedKey, []byte{seedValue})
+	current := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, []snapshot.BatchEntry{
 		{ID: seedIdx, New: unsafe.Pointer(&seed)},
 	})
 	manager := snapshot.NewRegistry(false)
 	manager.Publish(current)
-	sm.MarkCommittedPublished(current.StrMap)
-	putStringAttemptPayload(t, raw, bucket, seedKey, []byte{seedValue})
 
 	ex.strKey = true
-	ex.strMap = sm
-	ex.strKey = true
-	ex.strMap = sm
+	ex.strmapBucket = mapBucket
 	ex.schema = rt
 	ex.indexed = true
 	ex.unique = UniqueContext{
-		Schema:          rt,
-		Current:         manager.Current,
-		UniqueViolation: uniqueErr,
+		Schema:  rt,
+		Current: manager.Current,
 	}
-	ex.errs = ErrorSet{UniqueViolation: uniqueErr}
 	ex.snapshotOps = SnapshotOps{
 		Manager:     manager,
 		Schema:      rt,
-		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
-		StrMap:      sm,
+		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	ex.indexPublishOps = IndexPublishOps{
-		PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
-			manager.Publish(snap)
-			sm.MarkCommittedPublished(snap.StrMap)
-			return nil
-		},
+	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
+		manager.Publish(snap)
+		return nil
 	}
-	return ex, raw, bucket, sm
+	return ex, raw, bucket, mapBucket
 }
 
-func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx, string) error) (*Batcher, *bbolt.DB, []byte) {
+func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "wexec.db")
@@ -281,15 +270,13 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	snapOps := SnapshotOps{
 		Manager:     manager,
 		Schema:      rt,
-		CacheConfig: func() snapshot.CacheConfig { return snapshot.CacheConfig{} },
+		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	publishOps := IndexPublishOps{
-		PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
-			manager.Publish(snap)
-			*events = append(*events, "publish")
-			return nil
-		},
+	publishCommitted := func(seq uint64, op string, snap *snapshot.View) error {
+		manager.Publish(snap)
+		*events = append(*events, "publish")
+		return nil
 	}
 	ex := NewBatcher(Config{
 		MaxOps:       8,
@@ -297,17 +284,17 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 		Unavailable:  func() error { return nil },
 
 		Bolt:               raw,
-		Bucket:             bucket,
+		DataBucket:         bucket,
 		BucketFillPercent:  0.8,
 		RejectEmptyPayload: true,
 		PublishMu:          &mu,
-		Commit:             commit,
 		Indexed:            true,
 		Ops:                &ops,
 		Schema:             rt,
 		SnapshotOps:        snapOps,
-		IndexPublishOps:    publishOps,
+		PublishCommitted:   publishCommitted,
 	})
+	ex.commit = commit
 	return ex, raw, bucket
 }
 
@@ -323,17 +310,31 @@ func putAttemptPayload(t *testing.T, raw *bbolt.DB, bucket []byte, id uint64, pa
 	}
 }
 
-func putStringAttemptPayload(t *testing.T, raw *bbolt.DB, bucket []byte, id string, payload []byte) {
+func putStringAttemptPayload(t *testing.T, raw *bbolt.DB, bucket []byte, mapBucket []byte, id string, payload []byte) uint64 {
 	t.Helper()
 
+	var idx uint64
 	err := raw.Update(func(tx *bbolt.Tx) error {
 		var keyBuf [8]byte
 		key := keycodec.DataKeyFromUserKey(id, true)
-		return tx.Bucket(bucket).Put(key.Bytes(true, &keyBuf), payload)
+		m := tx.Bucket(mapBucket)
+		var err error
+		idx, err = m.NextSequence()
+		if err != nil {
+			return err
+		}
+		var mapKey [8]byte
+		if err = m.Put(keycodec.U64BytesWithBuf(idx, &mapKey), key.Bytes(true, &keyBuf)); err != nil {
+			return err
+		}
+		value := keycodec.AppendU64Bytes(nil, idx)
+		value = append(value, payload...)
+		return tx.Bucket(bucket).Put(key.Bytes(true, &keyBuf), value)
 	})
 	if err != nil {
 		t.Fatalf("put string payload: %v", err)
 	}
+	return idx
 }
 
 func readAttemptPayload(t *testing.T, raw *bbolt.DB, bucket []byte, id uint64) []byte {
@@ -363,12 +364,65 @@ func readStringAttemptPayload(t *testing.T, raw *bbolt.DB, bucket []byte, id str
 		key := keycodec.DataKeyFromUserKey(id, true)
 		v := tx.Bucket(bucket).Get(key.Bytes(true, &keyBuf))
 		if v != nil {
-			out = append([]byte(nil), v...)
+			if len(v) < 8 {
+				return errors.New("short string value")
+			}
+			out = append([]byte(nil), v[8:]...)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("read string payload: %v", err)
+	}
+	return out
+}
+
+func createStringAttemptMap(t testing.TB, raw *bbolt.DB, bucket []byte) []byte {
+	t.Helper()
+
+	mapBucket := bucketMapName(bucket)
+	err := raw.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucket(mapBucket)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("create string map: %v", err)
+	}
+	return mapBucket
+}
+
+func bucketMapName(bucket []byte) []byte {
+	return append(append([]byte(nil), bucket...), ".rbimap"...)
+}
+
+func stringAttemptMapSequence(t *testing.T, raw *bbolt.DB, mapBucket []byte) uint64 {
+	t.Helper()
+
+	var seq uint64
+	err := raw.View(func(tx *bbolt.Tx) error {
+		seq = tx.Bucket(mapBucket).Sequence()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read string map sequence: %v", err)
+	}
+	return seq
+}
+
+func readStringAttemptMap(t *testing.T, raw *bbolt.DB, mapBucket []byte, idx uint64) string {
+	t.Helper()
+
+	var out string
+	err := raw.View(func(tx *bbolt.Tx) error {
+		var key [8]byte
+		v := tx.Bucket(mapBucket).Get(keycodec.U64BytesWithBuf(idx, &key))
+		if v != nil {
+			out = string(v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read string map: %v", err)
 	}
 	return out
 }

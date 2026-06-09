@@ -2,6 +2,7 @@ package wexec
 
 import (
 	"errors"
+	"github.com/vapstack/rbi/rbierrors"
 	"reflect"
 	"testing"
 	"unsafe"
@@ -14,9 +15,8 @@ import (
 
 func TestSharedSetUniqueRejectRecheckedAfterRetry(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
-	uniqueErr := errors.New("unique violation")
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, nil, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, nil, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 
@@ -45,14 +45,13 @@ func TestSharedSetUniqueRejectRecheckedAfterRetry(t *testing.T) {
 }
 
 func TestSharedSetUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}, {V: 3}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
 		{ID: 3, New: unsafe.Pointer(&seed[2])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -64,7 +63,7 @@ func TestSharedSetUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, uniqueErr) {
+	if err := <-badReq.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want unique error", err)
 	}
 	if err := <-goodReq.Done; err != nil {
@@ -90,13 +89,12 @@ func TestSharedSetUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
 }
 
 func TestRunAtomicUniqueDeleteThenSetReusesFreedValue(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -131,13 +129,12 @@ func TestRunAtomicUniqueDeleteThenSetReusesFreedValue(t *testing.T) {
 }
 
 func TestRunAtomicUniqueDuplicateIDUsesFinalValue(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -176,14 +173,13 @@ func TestRunAtomicUniqueDuplicateIDUsesFinalValue(t *testing.T) {
 }
 
 func TestSharedPatchUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	seed := []attemptRec{{V: 1}, {V: 2}, {V: 3}}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed[0])},
 		{ID: 2, New: unsafe.Pointer(&seed[1])},
 		{ID: 3, New: unsafe.Pointer(&seed[2])},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})
@@ -195,7 +191,7 @@ func TestSharedPatchUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, uniqueErr) {
+	if err := <-badReq.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want unique error", err)
 	}
 	if err := <-goodReq.Done; err != nil {
@@ -221,9 +217,8 @@ func TestSharedPatchUniqueRejectPreservesAcceptedWritesAndIndex(t *testing.T) {
 }
 
 func TestSharedStringSetUniqueRejectRollsBackCreatedKey(t *testing.T) {
-	uniqueErr := errors.New("unique violation")
 	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, uniqueErr, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 
@@ -232,7 +227,7 @@ func TestSharedStringSetUniqueRejectRollsBackCreatedKey(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, uniqueErr) {
+	if err := <-badReq.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want unique error", err)
 	}
 	if err := <-goodReq.Done; err != nil {
@@ -245,28 +240,86 @@ func TestSharedStringSetUniqueRejectRollsBackCreatedKey(t *testing.T) {
 		t.Fatalf("real payload = %v, want [2]", got)
 	}
 
-	snap := ex.unique.Current()
-	if snap.StrMap.Next() != 3 {
-		t.Fatalf("strmap next = %d, want 3", snap.StrMap.Next())
+	if seq := stringAttemptMapSequence(t, raw, bucketMapName(bucket)); seq != 3 {
+		t.Fatalf("string map sequence = %d, want 3", seq)
 	}
-	if idx, ok := snap.StrMap.Index("seed"); !ok || idx != 1 {
-		t.Fatalf("seed idx = %d ok=%v, want 1", idx, ok)
+	if got := readStringAttemptMap(t, raw, bucketMapName(bucket), 1); got != "seed" {
+		t.Fatalf("map[1] = %q, want seed", got)
 	}
-	if _, ok := snap.StrMap.Index("ghost"); ok {
-		t.Fatalf("rejected key remained in strmap")
+	if got := readStringAttemptMap(t, raw, bucketMapName(bucket), 2); got != "" {
+		t.Fatalf("map[2] = %q, want empty", got)
 	}
-	if idx, ok := snap.StrMap.Index("real"); !ok || idx != 3 {
-		t.Fatalf("real idx = %d ok=%v, want 3", idx, ok)
+	if got := readStringAttemptMap(t, raw, bucketMapName(bucket), 3); got != "real" {
+		t.Fatalf("map[3] = %q, want real", got)
 	}
-	if s, ok := snap.StrMap.String(2); ok {
-		t.Fatalf("hole idx 2 mapped to %q", s)
+}
+
+func TestSharedStringDeleteSurvivesRejectedSetSameKey(t *testing.T) {
+	var events []string
+	ex, raw, bucket, mapBucket := newStringAttemptTestExecutor(t, &events, "victim", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	otherIdx := putStringAttemptPayload(t, raw, bucket, mapBucket, "other", []byte{2})
+	victim := attemptRec{V: 1}
+	other := attemptRec{V: 2}
+	ex.snapshotOps.Manager.Publish(snapshot.Build(1, nil, ex.schema, snapshot.CacheConfig{}, ex.schema.Patch.Fields, []snapshot.BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&victim)},
+		{ID: otherIdx, New: unsafe.Pointer(&other)},
+	}))
+
+	key := keycodec.DataKeyFromUserKey("victim", true)
+	deleteReq := ex.buildDeleteRequest(key, nil)
+	setValue := attemptRec{V: 2}
+	setReq, err := ex.buildSetRequest(key, unsafe.Pointer(&setValue), nil, nil, nil)
+	if err != nil {
+		requestPool.Put(deleteReq)
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	defer requestPool.Put(deleteReq)
+	defer requestPool.Put(setReq)
+
+	ex.sched.mu.Lock()
+	ex.sched.window = 0
+	ex.sched.maxOps = 16
+	ex.sched.running = true
+	ex.sched.enqueue(&writeJob{reqs: []*request{deleteReq}, done: deleteReq.Done})
+	ex.sched.enqueue(&writeJob{reqs: []*request{setReq}, done: setReq.Done})
+	ex.sched.mu.Unlock()
+
+	first := ex.sched.popBatch(true)
+	if len(first) != 1 || first[0].reqs[0] != deleteReq {
+		t.Fatalf("first batch len = %d, want only delete", len(first))
+	}
+	ex.executeJobs(first)
+
+	if err = <-deleteReq.Done; err != nil {
+		t.Fatalf("delete request error = %v", err)
+	}
+
+	second := ex.sched.popBatch(true)
+	if len(second) != 1 || second[0].reqs[0] != setReq {
+		t.Fatalf("second batch len = %d, want only set", len(second))
+	}
+	ex.executeJobs(second)
+
+	if err = <-setReq.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("set request error = %v, want unique error", err)
+	}
+	if got := readStringAttemptPayload(t, raw, bucket, "victim"); got != nil {
+		t.Fatalf("victim payload survived rejected set: %v", got)
+	}
+	if got := readStringAttemptMap(t, raw, mapBucket, 1); got != "" {
+		t.Fatalf("map[1] = %q, want empty after delete", got)
+	}
+	if got := readStringAttemptPayload(t, raw, bucket, "other"); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("other payload = %v, want [2]", got)
 	}
 }
 
 func TestSharedStringSetUnavailableAfterPrepareRollsBackCreatedKeys(t *testing.T) {
 	closedErr := errors.New("closed")
 	var events []string
-	ex, raw, bucket, sm := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket, mapBucket := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.unavailable = func() error {
@@ -291,25 +344,21 @@ func TestSharedStringSetUnavailableAfterPrepareRollsBackCreatedKeys(t *testing.T
 		t.Fatalf("ghost-b payload persisted: %v", got)
 	}
 
-	snap := sm.Snapshot()
-	if snap.Next() != 1 {
-		t.Fatalf("strmap next = %d, want 1", snap.Next())
+	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 1 {
+		t.Fatalf("string map sequence = %d, want 1", seq)
 	}
-	if idx, ok := snap.Index("seed"); !ok || idx != 1 {
-		t.Fatalf("seed idx = %d ok=%v, want 1", idx, ok)
+	if got := readStringAttemptMap(t, raw, mapBucket, 1); got != "seed" {
+		t.Fatalf("map[1] = %q, want seed", got)
 	}
-	if _, ok := snap.Index("ghost-a"); ok {
-		t.Fatalf("ghost-a remained in strmap")
-	}
-	if _, ok := snap.Index("ghost-b"); ok {
-		t.Fatalf("ghost-b remained in strmap")
+	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "" {
+		t.Fatalf("map[2] = %q, want empty", got)
 	}
 }
 
 func TestSharedStringSetBeforeStoreFailureDoesNotCreateStringKey(t *testing.T) {
 	hookErr := errors.New("before store failed")
 	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 
@@ -336,22 +385,19 @@ func TestSharedStringSetBeforeStoreFailureDoesNotCreateStringKey(t *testing.T) {
 		t.Fatalf("real payload = %v, want [3]", got)
 	}
 
-	snap := ex.unique.Current()
-	if snap.StrMap.Next() != 2 {
-		t.Fatalf("strmap next = %d, want 2", snap.StrMap.Next())
+	mapBucket := bucketMapName(bucket)
+	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 2 {
+		t.Fatalf("string map sequence = %d, want 2", seq)
 	}
-	if _, ok := snap.StrMap.Index("ghost"); ok {
-		t.Fatalf("failed key appeared in strmap")
-	}
-	if idx, ok := snap.StrMap.Index("real"); !ok || idx != 2 {
-		t.Fatalf("real idx = %d ok=%v, want 2", idx, ok)
+	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "real" {
+		t.Fatalf("map[2] = %q, want real", got)
 	}
 }
 
 func TestSharedStringSetDecodePreparedValueFailureDoesNotCreateStringKey(t *testing.T) {
 	decodeErr := errors.New("decode marker")
 	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
@@ -363,6 +409,7 @@ func TestSharedStringSetDecodePreparedValueFailureDoesNotCreateStringKey(t *test
 
 	badReq := stringSetAttemptReq("ghost", 2)
 	badReq.setPayload.Reset()
+	badReq.payloadOff = reserveStringValuePrefix(badReq.setPayload, true)
 	_ = badReq.setPayload.WriteByte(0xc1)
 	badReq.beforeStore = []BeforeStoreHook{
 		func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
@@ -386,22 +433,19 @@ func TestSharedStringSetDecodePreparedValueFailureDoesNotCreateStringKey(t *test
 		t.Fatalf("real payload = %v, want [3]", got)
 	}
 
-	snap := ex.unique.Current()
-	if snap.StrMap.Next() != 2 {
-		t.Fatalf("strmap next = %d, want 2", snap.StrMap.Next())
+	mapBucket := bucketMapName(bucket)
+	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 2 {
+		t.Fatalf("string map sequence = %d, want 2", seq)
 	}
-	if _, ok := snap.StrMap.Index("ghost"); ok {
-		t.Fatalf("failed key appeared in strmap")
-	}
-	if idx, ok := snap.StrMap.Index("real"); !ok || idx != 2 {
-		t.Fatalf("real idx = %d ok=%v, want 2", idx, ok)
+	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "real" {
+		t.Fatalf("map[2] = %q, want real", got)
 	}
 }
 
 func TestSharedStringSetBeforeCommitFailureRetriesNeighborWithRolledBackStringKeys(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 
@@ -428,22 +472,19 @@ func TestSharedStringSetBeforeCommitFailureRetriesNeighborWithRolledBackStringKe
 		t.Fatalf("real payload = %v, want [3]", got)
 	}
 
-	snap := ex.unique.Current()
-	if snap.StrMap.Next() != 2 {
-		t.Fatalf("strmap next = %d, want 2", snap.StrMap.Next())
+	mapBucket := bucketMapName(bucket)
+	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 2 {
+		t.Fatalf("string map sequence = %d, want 2", seq)
 	}
-	if _, ok := snap.StrMap.Index("ghost"); ok {
-		t.Fatalf("failed key appeared in strmap")
-	}
-	if idx, ok := snap.StrMap.Index("real"); !ok || idx != 2 {
-		t.Fatalf("real idx = %d ok=%v, want 2", idx, ok)
+	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "real" {
+		t.Fatalf("map[2] = %q, want real", got)
 	}
 }
 
 func TestSharedStringSetCommitFailureRollsBackStringKey(t *testing.T) {
 	commitErr := errors.New("commit failed")
 	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, errors.New("unique violation"), func(*bbolt.Tx, string) error {
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(*bbolt.Tx) error {
 		return commitErr
 	})
 
@@ -456,15 +497,12 @@ func TestSharedStringSetCommitFailureRollsBackStringKey(t *testing.T) {
 	if got := readStringAttemptPayload(t, raw, bucket, "ghost"); got != nil {
 		t.Fatalf("ghost payload persisted: %v", got)
 	}
-	snap := ex.unique.Current()
-	if snap.StrMap.Next() != 1 {
-		t.Fatalf("strmap next = %d, want 1", snap.StrMap.Next())
+	mapBucket := bucketMapName(bucket)
+	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 1 {
+		t.Fatalf("string map sequence = %d, want 1", seq)
 	}
-	if _, ok := snap.StrMap.Index("ghost"); ok {
-		t.Fatalf("failed key appeared in published strmap")
-	}
-	if _, ok := ex.strMap.Snapshot().Index("ghost"); ok {
-		t.Fatalf("failed key remained in live strmap")
+	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "" {
+		t.Fatalf("map[2] = %q, want empty", got)
 	}
 	if st := ex.Stats(); st.TxCommitErrors == 0 {
 		t.Fatalf("TxCommitErrors = 0 after failed commit")
@@ -473,12 +511,11 @@ func TestSharedStringSetCommitFailureRollsBackStringKey(t *testing.T) {
 
 func TestExecuteJobsRepeatedPatchUniqueFirstBeforeCommitErrorRetriesFollowerFromOriginalState(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
-	uniqueErr := errors.New("unique violation")
 	seed := attemptRec{V: 1}
 	var events []string
-	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, uniqueErr, []snapshot.BatchEntry{
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
 		{ID: 1, New: unsafe.Pointer(&seed)},
-	}, func(tx *bbolt.Tx, op string) error {
+	}, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{1})

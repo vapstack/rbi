@@ -122,6 +122,29 @@ func TestBuildSetRequestHookSuppressesCoalescingPolicy(t *testing.T) {
 	requestPool.Put(req)
 }
 
+func TestBuildDeleteRequestStringKeySuppressesCoalescingPolicy(t *testing.T) {
+	ex := NewBatcher(Config{
+		MaxOps:      8,
+		Unavailable: func() error { return nil },
+	})
+
+	req := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey(uint64(1), false), nil)
+	if !req.canShareRepeatedID() || !req.canCoalesceSetDelete() {
+		t.Fatalf("numeric delete policy = %08b, want repeat-safe and coalescible", req.policy)
+	}
+	requestPool.Put(req)
+
+	ex.strKey = true
+	req = ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("alpha", true), nil)
+	if !req.canShareRepeatedID() {
+		t.Fatalf("string delete was not marked repeat-id safe")
+	}
+	if req.canCoalesceSetDelete() {
+		t.Fatalf("string delete was marked set/delete coalescible: %08b", req.policy)
+	}
+	requestPool.Put(req)
+}
+
 func TestBuildSetRequestEncodeFailureReturnsError(t *testing.T) {
 	encodeErr := errors.New("encode failed")
 	ex := NewBatcher(Config{

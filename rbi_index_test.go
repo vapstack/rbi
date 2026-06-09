@@ -1530,7 +1530,10 @@ func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
 		}
 	}
 
-	stats := db.Stats()
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	indexStats := db.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
 		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)
@@ -1638,7 +1641,10 @@ func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) 
 		t.Fatalf("writer error: %v", *errPtr)
 	}
 
-	stats := db.Stats()
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	indexStats := db.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
 		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)

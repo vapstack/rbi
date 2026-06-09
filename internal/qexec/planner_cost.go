@@ -7,6 +7,8 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 // Cost model margins. Values below 1 require measurable advantage
@@ -19,7 +21,7 @@ const (
 	plannerORBranchFallbackDiv = 32
 )
 
-func (qv *View) plannerUniverseCardinality(snap *PlannerStatsSnapshot) uint64 {
+func (qv *View) plannerUniverseCardinality(snap *rbistats.PlannerSnapshot) uint64 {
 	if snap != nil && snap.UniverseCardinality > 0 {
 		return snap.UniverseCardinality
 	}
@@ -82,8 +84,8 @@ func (d plannerORNoOrderDecision) selectedKind() plannerORNoOrderCandidateKind {
 	return d.selected.kind
 }
 
-func (d plannerORNoOrderDecision) traceRoute() TraceORRoute {
-	return TraceORRoute{
+func (d plannerORNoOrderDecision) traceRoute() rbitrace.ORRoute {
+	return rbitrace.ORRoute{
 		Selected:     d.selected.kind.String(),
 		Rejected:     d.rejected.kind.String(),
 		SelectedCost: d.selected.cost,
@@ -97,9 +99,9 @@ func (d plannerORNoOrderDecision) traceRoute() TraceORRoute {
 	}
 }
 
-func (c plannerORNoOrderCandidate) traceWork() TraceRouteWork {
+func (c plannerORNoOrderCandidate) traceWork() rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	switch c.kind {
 	case plannerORNoOrderCandidateMaterializedFallback:
@@ -107,17 +109,17 @@ func (c plannerORNoOrderCandidate) traceWork() TraceRouteWork {
 		if build > c.cost {
 			build = c.cost
 		}
-		return TraceRouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
+		return rbitrace.RouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
 	case plannerORNoOrderCandidateAdaptiveMerge, plannerORNoOrderCandidateBaselineMerge:
 		scan := float64(c.expectedRows)
 		if scan > c.cost {
 			scan = c.cost
 		}
-		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+		return rbitrace.RouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
 	case plannerORNoOrderCandidateUniverse:
-		return TraceRouteWork{CandidateScan: c.cost}
+		return rbitrace.RouteWork{CandidateScan: c.cost}
 	default:
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 }
 
@@ -187,8 +189,8 @@ func (d plannerOROrderDecision) selectedKind() plannerOROrderCandidateKind {
 	return d.selected.kind
 }
 
-func (d plannerOROrderDecision) traceRoute() TraceORRoute {
-	return TraceORRoute{
+func (d plannerOROrderDecision) traceRoute() rbitrace.ORRoute {
+	return rbitrace.ORRoute{
 		Selected:            d.selected.kind.String(),
 		Rejected:            d.rejected.kind.String(),
 		SelectedCost:        d.selected.cost,
@@ -208,9 +210,9 @@ func (d plannerOROrderDecision) traceRoute() TraceORRoute {
 	}
 }
 
-func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
+func (c plannerOROrderCandidate) traceWork() rbitrace.RouteWork {
 	if c.cost <= 0 {
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 	switch c.kind {
 	case plannerOROrderCandidateMaterializedFallback:
@@ -218,7 +220,7 @@ func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
 		if build > c.cost {
 			build = c.cost
 		}
-		return TraceRouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
+		return rbitrace.RouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
 	case plannerOROrderCandidateStream:
 		build := float64(c.eagerBuildWork)
 		if build > c.cost {
@@ -229,7 +231,7 @@ func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
 		if scan > remain {
 			scan = remain
 		}
-		return TraceRouteWork{CandidateScan: scan, PostingContains: remain - scan, MaterializedBuild: build}
+		return rbitrace.RouteWork{CandidateScan: scan, PostingContains: remain - scan, MaterializedBuild: build}
 	case plannerOROrderCandidateKWayMerge:
 		build := float64(c.eagerBuildWork)
 		if build > c.cost {
@@ -247,7 +249,7 @@ func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
 		if scan+contains > remain {
 			contains = remain - scan
 		}
-		work := TraceRouteWork{CandidateScan: scan, PostingContains: contains, BranchMerge: remain - scan - contains, MaterializedBuild: build}
+		work := rbitrace.RouteWork{CandidateScan: scan, PostingContains: contains, BranchMerge: remain - scan - contains, MaterializedBuild: build}
 		if plannerMaterializedCacheStateUnretained(c.cacheState) {
 			work.UnretainedRebuildPenalty = work.BranchMerge
 			work.BranchMerge = 0
@@ -266,9 +268,9 @@ func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
 		if scan > remain {
 			scan = remain
 		}
-		return TraceRouteWork{CandidateScan: scan, BranchMerge: remain - scan, MaterializedBuild: build}
+		return rbitrace.RouteWork{CandidateScan: scan, BranchMerge: remain - scan, MaterializedBuild: build}
 	default:
-		return TraceRouteWork{}
+		return rbitrace.RouteWork{}
 	}
 }
 
@@ -955,7 +957,7 @@ func (branches plannerORBranches) orderStreamChecksByBranch(
 	return checks * branchFactor
 }
 
-func plannerFieldStatsMergeRankRows(stats PlannerFieldStats, candidateUpper, need, universe uint64) uint64 {
+func plannerFieldStatsMergeRankRows(stats rbistats.PlannerField, candidateUpper, need, universe uint64) uint64 {
 	if candidateUpper == 0 || need == 0 || universe == 0 {
 		return 0
 	}
@@ -996,7 +998,7 @@ func plannerFieldStatsMergeRankRows(stats PlannerFieldStats, candidateUpper, nee
 	return uint64(rows)
 }
 
-func (qv *View) plannerOrderFieldStats(field string, snap *PlannerStatsSnapshot, universe uint64, distinctFallback uint64) PlannerFieldStats {
+func (qv *View) plannerOrderFieldStats(field string, snap *rbistats.PlannerSnapshot, universe uint64, distinctFallback uint64) rbistats.PlannerField {
 	if snap != nil {
 		if s, ok := snap.Fields[field]; ok {
 			return s
@@ -1016,7 +1018,7 @@ func (qv *View) plannerOrderFieldStats(field string, snap *PlannerStatsSnapshot,
 		p95 = 1
 	}
 
-	return PlannerFieldStats{
+	return rbistats.PlannerField{
 		DistinctKeys:    distinctFallback,
 		NonEmptyKeys:    distinctFallback,
 		TotalBucketCard: universe,
@@ -1027,7 +1029,7 @@ func (qv *View) plannerOrderFieldStats(field string, snap *PlannerStatsSnapshot,
 	}
 }
 
-func plannerFieldStatsSkew(stats PlannerFieldStats) float64 {
+func plannerFieldStatsSkew(stats rbistats.PlannerField) float64 {
 	avg := stats.AvgBucketCard
 	if avg <= 0 {
 		return 1.0
@@ -1156,7 +1158,7 @@ type plannerOrderedDecision struct {
 type plannerExecutionOrderDecision struct {
 	use bool
 
-	plan PlanName
+	plan rbitrace.PlanName
 
 	expectedProbeRows uint64
 	executionCost     float64
@@ -1210,7 +1212,7 @@ func (qv *View) estimateMergedScalarRangeOrderCost(
 	field string,
 	bounds indexdata.Bounds,
 	universe uint64,
-	stats PlannerFieldStats,
+	stats rbistats.PlannerField,
 ) (selectivity float64, fallbackWork float64, ok bool) {
 
 	if field == "" {
@@ -1359,9 +1361,9 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 		return d
 	}
 
-	plan := PlanLimitOrderBasic
+	plan := rbitrace.PlanLimitOrderBasic
 	if hasOrderPrefix {
-		plan = PlanLimitOrderPrefix
+		plan = rbitrace.PlanLimitOrderPrefix
 	}
 
 	d.use = true
@@ -1794,7 +1796,7 @@ func (qv *View) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrde
 func (qv *View) estimateOrderedAnchorSetupCost(
 	orderField string,
 	leaves []qir.Expr,
-	snap *PlannerStatsSnapshot,
+	snap *rbistats.PlannerSnapshot,
 	universe, orderDistinct uint64,
 	coverage float64,
 	needWindow int,
@@ -1933,7 +1935,7 @@ func (qv *View) estimateOrderedAnchorSetupCost(
 		(1.0 + float64(nonLeadCount)*0.35 + float64(nonLeadRangeLikeCount)*0.25)
 }
 
-func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.Expr, ov indexdata.FieldIndexView, snap *PlannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.Expr, ov indexdata.FieldIndexView, snap *rbistats.PlannerSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2137,7 +2139,7 @@ func (qv *View) extractOrderRangeCoverageLeavesIndexView(orderField string, leav
 
 func (qv *View) estimateLeafOrderCost(
 	e qir.Expr,
-	snap *PlannerStatsSnapshot,
+	snap *rbistats.PlannerSnapshot,
 	universe uint64,
 	orderField string,
 	orderHasBuckets bool,
@@ -2237,7 +2239,7 @@ func (qv *View) estimateLeafOrderCost(
 	return selectivity, fallbackWork, orderRange, hasPrefix, true
 }
 
-func (qv *View) estimateEqSelectivity(field string, value any, universe uint64, stats PlannerFieldStats) (float64, bool) {
+func (qv *View) estimateEqSelectivity(field string, value any, universe uint64, stats rbistats.PlannerField) (float64, bool) {
 	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
 		Op:           qir.OpEQ,
 		FieldOrdinal: qv.fieldOrdinalByName(field),
@@ -2353,7 +2355,7 @@ func (qv *View) estimateInLikeSelectivity(field string, value any, universe uint
 	return sel, valueCount, true
 }
 
-func (qv *View) estimateRangeSelectivity(e qir.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
+func (qv *View) estimateRangeSelectivity(e qir.Expr, universe uint64, stats rbistats.PlannerField) (float64, bool) {
 	rb, ok, err := qv.rangeBoundsForScalarExpr(e)
 	if err != nil || !ok {
 		return 0, false
@@ -2397,7 +2399,7 @@ func (qv *View) estimateRangeSelectivity(e qir.Expr, universe uint64, stats Plan
 	return 0, false
 }
 
-func (qv *View) plannerFieldStats(field string, snap *PlannerStatsSnapshot, universe uint64) PlannerFieldStats {
+func (qv *View) plannerFieldStats(field string, snap *rbistats.PlannerSnapshot, universe uint64) rbistats.PlannerField {
 	distinct := uint64(qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field).KeyCount())
 	return qv.plannerOrderFieldStats(field, snap, universe, distinct)
 }

@@ -4,6 +4,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/vapstack/rbi/rbistats"
 )
 
 type scheduler struct {
@@ -49,7 +51,7 @@ func newScheduler(maxOps int, window time.Duration, maxQueue int, statsEnabled b
 	}
 }
 
-func (s *scheduler) getStats() Stats {
+func (s *scheduler) getStats() rbistats.AutoBatch {
 	s.mu.Lock()
 	queueLen := s.queueLen
 	queueCap := cap(s.queue)

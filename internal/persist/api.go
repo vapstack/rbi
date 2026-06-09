@@ -12,31 +12,24 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
 )
 
-type Errors struct {
-	Stale   error
-	Invalid error
-}
-
 type LoadConfig struct {
-	File            string
-	DBPath          string
-	Bucket          []byte
-	CurrentSeq      uint64
-	Schema          *schema.Schema
-	StrMapCompactAt int
-	Errors          Errors
+	File       string
+	DBPath     string
+	Bucket     []byte
+	CurrentSeq uint64
+	Schema     *schema.Schema
+	StrKey     bool
 }
 
 type LoadResult struct {
 	Storage           snapshot.Storage
-	StrMap            *strmap.Mapper
-	PlannerStats      *qexec.PlannerStatsSnapshot
+	PlannerStats      *rbistats.PlannerSnapshot
 	SkipFields        map[string]struct{}
 	SkipMeasureFields map[string]struct{}
 	LenLoaded         bool
@@ -46,8 +39,9 @@ type StoreConfig struct {
 	File         string
 	BucketSeq    uint64
 	Schema       *schema.Schema
+	StrKey       bool
 	Snapshot     *snapshot.View
-	PlannerStats *qexec.PlannerStatsSnapshot
+	PlannerStats *rbistats.PlannerSnapshot
 }
 
 const fileBufferSize = 64 << 10
@@ -88,22 +82,22 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 
 	ver, err := reader.ReadByte()
 	if err != nil {
-		return LoadResult{}, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", cfg.Errors.Invalid, err))
+		return LoadResult{}, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", rbierrors.ErrPersistedIndexInvalid, err))
 	}
 	diag.version = ver
 	diag.versionKnown = true
 
 	switch ver {
 	case persistedIndexVersion:
-		result, err = loadV26(reader, cfg)
+		result, err = loadV28(reader, cfg)
 	default:
-		return LoadResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", cfg.Errors.Invalid, ver))
+		return LoadResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", rbierrors.ErrPersistedIndexInvalid, ver))
 	}
 	if err != nil {
-		if errors.Is(err, cfg.Errors.Stale) || errors.Is(err, cfg.Errors.Invalid) {
-			return LoadResult{}, diag.wrap("load_v26", err)
+		if errors.Is(err, rbierrors.ErrPersistedIndexStale) || errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
+			return LoadResult{}, diag.wrap("load_v28", err)
 		}
-		return LoadResult{}, diag.wrap("load_v26", fmt.Errorf("error loading index: %w", err))
+		return LoadResult{}, diag.wrap("load_v28", fmt.Errorf("error loading index: %w", err))
 	}
 	return result, nil
 }
@@ -135,7 +129,7 @@ func Store(cfg StoreConfig) (err error) {
 	}()
 
 	buf := bufio.NewWriterSize(f, fileBufferSize)
-	if err = storeV26(buf, cfg); err != nil {
+	if err = storeV28(buf, cfg); err != nil {
 		return err
 	}
 
@@ -161,23 +155,44 @@ func Store(cfg StoreConfig) (err error) {
 	return nil
 }
 
-func loadV26(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
+func loadV28(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading bucket sequence: %w", err)
 	}
 	if storedSeq != cfg.CurrentSeq {
-		return LoadResult{}, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", cfg.Errors.Stale, storedSeq, cfg.CurrentSeq)
+		return LoadResult{}, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", rbierrors.ErrPersistedIndexStale, storedSeq, cfg.CurrentSeq)
 	}
 
-	result, err := loadPayload(reader, cfg.Schema, cfg.StrMapCompactAt)
+	if err = readKeyStorageHeader(reader, cfg); err != nil {
+		return LoadResult{}, err
+	}
+
+	result, err := loadPayload(reader, cfg.Schema)
 	if err != nil {
-		return LoadResult{}, fmt.Errorf("%w: %w", cfg.Errors.Invalid, err)
+		return LoadResult{}, fmt.Errorf("%w: %w", rbierrors.ErrPersistedIndexInvalid, err)
 	}
 	return result, nil
 }
 
-func loadPayload(reader *bufio.Reader, s *schema.Schema, strMapCompactAt int) (LoadResult, error) {
+func readKeyStorageHeader(reader *bufio.Reader, cfg LoadConfig) error {
+	kind, err := reader.ReadByte()
+	if err != nil {
+		return fmt.Errorf("%w: reading key storage kind: %w", rbierrors.ErrPersistedIndexInvalid, err)
+	}
+	if !cfg.StrKey {
+		if kind != keyStorageNumeric {
+			return fmt.Errorf("%w: key storage kind mismatch (stored=%d, expected=%d)", rbierrors.ErrPersistedIndexInvalid, kind, keyStorageNumeric)
+		}
+		return nil
+	}
+	if kind != keyStorageStringDurableID {
+		return fmt.Errorf("%w: key storage kind mismatch (stored=%d, expected=%d)", rbierrors.ErrPersistedIndexInvalid, kind, keyStorageStringDurableID)
+	}
+	return nil
+}
+
+func loadPayload(reader *bufio.Reader, s *schema.Schema) (LoadResult, error) {
 	universe, err := posting.ReadFrom(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading universe: %w", err)
@@ -188,11 +203,6 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema, strMapCompactAt int) (L
 			universe.Release()
 		}
 	}()
-
-	sm, err := strmap.Read(reader, strMapCompactAt)
-	if err != nil {
-		return LoadResult{}, err
-	}
 
 	compatible, err := readFieldCompatibility(reader, s.Fields)
 	if err != nil {
@@ -315,7 +325,6 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema, strMapCompactAt int) (L
 	universeOwned = false
 	return LoadResult{
 		Storage:           storage,
-		StrMap:            sm,
 		PlannerStats:      plannerStats,
 		SkipFields:        skipFields,
 		SkipMeasureFields: skipMeasureFields,
@@ -323,24 +332,36 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema, strMapCompactAt int) (L
 	}, nil
 }
 
-func storeV26(writer *bufio.Writer, cfg StoreConfig) error {
+func storeV28(writer *bufio.Writer, cfg StoreConfig) error {
 	if err := writer.WriteByte(persistedIndexVersion); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
 	if err := writeSidecarUvarint(writer, cfg.BucketSeq); err != nil {
 		return fmt.Errorf("store: writing bucket sequence: %w", err)
 	}
+	if err := writeKeyStorageHeader(writer, cfg); err != nil {
+		return err
+	}
 	return storePayload(writer, cfg.Schema, cfg.Snapshot, cfg.PlannerStats)
 }
 
-func storePayload(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, plannerStats *qexec.PlannerStatsSnapshot) error {
+func writeKeyStorageHeader(writer *bufio.Writer, cfg StoreConfig) error {
+	if !cfg.StrKey {
+		if err := writer.WriteByte(keyStorageNumeric); err != nil {
+			return fmt.Errorf("store: writing key storage kind: %w", err)
+		}
+		return nil
+	}
+	if err := writer.WriteByte(keyStorageStringDurableID); err != nil {
+		return fmt.Errorf("store: writing key storage kind: %w", err)
+	}
+	return nil
+}
+
+func storePayload(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, plannerStats *rbistats.PlannerSnapshot) error {
 	universe := snap.Universe.Borrow()
 	if err := universe.WriteTo(writer); err != nil {
 		return fmt.Errorf("encode: writing universe: %w", err)
-	}
-
-	if err := strmap.WriteSnapshot(writer, snap.StrMap); err != nil {
-		return err
 	}
 
 	if err := writeFields(writer, s.Fields); err != nil {

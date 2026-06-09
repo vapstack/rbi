@@ -5,7 +5,7 @@
 
 > This package should be considered experimental
 
-An embedded indexed database layer on top of [bbolt](https://github.com/etcd-io/bbolt).
+Embedded indexed database layer on top of [bbolt](https://github.com/etcd-io/bbolt).
 
 Indexes are kept fully in memory and built on a heavily reworked fork of
 [roaring64](https://github.com/RoaringBitmap/roaring)
@@ -76,7 +76,6 @@ func main() {
 	
     db, err := rbi.New[uint64, User](bolt, rbi.Options{})
     if err != nil {
-        _ = bolt.Close()
         panic(err)
     }
     defer db.Close()
@@ -155,8 +154,7 @@ For the full API reference see
 * `Delete` – remove a record and its index entries
 * `BatchDelete` – batch variant of `Delete`
 
-Do not write directly to the bucket managed by `rbi` through raw Bolt APIs,
-(including `SetSequence`/`NextSequence`).
+Do not write directly to buckets managed by RBI through raw Bolt APIs.
 
 ### Automatic batching
 
@@ -201,7 +199,7 @@ q := qx.Query(
 * `QueryKeys` - return matching IDs
 * `Count` - return result cardinality
 * `SeqScan` - performs a sequential scan over all records starting at the given key
-* `ScanKeys` - iterate the current in-memory key set without opening a Bolt read transaction
+* `ScanKeys` - traverse live keys starting at the given key
 * `Aggregate` - evaluate grouped or ungrouped reductions over indexed and measure fields
 
 ### Supported `qx` subset:
@@ -213,7 +211,6 @@ q := qx.Query(
 - Predicate left-hand side must always be a source field reference.
 - Predicate right-hand side must always be a literal value.
 - No computed expressions on any side.
-- Projections are not supported.
 - Outside aggregation, ordering supports exactly one expression, and only these forms:
   - By field:\
     `Sort("field", ASC|DESC)` or `SortBy(REF("field"), ASC)`
@@ -271,9 +268,9 @@ standalone `DISTINCT(field)` combined with grouping or other metrics.
 Non-aggregate queries support ordering by **a single indexed field only**.
 
 Queries that specify more than one non-aggregate ordering expression are
-rejected with an error. This restriction is intentional and allows ordered
-queries to execute directly via index traversal without materializing or
-re-sorting intermediate result sets.
+rejected with an error. This restriction allows ordered queries to execute
+directly via index traversal without materializing or re-sorting intermediate 
+result sets.
 
 If multi-column ordering is required, it must be implemented at the application level.
 
@@ -281,7 +278,7 @@ Aggregate queries have separate output ordering and can use multiple `SortOut` k
 
 ## Composite indexes
 
-Composite indexes are not supported. All RBI indexes live in memory, so storing
+Composite indexes are not supported. All indexes live in memory, so storing
 field combinations can multiply memory use by the number of distinct values in
 the combined fields.
 
@@ -293,11 +290,11 @@ reuses bounded materialized range/predicate state on warm snapshots.
 ## Transparent mode
 
 If a value type has no indexed fields, RBI automatically switches 
-to a transparent mode. This is useful for a strongly-typed generic API 
+to a transparent mode. This can be useful as a strongly-typed generic API 
 over a bbolt bucket without maintaining secondary indexes.
 
 In transparent mode:
-- read/write/scan methods continue to work (except `ScanKeys`)
+- read/write/scan methods continue to work
 - query/count/aggregation methods return `ErrNoIndex`
 - minimal overhead (no index maintenance) 
 
@@ -322,13 +319,15 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
 
     // Planner/trace settings
     AnalyzeInterval: 30 * time.Minute, // < 0 disables periodic analyze loop
-    TraceSink: func(ev rbi.TraceEvent) { /* log/collect trace */ },
+    TraceSink: func(ev rbitrace.Event) { /* log/collect trace */ },
     TraceSampleEvery: 1000, // 0 uses default (1), < 0 disables tracing    
 
     // Single-op auto-batcher settings
     AutoBatchWindow: 100 * time.Microsecond,
     AutoBatchMax: 128,
     AutoBatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
+    
+    // ...
 })
 ```
 
@@ -349,7 +348,7 @@ passed to `New` to become defaults for the whole DB instance.
 
 - `BeforeCommit` - runs inside the Bolt write transaction after the record
   has been written, but before commit. Useful for audit records and other
-  writes to neighboring buckets.
+  writes to neighboring non-RBI buckets.
 
 * `NoBatch` - forces a write call to execute in its own internal batch. For
   `Batch*` methods this is redundant because they are already isolated.
@@ -386,7 +385,7 @@ passed to `New` to become defaults for the whole DB instance.
   internal locks while running `BeforeCommit`, so re-entering the same `DB`
   can deadlock or become mode-dependent.
 
-* `BeforeCommit` must not modify the bucket managed by RBI itself.
+* `BeforeCommit` must not modify any buckets managed by RBI.
 
 ## Struct tags and indexing
 
@@ -608,21 +607,6 @@ entries are about 192 KiB before cache metadata. Less fragmented postings can be
 smaller; sparse or oversized hot postings can be larger, but cache memory is
 usually small compared with the main index.
 
-### String key mapping
-
-For `DB[string, V]`, RBI maps user string keys to internal `uint64` ids so
-posting lists remain numeric. The mapper keeps forward lookup and reverse
-lookup data in memory, separate from field indexes.
-
-```text
-ApproxMem(string keys) ~= N * (K + 64...80)
-```
-
-For 10,000,000 string keys with an average key length of 22 bytes, a rough
-planning range is about 820...973 MiB. Actual memory depends on Go map load
-factor, snapshot compaction, and key churn. `DB[uint64, V]` does not pay this
-mapping cost.
-
 ### Snapshots and pinned reads
 
 Published index snapshots are immutable and updated with copy-on-write. A
@@ -652,7 +636,6 @@ Each instance maintains its own in-memory index.
 By default, the bucket name is derived from the value type.
 A custom bucket name can be provided via `Options` 
 if explicit control is required (e.g. when value type is renamed).
-
 
 ## Encoding and schema evolution
 
@@ -693,13 +676,24 @@ type Codec interface {
 If it does, RBI uses it instead of msgpack for all encoding/decoding work.
 Fallback decoding, if required, is the responsibility of the implementation.
 
+## Storage notes
+
+RBI stores records in the configured bbolt bucket using a key layout that
+depends on `K`.
+
+For `DB[uint64, V]`, bbolt keys are 8-byte big-endian `uint64` values.
+
+For `DB[string, V]`, bbolt keys are the string keys themselves as raw bytes.
+The stored value has an 8-byte prefix with the internal numeric id,
+followed by the encoded record payload.
+
 ## Limitations
 
 This package does not aim to be a relational database or a SQL engine.
 
-* no projections (`SELECT field1, field2`),
-* no joins,
-* no query-time computed fields.
+- no projections (`SELECT field1, field2`)
+- no joins
+- no query-time computed fields
 
 ## Performance notes
 

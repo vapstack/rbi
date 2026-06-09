@@ -69,7 +69,7 @@ func BenchmarkBuildPreparedEmptyBase(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+1), nil, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+1), nil, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -78,7 +78,7 @@ func BenchmarkBuildPreparedEmptyBase(b *testing.B) {
 func BenchmarkNewViewRetainSharedStorage(b *testing.B) {
 	rt := benchRuntime(b)
 	records := benchRecords(256, 0)
-	base := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64}, nil, rt.Patch.Fields, benchEntries(records, 1))
+	base := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64}, rt.Patch.Fields, benchEntries(records, 1))
 	defer base.releaseRuntimeCaches()
 	defer base.releaseStorage()
 
@@ -101,7 +101,7 @@ func BenchmarkNewViewRetainSharedStorage(b *testing.B) {
 func BenchmarkBuildPreparedInsertOnly(b *testing.B) {
 	rt := benchRuntime(b)
 	baseRecords := benchRecords(256, 0)
-	base := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(baseRecords, 1))
+	base := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(baseRecords, 1))
 	defer base.releaseRuntimeCaches()
 	defer base.releaseStorage()
 
@@ -111,7 +111,7 @@ func BenchmarkBuildPreparedInsertOnly(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), base, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), base, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -120,7 +120,7 @@ func BenchmarkBuildPreparedInsertOnly(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedUpdate(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -137,7 +137,7 @@ func BenchmarkBuildPreparedAggregatedUpdate(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -146,7 +146,7 @@ func BenchmarkBuildPreparedAggregatedUpdate(b *testing.B) {
 func BenchmarkBuildPreparedInPlaceAggregatedUpdate(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -163,7 +163,7 @@ func BenchmarkBuildPreparedInPlaceAggregatedUpdate(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -172,7 +172,7 @@ func BenchmarkBuildPreparedInPlaceAggregatedUpdate(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedUpdateWithWarmCaches(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64, MatPredMaxCard: 512}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64, MatPredMaxCard: 512}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -196,7 +196,7 @@ func BenchmarkBuildPreparedAggregatedUpdateWithWarmCaches(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -205,7 +205,7 @@ func BenchmarkBuildPreparedAggregatedUpdateWithWarmCaches(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedPartialUpdate(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -222,7 +222,7 @@ func BenchmarkBuildPreparedAggregatedPartialUpdate(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -231,7 +231,7 @@ func BenchmarkBuildPreparedAggregatedPartialUpdate(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedDelete(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -246,7 +246,7 @@ func BenchmarkBuildPreparedAggregatedDelete(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -255,7 +255,7 @@ func BenchmarkBuildPreparedAggregatedDelete(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedPartialDelete(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -270,7 +270,7 @@ func BenchmarkBuildPreparedAggregatedPartialDelete(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -279,7 +279,7 @@ func BenchmarkBuildPreparedAggregatedPartialDelete(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedPatchOnly(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -298,7 +298,7 @@ func BenchmarkBuildPreparedAggregatedPatchOnly(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -307,7 +307,7 @@ func BenchmarkBuildPreparedAggregatedPatchOnly(b *testing.B) {
 func BenchmarkBuildPreparedInPlaceAggregatedPatchOnly(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(256, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -326,7 +326,7 @@ func BenchmarkBuildPreparedInPlaceAggregatedPatchOnly(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -335,7 +335,7 @@ func BenchmarkBuildPreparedInPlaceAggregatedPatchOnly(b *testing.B) {
 func BenchmarkBuildPreparedAggregatedRepeatedID(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(128, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -358,7 +358,7 @@ func BenchmarkBuildPreparedAggregatedRepeatedID(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		snap := Build(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := Build(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -367,7 +367,7 @@ func BenchmarkBuildPreparedAggregatedRepeatedID(b *testing.B) {
 func BenchmarkBuildPreparedInPlaceAggregatedRepeatedID(b *testing.B) {
 	rt := benchRuntime(b)
 	oldRecords := benchRecords(128, 0)
-	prev := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(oldRecords, 1))
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(oldRecords, 1))
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
@@ -394,7 +394,7 @@ func BenchmarkBuildPreparedInPlaceAggregatedRepeatedID(b *testing.B) {
 		b.StopTimer()
 		copy(entries, template)
 		b.StartTimer()
-		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, nil, rt.Patch.Fields, entries)
+		snap := BuildInPlace(uint64(i+2), prev, rt, cfg, rt.Patch.Fields, entries)
 		snap.releaseRuntimeCaches()
 		snap.releaseStorage()
 	}
@@ -580,7 +580,7 @@ func BenchmarkNumericRangeCacheEntry(b *testing.B) {
 func BenchmarkRuntimeCacheClearRelease(b *testing.B) {
 	rt := benchRuntime(b)
 	records := benchRecords(256, 0)
-	snap := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64, MatPredMaxCard: 512}, nil, rt.Patch.Fields, benchEntries(records, 1))
+	snap := Build(1, nil, rt, CacheConfig{MatPredMaxEntries: 64, MatPredMaxCard: 512}, rt.Patch.Fields, benchEntries(records, 1))
 	defer snap.releaseRuntimeCaches()
 	defer snap.releaseStorage()
 
@@ -621,7 +621,7 @@ func BenchmarkRuntimeCacheClearRelease(b *testing.B) {
 func BenchmarkViewStorageHelpers(b *testing.B) {
 	rt := benchRuntime(b)
 	records := benchRecords(256, 0)
-	snap := Build(1, nil, rt, CacheConfig{}, nil, rt.Patch.Fields, benchEntries(records, 1))
+	snap := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, benchEntries(records, 1))
 	defer snap.releaseRuntimeCaches()
 	defer snap.releaseStorage()
 

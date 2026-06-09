@@ -4,19 +4,19 @@ import (
 	"fmt"
 	"io"
 	"log"
-	randv2 "math/rand/v2"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"go.etcd.io/bbolt"
 )
 
-func newRand(seed int64) *randv2.Rand {
-	s := uint64(seed)
-	return randv2.New(randv2.NewPCG(s, s^0x9e3779b97f4a7c15))
+func newRand(seed int64) *rand.Rand {
+	return mathutil.NewRand(seed)
 }
 
 var testDiscardLogger = log.New(io.Discard, "", 0)
@@ -168,7 +168,7 @@ func ioExtMustReadUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64) []byte
 	t.Helper()
 	var raw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -189,7 +189,7 @@ func ioExtMustReadStringRaw(t *testing.T, db *DB[string, Product], id string) []
 	t.Helper()
 	var raw []byte
 	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -209,7 +209,7 @@ func ioExtMustReadStringRaw(t *testing.T, db *DB[string, Product], id string) []
 func ioExtMustCorruptUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64, raw []byte) {
 	t.Helper()
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -218,6 +218,38 @@ func ioExtMustCorruptUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64, raw
 	}); err != nil {
 		t.Fatalf("corrupt raw(%d): %v", id, err)
 	}
+}
+
+func scanRawBolt[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], seek K, fn func(K, []byte) (bool, error)) error {
+	tb.Helper()
+	return db.Bolt().View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(db.BucketName())
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		c := b.Cursor()
+		var keyBuf [8]byte
+		for key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf)); key != nil; key, value = c.Next() {
+			more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value)
+			if err != nil || !more {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func rawPayloadForTest[K ~string | ~uint64, V any](db *DB[K, V], raw []byte) ([]byte, error) {
+	if db.strKey {
+		if len(raw) < 8 {
+			return nil, fmt.Errorf("string storage format: value shorter than %d bytes", 8)
+		}
+		if keycodec.U64FromBytes(raw[:8]) == 0 {
+			return nil, fmt.Errorf("string storage format: zero string id")
+		}
+		return raw[8:], nil
+	}
+	return raw, nil
 }
 
 func ioExtReadBucketValue(t testing.TB, raw *bbolt.DB, bucketName, key string) ([]byte, bool) {

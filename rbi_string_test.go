@@ -11,11 +11,151 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
+
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
-func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *testing.T) {
+func TestStringMapBucketEnsureCreatesAndReuses(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	defer func() { _ = raw.Close() }()
+
+	dataBucket := []byte("users")
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		if _, err := tx.CreateBucket(dataBucket); err != nil {
+			return err
+		}
+		m, err := createStrMapBucket(tx, dataBucket)
+		if err != nil {
+			return err
+		}
+		k, v := m.Cursor().First()
+		if k != nil || v != nil {
+			return fmt.Errorf("new string map is not empty")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ensureStringMapBucket: %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		_, err := createStrMapBucket(tx, dataBucket)
+		return err
+	}); err != nil {
+		t.Fatalf("ensureStringMapBucket existing: %v", err)
+	}
+}
+
+func TestStringMapBucketMissingForNonEmptyDataFails(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	defer func() { _ = raw.Close() }()
+
+	dataBucket := []byte("users")
+	err := raw.Update(func(tx *bbolt.Tx) error {
+		data, err := tx.CreateBucket(dataBucket)
+		if err != nil {
+			return err
+		}
+		if err = data.Put([]byte("k"), []byte("payload")); err != nil {
+			return err
+		}
+		_, err = createStrMapBucket(tx, dataBucket)
+		return err
+	})
+	if !errors.Is(err, rbierrors.ErrInvalidStringStorageFormat) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestStringMapBucketEnsureExistingIsStructuralOnly(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	defer func() { _ = raw.Close() }()
+
+	dataBucket := []byte("users")
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		data, err := tx.CreateBucket(dataBucket)
+		if err != nil {
+			return err
+		}
+		if err = data.Put([]byte("k"), []byte("bad")); err != nil {
+			return err
+		}
+		mapName := append(append([]byte(nil), dataBucket...), stringMapBucketSuffix...)
+		m, err := tx.CreateBucket(mapName)
+		if err != nil {
+			return err
+		}
+		return m.Put([]byte("short"), []byte("stale"))
+	}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		_, err := createStrMapBucket(tx, dataBucket)
+		return err
+	}); err != nil {
+		t.Fatalf("ensureStringMapBucket existing: %v", err)
+	}
+}
+
+func putStringMapKeyTest(m *bbolt.Bucket, idx uint64, key []byte) error {
+	var buf [8]byte
+	return m.Put(keycodec.U64BytesWithBuf(idx, &buf), key)
+}
+
+func deleteStringMapKeyTest(m *bbolt.Bucket, idx uint64) error {
+	var buf [8]byte
+	return m.Delete(keycodec.U64BytesWithBuf(idx, &buf))
+}
+
+func TestStringMapPutGetDeleteAndOrdering(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	defer func() { _ = raw.Close() }()
+
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		m, err := tx.CreateBucket([]byte("map"))
+		if err != nil {
+			return err
+		}
+		if err = putStringMapKeyTest(m, 256, []byte("c")); err != nil {
+			return err
+		}
+		if err = putStringMapKeyTest(m, 1, []byte("a")); err != nil {
+			return err
+		}
+		if err = putStringMapKeyTest(m, 2, []byte("b")); err != nil {
+			return err
+		}
+		var key [8]byte
+		if !slices.Equal(m.Get(keycodec.U64BytesWithBuf(2, &key)), []byte("b")) {
+			return fmt.Errorf("get idx=2 failed")
+		}
+
+		var ids []uint64
+		c := m.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			ids = append(ids, keycodec.U64FromBytes(k))
+		}
+		if !slices.Equal(ids, []uint64{1, 2, 256}) {
+			return fmt.Errorf("ids=%v", ids)
+		}
+
+		if err = deleteStringMapKeyTest(m, 2); err != nil {
+			return err
+		}
+		if m.Get(keycodec.U64BytesWithBuf(2, &key)) != nil {
+			return fmt.Errorf("idx=2 still present")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("map helpers: %v", err)
+	}
+}
+
+func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_reinsert_reopen.db")
 
@@ -95,21 +235,20 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		}
 	}
 
-	for _, key := range order {
-		if _, drop := deleted[key]; !drop {
-			continue
-		}
+	reinsertOrder := []string{"k-02", "k-08", "k-04"}
+	for _, key := range reinsertOrder {
 		if err := db.Set(key, &Rec{Name: key, Age: 1}); err != nil {
 			t.Fatalf("reinsert Set(%q): %v", key, err)
 		}
 	}
 
+	wantReinsert := append(slices.Clone(liveOrder), reinsertOrder...)
 	gotAll, err := db.QueryKeys(qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys(all after reinsert): %v", err)
 	}
-	if !slices.Equal(gotAll, order) {
-		t.Fatalf("reinsert changed internal order: got=%v want=%v", gotAll, order)
+	if !slices.Equal(gotAll, wantReinsert) {
+		t.Fatalf("reinsert order mismatch: got=%v want=%v", gotAll, wantReinsert)
 	}
 }
 
@@ -169,7 +308,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	go func() {
 		badDone <- db.Set("ghost-hole", &StringUniqueTestRec{Email: "seed@x", Code: 3})
 	}()
-	waitAutoBatchExtraStats(t, db, "queued rejected string set", func(st AutoBatchStats) bool {
+	waitAutoBatchExtraStats(t, db, "queued rejected string set", func(st rbistats.AutoBatch) bool {
 		return st.Submitted == baseline.Submitted+1 && st.QueueLen == 1
 	})
 
@@ -177,7 +316,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	go func() {
 		goodDone <- db.Set("real-hole", &StringUniqueTestRec{Email: "real@x", Code: 4})
 	}()
-	waitAutoBatchExtraStats(t, db, "queued rejected+accepted string sets", func(st AutoBatchStats) bool {
+	waitAutoBatchExtraStats(t, db, "queued rejected+accepted string sets", func(st rbistats.AutoBatch) bool {
 		return st.Submitted == baseline.Submitted+2 && st.QueueLen == 2
 	})
 
@@ -186,8 +325,8 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	if err := <-blockerDone; err != nil {
 		t.Fatalf("blocker Set: %v", err)
 	}
-	if err := <-badDone; !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("bad Set error = %v, want %v", err, ErrUniqueViolation)
+	if err := <-badDone; !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("bad Set error = %v, want %v", err, rbierrors.ErrUniqueViolation)
 	}
 	if err := <-goodDone; err != nil {
 		t.Fatalf("good Set: %v", err)
@@ -246,6 +385,68 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	assertHole("reopen")
 }
 
+func TestStringExt_TruncateRecreatesEmptyStringMap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "string_truncate_map.db")
+
+	db, raw := openBoltAndNew[string, Rec](t, path)
+	defer func() {
+		_ = db.Close()
+		_ = raw.Close()
+	}()
+
+	if err := db.Set("a", &Rec{Name: "a"}); err != nil {
+		t.Fatalf("Set(a): %v", err)
+	}
+	if err := db.Set("b", &Rec{Name: "b"}); err != nil {
+		t.Fatalf("Set(b): %v", err)
+	}
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		m := tx.Bucket(db.strmapBucket)
+		if m == nil {
+			return fmt.Errorf("string map bucket missing")
+		}
+		if seq := m.Sequence(); seq != 0 {
+			return fmt.Errorf("string map sequence=%d want 0", seq)
+		}
+		k, v := m.Cursor().First()
+		if k != nil || v != nil {
+			return fmt.Errorf("string map retained entry key=%x value=%q", k, v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify empty string map: %v", err)
+	}
+
+	if err := db.Set("c", &Rec{Name: "c"}); err != nil {
+		t.Fatalf("Set(c): %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		m := tx.Bucket(db.strmapBucket)
+		if m == nil {
+			return fmt.Errorf("string map bucket missing")
+		}
+		var mapKey [8]byte
+		if got := m.Get(keycodec.U64BytesWithBuf(1, &mapKey)); !slices.Equal(got, []byte("c")) {
+			return fmt.Errorf("map[1]=%q want c", got)
+		}
+		v := tx.Bucket(db.dataBucket).Get([]byte("c"))
+		idx := keycodec.U64FromBytes(v[:8])
+		if idx != 1 {
+			return fmt.Errorf("idx after truncate=%d want 1", idx)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify reused id after truncate: %v", err)
+	}
+}
+
 func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 	db, _ := openTempDBStringUnique(t)
 
@@ -265,8 +466,8 @@ func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 	}
 
 	err := db.Set("ghost-dup", &StringUniqueTestRec{Email: "a@x", Code: 99})
-	if !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("duplicate Set error = %v, want %v", err, ErrUniqueViolation)
+	if !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("duplicate Set error = %v, want %v", err, rbierrors.ErrUniqueViolation)
 	}
 	if got, getErr := db.Get("ghost-dup"); getErr != nil || got != nil {
 		t.Fatalf("rejected key lookup = %#v/%v, want nil/<nil>", got, getErr)
@@ -286,7 +487,7 @@ func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 	}
 }
 
-func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanOrder(t *testing.T) {
+func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanKeys(t *testing.T) {
 	db, _ := openTempDBString(t)
 
 	const n = 320
@@ -308,16 +509,16 @@ func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanOrder(t *testing.T) 
 		t.Fatalf("query set mismatch: got=%v want=%v", gotKeys[:min(len(gotKeys), 8)], want[:8])
 	}
 
-	gotScan := make([]string, 0, n)
+	var scanned []string
 	err = db.ScanKeys("", func(id string) (bool, error) {
-		gotScan = append(gotScan, id)
+		scanned = append(scanned, id)
 		return true, nil
 	})
 	if err != nil {
 		t.Fatalf("ScanKeys: %v", err)
 	}
-	if !slices.Equal(gotScan, want) {
-		t.Fatalf("scan order mismatch: got=%v want=%v", gotScan[:min(len(gotScan), 8)], want[:8])
+	if !slices.Equal(scanned, want) {
+		t.Fatalf("scan set mismatch: got=%v want=%v", scanned[:min(len(scanned), 8)], want[:8])
 	}
 }
 
@@ -477,7 +678,7 @@ func TestStringKeys_ExoticCharacters(t *testing.T) {
 			t.Errorf("Key %q: expected name %q, got %q", k, expectedName, v.Name)
 		}
 
-		// validate index lookup via string mapper
+		// validate index lookup through durable string ids
 		q := qx.Query(qx.EQ("name", expectedName))
 		ids, err := db.QueryKeys(q)
 		if err != nil {
@@ -1181,8 +1382,8 @@ func TestBatchSet_UniqueReject_DoesNotPersistStringKey(t *testing.T) {
 	}
 
 	err := db.Set("u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
+	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 	if v, err := db.Get("u-dup"); err != nil {
 		t.Fatalf("Get(u-dup): %v", err)

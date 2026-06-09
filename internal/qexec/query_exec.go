@@ -7,10 +7,13 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func (qv *View) execSelectedNoOrderNoFilter(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
@@ -1014,13 +1017,13 @@ func (qv *View) validateOrderBasicExpr(e qir.Expr) error {
 
 	case qir.OpConst:
 		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
-			return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: invalid expression, op: %v", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		return nil
 
 	case qir.OpAND:
 		if len(e.Operands) == 0 {
-			return fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
+			return fmt.Errorf("%w: empty AND expression", rbierrors.ErrInvalidQuery)
 		}
 		for _, op := range e.Operands {
 			if err := qv.validateOrderBasicExpr(op); err != nil {
@@ -1031,7 +1034,7 @@ func (qv *View) validateOrderBasicExpr(e qir.Expr) error {
 
 	case qir.OpOR:
 		if len(e.Operands) == 0 {
-			return fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
+			return fmt.Errorf("%w: empty OR expression", rbierrors.ErrInvalidQuery)
 		}
 		for _, op := range e.Operands {
 			if err := qv.validateOrderBasicExpr(op); err != nil {
@@ -1047,7 +1050,7 @@ func (qv *View) validateOrderBasicExpr(e qir.Expr) error {
 
 func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	if e.FieldOrdinal < 0 {
-		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+		return fmt.Errorf("%w: invalid expression, op: %v", rbierrors.ErrInvalidQuery, e.Op)
 	}
 	fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
@@ -1070,7 +1073,7 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 				return err
 			}
 			if isSlice {
-				return fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, fieldName)
+				return fmt.Errorf("%w: %v expects a single value for scalar field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 			}
 			return nil
 		}
@@ -1082,13 +1085,13 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			return err
 		}
 		if !isSlice {
-			return fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return fmt.Errorf("%w: %v expects a slice for slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		return nil
 
 	case qir.OpIN:
 		if fm.Slice {
-			return fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return fmt.Errorf("%w: %v not supported on slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if valsBuf != nil {
@@ -1098,17 +1101,17 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			return err
 		}
 		if !isSlice && e.Value != nil {
-			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v expects a slice", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		valCount := len(valsBuf)
 		if valCount == 0 && !hasNil {
-			return fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v: no values provided", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		return nil
 
 	case qir.OpHASANY, qir.OpHASALL:
 		if !fm.Slice {
-			return fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return fmt.Errorf("%w: %v not supported on non-slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if valsBuf != nil {
@@ -1118,10 +1121,10 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			return err
 		}
 		if !isSlice && e.Value != nil {
-			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v expects a slice", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		if len(valsBuf) == 0 {
-			return fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v: no values provided", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		return nil
 
@@ -1131,7 +1134,7 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			return err
 		}
 		if isSlice {
-			return fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v expects a single value", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		return nil
 
@@ -1141,12 +1144,12 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 			return err
 		}
 		if isSlice {
-			return fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+			return fmt.Errorf("%w: %v expects a single string value", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		return nil
 
 	default:
-		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+		return fmt.Errorf("%w: invalid expression, op: %v", rbierrors.ErrInvalidQuery, e.Op)
 	}
 }
 
@@ -1796,15 +1799,15 @@ func (qv *View) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResult, bool) {
 // for an order-field-bounded LIMIT scan.
 const orderBasicBoundedRangeBaseMinRowsPerNeed = 64
 
-func (qv *View) dispatchLimitMaterialized(q *qir.Shape) ([]uint64, bool, PlanName, error) {
+func (qv *View) dispatchLimitMaterialized(q *qir.Shape) ([]uint64, bool, rbitrace.PlanName, error) {
 	out, err := qv.queryMaterialized(q)
-	return out, true, PlanMaterialized, err
+	return out, true, rbitrace.PlanMaterialized, err
 }
 
 func (qv *View) dispatchOrderedLimitFallback(
 	q *qir.Shape,
 	decision plannerOrderedLimitDecision,
-) ([]uint64, bool, PlanName, error) {
+) ([]uint64, bool, rbitrace.PlanName, error) {
 	if decision.materializedFallback.kind == plannerOrderedLimitCandidateMaterializedFallback {
 		return qv.dispatchLimitMaterialized(q)
 	}
@@ -1813,7 +1816,7 @@ func (qv *View) dispatchOrderedLimitFallback(
 
 // executeOrderedLimit is the ordered LIMIT selector-family boundary: it may
 // collect cheap facts, but physical routes are chosen only by selectOrderedLimit.
-func (qv *View) executeOrderedLimit(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanName, error) {
+func (qv *View) executeOrderedLimit(q *qir.Shape, trace *Trace) ([]uint64, bool, rbitrace.PlanName, error) {
 	facts := orderedLimitFactsPool.Get()
 	defer facts.Release()
 
@@ -1856,7 +1859,7 @@ func (qv *View) dispatchOrderedLimit(
 	decision plannerOrderedLimitDecision,
 	guard plannerOrderedLimitRuntimeGuard,
 	trace *Trace,
-) ([]uint64, bool, PlanName, error) {
+) ([]uint64, bool, rbitrace.PlanName, error) {
 	order := facts.order
 	f := facts.orderField
 	fm := facts.orderMeta
@@ -1873,7 +1876,7 @@ func (qv *View) dispatchOrderedLimit(
 				return nil, true, "", err
 			}
 		}
-		return nil, true, PlanLimitOrderBasic, nil
+		return nil, true, rbitrace.PlanLimitOrderBasic, nil
 	}
 
 	selected := decision.selectedKind()
@@ -1881,7 +1884,7 @@ func (qv *View) dispatchOrderedLimit(
 DISPATCH:
 	switch selected {
 	case plannerOrderedLimitCandidateEmpty:
-		return nil, true, PlanLimitOrderBasic, nil
+		return nil, true, rbitrace.PlanLimitOrderBasic, nil
 
 	case plannerOrderedLimitCandidateMaterializedFallback:
 		return qv.dispatchLimitMaterialized(q)
@@ -1894,17 +1897,17 @@ DISPATCH:
 		defer predSet.Release()
 		for i := 0; i < predSet.Len(); i++ {
 			if predSet.owner[i].alwaysFalse {
-				return nil, true, PlanCandidateOrder, nil
+				return nil, true, rbitrace.PlanCandidateOrder, nil
 			}
 		}
-		return qv.execPlanCandidateOrderBasic(q, predSet.owner, trace), true, PlanCandidateOrder, nil
+		return qv.execPlanCandidateOrderBasic(q, predSet.owner, trace), true, rbitrace.PlanCandidateOrder, nil
 
 	case plannerOrderedLimitCandidateOrderScan:
 		if len(baseOps) == 0 {
 			out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
-			plan := PlanLimitOrderBasic
+			plan := rbitrace.PlanLimitOrderBasic
 			if hasPrefixBoundForFieldOrdinal(ops, order.FieldOrdinal) {
-				plan = PlanLimitOrderPrefix
+				plan = rbitrace.PlanLimitOrderPrefix
 			}
 			return out, true, plan, nil
 		}
@@ -1929,9 +1932,9 @@ DISPATCH:
 					}
 					if !isSlice && !isNil {
 						filter := lookupScalarPostingRetained(residualView, key)
-						plan := PlanLimitOrderBasic
+						plan := rbitrace.PlanLimitOrderBasic
 						if facts.bounds.HasPrefix {
-							plan = PlanLimitOrderPrefix
+							plan = rbitrace.PlanLimitOrderPrefix
 						}
 						if filter.IsEmpty() {
 							return nil, true, plan, nil
@@ -1979,7 +1982,7 @@ DISPATCH:
 					if predsBuf != nil {
 						leafPredSlicePool.Put(predsBuf)
 					}
-					return nil, true, PlanLimitOrderBasic, nil
+					return nil, true, rbitrace.PlanLimitOrderBasic, nil
 				}
 				universe := qv.snap.Universe.Cardinality()
 				if predsBuf != nil {
@@ -2034,9 +2037,9 @@ DISPATCH:
 				if predsBuf != nil {
 					leafPredSlicePool.Put(predsBuf)
 				}
-				plan := PlanLimitOrderBasic
+				plan := rbitrace.PlanLimitOrderBasic
 				if hasPrefixBoundForFieldOrdinal(ops, order.FieldOrdinal) {
-					plan = PlanLimitOrderPrefix
+					plan = rbitrace.PlanLimitOrderPrefix
 				}
 				return out, true, plan, nil
 			}
@@ -2051,7 +2054,7 @@ DISPATCH:
 		for i := 0; i < predSet.Len(); i++ {
 			if predSet.owner[i].alwaysFalse {
 				predSet.Release()
-				return nil, true, PlanOrdered, nil
+				return nil, true, rbitrace.PlanOrdered, nil
 			}
 		}
 		execTrace := trace
@@ -2076,7 +2079,7 @@ DISPATCH:
 		if trace != nil && trace.ev.Plan != "" {
 			return out, true, "", nil
 		}
-		return out, true, PlanOrdered, nil
+		return out, true, rbitrace.PlanOrdered, nil
 	}
 
 	if !selected.usesBaseCore() {
@@ -2094,7 +2097,7 @@ DISPATCH:
 		if baseRawCoreIdxBuf != nil {
 			pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
 		}
-		return nil, true, PlanLimitOrderBasic, nil
+		return nil, true, rbitrace.PlanLimitOrderBasic, nil
 	}
 	warmBaseIdx, warmBase, hasWarmBaseOps := qv.loadFirstWarmOrderBasicBaseCore(baseCoresBuf)
 
@@ -2187,7 +2190,7 @@ DISPATCH:
 						pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
 						base.ids.Release()
 						releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
-						return nil, true, PlanLimitOrderBasic, nil
+						return nil, true, rbitrace.PlanLimitOrderBasic, nil
 					}
 					if p.covered || p.alwaysTrue {
 						continue
@@ -2250,7 +2253,7 @@ DISPATCH:
 	if !base.neg && base.ids.IsEmpty() {
 		base.ids.Release()
 		releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
-		return nil, true, PlanLimitOrderBasic, nil
+		return nil, true, rbitrace.PlanLimitOrderBasic, nil
 	}
 
 	var (
@@ -2266,19 +2269,19 @@ DISPATCH:
 	releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
 
 	if err != nil {
-		return out, used, PlanLimitOrderBasic, err
+		return out, used, rbitrace.PlanLimitOrderBasic, err
 	}
 	if !used {
 		return qv.dispatchOrderedLimitFallback(q, decision)
 	}
 
-	return out, used, PlanLimitOrderBasic, err
+	return out, used, rbitrace.PlanLimitOrderBasic, err
 }
 
 const fieldIndexRangeExactCapMinLimit = 4096
 
 func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, offset, limit, extraRows uint64) (uint64, bool) {
-	window := satAddUint64(offset, limit)
+	window := mathutil.SatAddUint64(offset, limit)
 	if br.Empty() {
 		return boundedWindowCap(extraRows, offset, limit)
 	}
@@ -2288,7 +2291,7 @@ func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldInd
 	if uint64(br.Len()) < window {
 		_, rows := ov.RangeStats(br)
 		if extraRows != 0 {
-			rows = satAddUint64(rows, extraRows)
+			rows = mathutil.SatAddUint64(rows, extraRows)
 		}
 		return boundedWindowCap(rows, offset, limit)
 	}

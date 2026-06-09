@@ -13,10 +13,10 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
 )
 
 func TestReadSidecarStringRoundTrip(t *testing.T) {
@@ -229,9 +229,6 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
 	writePersistTestUniverse(t, writer)
-	if err := strmap.WriteSnapshot(writer, nil); err != nil {
-		t.Fatalf("write strmap: %v", err)
-	}
 	if err := writeSidecarUvarint(writer, 2); err != nil {
 		t.Fatalf("write field count: %v", err)
 	}
@@ -268,9 +265,9 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 	if err := writeSidecarUvarint(writer, 0); err != nil {
 		t.Fatalf("write measure section count: %v", err)
 	}
-	if err := writePlannerStatsSnapshot(writer, &qexec.PlannerStatsSnapshot{
+	if err := writePlannerStatsSnapshot(writer, &rbistats.PlannerSnapshot{
 		Version: 1,
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"keep": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
 		},
 	}); err != nil {
@@ -280,7 +277,7 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	result, err := loadPayload(bufio.NewReader(&buf), rt, 0)
+	result, err := loadPayload(bufio.NewReader(&buf), rt)
 	if err != nil {
 		t.Fatalf("loadPayload: %v", err)
 	}
@@ -300,8 +297,6 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 }
 
 func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
-	errInvalid := errors.New("invalid sentinel")
-	errStale := errors.New("stale sentinel")
 	field := persistTestField("field", 0)
 	rt := &schema.Schema{
 		Fields:        map[string]*schema.Field{"field": field},
@@ -318,10 +313,10 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 	if err := writeSidecarUvarint(writer, 11); err != nil {
 		t.Fatalf("write seq: %v", err)
 	}
-	writePersistTestUniverse(t, writer)
-	if err := strmap.WriteSnapshot(writer, nil); err != nil {
-		t.Fatalf("write strmap: %v", err)
+	if err := writer.WriteByte(keyStorageNumeric); err != nil {
+		t.Fatalf("write key storage kind: %v", err)
 	}
+	writePersistTestUniverse(t, writer)
 	if err := writeFields(writer, rt.Fields); err != nil {
 		t.Fatalf("write fields: %v", err)
 	}
@@ -347,15 +342,13 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 	}
 
 	_, err := Load(LoadConfig{
-		File:            file,
-		DBPath:          "test.db",
-		Bucket:          []byte("bucket"),
-		CurrentSeq:      11,
-		Schema:          rt,
-		StrMapCompactAt: 0,
-		Errors:          Errors{Stale: errStale, Invalid: errInvalid},
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 11,
+		Schema:     rt,
 	})
-	if !errors.Is(err, errInvalid) {
+	if !errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
 		t.Fatalf("Load err=%v, want invalid sentinel", err)
 	}
 }
@@ -393,9 +386,9 @@ func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := storePayload(writer, rt, snap, &qexec.PlannerStatsSnapshot{
+	if err := storePayload(writer, rt, snap, &rbistats.PlannerSnapshot{
 		Version: 1,
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"field": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
 		},
 	}); err != nil {
@@ -405,7 +398,7 @@ func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	result, err := loadPayload(bufio.NewReader(&buf), rt, 0)
+	result, err := loadPayload(bufio.NewReader(&buf), rt)
 	if err != nil {
 		t.Fatalf("loadPayload: %v", err)
 	}
@@ -419,9 +412,6 @@ func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 }
 
 func TestLoadRejectsStaleSequence(t *testing.T) {
-	errInvalid := errors.New("invalid sentinel")
-	errStale := errors.New("stale sentinel")
-
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
 	if err := writer.WriteByte(persistedIndexVersion); err != nil {
@@ -440,15 +430,13 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 	}
 
 	_, err := Load(LoadConfig{
-		File:            file,
-		DBPath:          "test.db",
-		Bucket:          []byte("bucket"),
-		CurrentSeq:      11,
-		Schema:          &schema.Schema{},
-		StrMapCompactAt: 0,
-		Errors:          Errors{Stale: errStale, Invalid: errInvalid},
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 11,
+		Schema:     &schema.Schema{},
 	})
-	if !errors.Is(err, errStale) {
+	if !errors.Is(err, rbierrors.ErrPersistedIndexStale) {
 		t.Fatalf("Load err=%v, want stale sentinel", err)
 	}
 	if !strings.Contains(err.Error(), "bucket sequence mismatch") {
@@ -457,23 +445,19 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 }
 
 func TestLoadRejectsUnsupportedVersion(t *testing.T) {
-	errInvalid := errors.New("invalid sentinel")
-	errStale := errors.New("stale sentinel")
 	file := filepath.Join(t.TempDir(), "unsupported.rbi")
 	if err := os.WriteFile(file, []byte{99}, 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
 
 	_, err := Load(LoadConfig{
-		File:            file,
-		DBPath:          "test.db",
-		Bucket:          []byte("bucket"),
-		CurrentSeq:      1,
-		Schema:          &schema.Schema{},
-		StrMapCompactAt: 0,
-		Errors:          Errors{Stale: errStale, Invalid: errInvalid},
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 1,
+		Schema:     &schema.Schema{},
 	})
-	if !errors.Is(err, errInvalid) {
+	if !errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
 		t.Fatalf("Load err=%v, want invalid sentinel", err)
 	}
 	if !strings.Contains(err.Error(), "unsupported persisted index version: 99") {
@@ -561,11 +545,11 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 		IndexedFieldByName: rt.IndexedByName,
 		Universe:           universe,
 	}
-	stats := &qexec.PlannerStatsSnapshot{
+	stats := &rbistats.PlannerSnapshot{
 		Version:             5,
 		GeneratedAt:         time.Date(2026, 5, 28, 1, 2, 3, 4, time.FixedZone("MSK", 3*60*60)),
 		UniverseCardinality: 2,
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"name": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
 			"tags": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
 		},
@@ -586,16 +570,11 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	}
 
 	result, err := Load(LoadConfig{
-		File:            file,
-		DBPath:          "test.db",
-		Bucket:          []byte("bucket"),
-		CurrentSeq:      77,
-		Schema:          rt,
-		StrMapCompactAt: 0,
-		Errors: Errors{
-			Stale:   errors.New("stale sentinel"),
-			Invalid: errors.New("invalid sentinel"),
-		},
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 77,
+		Schema:     rt,
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -642,10 +621,10 @@ func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 	if err := writeSidecarUvarint(writer, 1); err != nil {
 		t.Fatalf("write seq: %v", err)
 	}
-	writePersistTestUniverse(t, writer)
-	if err := strmap.WriteSnapshot(writer, nil); err != nil {
-		t.Fatalf("write strmap: %v", err)
+	if err := writer.WriteByte(keyStorageNumeric); err != nil {
+		t.Fatalf("write key storage kind: %v", err)
 	}
+	writePersistTestUniverse(t, writer)
 	if err := writer.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -656,15 +635,10 @@ func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 	}
 
 	_, err := Load(LoadConfig{
-		File:            file,
-		DBPath:          "test.db",
-		Bucket:          []byte("bucket"),
-		CurrentSeq:      1,
-		StrMapCompactAt: 0,
-		Errors: Errors{
-			Stale:   errors.New("stale sentinel"),
-			Invalid: errors.New("invalid sentinel"),
-		},
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 1,
 	})
 	if err == nil {
 		t.Fatalf("Load succeeded, want recovered panic")
@@ -676,11 +650,11 @@ func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 
 func TestPlannerStatsSnapshotCodecRoundTrip(t *testing.T) {
 	generatedAt := time.Unix(10, 123).UTC()
-	in := &qexec.PlannerStatsSnapshot{
+	in := &rbistats.PlannerSnapshot{
 		Version:             7,
 		GeneratedAt:         generatedAt,
 		UniverseCardinality: 100,
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"age": {
 				DistinctKeys:    4,
 				NonEmptyKeys:    4,
@@ -728,9 +702,9 @@ func TestPlannerStatsSnapshotCodecRoundTrip(t *testing.T) {
 }
 
 func TestPlannerStatsSnapshotCodecRejectsMissingCompatibleField(t *testing.T) {
-	in := &qexec.PlannerStatsSnapshot{
+	in := &rbistats.PlannerSnapshot{
 		Version: 1,
-		Fields: map[string]qexec.PlannerFieldStats{
+		Fields: map[string]rbistats.PlannerField{
 			"age": {DistinctKeys: 1, NonEmptyKeys: 1, TotalBucketCard: 1},
 		},
 	}
@@ -768,7 +742,7 @@ func TestPlannerStatsSnapshotCodecRejectsDuplicateCompatibleField(t *testing.T) 
 		if err := writeSidecarString(writer, "age"); err != nil {
 			t.Fatalf("write field name %d: %v", i, err)
 		}
-		if err := writePlannerFieldStats(writer, qexec.PlannerFieldStats{
+		if err := writePlannerFieldStats(writer, rbistats.PlannerField{
 			DistinctKeys:    1,
 			NonEmptyKeys:    1,
 			TotalBucketCard: 1,

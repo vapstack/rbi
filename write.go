@@ -1,13 +1,13 @@
 package rbi
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 )
 
@@ -164,7 +164,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 		f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 			cloned := fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
 			if cloned == nil {
-				return nil, errCloneNil
+				return nil, rbierrors.ErrCloneNil
 			}
 			return unsafe.Pointer(cloned), nil
 		}
@@ -174,7 +174,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 	f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 		cloned := fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
 		if cloned == nil {
-			return nil, errCloneNil
+			return nil, rbierrors.ErrCloneNil
 		}
 		return unsafe.Pointer(cloned), nil
 	}
@@ -191,9 +191,7 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 //   - Must not modify oldValue or newValue.
 //   - Must not retain oldValue or newValue.
 //   - Must not commit or roll back the transaction.
-//   - Must not modify records or bucket sequence in the bucket managed by this DB instance
-//     (or by any other DB instance with enabled indexing),
-//     because such writes bypass index synchronization.
+//   - Must not modify records or bucket sequences in the buckets managed by RBI.
 //
 // The callback must not call methods on the DB instance. It runs inside the
 // write transaction while internal write execution is active, and re-entering
@@ -239,8 +237,6 @@ type execOptions[K ~string | ~uint64, V any] struct {
 	patchStrict   bool
 }
 
-var errCloneNil = errors.New("clone returned nil")
-
 func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts []ExecOption[K, V]) {
 	for _, opt := range opts {
 		if opt != nil {
@@ -268,7 +264,7 @@ func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOp
 			cfg.cloneValue = func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 				cloned := clone((*V)(value))
 				if cloned == nil {
-					return nil, errCloneNil
+					return nil, rbierrors.ErrCloneNil
 				}
 				return unsafe.Pointer(cloned), nil
 			}
@@ -316,7 +312,7 @@ func (db *DB[K, V]) resolveExecOptions(opts []ExecOption[K, V]) execOptions[K, V
 // returned.
 func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if newVal == nil {
-		return ErrNilValue
+		return rbierrors.ErrNilValue
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
@@ -372,7 +368,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 
 	for i := range newVals {
 		if newVals[i] == nil {
-			return fmt.Errorf("%w: values[%v]", ErrNilValue, i)
+			return fmt.Errorf("%w: values[%v]", rbierrors.ErrNilValue, i)
 		}
 	}
 

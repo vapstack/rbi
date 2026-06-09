@@ -9,14 +9,16 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type traceContractRecorder struct {
 	mu     sync.Mutex
-	events []TraceEvent
+	events []rbitrace.Event
 }
 
-func (r *traceContractRecorder) sink(ev TraceEvent) {
+func (r *traceContractRecorder) sink(ev rbitrace.Event) {
 	r.mu.Lock()
 	r.events = append(r.events, ev)
 	r.mu.Unlock()
@@ -29,7 +31,7 @@ func (r *traceContractRecorder) mark() int {
 	return n
 }
 
-func (r *traceContractRecorder) lastSince(t testing.TB, mark int) TraceEvent {
+func (r *traceContractRecorder) lastSince(t testing.TB, mark int) rbitrace.Event {
 	t.Helper()
 
 	r.mu.Lock()
@@ -40,7 +42,7 @@ func (r *traceContractRecorder) lastSince(t testing.TB, mark int) TraceEvent {
 	return r.events[len(r.events)-1]
 }
 
-func (r *traceContractRecorder) eventsSince(t testing.TB, mark int) []TraceEvent {
+func (r *traceContractRecorder) eventsSince(t testing.TB, mark int) []rbitrace.Event {
 	t.Helper()
 
 	r.mu.Lock()
@@ -48,11 +50,11 @@ func (r *traceContractRecorder) eventsSince(t testing.TB, mark int) []TraceEvent
 	if len(r.events) <= mark {
 		t.Fatalf("expected trace events after mark=%d, total=%d", mark, len(r.events))
 	}
-	out := append([]TraceEvent(nil), r.events[mark:]...)
+	out := append([]rbitrace.Event(nil), r.events[mark:]...)
 	return out
 }
 
-func traceContractAssertBase(t testing.TB, ev TraceEvent, rowsReturned uint64) {
+func traceContractAssertBase(t testing.TB, ev rbitrace.Event, rowsReturned uint64) {
 	t.Helper()
 
 	if ev.Timestamp.IsZero() {
@@ -84,7 +86,7 @@ func traceContractAssertBase(t testing.TB, ev TraceEvent, rowsReturned uint64) {
 	}
 }
 
-func traceContractAssertQueryResultTrace(t testing.TB, ev TraceEvent, rowsReturned uint64) {
+func traceContractAssertQueryResultTrace(t testing.TB, ev rbitrace.Event, rowsReturned uint64) {
 	t.Helper()
 
 	traceContractAssertBase(t, ev, rowsReturned)
@@ -93,7 +95,7 @@ func traceContractAssertQueryResultTrace(t testing.TB, ev TraceEvent, rowsReturn
 	}
 }
 
-func traceContractAssertORBranches(t testing.TB, branches []TraceORBranch, wantLen int) {
+func traceContractAssertORBranches(t testing.TB, branches []rbitrace.ORBranch, wantLen int) {
 	t.Helper()
 
 	if len(branches) != wantLen {
@@ -133,7 +135,7 @@ func traceContractAssertORBranches(t testing.TB, branches []TraceORBranch, wantL
 type traceContractCase struct {
 	name   string
 	run    func(t *testing.T, db *DB[uint64, Rec]) uint64
-	assert func(t *testing.T, ev TraceEvent, rowsReturned uint64)
+	assert func(t *testing.T, ev rbitrace.Event, rowsReturned uint64)
 }
 
 func TestTraceContract_PublicAPIFamilies(t *testing.T) {
@@ -186,7 +188,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				}
 				return uint64(len(got))
 			},
-			assert: func(t *testing.T, ev TraceEvent, rowsReturned uint64) {
+			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
 				t.Helper()
 
 				traceContractAssertQueryResultTrace(t, ev, rowsReturned)
@@ -208,7 +210,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				if len(ev.ORBranches) != 0 {
 					t.Fatalf("unexpected OR branch trace for order-basic query, trace=%+v", ev.ORBranches)
 				}
-				if ev.ORRoute.Route != "" {
+				if ev.ORRoute.Selected != "" {
 					t.Fatalf("unexpected ordered-OR route trace for order-basic query, trace=%+v", ev.ORRoute)
 				}
 			},
@@ -235,7 +237,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				db.ReleaseRecords(items...)
 				return n
 			},
-			assert: func(t *testing.T, ev TraceEvent, rowsReturned uint64) {
+			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
 				t.Helper()
 
 				traceContractAssertQueryResultTrace(t, ev, rowsReturned)
@@ -251,7 +253,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				if ev.EarlyStopReason == "" {
 					t.Fatalf("expected early stop reason, trace=%+v", ev)
 				}
-				if len(ev.ORBranches) != 0 || ev.ORRoute.Route != "" {
+				if len(ev.ORBranches) != 0 || ev.ORRoute.Selected != "" {
 					t.Fatalf("unexpected OR trace for Query values path, trace=%+v", ev)
 				}
 			},
@@ -277,7 +279,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				}
 				return uint64(len(got))
 			},
-			assert: func(t *testing.T, ev TraceEvent, rowsReturned uint64) {
+			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
 				t.Helper()
 
 				traceContractAssertQueryResultTrace(t, ev, rowsReturned)
@@ -290,8 +292,8 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				if ev.EarlyStopReason == "" {
 					t.Fatalf("expected early stop reason, trace=%+v", ev)
 				}
-				if ev.ORRoute.Route != "" {
-					t.Fatalf("unexpected ordered-OR route trace for unordered OR query, trace=%+v", ev.ORRoute)
+				if ev.ORRoute.Selected == "" || ev.ORRoute.SelectedCost <= 0 || ev.ORRoute.RejectedCost <= 0 {
+					t.Fatalf("expected unordered OR selector trace, trace=%+v", ev.ORRoute)
 				}
 				traceContractAssertORBranches(t, ev.ORBranches, 2)
 			},
@@ -317,7 +319,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				}
 				return uint64(len(got))
 			},
-			assert: func(t *testing.T, ev TraceEvent, rowsReturned uint64) {
+			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
 				t.Helper()
 
 				traceContractAssertQueryResultTrace(t, ev, rowsReturned)
@@ -333,13 +335,8 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				if ev.EarlyStopReason == "" {
 					t.Fatalf("expected early stop reason, trace=%+v", ev)
 				}
-				if ev.ORRoute.Route != "" {
-					if ev.ORRoute.Reason == "" {
-						t.Fatalf("expected ordered-OR route reason, trace=%+v", ev.ORRoute)
-					}
-					if ev.ORRoute.KWayCost <= 0 || ev.ORRoute.FallbackCost <= 0 {
-						t.Fatalf("expected ordered-OR route costs, trace=%+v", ev.ORRoute)
-					}
+				if ev.ORRoute.Selected == "" || ev.ORRoute.SelectedCost <= 0 || ev.ORRoute.RejectedCost <= 0 {
+					t.Fatalf("expected ordered OR selector trace, trace=%+v", ev.ORRoute)
 				}
 				if ev.ORRoute.RuntimeGuardEnabled && ev.ORRoute.RuntimeGuardReason == "" {
 					t.Fatalf("expected runtime guard reason, trace=%+v", ev.ORRoute)
@@ -365,7 +362,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				}
 				return cnt
 			},
-			assert: func(t *testing.T, ev TraceEvent, rowsReturned uint64) {
+			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
 				t.Helper()
 
 				traceContractAssertBase(t, ev, rowsReturned)
@@ -375,7 +372,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 				if ev.EarlyStopReason != "" {
 					t.Fatalf("unexpected early stop reason for count query, trace=%+v", ev)
 				}
-				if ev.ORRoute.Route != "" {
+				if ev.ORRoute.Selected != "" {
 					t.Fatalf("unexpected ordered-OR route trace for count query, trace=%+v", ev.ORRoute)
 				}
 				traceContractAssertORBranches(t, ev.ORBranches, 4)
@@ -465,7 +462,7 @@ func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 	traceContractAssertBase(t, ev2, second)
 	traceContractAssertBase(t, ev3, third)
 
-	if ev1.Plan != string(PlanCountPredicates) || ev2.Plan != string(PlanCountPredicates) || ev3.Plan != string(PlanCountPredicates) {
+	if ev1.Plan != rbitrace.PlanCountPredicates || ev2.Plan != rbitrace.PlanCountPredicates || ev3.Plan != rbitrace.PlanCountPredicates {
 		t.Fatalf("expected predicate-count trace plans, got=%q %q %q", ev1.Plan, ev2.Plan, ev3.Plan)
 	}
 	if ev1.CountPredicatePreparations == 0 {
@@ -615,7 +612,7 @@ func TestPlannerStats_RefreshAndVersion(t *testing.T) {
 	}
 
 	// Returned snapshot must be safe to mutate by caller.
-	s1.Fields["country"] = PlannerFieldStats{}
+	s1.Fields["country"] = rbistats.PlannerField{}
 	s2 := db.PlannerStats()
 	if s2.Fields["country"].DistinctKeys == 0 {
 		t.Fatalf("snapshot was mutated by caller")
@@ -1088,7 +1085,7 @@ func plannerExtExprOp(expr qx.Expr) qx.Op {
 	return qx.OpNONE
 }
 
-func plannerExtRequireTrace(events []TraceEvent) error {
+func plannerExtRequireTrace(events []rbitrace.Event) error {
 	if len(events) == 0 {
 		return fmt.Errorf("expected trace event")
 	}
@@ -1103,11 +1100,11 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 	db := plannerExtOpenSeededDB(t, Options{
 		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
+		TraceSink:        func(ev rbitrace.Event) { mu.Lock(); events = append(events, ev); mu.Unlock() },
 		TraceSampleEvery: 1,
 	})
 
@@ -1303,11 +1300,11 @@ func TestPlannerExt_Race_NoOrderORDuplicatesOnOverlap(t *testing.T) {
 func TestPlannerExt_Race_TraceUnderConcurrentQueries(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 	db := plannerExtOpenSeededDB(t, Options{
 		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
+		TraceSink:        func(ev rbitrace.Event) { mu.Lock(); events = append(events, ev); mu.Unlock() },
 		TraceSampleEvery: 1,
 	})
 
@@ -1407,7 +1404,7 @@ func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			s := db.PlannerStats()
 			if s.Fields != nil {
-				s.Fields["country"] = PlannerFieldStats{}
+				s.Fields["country"] = rbistats.PlannerField{}
 			}
 		}
 	}()
@@ -1426,7 +1423,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 
 	db := plannerExtOpenSeededDB(t, Options{
 		AnalyzeInterval:  analyzeInterval,
-		TraceSink:        func(TraceEvent) {},
+		TraceSink:        func(rbitrace.Event) {},
 		TraceSampleEvery: 1,
 	})
 
@@ -1523,7 +1520,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 					return
 				}
 
-				s.Fields["country"] = PlannerFieldStats{}
+				s.Fields["country"] = rbistats.PlannerField{}
 				delete(s.Fields, "age")
 				lastVersion = s.Version
 			}

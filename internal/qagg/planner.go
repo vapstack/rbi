@@ -5,7 +5,8 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type aggregateSelectorFamily uint8
@@ -447,7 +448,7 @@ func aggregateMulGreater(a uint64, b uint64, limit uint64) bool {
 }
 
 func dispatchInvalidAggregateRoute(route aggregateRouteCandidate) error {
-	return fmt.Errorf("%w: selected aggregate route %d was not executable", qexec.ErrInvalidQuery, route)
+	return fmt.Errorf("%w: selected aggregate route %d was not executable", rbierrors.ErrInvalidQuery, route)
 }
 
 func (route aggregateRouteCandidate) String() string {
@@ -541,12 +542,12 @@ func (access aggregateMeasureAccess) String() string {
 	}
 }
 
-func (decision aggregateRouteDecision) traceRoute() qexec.TraceAggregateRoute {
+func (decision aggregateRouteDecision) traceRoute() rbitrace.AggregateRoute {
 	rejected := ""
 	if decision.rejected != 0 {
 		rejected = decision.rejected.String()
 	}
-	return qexec.TraceAggregateRoute{
+	return rbitrace.AggregateRoute{
 		Selected:            decision.route.String(),
 		Rejected:            rejected,
 		FilterInput:         decision.filterInput.String(),

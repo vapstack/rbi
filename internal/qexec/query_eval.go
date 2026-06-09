@@ -12,6 +12,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbierrors"
 )
 
 // evalExpr evaluates a boolean expression tree into a postingResult representation.
@@ -23,7 +24,7 @@ func (qv *View) evalExpr(e qir.Expr) (postingResult, error) {
 
 	case qir.OpConst:
 		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
-			return postingResult{}, fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: invalid expression, op: %v", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		res := postingResult{neg: true}
 		if e.Not {
@@ -36,7 +37,7 @@ func (qv *View) evalExpr(e qir.Expr) (postingResult, error) {
 
 	case qir.OpOR:
 		if len(e.Operands) == 0 {
-			return postingResult{}, fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
+			return postingResult{}, fmt.Errorf("%w: empty OR expression", rbierrors.ErrInvalidQuery)
 		}
 
 		positive := postingResultSlicePool.Get(len(e.Operands))
@@ -115,7 +116,7 @@ func (qv *View) evalExpr(e qir.Expr) (postingResult, error) {
 
 func (qv *View) evalAndOperands(ops []qir.Expr, negate bool) (postingResult, error) {
 	if len(ops) == 0 {
-		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
+		return postingResult{}, fmt.Errorf("%w: empty AND expression", rbierrors.ErrInvalidQuery)
 	}
 
 	if len(ops) > 1 && qv.hasEvalMergeableNumericRangeOperands(ops) {
@@ -298,7 +299,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 				return postingResult{}, err
 			}
 			if isSlice {
-				return postingResult{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, fieldName)
+				return postingResult{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 			}
 
 			var ids posting.List
@@ -322,13 +323,13 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice {
-			return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		return qv.evalSliceEQ(fieldName, e.FieldOrdinal, valsBuf)
 
 	case qir.OpIN:
 		if f.Slice {
-			return postingResult{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return postingResult{}, fmt.Errorf("%w: %v not supported on slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
@@ -338,11 +339,11 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
-			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v expects a slice", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		valCount := len(valsBuf)
 		if valCount == 0 && !hasNil {
-			return postingResult{}, fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v: no values provided", rbierrors.ErrInvalidQuery, e.Op)
 		}
 
 		capHint := valCount
@@ -370,7 +371,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 
 	case qir.OpHASANY, qir.OpHASALL:
 		if !f.Slice {
-			return postingResult{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
+			return postingResult{}, fmt.Errorf("%w: %v not supported on non-slice field %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(e)
 		if err != nil {
@@ -380,11 +381,11 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
-			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v expects a slice", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		valCount := len(valsBuf)
 		if valCount == 0 {
-			return postingResult{}, fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v: no values provided", rbierrors.ErrInvalidQuery, e.Op)
 		}
 
 		if e.Op == qir.OpHASALL {
@@ -426,7 +427,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if isSlice {
-			return postingResult{}, fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v expects a single value", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		if bound.empty {
 			return postingResult{}, nil
@@ -441,7 +442,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if isSlice {
-			return postingResult{}, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v expects a single string value", rbierrors.ErrInvalidQuery, e.Op)
 		}
 		if isNil {
 			return postingResult{}, nil

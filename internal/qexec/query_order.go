@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func shouldUseOnePassIntersectionPosting(a posting.List, b posting.List, need uint64, all bool) bool {
@@ -779,8 +780,8 @@ type plannerArrayPosOrderDecision struct {
 	rejected             plannerArrayPosOrderCandidate
 }
 
-func (d plannerArrayPosOrderDecision) traceRoute() TraceArrayPosOrderRoute {
-	return TraceArrayPosOrderRoute{
+func (d plannerArrayPosOrderDecision) traceRoute() rbitrace.ArrayPosOrderRoute {
+	return rbitrace.ArrayPosOrderRoute{
 		Selected:     d.selected.kind.String(),
 		Rejected:     d.rejected.kind.String(),
 		SelectedCost: d.selected.cost,
@@ -858,7 +859,7 @@ func (qv *View) selectArrayPosOrder(q *qir.Shape) (plannerArrayPosOrderDecision,
 	}, true
 }
 
-func (qv *View) executeArrayPosOrder(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanName, error) {
+func (qv *View) executeArrayPosOrder(q *qir.Shape, trace *Trace) ([]uint64, bool, rbitrace.PlanName, error) {
 	var facts plannerArrayPosOrderFacts
 	if !qv.collectArrayPosOrderFacts(q, &facts) {
 		return nil, false, "", nil
@@ -880,7 +881,7 @@ func (qv *View) dispatchArrayPosOrder(
 	facts *plannerArrayPosOrderFacts,
 	decision plannerArrayPosOrderDecision,
 	trace *Trace,
-) ([]uint64, bool, PlanName, error) {
+) ([]uint64, bool, rbitrace.PlanName, error) {
 	switch decision.selected.kind {
 	case plannerArrayPosOrderCandidateMaterializedFallback:
 		return qv.dispatchLimitMaterialized(q)
@@ -895,7 +896,7 @@ func (qv *View) dispatchArrayPosOrder(
 			}
 			return nil, true, "", fmt.Errorf("selected ArrayPos ORDER route %s was not executable", decision.selected.kind.String())
 		}
-		return out, true, PlanMaterialized, nil
+		return out, true, rbitrace.PlanMaterialized, nil
 	}
 	return nil, false, "", nil
 }

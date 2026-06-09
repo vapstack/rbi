@@ -4,6 +4,7 @@ import (
 	"math/bits"
 
 	"github.com/vapstack/pooled"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -82,7 +83,7 @@ func (s *u64set) Add(x uint64) bool {
 	if s.n*2 >= len(s.keys) {
 		s.grow()
 	}
-	i := mix64(x) & s.mask
+	i := mathutil.Mix64(x) & s.mask
 	for {
 		if s.used[i] == 0 {
 			s.used[i] = 1
@@ -101,7 +102,7 @@ func (s *u64set) Has(x uint64) bool {
 	if len(s.keys) == 0 {
 		return false
 	}
-	i := mix64(x) & s.mask
+	i := mathutil.Mix64(x) & s.mask
 	for {
 		if s.used[i] == 0 {
 			return false
@@ -138,30 +139,6 @@ func (s *u64set) grow() {
 		}
 	}
 	releaseU64Set(&old)
-}
-
-func mix64(x uint64) uint64 {
-	x += 0x9e3779b97f4a7c15
-	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
-	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
-	return x ^ (x >> 31)
-}
-
-func satMulUint64(a, b uint64) uint64 {
-	if a == 0 || b == 0 {
-		return 0
-	}
-	if ^uint64(0)/a < b {
-		return ^uint64(0)
-	}
-	return a * b
-}
-
-func satAddUint64(total, add uint64) uint64 {
-	if ^uint64(0)-total < add {
-		return ^uint64(0)
-	}
-	return total + add
 }
 
 func (qv *View) isPositiveUniqueEqExpr(e qir.Expr) bool {

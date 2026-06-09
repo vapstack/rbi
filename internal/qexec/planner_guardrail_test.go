@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerGuardrailTotals struct {
@@ -18,7 +19,7 @@ type plannerGuardrailTotals struct {
 type plannerGuardrailCase struct {
 	name           string
 	q              *qx.QX
-	wantChosenPlan PlanName
+	wantChosenPlan rbitrace.PlanName
 }
 
 type plannerGuardrailFamily struct {
@@ -169,13 +170,13 @@ func plannerGuardrailRunForcedOrderedPlanner(
 	for i := 0; i < predSet.Len(); i++ {
 		if predSet.owner[i].alwaysFalse {
 			if trace != nil {
-				trace.SetPlan(PlanOrdered)
+				trace.SetPlan(rbitrace.PlanOrdered)
 			}
 			return nil, true, nil
 		}
 	}
 	if trace != nil {
-		trace.SetPlan(PlanOrdered)
+		trace.SetPlan(rbitrace.PlanOrdered)
 	}
 	out, ok := view.execPlanOrderedBasicReader(viewQ, predSet.owner, trace)
 	return out, ok, nil
@@ -188,7 +189,7 @@ func plannerGuardrailRunTryPlanCandidate(
 ) ([]uint64, bool, error) {
 	if viewQ.HasOrder {
 		out, ok, plan, err := view.executeOrderedLimit(viewQ, trace)
-		if ok && plan == PlanCandidateOrder {
+		if ok && plan == rbitrace.PlanCandidateOrder {
 			if trace != nil {
 				trace.SetPlan(plan)
 			}
@@ -197,7 +198,7 @@ func plannerGuardrailRunTryPlanCandidate(
 		return nil, false, err
 	}
 	out, ok, plan, err := view.executeNoOrderLimit(viewQ, trace)
-	if ok && plan == PlanCandidateNoOrder {
+	if ok && plan == rbitrace.PlanCandidateNoOrder {
 		if trace != nil {
 			trace.SetPlan(plan)
 		}
@@ -224,13 +225,13 @@ func plannerGuardrailRunForcedOrderedNoOrderPlanner(
 	for i := 0; i < predSet.Len(); i++ {
 		if predSet.owner[i].alwaysFalse {
 			if trace != nil {
-				trace.SetPlan(PlanOrderedNoOrder)
+				trace.SetPlan(rbitrace.PlanOrderedNoOrder)
 			}
 			return nil, true, nil
 		}
 	}
 	if trace != nil {
-		trace.SetPlan(PlanOrderedNoOrder)
+		trace.SetPlan(rbitrace.PlanOrderedNoOrder)
 	}
 	return view.execPlanLeadScanNoOrder(viewQ, predSet.owner, -1, trace), true, nil
 }
@@ -275,7 +276,7 @@ func plannerGuardrailRunForcedNoOrderRange(
 		}
 	}
 	if trace != nil {
-		trace.SetPlan(PlanLimitRangeNoOrder)
+		trace.SetPlan(rbitrace.PlanLimitRangeNoOrder)
 	}
 	return view.execSelectedNoOrderBounds(viewQ, f, bounds, leaves, trace)
 }
@@ -295,7 +296,7 @@ func runPlannerGuardrailFamily(t *testing.T, family plannerGuardrailFamily) {
 			h := newPlannerShadowHarness(t, db, recorder, tc.q)
 
 			chosen := h.run("guardrail_chosen", family.runChosen)
-			if tc.wantChosenPlan != "" && chosen.trace.Plan != string(tc.wantChosenPlan) {
+			if tc.wantChosenPlan != "" && chosen.trace.Plan != tc.wantChosenPlan {
 				t.Fatalf("expected chosen plan %q, got %q", tc.wantChosenPlan, chosen.trace.Plan)
 			}
 			alternative := h.run("guardrail_alternative", family.runAlternative)
@@ -352,7 +353,7 @@ func TestPlannerGuardrails_NoOrderORAdaptiveFamily(t *testing.T) {
 						qx.EQ("country", "NL"),
 					),
 				).Limit(10),
-				wantChosenPlan: PlanORMergeNoOrder,
+				wantChosenPlan: rbitrace.PlanORMergeNoOrder,
 			},
 			{
 				name: "Limit20",
@@ -363,7 +364,7 @@ func TestPlannerGuardrails_NoOrderORAdaptiveFamily(t *testing.T) {
 						qx.EQ("country", "NL"),
 					),
 				).Limit(20),
-				wantChosenPlan: PlanORMergeNoOrder,
+				wantChosenPlan: rbitrace.PlanORMergeNoOrder,
 			},
 			{
 				name: "Limit40",
@@ -374,7 +375,7 @@ func TestPlannerGuardrails_NoOrderORAdaptiveFamily(t *testing.T) {
 						qx.EQ("country", "NL"),
 					),
 				).Limit(40),
-				wantChosenPlan: PlanORMergeNoOrder,
+				wantChosenPlan: rbitrace.PlanORMergeNoOrder,
 			},
 		},
 		runChosen:      plannerGuardrailRunTryPlanORMergeMode,
@@ -393,9 +394,9 @@ func TestPlannerGuardrails_OrderedORMergeNaturalFamily(t *testing.T) {
 		name: "OrderedORMergeNaturalFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit40", q: q40, wantChosenPlan: PlanORMergeOrderMerge},
-			{name: "Limit80", q: q80, wantChosenPlan: PlanORMergeOrderMerge},
-			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderMerge},
+			{name: "Limit40", q: q40, wantChosenPlan: rbitrace.PlanORMergeOrderMerge},
+			{name: "Limit80", q: q80, wantChosenPlan: rbitrace.PlanORMergeOrderMerge},
+			{name: "Limit120", q: base, wantChosenPlan: rbitrace.PlanORMergeOrderMerge},
 		},
 		runChosen:      plannerGuardrailRunTryPlanORMergeMode,
 		runAlternative: plannerGuardrailRunForcedOROrderFallback,
@@ -413,9 +414,9 @@ func TestPlannerGuardrails_OrderedORStreamNaturalFamily(t *testing.T) {
 		name: "OrderedORStreamNaturalFamily",
 		open: plannerGuardrailOpenOrderedORMergeDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit60", q: q60, wantChosenPlan: PlanORMergeOrderStream},
-			{name: "Limit90", q: q90, wantChosenPlan: PlanORMergeOrderStream},
-			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderStream},
+			{name: "Limit60", q: q60, wantChosenPlan: rbitrace.PlanORMergeOrderStream},
+			{name: "Limit90", q: q90, wantChosenPlan: rbitrace.PlanORMergeOrderStream},
+			{name: "Limit120", q: base, wantChosenPlan: rbitrace.PlanORMergeOrderStream},
 		},
 		runChosen:      plannerGuardrailRunTryPlanORMergeMode,
 		runAlternative: plannerGuardrailRunForcedOROrderFallback,
@@ -437,9 +438,9 @@ func TestPlannerGuardrails_OrderedLimitExecutionFamily(t *testing.T) {
 		name: "OrderedLimitExecutionFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit30", q: q30, wantChosenPlan: PlanLimitOrderBasic},
-			{name: "Limit60", q: q60, wantChosenPlan: PlanLimitOrderBasic},
-			{name: "Limit120", q: base, wantChosenPlan: PlanLimitOrderBasic},
+			{name: "Limit30", q: q30, wantChosenPlan: rbitrace.PlanLimitOrderBasic},
+			{name: "Limit60", q: q60, wantChosenPlan: rbitrace.PlanLimitOrderBasic},
+			{name: "Limit120", q: base, wantChosenPlan: rbitrace.PlanLimitOrderBasic},
 		},
 		runChosen:             plannerGuardrailRunLimitRoutes,
 		runAlternative:        plannerGuardrailRunForcedOrderedPlanner,
@@ -462,9 +463,9 @@ func TestPlannerGuardrails_CandidateOrderFamily(t *testing.T) {
 		name: "CandidateOrderFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit40", q: q40, wantChosenPlan: PlanCandidateOrder},
-			{name: "Limit80", q: q80, wantChosenPlan: PlanCandidateOrder},
-			{name: "Limit120", q: base, wantChosenPlan: PlanCandidateOrder},
+			{name: "Limit40", q: q40, wantChosenPlan: rbitrace.PlanCandidateOrder},
+			{name: "Limit80", q: q80, wantChosenPlan: rbitrace.PlanCandidateOrder},
+			{name: "Limit120", q: base, wantChosenPlan: rbitrace.PlanCandidateOrder},
 		},
 		runChosen:             plannerGuardrailRunTryPlanCandidate,
 		runAlternative:        plannerGuardrailRunForcedOrderedPlanner,
@@ -487,9 +488,9 @@ func TestPlannerGuardrails_CandidateNoOrderFamily(t *testing.T) {
 		name: "CandidateNoOrderFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit30", q: q30, wantChosenPlan: PlanCandidateNoOrder},
-			{name: "Limit60", q: q60, wantChosenPlan: PlanCandidateNoOrder},
-			{name: "Limit90", q: base, wantChosenPlan: PlanCandidateNoOrder},
+			{name: "Limit30", q: q30, wantChosenPlan: rbitrace.PlanCandidateNoOrder},
+			{name: "Limit60", q: q60, wantChosenPlan: rbitrace.PlanCandidateNoOrder},
+			{name: "Limit90", q: base, wantChosenPlan: rbitrace.PlanCandidateNoOrder},
 		},
 		runChosen:      plannerGuardrailRunTryPlanCandidate,
 		runAlternative: plannerGuardrailRunForcedOrderedNoOrderPlanner,
@@ -535,11 +536,11 @@ func TestPlannerGuardrails_NoOrderBroadRangeLeadNamedFamily(t *testing.T) {
 		name: "NoOrderBroadRangeLeadNamedFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "BroadRangeLead_ThreeSelectiveResiduals", q: broadSelective, wantChosenPlan: PlanCandidateNoOrder},
+			{name: "BroadRangeLead_ThreeSelectiveResiduals", q: broadSelective, wantChosenPlan: rbitrace.PlanCandidateNoOrder},
 			{name: "BroadRangeLead_ThreeSelectiveResiduals_None", q: broadSelectiveNone},
 			{name: "MissingEqualityResidual", q: missingEquality},
-			{name: "BroadRangeLead_ThreeWeakResiduals_Control", q: weakControl, wantChosenPlan: PlanLimitRangeNoOrder},
-			{name: "NarrowRangeLead_ThreeResiduals_Control", q: narrowControl, wantChosenPlan: PlanLimitRangeNoOrder},
+			{name: "BroadRangeLead_ThreeWeakResiduals_Control", q: weakControl, wantChosenPlan: rbitrace.PlanLimitRangeNoOrder},
+			{name: "NarrowRangeLead_ThreeResiduals_Control", q: narrowControl, wantChosenPlan: rbitrace.PlanLimitRangeNoOrder},
 		},
 		runChosen:               plannerGuardrailRunNoOrderLimitSelector,
 		runAlternative:          plannerGuardrailRunForcedNoOrderRange,
@@ -752,7 +753,7 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 		newRec := oldRec
 		newRec.Name = "zach"
 		db.seq++
-		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, db.rt.Patch.Fields, []snapshot.BatchEntry{{
+		db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, db.rt.Patch.Fields, []snapshot.BatchEntry{{
 			ID:        1,
 			Old:       unsafe.Pointer(&oldRec),
 			New:       unsafe.Pointer(&newRec),
@@ -824,9 +825,9 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 }
 
 func TestPlannerGuardrails_OrderedLimitBroadResidualNoOffsetUsesOrderScan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db := newTestDB(t, testOptions{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
@@ -857,9 +858,9 @@ func TestPlannerGuardrails_OrderedLimitBroadResidualNoOffsetUsesOrderScan(t *tes
 }
 
 func TestPlannerGuardrails_OrderedLimitBoundedExactResidualsUsesOrderScan(t *testing.T) {
-	var events []TraceEvent
+	var events []rbitrace.Event
 	db := newTestDB(t, testOptions{
-		TraceSink: func(ev TraceEvent) {
+		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,

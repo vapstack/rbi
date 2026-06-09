@@ -11,6 +11,8 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qagg"
@@ -20,18 +22,17 @@ import (
 	"github.com/vapstack/rbi/internal/rebuild"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vapstack/rbi/internal/wexec"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 	"go.etcd.io/bbolt"
 )
-
-const randStreamMix uint64 = 0x9e3779b97f4a7c15
 
 type Index struct {
 	snapshot               *snapshot.Registry
 	schema                 *schema.Schema
 	strKey                 bool
-	strMap                 *strmap.Mapper
 	index                  []indexdata.FieldStorage
 	nilIndex               []indexdata.FieldStorage
 	lenIndex               []indexdata.FieldStorage
@@ -59,21 +60,14 @@ type Config struct {
 	NumericRangeBucketMinSpanKeys  int
 
 	AnalyzeInterval  time.Duration
-	TraceSink        func(qexec.TraceEvent)
+	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
-
-	StrMapCompactAt int
-}
-
-type LoadErrors struct {
-	Stale   error
-	Invalid error
 }
 
 type LoadResult struct {
 	SkipFields        map[string]struct{}
 	SkipMeasureFields map[string]struct{}
-	PlannerStats      *qexec.PlannerStatsSnapshot
+	PlannerStats      *rbistats.PlannerSnapshot
 }
 
 type BuildResult struct {
@@ -82,77 +76,36 @@ type BuildResult struct {
 	BuildRPS  int
 }
 
-type KeySet struct {
-	IDs    []uint64
-	lookup strmap.Lookup
-}
-
 type DBStats struct {
 	KeyCount uint64
 	Sequence uint64
 	HasLast  bool
-	LastID   uint64
-	LastKey  string
-}
-
-type IndexStats struct {
-	UniqueFieldKeys        map[string]uint64
-	Size                   uint64
-	FieldSize              map[string]uint64
-	FieldKeyBytes          map[string]uint64
-	FieldTotalCardinality  map[string]uint64
-	FieldApproxStructBytes map[string]uint64
-	FieldApproxHeapBytes   map[string]uint64
-	EntryCount             uint64
-	KeyBytes               uint64
-	PostingCardinality     uint64
-	ApproxStructBytes      uint64
-	ApproxHeapBytes        uint64
-}
-
-type PlannerStats struct {
-	Version             uint64
-	GeneratedAt         time.Time
-	UniverseCardinality uint64
-	FieldCount          int
-	Fields              map[string]qexec.PlannerFieldStats
-	AnalyzeInterval     time.Duration
-	TraceSampleEvery    uint64
-}
-
-type SnapshotStats struct {
-	Sequence     uint64
-	UniverseCard uint64
-	RegistrySize int
-	PinnedRefs   int
+	LastKey  keycodec.DataKey
 }
 
 type StagedSnapshot struct {
 	view *snapshot.View
 }
 
-type DecodeFunc func([]byte) (unsafe.Pointer, error)
-type ReleaseFunc func(unsafe.Pointer)
+type (
+	DecodeFunc  func([]byte) (unsafe.Pointer, error)
+	ReleaseFunc func(unsafe.Pointer)
+)
 
 func NewIndex(cfg Config) (*Index, error) {
 	if !cfg.Schema.HasQueryFields() {
 		return nil, nil
 	}
 
-	var sm *strmap.Mapper
-	if cfg.StrKey {
-		sm = strmap.New(0, cfg.StrMapCompactAt)
-	}
-
 	r := &Index{
 		schema:                 cfg.Schema,
 		strKey:                 cfg.StrKey,
-		strMap:                 sm,
 		universe:               posting.List{},
 		matPredCacheMaxEntries: max(0, cfg.SnapshotMaterializedPredCacheMaxEntries),
 		matPredCacheMaxCard:    qcache.MaterializedPredMaxCardinality(cfg.SnapshotMaterializedPredCacheMaxCardinality),
 		snapshot:               snapshot.NewRegistry(cfg.SnapshotStats),
 		exec: qexec.NewRuntime(qexec.Config{
+			StrKey:                         cfg.StrKey,
 			Schema:                         cfg.Schema,
 			NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
 			NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
@@ -180,31 +133,44 @@ func (index *Index) SnapshotCacheConfig() snapshot.CacheConfig {
 	}
 }
 
-func (index *Index) ConfigureWrite(cfg *wexec.Config, broken *atomic.Bool, logger *log.Logger, uniqueViolation error, brokenErr error) {
+func (index *Index) ConfigureWrite(cfg *wexec.Config, broken *atomic.Bool, logger *log.Logger) {
 	cfg.Indexed = true
-	cfg.StrMap = index.strMap
 	cfg.Unique = wexec.UniqueContext{
-		Schema:          index.schema,
-		Current:         index.snapshot.Current,
-		UniqueViolation: uniqueViolation,
+		Schema:  index.schema,
+		Current: index.snapshot.Current,
 	}
 	cfg.SnapshotOps = wexec.SnapshotOps{
 		Manager:     index.snapshot,
 		Schema:      index.schema,
-		CacheConfig: index.SnapshotCacheConfig,
-		StrMap:      index.strMap,
+		CacheConfig: index.SnapshotCacheConfig(),
 		PatchFields: index.schema.Patch.Fields,
 	}
-	cfg.IndexPublishOps = wexec.IndexPublishOps{
-		PublishCommitted: func(seq uint64, op string, snap *snapshot.View) error {
-			return index.PublishCommittedView(broken, logger, brokenErr, seq, op, snap)
-		},
+	cfg.PublishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
+		return index.PublishCommittedView(broken, logger, seq, op, snap)
 	}
 }
 
 func (index *Index) ValidateStringValues(ptr unsafe.Pointer) error {
 	for _, acc := range index.schema.StringValidation {
 		if err := acc.Validate(ptr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (index *Index) ScanKeys(seek uint64, fn func(uint64) (bool, error)) error {
+	snap, seq, ref := index.snapshot.PinCurrent()
+	defer index.snapshot.Unpin(seq, ref)
+
+	it := snap.Universe.Borrow().AdvancingIter()
+	defer it.Release()
+
+	it.AdvanceIfNeeded(seek)
+	for it.HasNext() {
+		id := it.Next()
+		more, err := fn(id)
+		if err != nil || !more {
 			return err
 		}
 	}
@@ -223,6 +189,7 @@ func (index *Index) Count(exprs ...qx.Expr) (uint64, error) {
 
 	view := index.exec.AcquireView(snap)
 	defer index.exec.ReleaseView(view)
+
 	return qagg.Count(view, prepared, true)
 }
 
@@ -242,15 +209,7 @@ func (index *Index) Aggregate(q *qx.QX) (qagg.Result, error) {
 	return qagg.Execute(view, snap, prepared)
 }
 
-func (keys *KeySet) StringAt(i int) string {
-	s, ok := keys.lookup.String(keys.IDs[i])
-	if !ok {
-		panic("rbi: no string key associated with snapshot idx")
-	}
-	return s
-}
-
-func (index *Index) QueryKeys(q *qx.QX, fn func(KeySet) error) error {
+func (index *Index) QueryKeys(q *qx.QX, fn func([]uint64) error) error {
 	prepared, shape, err := index.prepareQuery(q)
 	if err != nil {
 		return err
@@ -260,14 +219,14 @@ func (index *Index) QueryKeys(q *qx.QX, fn func(KeySet) error) error {
 	snap, seq, ref := index.snapshot.PinCurrent()
 	defer index.snapshot.Unpin(seq, ref)
 
-	keys, err := index.queryKeysOnSnapshot(snap, &shape, false)
+	ids, err := index.queryKeysOnSnapshot(snap, &shape, false)
 	if err != nil {
 		return err
 	}
-	return fn(keys)
+	return fn(ids)
 }
 
-func (index *Index) Query(q *qx.QX, bolt *bbolt.DB, bucketName []byte, unavailable func() error, fn func(*bbolt.Tx, KeySet) error) error {
+func (index *Index) Query(q *qx.QX, bolt *bbolt.DB, bucketName []byte, unavailable func() error, fn func(*bbolt.Tx, []uint64) error) error {
 	prepared, shape, err := index.prepareQuery(q)
 	if err != nil {
 		return err
@@ -304,14 +263,14 @@ func (index *Index) Query(q *qx.QX, bolt *bbolt.DB, bucketName []byte, unavailab
 	defer index.snapshot.Unpin(seq, ref)
 	defer func() { _ = tx.Rollback() }()
 
-	keys, err := index.queryKeysOnSnapshot(snap, &shape, true)
+	ids, err := index.queryKeysOnSnapshot(snap, &shape, true)
 	if err != nil {
 		return err
 	}
-	if len(keys.IDs) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
-	return fn(tx, keys)
+	return fn(tx, ids)
 }
 
 func (index *Index) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
@@ -325,128 +284,45 @@ func (index *Index) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
 	return prepared, qir.NewShape(prepared), nil
 }
 
-func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape, tryEmpty bool) (KeySet, error) {
+func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape, tryEmpty bool) ([]uint64, error) {
 	view := index.exec.AcquireView(snap)
 	defer index.exec.ReleaseView(view)
 
 	if tryEmpty && !index.exec.TraceSamplingEnabled() {
 		if empty, err := view.TryQueryEmptyOnSnapshot(q); empty || err != nil {
-			return KeySet{}, err
+			return nil, err
 		}
 	}
 
 	ids, err := view.Query(q, true)
 	if err != nil {
-		return KeySet{}, err
+		return nil, err
 	}
 	if len(ids) == 0 {
-		return KeySet{}, nil
+		return nil, nil
 	}
-	if !index.strKey {
-		return KeySet{IDs: ids}, nil
-	}
-	return KeySet{IDs: ids, lookup: snap.StrMap.Lookup()}, nil
+	return ids, nil
 }
 
-func (index *Index) ScanUintKeys(seek uint64, fn func(uint64) (bool, error)) error {
-	snap, seq, ref := index.snapshot.PinCurrent()
-	defer index.snapshot.Unpin(seq, ref)
+func (index *Index) BuildIndex(
+	bolt *bbolt.DB,
+	dataBucket, strmapBucket []byte,
+	skipFields, skipMeasureFields map[string]struct{},
+	decode DecodeFunc,
+	release ReleaseFunc,
+) (BuildResult, error) {
 
-	universe := snap.Universe
-	iter := universe.Iter()
-	defer iter.Release()
-
-	for iter.HasNext() {
-		idx := iter.Next()
-		if idx < seek {
-			continue
-		}
-		cont, err := fn(idx)
-		if err != nil {
-			return err
-		}
-		if !cont {
-			break
-		}
-	}
-	return nil
-}
-
-func (index *Index) ScanStringKeys(seek string, invalidKeyErr error, fn func(string) (bool, error)) error {
-	snap, seq, ref := index.snapshot.PinCurrent()
-	defer index.snapshot.Unpin(seq, ref)
-
-	universe := snap.Universe
-	if universe.IsEmpty() {
-		return nil
-	}
-
-	iter := universe.Iter()
-	defer iter.Release()
-
-	return scanStringKeys(snap.StrMap, universe, iter, seek, invalidKeyErr, fn)
-}
-
-func scanStringKeys(snap *strmap.Snapshot, universe posting.List, iter posting.Iterator, seek string, invalidKeyErr error, fn func(string) (bool, error)) error {
-	next := snap.Next()
-	card := universe.Cardinality()
-	minIdx, hasMin := universe.Minimum()
-	maxIdx, hasMax := universe.Maximum()
-
-	lookup := snap.Lookup()
-	if card == next && card > 0 && hasMin && hasMax && minIdx == 1 && maxIdx == next {
-		for idx := uint64(1); idx <= next; idx++ {
-			s, ok := lookup.String(idx)
-			if !ok {
-				return fmt.Errorf("%w: %v", invalidKeyErr, idx)
-			}
-			cont, err := emitScannedStringKey(seek, s, fn)
-			if err != nil {
-				return err
-			}
-			if !cont {
-				return nil
-			}
-		}
-		return nil
-	}
-
-	for iter.HasNext() {
-		idx := iter.Next()
-		s, ok := lookup.String(idx)
-		if !ok {
-			return fmt.Errorf("%w: %v", invalidKeyErr, idx)
-		}
-		cont, err := emitScannedStringKey(seek, s, fn)
-		if err != nil {
-			return err
-		}
-		if !cont {
-			return nil
-		}
-	}
-	return nil
-}
-
-func emitScannedStringKey(seek string, s string, fn func(string) (bool, error)) (bool, error) {
-	if s < seek {
-		return true, nil
-	}
-	return fn(s)
-}
-
-func (index *Index) BuildIndex(bolt *bbolt.DB, bucket []byte, skipFields map[string]struct{}, skipMeasureFields map[string]struct{}, decode DecodeFunc, release ReleaseFunc) (BuildResult, error) {
-	seq, err := currentBucketSequence(bolt, bucket)
+	seq, err := currentBucketSequence(bolt, dataBucket)
 	if err != nil {
 		return BuildResult{}, err
 	}
 	result, err := rebuild.Build(rebuild.Config{
 		Bolt:              bolt,
-		Bucket:            bucket,
+		DataBucket:        dataBucket,
+		StrMapBucket:      strmapBucket,
 		Schema:            index.schema,
 		Current:           index.snapshot.Current(),
 		StrKey:            index.strKey,
-		StrMap:            index.strMap,
 		SkipFields:        skipFields,
 		SkipMeasureFields: skipMeasureFields,
 		Decode:            rebuild.DecodeFunc(decode),
@@ -476,18 +352,14 @@ func (index *Index) BuildIndex(bolt *bbolt.DB, bucket []byte, skipFields map[str
 	}, nil
 }
 
-func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, currentSeq uint64, compactAt int, errs LoadErrors) (LoadResult, error) {
+func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, currentSeq uint64) (LoadResult, error) {
 	result, err := persist.Load(persist.LoadConfig{
-		File:            file,
-		DBPath:          dbPath,
-		Bucket:          bucket,
-		CurrentSeq:      currentSeq,
-		Schema:          index.schema,
-		StrMapCompactAt: compactAt,
-		Errors: persist.Errors{
-			Stale:   errs.Stale,
-			Invalid: errs.Invalid,
-		},
+		File:       file,
+		DBPath:     dbPath,
+		Bucket:     bucket,
+		CurrentSeq: currentSeq,
+		Schema:     index.schema,
+		StrKey:     index.strKey,
 	})
 	if err != nil {
 		return LoadResult{}, err
@@ -502,9 +374,6 @@ func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, current
 	index.releaseCurrentStorage()
 	index.lenIndexLoaded = result.LenLoaded
 
-	if index.strKey {
-		index.strMap = result.StrMap
-	}
 	st := result.Storage
 	result.Storage = snapshot.Storage{}
 	index.publishStorageSnapshotNoLock(currentSeq, st)
@@ -539,19 +408,16 @@ func (index *Index) StoreIndex(file string, bolt *bbolt.DB, bucket []byte) error
 		File:         file,
 		BucketSeq:    seq,
 		Schema:       index.schema,
+		StrKey:       index.strKey,
 		Snapshot:     snap,
 		PlannerStats: plannerStats,
 	})
 }
 
-func (index *Index) PublishCurrentSequenceSnapshot(bolt *bbolt.DB, bucket []byte) error {
+func (index *Index) PublishCurrentSnapshot(bolt *bbolt.DB, bucket []byte) error {
 	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return err
-	}
-	var strSnap *strmap.Snapshot
-	if index.strMap != nil {
-		strSnap = index.strMap.Snapshot()
 	}
 	prev := index.snapshot.Current()
 	var snap *snapshot.View
@@ -566,7 +432,6 @@ func (index *Index) PublishCurrentSequenceSnapshot(bolt *bbolt.DB, bucket []byte
 			LenZeroComplement: lenZeroComplement,
 			Measure:           indexdata.CloneMeasureStorageSlots(index.measure, len(index.schema.Measures)),
 			Universe:          index.universe,
-			StrMap:            strSnap,
 		})
 	} else {
 		snap = snapshot.NewView(seq, nil, index.schema, index.SnapshotCacheConfig(), snapshot.Storage{
@@ -576,25 +441,15 @@ func (index *Index) PublishCurrentSequenceSnapshot(bolt *bbolt.DB, bucket []byte
 			LenZeroComplement: index.lenZeroComplement,
 			Measure:           index.measure,
 			Universe:          index.universe,
-			StrMap:            strSnap,
 		})
 	}
 	index.installViewNoLock(snap)
-	if index.strMap != nil {
-		index.strMap.MarkCommittedPublished(strSnap)
-	}
 	return nil
 }
 
 func (index *Index) publishStorageSnapshotNoLock(seq uint64, st snapshot.Storage) {
-	if index.strMap != nil {
-		st.StrMap = index.strMap.Snapshot()
-	}
 	snap := snapshot.NewView(seq, index.snapshot.Current(), index.schema, index.SnapshotCacheConfig(), st)
 	index.installViewNoLock(snap)
-	if index.strMap != nil {
-		index.strMap.MarkCommittedPublished(st.StrMap)
-	}
 }
 
 func (index *Index) installViewNoLock(s *snapshot.View) {
@@ -617,10 +472,6 @@ func (index *Index) StageTruncate(seq uint64) StagedSnapshot {
 	measureSlotCount := len(index.schema.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	nextUniverse := posting.List{}
-	var nextStrMap *strmap.Snapshot
-	if index.strKey {
-		nextStrMap = strmap.EmptySnapshot()
-	}
 	snap := snapshot.NewView(seq, index.snapshot.Current(), index.schema, index.SnapshotCacheConfig(), snapshot.Storage{
 		Index:             nextIndex,
 		NilIndex:          nextNilIndex,
@@ -628,7 +479,6 @@ func (index *Index) StageTruncate(seq uint64) StagedSnapshot {
 		LenZeroComplement: nextLenZeroComplement,
 		Measure:           nextMeasure,
 		Universe:          nextUniverse,
-		StrMap:            nextStrMap,
 	})
 	index.snapshot.Stage(snap)
 	return StagedSnapshot{view: snap}
@@ -638,34 +488,28 @@ func (index *Index) DropStaged(seq uint64) {
 	index.snapshot.DropStaged(seq)
 }
 
-func (index *Index) PublishCommittedStaged(broken *atomic.Bool, logger *log.Logger, brokenErr error, seq uint64, op string, staged StagedSnapshot) error {
-	if index.strKey {
-		index.strMap.Truncate()
-	}
-	return index.PublishCommittedView(broken, logger, brokenErr, seq, op, staged.view)
+func (index *Index) PublishCommittedStaged(broken *atomic.Bool, logger *log.Logger, seq uint64, op string, staged StagedSnapshot) error {
+	return index.PublishCommittedView(broken, logger, seq, op, staged.view)
 }
 
-func (index *Index) PublishCommittedView(broken *atomic.Bool, logger *log.Logger, brokenErr error, seq uint64, op string, snap *snapshot.View) (err error) {
-	defer index.recoverCommittedPublishPanic(broken, logger, brokenErr, seq, op, &err)
+func (index *Index) PublishCommittedView(broken *atomic.Bool, logger *log.Logger, seq uint64, op string, snap *snapshot.View) (err error) {
+	defer index.recoverCommittedPublishPanic(broken, logger, seq, op, &err)
 	index.installViewNoLock(snap)
-	if index.strMap != nil {
-		index.strMap.MarkCommittedPublished(snap.StrMap)
-	}
 	return nil
 }
 
-func (index *Index) recoverCommittedPublishPanic(broken *atomic.Bool, logger *log.Logger, brokenErr error, seq uint64, op string, err *error) {
+func (index *Index) recoverCommittedPublishPanic(broken *atomic.Bool, logger *log.Logger, seq uint64, op string, err *error) {
 	if v := recover(); v != nil {
 		if broken.CompareAndSwap(false, true) {
 			logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, v)
 			index.stopAnalyzerSignal()
 		}
-		*err = brokenErr
+		*err = rbierrors.ErrBroken
 		index.snapshot.DropStaged(seq)
 	}
 }
 
-func (index *Index) PublishLoadedPlannerStats(s *qexec.PlannerStatsSnapshot) {
+func (index *Index) PublishLoadedPlannerStats(s *rbistats.PlannerSnapshot) {
 	index.exec.PublishLoadedPlannerStats(s, index.snapshot.Current())
 }
 
@@ -685,8 +529,10 @@ func (index *Index) RefreshPlannerStats(unavailable func() error) error {
 
 func (index *Index) RefreshPlannerStatsLocked() {
 	version := index.exec.StatsVersion.Add(1)
+
 	snap, seq, ref := index.snapshot.PinCurrent()
 	defer index.snapshot.Unpin(seq, ref)
+
 	s := index.exec.BuildPlannerStatsSnapshot(snap, version)
 	index.exec.Stats.Store(s)
 }
@@ -740,7 +586,7 @@ func (index *Index) stopAnalyzerSignal() {
 func (index *Index) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- struct{}, base time.Duration, refresh func() error, terminal func(error) bool, resetFailure func(error) bool) {
 	defer close(done)
 
-	rng := newRand(time.Now().UnixNano())
+	rng := mathutil.NewRand(time.Now().UnixNano())
 	failures := 0
 
 	timer := time.NewTimer(nextAnalyzeDelay(base, failures, rng))
@@ -798,41 +644,51 @@ func addPositiveJitter(d time.Duration, rng *rand.Rand) time.Duration {
 	return d + time.Duration(rng.Int64N(int64(j)+1))
 }
 
-func newRand(seed int64) *rand.Rand {
-	s := uint64(seed)
-	return rand.New(rand.NewPCG(s, s^randStreamMix))
-}
+func (index *Index) DBStats(bolt *bbolt.DB, bucketName []byte) (DBStats, error) {
+	guard := index.snapshot.PinGuardLock()
+	tx, err := bolt.Begin(false)
+	if err != nil {
+		guard.Unlock()
+		return DBStats{}, fmt.Errorf("tx error: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 
-func (index *Index) DBStats() DBStats {
-	snap, seq, ref := index.snapshot.PinCurrent()
+	bucket := tx.Bucket(bucketName)
+	if bucket == nil {
+		guard.Unlock()
+		return DBStats{}, fmt.Errorf("bucket does not exist")
+	}
+
+	seq := bucket.Sequence()
+	snap, ref, ok := guard.PinBySeq(seq)
+	if !ok {
+		guard.Unlock()
+		return DBStats{}, fmt.Errorf("snapshot sequence %d is not available", seq)
+	}
+	guard.Unlock()
 	defer index.snapshot.Unpin(seq, ref)
 
-	out := DBStats{Sequence: snap.Seq}
+	out := DBStats{Sequence: seq}
 	out.KeyCount = snap.UniverseCardinality()
-	if snap.Universe.IsEmpty() {
-		return out
-	}
-	maxIdx, _ := snap.Universe.Maximum()
-	out.LastID = maxIdx
-	out.HasLast = true
-	if index.strKey {
-		if key, ok := snap.StrMap.String(maxIdx); ok {
-			out.LastKey = key
-		} else {
-			out.HasLast = false
+	key, _ := bucket.Cursor().Last()
+	if key != nil {
+		out.HasLast = true
+		if !index.strKey && len(key) != 8 {
+			return DBStats{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
 		}
+		out.LastKey = keycodec.DataKeyFromBytes(key, index.strKey)
 	}
-	return out
+	return out, nil
 }
 
-func (index *Index) IndexStats() IndexStats {
+func (index *Index) IndexStats() rbistats.Index {
 	snap, seq, ref := index.snapshot.PinCurrent()
 	defer index.snapshot.Unpin(seq, ref)
 	return index.indexStats(snap)
 }
 
-func (index *Index) indexStats(snap *snapshot.View) IndexStats {
-	idx := IndexStats{
+func (index *Index) indexStats(snap *snapshot.View) rbistats.Index {
+	idx := rbistats.Index{
 		UniqueFieldKeys:        make(map[string]uint64),
 		FieldSize:              make(map[string]uint64),
 		FieldKeyBytes:          make(map[string]uint64),
@@ -880,9 +736,9 @@ func (index *Index) indexStats(snap *snapshot.View) IndexStats {
 	return idx
 }
 
-func (index *Index) PlannerStats() PlannerStats {
-	var out PlannerStats
-	out.Fields = make(map[string]qexec.PlannerFieldStats)
+func (index *Index) PlannerStats() rbistats.Planner {
+	var out rbistats.Planner
+	out.Fields = make(map[string]rbistats.PlannerField)
 
 	if ps := index.exec.Stats.Load(); ps != nil {
 		out.Version = ps.Version
@@ -890,36 +746,32 @@ func (index *Index) PlannerStats() PlannerStats {
 		out.UniverseCardinality = ps.UniverseCardinality
 		out.FieldCount = len(ps.Fields)
 		if out.FieldCount > 0 {
-			out.Fields = make(map[string]qexec.PlannerFieldStats, out.FieldCount)
+			out.Fields = make(map[string]rbistats.PlannerField, out.FieldCount)
 			for k, v := range ps.Fields {
 				out.Fields[k] = v
 			}
 		}
 	}
 	out.TraceSampleEvery = index.exec.Tracer.SampleEvery()
+
 	index.exec.Analyzer.Lock()
 	out.AnalyzeInterval = index.exec.Analyzer.Interval
 	index.exec.Analyzer.Unlock()
 	return out
 }
 
-func (index *Index) SnapshotStats() SnapshotStats {
+func (index *Index) SnapshotStats() rbistats.Snapshot {
 	if !index.snapshot.StatsEnabled() {
-		return SnapshotStats{}
+		return rbistats.Snapshot{}
 	}
 	snap, seq, ref := index.snapshot.PinCurrent()
 	if snap == nil {
-		return SnapshotStats{}
+		return rbistats.Snapshot{}
 	}
 	defer index.snapshot.Unpin(seq, ref)
 
 	stats := index.snapshot.Stats(snap, ref)
-	return SnapshotStats{
-		Sequence:     stats.Sequence,
-		UniverseCard: stats.UniverseCard,
-		RegistrySize: stats.RegistrySize,
-		PinnedRefs:   stats.PinnedRefs,
-	}
+	return stats
 }
 
 func (index *Index) releaseCurrentStorage() {

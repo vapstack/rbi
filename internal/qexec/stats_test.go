@@ -1,6 +1,10 @@
 package qexec
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vapstack/rbi/rbistats"
+)
 
 func TestP2Quantile_WarmupKeepsExactPercentileAtFiveSamples(t *testing.T) {
 	q := newP2Quantile(0.95)
@@ -39,7 +43,7 @@ func TestPlannerStatsSnapshot_BuildPersistAndPublish(t *testing.T) {
 		t.Fatalf("persist fields mismatch: got=%d want=%d", len(persisted.Fields), len(built.Fields))
 	}
 
-	db.engine.exec.PublishLoadedPlannerStats(&PlannerStatsSnapshot{
+	db.engine.exec.PublishLoadedPlannerStats(&rbistats.PlannerSnapshot{
 		Version:     7,
 		GeneratedAt: built.GeneratedAt,
 		Fields:      built.Fields,

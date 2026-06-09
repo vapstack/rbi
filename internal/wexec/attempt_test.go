@@ -18,7 +18,7 @@ func TestAttemptCommitFailureDropsStagedSnapshotAndSkipsPublish(t *testing.T) {
 	commitErr := errors.New("commit failed")
 	var events []string
 	var ex *Batcher
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(*bbolt.Tx, string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(*bbolt.Tx) error {
 		snap, ref, ok := ex.snapshotOps.Manager.PinBySeq(1)
 		if !ok || snap == nil || snap.Seq != 1 {
 			t.Fatalf("snapshot was not staged before commit: snap=%#v ok=%v", snap, ok)
@@ -56,11 +56,11 @@ func TestAttemptCommitFailureDropsStagedSnapshotAndSkipsPublish(t *testing.T) {
 
 func TestAttemptPublishRunsAfterSuccessfulCommit(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		events = append(events, "commit")
 		return tx.Commit()
 	})
-	ex.indexPublishOps.PublishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
+	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
 		if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
 			t.Fatalf("publish ran before committed payload was visible: %v", got)
 		}
@@ -85,11 +85,11 @@ func TestAttemptPublishRunsAfterSuccessfulCommit(t *testing.T) {
 func TestAttemptPublishErrorAssignsRequestAfterCommit(t *testing.T) {
 	publishErr := errors.New("publish failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		events = append(events, "commit")
 		return tx.Commit()
 	})
-	ex.indexPublishOps.PublishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
+	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
 		if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
 			t.Fatalf("publish ran before committed payload was visible: %v", got)
 		}
@@ -116,10 +116,54 @@ func TestAttemptPublishErrorAssignsRequestAfterCommit(t *testing.T) {
 	}
 }
 
+func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
+	var events []string
+	ex, raw, bucketName, mapBucketName := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	rec := attemptRec{V: 9}
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey("new", true), unsafe.Pointer(&rec), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	defer requestPool.Put(req)
+
+	tx, err := raw.Begin(true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	att := attemptStatePool.Get()
+	defer attemptStatePool.Put(att)
+	att.prepare(tx.Bucket(bucketName), false, ex.ops.Release, 1, true, true, len(ex.schema.Unique))
+	att.strmapBucket = tx.Bucket(mapBucketName)
+	ex.prepareSet(att, req)
+	if req.Err != nil {
+		t.Fatalf("prepareSet req error: %v", req.Err)
+	}
+	if len(att.ownedPayloads) != 0 {
+		t.Fatalf("prepareSet created attempt-owned payloads: %d", len(att.ownedPayloads))
+	}
+	if len(att.prepared) != 1 {
+		t.Fatalf("prepared len=%d want 1", len(att.prepared))
+	}
+	op := att.prepared[0]
+	if !reflect.DeepEqual(op.payload, []byte{9}) {
+		t.Fatalf("logical payload=%v want [9]", op.payload)
+	}
+	if len(op.physical) != stringValuePrefixLen+len(op.payload) {
+		t.Fatalf("physical len=%d want %d", len(op.physical), stringValuePrefixLen+len(op.payload))
+	}
+	if &op.payload[0] != &op.physical[stringValuePrefixLen] {
+		t.Fatalf("logical payload does not share physical buffer")
+	}
+}
+
 func TestSharedRetrySkipsBeforeCommitFailureAndCommitsRest(t *testing.T) {
 	callbackErr := errors.New("callback failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -152,7 +196,7 @@ func TestSharedRetrySkipsBeforeCommitFailureAndCommitsRest(t *testing.T) {
 func TestSharedSetBeforeStoreFailureCommitsRest(t *testing.T) {
 	hookErr := errors.New("before store failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -184,7 +228,7 @@ func TestSharedSetBeforeStoreFailureCommitsRest(t *testing.T) {
 func TestSharedSetBeforeStoreRestartsFromPayloadOnRetry(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -227,7 +271,7 @@ func TestSharedSetBeforeStoreRestartsFromPayloadOnRetry(t *testing.T) {
 func TestSharedSetCloneValueRestartsFromBaselineOnRetry(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -285,7 +329,7 @@ func TestSharedSetCloneValueRestartsFromBaselineOnRetry(t *testing.T) {
 func TestSharedSetDecodePreparedValueFailureCommitsRest(t *testing.T) {
 	decodeErr := errors.New("decode failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -325,7 +369,7 @@ func TestSharedSetDecodePreparedValueFailureCommitsRest(t *testing.T) {
 
 func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -353,7 +397,7 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 func TestSharedSetValidateIndexFailureCommitsRest(t *testing.T) {
 	validateErr := errors.New("validate index failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -386,7 +430,7 @@ func TestSharedSetValidateIndexFailureCommitsRest(t *testing.T) {
 func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
 	decodeErr := errors.New("decode failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -421,7 +465,7 @@ func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
 func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
 	encodeErr := errors.New("encode failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -461,7 +505,7 @@ func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
 func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -495,7 +539,7 @@ func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
 func TestSharedDeleteDecodeFailureCommitsRest(t *testing.T) {
 	decodeErr := errors.New("decode failed")
 	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
@@ -531,7 +575,7 @@ func TestSharedDeleteDecodeFailureCommitsRest(t *testing.T) {
 func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
 	hookErr := errors.New("before process failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -564,7 +608,7 @@ func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
 func TestSharedPatchExistingDecodeFailureCommitsRest(t *testing.T) {
 	decodeErr := errors.New("decode failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	origDecode := ex.ops.Decode
@@ -598,7 +642,7 @@ func TestSharedPatchExistingDecodeFailureCommitsRest(t *testing.T) {
 func TestSharedPatchBeforeStoreFailureCommitsRest(t *testing.T) {
 	hookErr := errors.New("before store failed")
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -630,7 +674,7 @@ func TestSharedPatchBeforeStoreFailureCommitsRest(t *testing.T) {
 
 func TestSharedPatchStrictUnknownFieldFailureCommitsRest(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -657,7 +701,7 @@ func TestSharedPatchStrictUnknownFieldFailureCommitsRest(t *testing.T) {
 
 func TestSharedPatchMissingTargetCommitsRest(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 
@@ -682,7 +726,7 @@ func TestSharedPatchMissingTargetCommitsRest(t *testing.T) {
 
 func TestSharedPatchApplyFailureCommitsRest(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
@@ -708,7 +752,7 @@ func TestSharedPatchApplyFailureCommitsRest(t *testing.T) {
 
 func TestSharedPatchMissingTargetSkipsBeforeCommit(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 2, []byte{20})
@@ -741,7 +785,7 @@ func TestSharedPatchMissingTargetSkipsBeforeCommit(t *testing.T) {
 
 func TestSharedDeleteMissingTargetSkipsBeforeCommit(t *testing.T) {
 	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx, op string) error {
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
 	})
 	putAttemptPayload(t, raw, bucket, 2, []byte{20})

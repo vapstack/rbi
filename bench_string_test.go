@@ -366,7 +366,7 @@ func Benchmark_Read_Query_Items_SingleByEmail_StringKeyDB(b *testing.B) {
 	runStringReadQueryBench(b, db, q)
 }
 
-func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {
+func Benchmark_Read_Index_Keys_Query_All_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchN)
 
 	var count int
@@ -375,13 +375,11 @@ func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		count = 0
-		if err := db.ScanKeys("", func(_ string) (bool, error) {
-			count++
-			return true, nil
-		}); err != nil {
-			b.Fatalf("ScanKeys(string): %v", err)
+		keys, err := db.QueryKeys(qx.Query())
+		if err != nil {
+			b.Fatalf("QueryKeys(string): %v", err)
 		}
+		count = len(keys)
 	}
 	b.ReportMetric(float64(count), "keys/op")
 }

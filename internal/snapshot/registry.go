@@ -5,14 +5,8 @@ import (
 	"sync/atomic"
 
 	"github.com/vapstack/rbi/internal/qcache"
+	"github.com/vapstack/rbi/rbistats"
 )
-
-type RegistryStats struct {
-	Sequence     uint64
-	UniverseCard uint64
-	RegistrySize int
-	PinnedRefs   int
-}
 
 type Registry struct {
 	current      atomic.Pointer[View]
@@ -276,8 +270,8 @@ func (sm *Registry) PinCurrent() (*View, uint64, *Ref) {
 	return snap, snap.Seq, ref
 }
 
-func (sm *Registry) Stats(s *View, exclude *Ref) RegistryStats {
-	diag := RegistryStats{
+func (sm *Registry) Stats(s *View, exclude *Ref) rbistats.Snapshot {
+	diag := rbistats.Snapshot{
 		Sequence: s.Seq,
 	}
 	if !s.Universe.IsEmpty() {

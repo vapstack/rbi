@@ -5,6 +5,7 @@ import (
 	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 func PrepareCount(s *schema.Schema, exprs ...qx.Expr) (*qir.Query, error) {
@@ -48,7 +49,7 @@ func Count(view *qexec.View, q *qir.Query, emitTrace bool) (uint64, error) {
 			out = 0
 		}
 		if trace != nil {
-			trace.SetPlan(PlanCountMaterialized)
+			trace.SetPlan(rbitrace.PlanCountMaterialized)
 			if !expr.Not {
 				trace.AddExamined(out)
 			}
@@ -70,7 +71,7 @@ func Count(view *qexec.View, q *qir.Query, emitTrace bool) (uint64, error) {
 	}
 	if out, ok, err := view.TryFilterCardinalityPreparedAndReordered(expr); ok || err != nil {
 		if trace != nil && ok {
-			trace.SetPlan(PlanCountMaterialized)
+			trace.SetPlan(rbitrace.PlanCountMaterialized)
 		}
 		return countFinishTrace(trace, out, err)
 	}

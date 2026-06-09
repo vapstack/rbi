@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type leafPred struct {
@@ -620,7 +621,7 @@ func (qv *View) execSelectedNoOrderUniqueEq(q *qir.Shape, leaves []qir.Expr, tra
 	}
 	if sawEmpty {
 		if trace != nil {
-			trace.SetPlan(PlanUniqueEq)
+			trace.SetPlan(rbitrace.PlanUniqueEq)
 			trace.SetEarlyStopReason("empty_leaf")
 		}
 		return nil, true, nil
@@ -631,7 +632,7 @@ func (qv *View) execSelectedNoOrderUniqueEq(q *qir.Shape, leaves []qir.Expr, tra
 	defer iter.Release()
 
 	if trace != nil {
-		trace.SetPlan(PlanUniqueEq)
+		trace.SetPlan(rbitrace.PlanUniqueEq)
 	}
 
 	needAll := q.Limit == 0
@@ -698,7 +699,7 @@ func (qv *View) execSelectedNoOrderDirectUniqueEq(q *qir.Shape, trace *Trace) ([
 	}
 	if ids.IsEmpty() {
 		if trace != nil {
-			trace.SetPlan(PlanUniqueEq)
+			trace.SetPlan(rbitrace.PlanUniqueEq)
 			trace.AddExamined(0)
 			trace.SetEarlyStopReason("input_exhausted")
 		}
@@ -707,7 +708,7 @@ func (qv *View) execSelectedNoOrderDirectUniqueEq(q *qir.Shape, trace *Trace) ([
 	defer ids.Release()
 
 	if trace != nil {
-		trace.SetPlan(PlanUniqueEq)
+		trace.SetPlan(rbitrace.PlanUniqueEq)
 	}
 	if idx, ok := ids.TrySingle(); ok {
 		out := make([]uint64, 1)

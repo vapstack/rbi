@@ -11,9 +11,12 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/rbistats"
+	"github.com/vapstack/rbi/rbitrace"
 )
 
 type plannerPrecountRec struct {
@@ -73,8 +76,8 @@ func TestCardinalityUniqueEqWideANDUsesUniquePath(t *testing.T) {
 	if got != 1 {
 		t.Fatalf("TryFilterCardinalityByUniqueEq=%d, want 1", got)
 	}
-	if trace.Event().Plan != string(planFilterCardinalityUniqueEq) {
-		t.Fatalf("plan=%q want %q", trace.Event().Plan, planFilterCardinalityUniqueEq)
+	if trace.Event().Plan != rbitrace.PlanCountUniqueEq {
+		t.Fatalf("plan=%q want %q", trace.Event().Plan, rbitrace.PlanCountUniqueEq)
 	}
 }
 
@@ -433,7 +436,7 @@ func TestTryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 	defer prepared.Release()
 
 	view := db.view()
-	trace := Trace{sink: func(TraceEvent) {}}
+	trace := Trace{sink: func(rbitrace.Event) {}}
 	got, ok, plan, err := view.executeOrderedLimit(&shape, &trace)
 	if err != nil {
 		t.Fatalf("executeOrderedLimit: %v", err)
@@ -444,8 +447,8 @@ func TestTryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 	if plan != "" {
 		trace.SetPlan(plan)
 	}
-	if trace.ev.Plan != string(PlanOrdered) && trace.ev.Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("unexpected plan: got=%q want %q or %q", trace.ev.Plan, PlanOrdered, PlanLimitOrderBasic)
+	if trace.ev.Plan != rbitrace.PlanOrdered && trace.ev.Plan != rbitrace.PlanLimitOrderBasic {
+		t.Fatalf("unexpected plan: got=%q want %q or %q", trace.ev.Plan, rbitrace.PlanOrdered, rbitrace.PlanLimitOrderBasic)
 	}
 
 	want := make([]uint64, 0, 25)
@@ -542,10 +545,10 @@ func TestRangeContainsThresholds_Adaptive(t *testing.T) {
 		t.Fatalf("expected adaptive range probe to materialize")
 	}
 	perCall := rangeProbeContainsWork(2_048, 2_048*256)
-	if before := materializeAt - 1; rangeAdaptiveProbeWorkForRows(before, 2_048, 2_048*256) != satMulUint64(before, perCall) {
+	if before := materializeAt - 1; rangeAdaptiveProbeWorkForRows(before, 2_048, 2_048*256) != mathutil.SatMulUint64(before, perCall) {
 		t.Fatalf("adaptive work must stay linear before materialization")
 	}
-	linearAt := satMulUint64(materializeAt, perCall)
+	linearAt := mathutil.SatMulUint64(materializeAt, perCall)
 	if adaptiveAt := rangeAdaptiveProbeWorkForRows(materializeAt, 2_048, 2_048*256); adaptiveAt <= linearAt {
 		t.Fatalf("adaptive work at materialization threshold must include build: adaptive=%d linear=%d", adaptiveAt, linearAt)
 	}
@@ -597,7 +600,7 @@ func TestPlannerOrderedProfileCountsNonOrderPrefixResidual(t *testing.T) {
 
 	view := db.engine.currentQueryViewForTests()
 	snap := view.exec.Stats.Load()
-	universe := snap.UniverseOr(view.snap.Universe.Cardinality())
+	universe := view.plannerUniverseCardinality(snap)
 	orderField := view.exec.FieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
 	profile, ok := view.estimateOrderedProfileIndexView(orderField, leaves, ov, snap, universe)
@@ -720,10 +723,10 @@ func TestPlannerOrderedFallbackProbeFactor_Adaptive(t *testing.T) {
 func TestTracer_ORNoOrderAdaptiveStopsAtLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -760,7 +763,7 @@ func TestTracer_ORNoOrderAdaptiveStopsAtLimit(t *testing.T) {
 	ev := events[len(events)-1]
 	mu.Unlock()
 
-	if ev.Plan != "plan_or_merge_no_order" {
+	if ev.Plan != rbitrace.PlanORMergeNoOrder {
 		t.Fatalf("expected no-order OR plan, got %q", ev.Plan)
 	}
 	if ev.EarlyStopReason != "limit_reached" {
@@ -2548,7 +2551,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 
 	foundAgeRange := false
 	snap := view.exec.Stats.Load()
-	universe := snap.UniverseOr(view.snap.Universe.Cardinality())
+	universe := view.plannerUniverseCardinality(snap)
 	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
 	for i := 0; i < branches.Len(); i++ {
 		branch := &branches.owner[i]
@@ -2616,7 +2619,7 @@ func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t
 	defer branches.Release()
 
 	snap := view.exec.Stats.Load()
-	universe := snap.UniverseOr(view.snap.Universe.Cardinality())
+	universe := view.plannerUniverseCardinality(snap)
 	foundAgeRange := false
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.owner[i]
@@ -2669,7 +2672,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	defer branches.Release()
 
 	snap := view.exec.Stats.Load()
-	universe := snap.UniverseOr(view.snap.Universe.Cardinality())
+	universe := view.plannerUniverseCardinality(snap)
 	if universe == 0 {
 		t.Fatalf("unexpected zero universe")
 	}
@@ -2737,7 +2740,7 @@ func TestPlannerOROrderDecision_KWayOverrideKeepsTailRiskPenalties(t *testing.T)
 		sumCard:       60_000,
 		branchCount:   2,
 		orderDistinct: 1_000,
-		orderStats: PlannerFieldStats{
+		orderStats: rbistats.PlannerField{
 			DistinctKeys:    1_000,
 			NonEmptyKeys:    1_000,
 			TotalBucketCard: 100_000,
@@ -3341,10 +3344,10 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 func TestPlannerRouting_MixedPredicatesMayUseMaterialized(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3380,11 +3383,11 @@ func TestPlannerRouting_MixedPredicatesMayUseMaterialized(t *testing.T) {
 	ev := events[len(events)-1]
 
 	switch ev.Plan {
-	case string(PlanMaterialized), string(PlanOrderedAnchor), string(PlanOrdered), string(PlanLimitOrderBasic):
+	case rbitrace.PlanMaterialized, rbitrace.PlanOrderedAnchor, rbitrace.PlanOrdered, rbitrace.PlanLimitOrderBasic:
 	default:
 		t.Fatalf("unexpected plan: %q", ev.Plan)
 	}
-	if ev.Plan != string(PlanMaterialized) {
+	if ev.Plan != rbitrace.PlanMaterialized {
 		if ev.OrderIndexScanWidth == 0 {
 			t.Fatalf("expected non-zero order index scan width")
 		}
@@ -3397,10 +3400,10 @@ func TestPlannerRouting_MixedPredicatesMayUseMaterialized(t *testing.T) {
 func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3457,7 +3460,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}
-	tr.SetPlan(PlanOrdered)
+	tr.SetPlan(rbitrace.PlanOrdered)
 	got := db.engine.execPlanOrderedBasicFallback(q, preds, active, ov, br, tr)
 	tr.Finish(uint64(len(got)), nil)
 
@@ -3489,10 +3492,10 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3525,7 +3528,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_limit_order_prefix" {
+	if ev.Plan != rbitrace.PlanLimitOrderPrefix {
 		t.Fatalf("expected prefix limit route, got %q", ev.Plan)
 	}
 	if ev.EstimatedRows == 0 {
@@ -3545,10 +3548,10 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3581,7 +3584,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_limit_range_no_order" {
+	if ev.Plan != rbitrace.PlanLimitRangeNoOrder {
 		t.Fatalf("expected no-order prefix limit route, got %q", ev.Plan)
 	}
 }
@@ -3589,10 +3592,10 @@ func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3633,7 +3636,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.Plan != "plan_limit_range_no_order" {
+	if ev.Plan != rbitrace.PlanLimitRangeNoOrder {
 		t.Fatalf("expected no-order prefix limit route, got %q", ev.Plan)
 	}
 }
@@ -3789,10 +3792,10 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3826,7 +3829,7 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_limit_order_basic" {
+	if ev.Plan != rbitrace.PlanLimitOrderBasic {
 		t.Fatalf("expected basic limit route, got %q", ev.Plan)
 	}
 	if ev.EstimatedRows == 0 {
@@ -3843,10 +3846,10 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 func TestPlannerRouting_OrderLimitWithSecondaryRange_MatchesSeqScan(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3898,10 +3901,10 @@ func TestPlannerRouting_OrderLimitWithSecondaryRange_MatchesSeqScan(t *testing.T
 func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
@@ -3943,7 +3946,7 @@ func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *
 	if ev.RowsReturned < uint64(len(got)) {
 		t.Fatalf("rows returned below page size: ev=%d got=%d", ev.RowsReturned, len(got))
 	}
-	if ev.Plan != string(PlanMaterialized) && ev.RowsExamined == 0 {
+	if ev.Plan != rbitrace.PlanMaterialized && ev.RowsExamined == 0 {
 		t.Fatalf("expected rows examined to be recorded")
 	}
 }
@@ -3983,10 +3986,10 @@ func TestLimitRoutes_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.T)
 func TestPlannerRouting_OrderedNoOrderWithNegativeIN_MatchesSeqScan(t *testing.T) {
 	var (
 		mu     sync.Mutex
-		events []TraceEvent
+		events []rbitrace.Event
 	)
 
-	sink := func(ev TraceEvent) {
+	sink := func(ev rbitrace.Event) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()

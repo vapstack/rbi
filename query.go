@@ -7,10 +7,10 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/engine"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qagg"
-	"github.com/vapstack/rbi/internal/qexec"
+	"github.com/vapstack/rbi/rbierrors"
+	"github.com/vapstack/rbi/rbistats"
 	"go.etcd.io/bbolt"
 )
 
@@ -31,46 +31,6 @@ const (
 	ValueKindString = qagg.ValueKindString
 )
 
-type PlanName = qexec.PlanName
-
-const (
-	PlanMaterialized       = qexec.PlanMaterialized
-	PlanAggregate          = qagg.PlanAggregate
-	PlanCountMaterialized  = qagg.PlanCountMaterialized
-	PlanCountUniqueEq      = qagg.PlanCountUniqueEq
-	PlanCountScalarLookup  = qagg.PlanCountScalarLookup
-	PlanCountScalarInSplit = qagg.PlanCountScalarInSplit
-	PlanCountPredicates    = qagg.PlanCountPredicates
-	PlanCountORPredicates  = qagg.PlanCountORPredicates
-	PlanCountORHybrid      = qagg.PlanCountORHybrid
-
-	PlanCandidateNoOrder = qexec.PlanCandidateNoOrder
-	PlanCandidateOrder   = qexec.PlanCandidateOrder
-
-	PlanORMergeNoOrder     = qexec.PlanORMergeNoOrder
-	PlanORMergeOrderMerge  = qexec.PlanORMergeOrderMerge
-	PlanORMergeOrderStream = qexec.PlanORMergeOrderStream
-
-	PlanOrdered        = qexec.PlanOrdered
-	PlanOrderedNoOrder = qexec.PlanOrderedNoOrder
-	PlanOrderedAnchor  = qexec.PlanOrderedAnchor
-	PlanOrderedLead    = qexec.PlanOrderedLead
-
-	PlanLimit              = qexec.PlanLimit
-	PlanLimitOrderBasic    = qexec.PlanLimitOrderBasic
-	PlanLimitOrderPrefix   = qexec.PlanLimitOrderPrefix
-	PlanLimitPrefixNoOrder = qexec.PlanLimitPrefixNoOrder
-	PlanLimitRangeNoOrder  = qexec.PlanLimitRangeNoOrder
-	PlanUniqueEq           = qexec.PlanUniqueEq
-)
-
-type (
-	TraceEvent        = qexec.TraceEvent
-	TraceORRoute      = qexec.TraceORRoute
-	TraceORBranch     = qexec.TraceORBranch
-	PlannerFieldStats = qexec.PlannerFieldStats
-)
-
 // Aggregate evaluates a reduction query against the current index snapshot.
 func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	if err := db.unavailableErr(); err != nil {
@@ -78,7 +38,7 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	}
 
 	if db.index == nil {
-		return Result{}, ErrNoIndex
+		return Result{}, rbierrors.ErrNoIndex
 	}
 
 	return db.index.Aggregate(q)
@@ -92,7 +52,7 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	}
 
 	if db.index == nil {
-		return 0, ErrNoIndex
+		return 0, rbierrors.ErrNoIndex
 	}
 	return db.index.Count(exprs...)
 }
@@ -104,12 +64,12 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 
 	if db.index == nil {
-		return nil, ErrNoIndex
+		return nil, rbierrors.ErrNoIndex
 	}
 	var out []*V
-	err := db.index.Query(q, db.bolt, db.bucket, db.unavailableErr, func(tx *bbolt.Tx, keys engine.KeySet) error {
+	err := db.index.Query(q, db.bolt, db.dataBucket, db.unavailableErr, func(tx *bbolt.Tx, ids []uint64) error {
 		var err error
-		out, err = db.batchGetTxCompact(tx, keys)
+		out, err = db.batchGetTxCompact(tx, ids)
 		return err
 	})
 	if err != nil {
@@ -118,23 +78,47 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	return out, nil
 }
 
-func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, keys engine.KeySet) ([]*V, error) {
-	bucket := tx.Bucket(db.bucket)
+func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) {
+	bucket := tx.Bucket(db.dataBucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
 	}
-	if len(keys.IDs) == 0 {
+	if len(ids) == 0 {
 		return nil, nil
 	}
 
-	out := make([]*V, 0, len(keys.IDs))
+	out := make([]*V, 0, len(ids))
 	if db.strKey {
-		for i := range keys.IDs {
-			v := bucket.Get(keycodec.StringBytes(keys.StringAt(i)))
-			if v == nil {
-				continue
+		m, err := db.stringMap(tx)
+		if err != nil {
+			return nil, err
+		}
+		var mapKey [8]byte
+		for _, idx := range ids {
+			key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
+			if key == nil {
+				db.ReleaseRecords(out...)
+				return nil, fmt.Errorf("%w: missing string reverse key for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
 			}
-			value, err := db.decode(v)
+			v := bucket.Get(key)
+			if v == nil {
+				db.ReleaseRecords(out...)
+				return nil, fmt.Errorf("%w: missing string data for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
+			}
+			if len(v) < 8 {
+				db.ReleaseRecords(out...)
+				return nil, fmt.Errorf("%w: value shorter than %d bytes", rbierrors.ErrInvalidStringStorageFormat, 8)
+			}
+			storedIdx := keycodec.U64FromBytes(v[:8])
+			if storedIdx == 0 {
+				db.ReleaseRecords(out...)
+				return nil, fmt.Errorf("%w: zero string id", rbierrors.ErrInvalidStringStorageFormat)
+			}
+			if storedIdx != idx {
+				db.ReleaseRecords(out...)
+				return nil, fmt.Errorf("%w: string idx mismatch rev=%d value=%d", rbierrors.ErrInvalidStringStorageFormat, idx, storedIdx)
+			}
+			value, err := db.decode(v[8:])
 			if err != nil {
 				db.ReleaseRecords(out...)
 				return nil, fmt.Errorf("decode: %w", err)
@@ -145,12 +129,12 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, keys engine.KeySet) ([]*V, e
 	}
 
 	var key [8]byte
-	for _, idx := range keys.IDs {
+	for _, idx := range ids {
 		v := bucket.Get(keycodec.U64BytesWithBuf(idx, &key))
 		if v == nil {
 			continue
 		}
-		value, err := db.decode(v)
+		value, err := db.decodeStoredValue(v)
 		if err != nil {
 			db.ReleaseRecords(out...)
 			return nil, fmt.Errorf("decode: %w", err)
@@ -167,16 +151,39 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	}
 
 	if db.index == nil {
-		return nil, ErrNoIndex
+		return nil, rbierrors.ErrNoIndex
 	}
 
 	var out []K
-	if err := db.index.QueryKeys(q, func(keys engine.KeySet) error {
-		if db.strKey {
-			out = db.queryKeysFromStrings(keys)
-		} else {
-			out = db.queryKeysFromIDs(keys.IDs)
+	if db.strKey {
+		err := db.index.Query(q, db.bolt, db.dataBucket, db.unavailableErr, func(tx *bbolt.Tx, ids []uint64) error {
+			m, err := db.stringMap(tx)
+			if err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			out = make([]K, 0, len(ids))
+			var mapKey [8]byte
+			for _, idx := range ids {
+				key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
+				if key == nil {
+					return fmt.Errorf("%w: missing string reverse key for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
+				}
+				s := string(key)
+				out = append(out, *(*K)(unsafe.Pointer(&s)))
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
+		return out, nil
+	}
+
+	if err := db.index.QueryKeys(q, func(ids []uint64) error {
+		out = db.queryKeysFromIDs(ids)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -191,16 +198,12 @@ func (db *DB[K, V]) queryKeysFromIDs(ids []uint64) []K {
 	return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids))
 }
 
-func (db *DB[K, V]) queryKeysFromStrings(keys engine.KeySet) []K {
-	if len(keys.IDs) == 0 {
-		return nil
+func (db *DB[K, V]) stringMap(tx *bbolt.Tx) (*bbolt.Bucket, error) {
+	m := tx.Bucket(db.strmapBucket)
+	if m == nil {
+		return nil, fmt.Errorf("%w: missing string map bucket", rbierrors.ErrInvalidStringStorageFormat)
 	}
-	out := make([]K, len(keys.IDs))
-	for i := range keys.IDs {
-		s := keys.StringAt(i)
-		out[i] = *(*K)(unsafe.Pointer(&s))
-	}
-	return out
+	return m, nil
 }
 
 // RefreshPlannerStats rebuilds planner statistics from the current in-memory index.
@@ -212,14 +215,14 @@ func (db *DB[K, V]) queryKeysFromStrings(keys engine.KeySet) []K {
 // the planner stats payload atomically.
 //
 // In transparent mode planner stats are disabled because no runtime index
-// exists; the method returns ErrNoIndex.
+// exists; the method returns rbierrors.ErrNoIndex.
 func (db *DB[K, V]) RefreshPlannerStats() error {
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
 
 	if db.index == nil {
-		return ErrNoIndex
+		return rbierrors.ErrNoIndex
 	}
 
 	return db.index.RefreshPlannerStats(db.unavailableErr)
@@ -247,7 +250,7 @@ func (db *DB[K, V]) stopAnalyzeLoop() {
 }
 
 func plannerAnalyzeTerminalError(err error) bool {
-	return errors.Is(err, ErrClosed) || errors.Is(err, ErrBroken)
+	return errors.Is(err, rbierrors.ErrClosed) || errors.Is(err, rbierrors.ErrBroken)
 }
 
 func plannerAnalyzeResetFailure(error) bool {
@@ -268,22 +271,16 @@ func plannerAnalyzeResetFailure(error) bool {
 // is enabled.
 //
 // On closed or broken DB, SnapshotStats returns zero value.
-func (db *DB[K, V]) SnapshotStats() SnapshotStats {
+func (db *DB[K, V]) SnapshotStats() rbistats.Snapshot {
 	if db.index == nil {
-		return SnapshotStats{}
+		return rbistats.Snapshot{}
 	}
 	if !db.options.EnableSnapshotStats {
-		return SnapshotStats{}
+		return rbistats.Snapshot{}
 	}
 	if err := db.unavailableErr(); err != nil {
-		return SnapshotStats{}
+		return rbistats.Snapshot{}
 	}
 
-	stats := db.index.SnapshotStats()
-	return SnapshotStats{
-		Sequence:     stats.Sequence,
-		UniverseCard: stats.UniverseCard,
-		RegistrySize: stats.RegistrySize,
-		PinnedRefs:   stats.PinnedRefs,
-	}
+	return db.index.SnapshotStats()
 }

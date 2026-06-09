@@ -22,6 +22,7 @@ var requestPool = pooled.Pointers[request]{
 			encodePool.Put(req.setPayload)
 			req.setPayload = nil
 		}
+		req.payloadOff = 0
 		req.setValue = nil
 		req.setBaseline = nil
 		clear(req.patch)

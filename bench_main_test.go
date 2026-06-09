@@ -316,7 +316,11 @@ func stressBenchAltPatch(rec *StressBenchUser) []Field {
 
 func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.Stats().KeyCount)
+	stats, err := db.Stats()
+	if err != nil {
+		tb.Fatalf("Stats: %v", err)
+	}
+	total := int(stats.KeyCount)
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
@@ -340,7 +344,11 @@ func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) 
 
 func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) *benchTurnoverRing[string] {
 	tb.Helper()
-	total := int(db.Stats().KeyCount)
+	stats, err := db.Stats()
+	if err != nil {
+		tb.Fatalf("Stats: %v", err)
+	}
+	total := int(stats.KeyCount)
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[string], 0, len(ords))
 	for _, ord := range ords {
@@ -364,7 +372,11 @@ func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) 
 
 func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.Stats().KeyCount)
+	stats, err := db.Stats()
+	if err != nil {
+		tb.Fatalf("Stats: %v", err)
+	}
+	total := int(stats.KeyCount)
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {

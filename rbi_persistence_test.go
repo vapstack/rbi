@@ -138,7 +138,7 @@ func TestTransparentMode_WritesAdvanceBucketSequenceAndInvalidateStaleSidecar(t 
 		_ = rawReopen.Close()
 	}()
 
-	currentSeq := readBucketSequence(t, rawReopen, dbReopen.bucket)
+	currentSeq := readBucketSequence(t, rawReopen, dbReopen.dataBucket)
 	if currentSeq <= storedSeq {
 		t.Fatalf("bucket sequence did not advance across transparent writes: current=%d stored=%d", currentSeq, storedSeq)
 	}
@@ -196,7 +196,7 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 		_ = rawReopen.Close()
 	}()
 
-	currentSeq := readBucketSequence(t, rawReopen, dbReopen.bucket)
+	currentSeq := readBucketSequence(t, rawReopen, dbReopen.dataBucket)
 	if currentSeq <= storedSeq {
 		t.Fatalf("bucket sequence did not advance across transparent truncate: current=%d stored=%d", currentSeq, storedSeq)
 	}
@@ -237,7 +237,7 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	seq := readBucketSequence(t, rawDB, db.bucket)
+	seq := readBucketSequence(t, rawDB, db.dataBucket)
 	if err = rawDB.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
@@ -286,10 +286,10 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	if !strings.Contains(gotLog, "bucket=\"Rec\"") {
 		t.Fatalf("expected corrupted persisted index log to include bucket context, got: %q", gotLog)
 	}
-	if !strings.Contains(gotLog, "stage=load_v26") {
+	if !strings.Contains(gotLog, "stage=load_v28") {
 		t.Fatalf("expected corrupted persisted index log to include load stage, got: %q", gotLog)
 	}
-	if !strings.Contains(gotLog, "version=26") {
+	if !strings.Contains(gotLog, "version=28") {
 		t.Fatalf("expected corrupted persisted index log to include format version, got: %q", gotLog)
 	}
 	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
@@ -700,7 +700,7 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 	}
 
 	if err = raw.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(db.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket missing after close")
 		}
@@ -739,7 +739,7 @@ func TestPersistedIndex_RemainsPresentUntilClose(t *testing.T) {
 		t.Fatalf("expected persisted index before write, stat err=%v", err)
 	}
 	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	if currentSeq := readBucketSequence(t, raw2, db2.bucket); currentSeq != storedSeq {
+	if currentSeq := readBucketSequence(t, raw2, db2.dataBucket); currentSeq != storedSeq {
 		t.Fatalf("expected persisted index sequence=%d before write, got bucket sequence=%d", storedSeq, currentSeq)
 	}
 	if err := db2.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
@@ -748,7 +748,7 @@ func TestPersistedIndex_RemainsPresentUntilClose(t *testing.T) {
 	if _, err := os.Stat(db2.rbiFile); err != nil {
 		t.Fatalf("expected persisted index to remain present after write, stat err=%v", err)
 	}
-	if currentSeq := readBucketSequence(t, raw2, db2.bucket); currentSeq <= storedSeq {
+	if currentSeq := readBucketSequence(t, raw2, db2.dataBucket); currentSeq <= storedSeq {
 		t.Fatalf("expected bucket sequence to advance after write, before=%d after=%d", storedSeq, currentSeq)
 	}
 	if staleSeq := readPersistedIndexSequence(t, db2.rbiFile); staleSeq != storedSeq {
@@ -757,7 +757,7 @@ func TestPersistedIndex_RemainsPresentUntilClose(t *testing.T) {
 	if err := db2.Close(); err != nil {
 		t.Fatalf("Close after write: %v", err)
 	}
-	if freshSeq := readPersistedIndexSequence(t, db2.rbiFile); freshSeq != readBucketSequence(t, raw2, db2.bucket) {
+	if freshSeq := readPersistedIndexSequence(t, db2.rbiFile); freshSeq != readBucketSequence(t, raw2, db2.dataBucket) {
 		t.Fatalf("expected Close to refresh persisted index sequence, got %d", freshSeq)
 	}
 }
@@ -790,7 +790,7 @@ func TestPersistedIndex_RebuildsAfterCloseFailure(t *testing.T) {
 		t.Fatalf("expected stale persisted index file to remain after failed Close, stat err=%v", err)
 	}
 	staleSeq := readPersistedIndexSequence(t, persistedPath)
-	currentSeq := readBucketSequence(t, raw2, db2.bucket)
+	currentSeq := readBucketSequence(t, raw2, db2.dataBucket)
 	if staleSeq == currentSeq {
 		t.Fatalf("expected persisted index sequence to stay stale after failed Close, seq=%d", staleSeq)
 	}
@@ -836,7 +836,7 @@ func TestPersistedIndex_NoOpDeleteKeepsSequence(t *testing.T) {
 	}()
 
 	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	beforeSeq := readBucketSequence(t, raw2, db2.bucket)
+	beforeSeq := readBucketSequence(t, raw2, db2.dataBucket)
 	if storedSeq != beforeSeq {
 		t.Fatalf("expected persisted index sequence=%d before no-op delete, got bucket sequence=%d", storedSeq, beforeSeq)
 	}
@@ -846,7 +846,7 @@ func TestPersistedIndex_NoOpDeleteKeepsSequence(t *testing.T) {
 	}
 
 	afterStoredSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	afterSeq := readBucketSequence(t, raw2, db2.bucket)
+	afterSeq := readBucketSequence(t, raw2, db2.dataBucket)
 	if afterSeq != beforeSeq {
 		t.Fatalf("expected missing Delete to keep bucket sequence=%d, got %d", beforeSeq, afterSeq)
 	}
@@ -893,7 +893,10 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("expected [1], got %v", ids)
 	}
 
-	st := db2.Stats()
+	st, err := db2.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	if st.KeyCount != 2 {
 		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
@@ -1082,7 +1085,7 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 	}
 
 	persistedPath := path + ".Rec.rbi"
-	initialSeq := readBucketSequence(t, raw1, db1.bucket)
+	initialSeq := readBucketSequence(t, raw1, db1.dataBucket)
 	if initialSeq == 0 {
 		t.Fatalf("expected sequence to advance after write, got %d", initialSeq)
 	}
@@ -1103,7 +1106,7 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	truncateSeq := readBucketSequence(t, raw2, db2.bucket)
+	truncateSeq := readBucketSequence(t, raw2, db2.dataBucket)
 	if truncateSeq <= storedSeq {
 		t.Fatalf("truncate must preserve monotonic sequence: stored=%d truncate=%d", storedSeq, truncateSeq)
 	}
@@ -1122,7 +1125,7 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 	defer func() { _ = db3.Close() }()
 	defer func() { _ = raw3.Close() }()
 
-	if got := readBucketSequence(t, raw3, db3.bucket); got != truncateSeq {
+	if got := readBucketSequence(t, raw3, db3.dataBucket); got != truncateSeq {
 		t.Fatalf("reopened bucket sequence mismatch: got=%d want=%d", got, truncateSeq)
 	}
 	if snap := db3.SnapshotStats(); snap.Sequence != truncateSeq {
