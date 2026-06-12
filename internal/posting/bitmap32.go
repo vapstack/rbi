@@ -60,6 +60,17 @@ type intIterator struct {
 	bitmapIter bitmapContainerShortIterator
 }
 
+type intDescIterator struct {
+	pos              int
+	hs               uint32
+	iter             shortDescIterable
+	highlowcontainer *containerIndex
+
+	shortIter  shortDescIterator
+	runIter    runDescIterator16
+	bitmapIter bitmapContainerDescIterator
+}
+
 // hasNext returns true if there are more integers to iterate over.
 func (ii *intIterator) hasNext() bool {
 	return ii.pos < ii.highlowcontainer.size()
@@ -114,6 +125,67 @@ func (ii *intIterator) advanceIfNeeded(minval uint32) {
 
 		if !ii.iter.hasNext() {
 			ii.pos++
+			ii.init()
+		}
+	}
+}
+
+func (ii *intDescIterator) hasNext() bool {
+	return ii.pos >= 0
+}
+
+func (ii *intDescIterator) initialize(rb *bitmap32) {
+	ii.highlowcontainer = &rb.highlowcontainer
+	ii.pos = ii.highlowcontainer.size() - 1
+	ii.init()
+}
+
+func (ii *intDescIterator) init() {
+	if ii.pos < 0 {
+		ii.iter = nil
+		return
+	}
+	ii.hs = uint32(ii.highlowcontainer.getKeyAtIndex(ii.pos)) << 16
+	c := ii.highlowcontainer.getContainerAtIndex(ii.pos)
+	switch t := c.(type) {
+	case *containerArray:
+		ii.shortIter = shortDescIterator{slice: t.content, loc: len(t.content) - 1}
+		ii.iter = &ii.shortIter
+	case *containerRun:
+		ii.runIter = runDescIterator16{rc: t, curIndex: len(t.iv) - 1}
+		if ii.runIter.curIndex >= 0 {
+			ii.runIter.curPosInIndex = t.iv[ii.runIter.curIndex].length
+		}
+		ii.iter = &ii.runIter
+	case *containerBitmap:
+		ii.bitmapIter = bitmapContainerDescIterator{ptr: t, i: int(t.maximum())}
+		ii.iter = &ii.bitmapIter
+	}
+}
+
+func (ii *intDescIterator) next() uint32 {
+	x := uint32(ii.iter.next()) | ii.hs
+	if !ii.iter.hasNext() {
+		ii.pos--
+		ii.init()
+	}
+	return x
+}
+
+func (ii *intDescIterator) advanceIfNeeded(maxval uint32) {
+	to := maxval & 0xffff0000
+	if ii.hasNext() && ii.hs > to {
+		pos := ii.highlowcontainer.binarySearch(0, int64(ii.pos+1), uint16(maxval>>16))
+		if pos < 0 {
+			pos = -pos - 2
+		}
+		ii.pos = pos
+		ii.init()
+	}
+	if ii.hasNext() && ii.hs == to {
+		ii.iter.advanceIfNeeded(lowbits(maxval))
+		if !ii.iter.hasNext() {
+			ii.pos--
 			ii.init()
 		}
 	}

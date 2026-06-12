@@ -88,9 +88,12 @@ var (
 	smallPostingPool           sync.Pool
 	midPostingPool             sync.Pool
 	arrayIterPool              sync.Pool
+	arrayDescIterPool          sync.Pool
 	singletonIterPool          sync.Pool
+	singletonDescIterPool      sync.Pool
 	largePostingPool           sync.Pool
 	largeIteratorPool          sync.Pool
+	largeDescIteratorPool      sync.Pool
 	largeArrayStoragePools     [len(largeArrayPoolCapacities)]sync.Pool
 )
 
@@ -295,12 +298,34 @@ func getArrayIter(ids []uint64) *arrayIter {
 	return &arrayIter{ids: ids}
 }
 
+func getArrayDescIter(ids []uint64) *arrayDescIter {
+	if v := arrayDescIterPool.Get(); v != nil {
+		it := v.(*arrayDescIter)
+		it.ids = ids
+		it.i = len(ids) - 1
+		return it
+	}
+	return &arrayDescIter{ids: ids, i: len(ids) - 1}
+}
+
 func getSingletonIter(v uint64) *singletonIter {
 	var it *singletonIter
 	if pv := singletonIterPool.Get(); pv != nil {
 		it = pv.(*singletonIter)
 	} else {
 		it = new(singletonIter)
+	}
+	it.v = v
+	it.has = true
+	return it
+}
+
+func getSingletonDescIter(v uint64) *singletonDescIter {
+	var it *singletonDescIter
+	if pv := singletonDescIterPool.Get(); pv != nil {
+		it = pv.(*singletonDescIter)
+	} else {
+		it = new(singletonDescIter)
 	}
 	it.v = v
 	it.has = true
@@ -328,6 +353,18 @@ func getLargeIteratorSnapshot(lp *largePosting) *largeIterator {
 		it = new(largeIterator)
 	}
 	it.initializeSnapshot(lp)
+	return it
+}
+
+func getLargeDescIterator(lp *largePosting) *largeDescIterator {
+	var it *largeDescIterator
+	if v := largeDescIteratorPool.Get(); v != nil {
+		it = v.(*largeDescIterator)
+	} else {
+		it = new(largeDescIterator)
+	}
+	it.initializeSnapshot(lp)
+	it.init()
 	return it
 }
 

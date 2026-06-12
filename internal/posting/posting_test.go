@@ -3204,6 +3204,54 @@ func TestSkipLargeRejectsInvalidPayloads(t *testing.T) {
 	}
 }
 
+func TestListDescIterVisitsCompactAndLargePostingsDescending(t *testing.T) {
+	cases := []struct {
+		name string
+		ids  []uint64
+	}{
+		{name: "empty"},
+		{name: "single", ids: []uint64{7}},
+		{name: "small", ids: []uint64{3, 7, 11}},
+		{name: "mid", ids: []uint64{1, 2, 3, 5, 8, 13, 21, 34, 55}},
+		{name: "large", ids: []uint64{1, 3, 5, 1<<16 | 2, 1<<16 | 9, 1<<32 | 4, 2<<32 | 7, 2<<32 | 99}},
+		{name: "largeRun", ids: []uint64{11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1<<32 | 1, 1<<32 | 2}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			list := BuildFromSorted(tc.ids)
+			defer list.Release()
+
+			it := list.DescIter()
+			got := make([]uint64, 0, len(tc.ids))
+			for it.HasNext() {
+				got = append(got, it.Next())
+			}
+			it.Release()
+
+			want := slices.Clone(tc.ids)
+			slices.Reverse(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("DescIter=%v want %v", got, want)
+			}
+			if len(tc.ids) > 1 {
+				max := tc.ids[len(tc.ids)-2]
+				desc := list.DescAdvancingIter()
+				desc.AdvanceIfNeeded(max)
+				got = got[:0]
+				for desc.HasNext() {
+					got = append(got, desc.Next())
+				}
+				desc.Release()
+				want = slices.Clone(tc.ids[:len(tc.ids)-1])
+				slices.Reverse(want)
+				if !slices.Equal(got, want) {
+					t.Fatalf("DescAdvancingIter=%v want %v", got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestByteSliceAdaptersShareBackingAndHandleEmpty(t *testing.T) {
 	if got := uint64SliceAsByteSlice(nil); got != nil {
 		t.Fatalf("uint64SliceAsByteSlice(nil) must return nil")

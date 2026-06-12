@@ -172,27 +172,56 @@ func BenchmarkListReadOnly(b *testing.B) {
 }
 
 func BenchmarkListIteration(b *testing.B) {
-	small := BuildFromSorted(postingBenchSmallIDs())
-	mid := BuildFromSorted(postingBenchMidIDs())
-	large := BuildFromSorted(buildTestLargeIDs(8, 64, 0))
+	smallIDs := postingBenchSmallIDs()
+	midIDs := postingBenchMidIDs()
+	largeIDs := buildTestLargeIDs(8, 64, 0)
+	small := BuildFromSorted(smallIDs)
+	mid := BuildFromSorted(midIDs)
+	large := BuildFromSorted(largeIDs)
 	defer small.Release()
 	defer mid.Release()
 	defer large.Release()
 
 	cases := [...]struct {
-		name string
-		ids  List
+		name       string
+		ids        List
+		advanceMax uint64
 	}{
-		{"Empty", List{}},
-		{"Small", small},
-		{"Mid", mid},
-		{"Large", large},
+		{"Empty", List{}, 0},
+		{"Small", small, smallIDs[len(smallIDs)/2]},
+		{"Mid", mid, midIDs[len(midIDs)/2]},
+		{"Large", large, largeIDs[len(largeIDs)/2]},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name+"/Iter", func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				it := tc.ids.Iter()
+				var sum uint64
+				for it.HasNext() {
+					sum += it.Next()
+				}
+				it.Release()
+				postingBenchUint64Sum += sum
+			}
+		})
+		b.Run(tc.name+"/DescIter", func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				it := tc.ids.DescIter()
+				var sum uint64
+				for it.HasNext() {
+					sum += it.Next()
+				}
+				it.Release()
+				postingBenchUint64Sum += sum
+			}
+		})
+		b.Run(tc.name+"/DescAdvancingIter", func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				it := tc.ids.DescAdvancingIter()
+				it.AdvanceIfNeeded(tc.advanceMax)
 				var sum uint64
 				for it.HasNext() {
 					sum += it.Next()
@@ -214,6 +243,62 @@ func BenchmarkListIteration(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkListDescAdvance(b *testing.B) {
+	arrayPayload := BuildFromSorted(buildTestLargeIDs(128, 64, 0))
+	bitmapPayload := BuildFromSorted(buildTestLargeIDs(32, 4097, 0))
+	runBitmap := getBitmap32()
+	intervals := make([]interval16, 1024)
+	for i := range intervals {
+		start := uint16(i * 4)
+		intervals[i] = newInterval16Range(start, start+1)
+	}
+	runBitmap.highlowcontainer.appendContainer(0, newContainerRunCopyIv(intervals))
+	runPosting := getLargePosting()
+	runPosting.highlowcontainer.appendContainer(0, runBitmap)
+	runPayload := largeValue(runPosting)
+	defer arrayPayload.Release()
+	defer bitmapPayload.Release()
+	defer runPayload.Release()
+
+	cases := [...]struct {
+		name string
+		ids  List
+		max  uint64
+	}{
+		{"LargeArrayPayloadsSkipFar", arrayPayload, 2<<32 | 65},
+		{"LargeBitmapPayloadsSkipFar", bitmapPayload, 2<<32 | 4097},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				it := tc.ids.DescAdvancingIter()
+				it.AdvanceIfNeeded(tc.max)
+				if it.HasNext() {
+					postingBenchUint64Sum += it.Next()
+				}
+				it.Release()
+			}
+		})
+	}
+
+	b.Run("LargeRunPayloadRepeatedAdvance", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			it := runPayload.DescAdvancingIter()
+			var sum uint64
+			for max := 4000; max > 0; max -= 251 {
+				it.AdvanceIfNeeded(uint64(max))
+				if it.HasNext() {
+					sum += it.Next()
+				}
+			}
+			it.Release()
+			postingBenchUint64Sum += sum
+		}
+	})
 }
 
 func BenchmarkListToArray(b *testing.B) {

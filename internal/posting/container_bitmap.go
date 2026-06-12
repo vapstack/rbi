@@ -342,6 +342,11 @@ type bitmapContainerShortIterator struct {
 	i   int
 }
 
+type bitmapContainerDescIterator struct {
+	ptr *containerBitmap
+	i   int
+}
+
 func (it *bitmapContainerShortIterator) next() uint16 {
 	j := it.i
 	it.i = it.ptr.nextSetBit(uint(it.i) + 1)
@@ -365,6 +370,22 @@ func (it *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
 func (it *bitmapContainerShortIterator) release() {
 	it.ptr = nil
 	bitmapShortIteratorPool.Put(it)
+}
+
+func (it *bitmapContainerDescIterator) hasNext() bool {
+	return it.i >= 0
+}
+
+func (it *bitmapContainerDescIterator) next() uint16 {
+	v := it.i
+	it.i = it.ptr.prevSetBit(it.i - 1)
+	return uint16(v)
+}
+
+func (it *bitmapContainerDescIterator) advanceIfNeeded(maxval uint16) {
+	if it.i > int(maxval) {
+		it.i = it.ptr.prevSetBit(int(maxval))
+	}
 }
 
 func newContainerBitmapShortIterator(a *containerBitmap) *bitmapContainerShortIterator {

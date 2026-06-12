@@ -1171,6 +1171,12 @@ type runIterator16 struct {
 	curPosInIndex uint16
 }
 
+type runDescIterator16 struct {
+	rc            *containerRun
+	curIndex      int
+	curPosInIndex uint16
+}
+
 // newRunIterator returns a new empty run iterator over rc.
 func (rc *containerRun) newRunIterator() *runIterator16 {
 	return getRunIterator16(rc)
@@ -1239,6 +1245,41 @@ func (ri *runIterator16) advanceIfNeeded(minval uint16) {
 func (ri *runIterator16) release() {
 	ri.rc = nil
 	runIteratorPool.Put(ri)
+}
+
+func (ri *runDescIterator16) hasNext() bool {
+	return ri.curIndex >= 0
+}
+
+func (ri *runDescIterator16) next() uint16 {
+	next := ri.rc.iv[ri.curIndex].start + ri.curPosInIndex
+	if ri.curPosInIndex == 0 {
+		ri.curIndex--
+		if ri.curIndex >= 0 {
+			ri.curPosInIndex = ri.rc.iv[ri.curIndex].length
+		}
+		return next
+	}
+	ri.curPosInIndex--
+	return next
+}
+
+func (ri *runDescIterator16) advanceIfNeeded(maxval uint16) {
+	if !ri.hasNext() || ri.rc.iv[ri.curIndex].start+ri.curPosInIndex <= maxval {
+		return
+	}
+	interval, present, _ := ri.rc.searchRange(int(maxval), 0, ri.curIndex+1)
+	if interval < 0 {
+		ri.curIndex = -1
+		ri.curPosInIndex = 0
+		return
+	}
+	ri.curIndex = interval
+	if present {
+		ri.curPosInIndex = maxval - ri.rc.iv[interval].start
+		return
+	}
+	ri.curPosInIndex = ri.rc.iv[interval].length
 }
 
 func (rc *containerRun) newRunManyIterator() *runIterator16 {

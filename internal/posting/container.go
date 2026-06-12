@@ -708,6 +708,11 @@ type shortIterator struct {
 	loc   int
 }
 
+type shortDescIterator struct {
+	slice []uint16
+	loc   int
+}
+
 func (si *shortIterator) hasNext() bool {
 	return si.loc < len(si.slice)
 }
@@ -763,6 +768,39 @@ func (si *shortIterator) nextMany64(hs uint64, buf []uint64) int {
 	}
 	si.loc = l
 	return n
+}
+
+type shortDescIterable interface {
+	hasNext() bool
+	next() uint16
+	advanceIfNeeded(uint16)
+}
+
+func (si *shortDescIterator) hasNext() bool {
+	return si.loc >= 0
+}
+
+func (si *shortDescIterator) next() uint16 {
+	v := si.slice[si.loc]
+	si.loc--
+	return v
+}
+
+func (si *shortDescIterator) advanceIfNeeded(maxval uint16) {
+	if si.loc < 0 || si.slice[si.loc] <= maxval {
+		return
+	}
+	lo := 0
+	hi := si.loc + 1
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if si.slice[mid] <= maxval {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	si.loc = lo - 1
 }
 
 func difference(set1 []uint16, set2 []uint16, buffer []uint16) int {

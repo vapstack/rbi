@@ -283,6 +283,10 @@ func (lp *largePosting) iterator() *largeIterator {
 	return getLargeIterator(lp)
 }
 
+func (lp *largePosting) descIterator() *largeDescIterator {
+	return getLargeDescIterator(lp)
+}
+
 func (lp *largePosting) release() {
 	lp.clear()
 	largePostingPool.Put(lp)
@@ -897,6 +901,13 @@ type largeIterator struct {
 	highlowcontainer largeArray
 }
 
+type largeDescIterator struct {
+	pos              int
+	hs               uint64
+	iter             intDescIterator
+	highlowcontainer largeArray
+}
+
 func (it *largeIterator) HasNext() bool {
 	return it.pos < it.highlowcontainer.size()
 }
@@ -968,6 +979,62 @@ func (it *largeIterator) Release() {
 	it.highlowcontainer.clear()
 	it.highlowcontainer.releaseBacking()
 	largeIteratorPool.Put(it)
+}
+
+func (it *largeDescIterator) HasNext() bool {
+	return it.pos >= 0
+}
+
+func (it *largeDescIterator) init() {
+	if it.pos < 0 {
+		it.iter = intDescIterator{}
+		return
+	}
+	it.iter.initialize(it.highlowcontainer.getContainerAtIndex(it.pos))
+	it.hs = uint64(it.highlowcontainer.getKeyAtIndex(it.pos)) << 32
+}
+
+func (it *largeDescIterator) Next() uint64 {
+	x := uint64(it.iter.next()) | it.hs
+	if !it.iter.hasNext() {
+		it.pos--
+		it.init()
+	}
+	return x
+}
+
+func (it *largeDescIterator) AdvanceIfNeeded(maxval uint64) {
+	to := maxval >> 32
+	if it.HasNext() && (it.hs>>32) > to {
+		pos := it.highlowcontainer.binarySearch(0, int64(it.pos+1), uint32(to))
+		if pos < 0 {
+			pos = -pos - 2
+		}
+		it.pos = pos
+		it.init()
+	}
+	if it.HasNext() && (it.hs>>32) == to {
+		it.iter.advanceIfNeeded(lowbits64(maxval))
+		if !it.iter.hasNext() {
+			it.pos--
+			it.init()
+		}
+	}
+}
+
+func (it *largeDescIterator) initializeSnapshot(lp *largePosting) {
+	it.pos = 0
+	it.hs = 0
+	it.iter = intDescIterator{}
+	it.highlowcontainer.copySharedFrom(&lp.highlowcontainer)
+	it.pos = it.highlowcontainer.size() - 1
+}
+
+func (it *largeDescIterator) Release() {
+	it.iter = intDescIterator{}
+	it.highlowcontainer.clear()
+	it.highlowcontainer.releaseBacking()
+	largeDescIteratorPool.Put(it)
 }
 
 func writeLarge(writer *bufio.Writer, lp *largePosting) error {

@@ -267,6 +267,11 @@ type arrayIter struct {
 	i   int
 }
 
+type arrayDescIter struct {
+	ids []uint64
+	i   int
+}
+
 func cloneSmallPosting(sp *smallPosting) *smallPosting {
 	clone := getSmallPosting()
 	*clone = *sp
@@ -417,6 +422,36 @@ func (it *arrayIter) AdvanceIfNeeded(minval uint64) {
 		}
 	}
 	it.i = lo
+}
+
+func (it *arrayDescIter) HasNext() bool {
+	return it.i >= 0
+}
+
+func (it *arrayDescIter) Next() uint64 {
+	if it.i < 0 {
+		return 0
+	}
+	v := it.ids[it.i]
+	it.i--
+	return v
+}
+
+func (it *arrayDescIter) AdvanceIfNeeded(maxval uint64) {
+	if it.i < 0 || it.ids[it.i] <= maxval {
+		return
+	}
+	lo := 0
+	hi := it.i + 1
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if it.ids[mid] <= maxval {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	it.i = lo - 1
 }
 
 func (p List) kind() uint64 {
@@ -1444,6 +1479,44 @@ func (p List) Iter() Iterator {
 		return getArrayIter(mp.ids[:mp.n])
 	default:
 		return (*largePosting)(p.ptr).iterator()
+	}
+}
+
+func (p List) DescIter() Iterator {
+	if p.IsEmpty() {
+		return emptyIter{}
+	}
+	if p.ptr == singleValue {
+		return getSingletonDescIter(p.single)
+	}
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
+		return getArrayDescIter(sp.ids[:sp.n])
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
+		return getArrayDescIter(mp.ids[:mp.n])
+	default:
+		return (*largePosting)(p.ptr).descIterator()
+	}
+}
+
+func (p List) DescAdvancingIter() DescendingIterator {
+	if p.IsEmpty() {
+		return emptyIter{}
+	}
+	if p.ptr == singleValue {
+		return getSingletonDescIter(p.single)
+	}
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
+		return getArrayDescIter(sp.ids[:sp.n])
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
+		return getArrayDescIter(mp.ids[:mp.n])
+	default:
+		return (*largePosting)(p.ptr).descIterator()
 	}
 }
 
@@ -2559,6 +2632,11 @@ type AdvancingIterator interface {
 	AdvanceIfNeeded(uint64)
 }
 
+type DescendingIterator interface {
+	Iterator
+	AdvanceIfNeeded(uint64)
+}
+
 type emptyIter struct{}
 
 func (emptyIter) HasNext() bool { return false }
@@ -2570,6 +2648,11 @@ func (emptyIter) AdvanceIfNeeded(uint64) {}
 func (emptyIter) Release() {}
 
 type singletonIter struct {
+	v   uint64
+	has bool
+}
+
+type singletonDescIter struct {
 	v   uint64
 	has bool
 }
@@ -2590,8 +2673,28 @@ func (it *singletonIter) AdvanceIfNeeded(minval uint64) {
 	}
 }
 
+func (it *singletonDescIter) HasNext() bool { return it.has }
+
+func (it *singletonDescIter) Next() uint64 {
+	if !it.has {
+		return 0
+	}
+	it.has = false
+	return it.v
+}
+
+func (it *singletonDescIter) AdvanceIfNeeded(maxval uint64) {
+	if it.has && it.v > maxval {
+		it.has = false
+	}
+}
+
 func (it *singletonIter) Release() {
 	singletonIterPool.Put(it)
+}
+
+func (it *singletonDescIter) Release() {
+	singletonDescIterPool.Put(it)
 }
 
 func (sp *smallPosting) release() {
@@ -2611,4 +2714,9 @@ func (mp *midPosting) Release() { mp.release() }
 func (it *arrayIter) Release() {
 	it.ids = nil
 	arrayIterPool.Put(it)
+}
+
+func (it *arrayDescIter) Release() {
+	it.ids = nil
+	arrayDescIterPool.Put(it)
 }
