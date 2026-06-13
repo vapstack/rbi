@@ -515,8 +515,6 @@ The returned value is used as the indexed representation.
 - `db` tag value, unless it is `db:"-"`
 - `json` tag name, unless it is `json:"-"` or empty
 
-This allows JSON payloads to be applied directly without additional mapping.
-
 ```go
 type User struct {
     // Indexed as "UserName". Patchable via "UserName"

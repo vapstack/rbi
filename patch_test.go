@@ -5,6 +5,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +49,24 @@ func (r *patchQueuedOwnershipRec) DecodeRBI(rd io.Reader) error {
 	return nil
 }
 
+func mustMakePatch[V any](t testing.TB, db *DB[uint64, V], oldVal, newVal *V, opts ...PatchOption) []Field {
+	t.Helper()
+	patch, err := db.MakePatch(oldVal, newVal, opts...)
+	if err != nil {
+		t.Fatalf("MakePatch: %v", err)
+	}
+	return patch
+}
+
+func mustMakePatchInto[V any](t testing.TB, db *DB[uint64, V], oldVal, newVal *V, dst []Field, opts ...PatchOption) []Field {
+	t.Helper()
+	patch, err := db.MakePatchInto(oldVal, newVal, dst, opts...)
+	if err != nil {
+		t.Fatalf("MakePatchInto: %v", err)
+	}
+	return patch
+}
+
 func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -71,8 +90,9 @@ func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	}
 
 	if err := db.Set(1, updated, BeforeCommit(func(_ *bbolt.Tx, _ uint64, oldValue, newValue *Rec) error {
-		patch = db.MakePatch(oldValue, newValue)
-		return nil
+		var err error
+		patch, err = db.MakePatch(oldValue, newValue)
+		return err
 	})); err != nil {
 		t.Fatalf("Set(update): %v", err)
 	}
@@ -117,7 +137,7 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 	oldVal := &Rec{Name: "alice"}
 	newVal := &Rec{Name: "alice", Tags: []string{}}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotTags, ok := fields["tags"].([]string)
@@ -137,6 +157,32 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 	}
 }
 
+func TestMakePatch_EmitsEmptyToNilSliceTransition(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	oldVal := &Rec{Name: "alice", Tags: []string{}}
+	newVal := &Rec{Name: "alice"}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+
+	gotTags, ok := fields["tags"].([]string)
+	if !ok {
+		t.Fatalf("patch must contain []string value for tags, got %#v", fields["tags"])
+	}
+	if gotTags != nil {
+		t.Fatalf("patch must preserve nil slice, got %#v", gotTags)
+	}
+	if len(patch) != 1 {
+		t.Fatalf("expected exactly one changed field, got %#v", patch)
+	}
+
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	if applied.Tags != nil {
+		t.Fatalf("patched record lost nil slice: %#v", applied.Tags)
+	}
+}
+
 func TestMakePatch_DefaultUsesDBNamesAndRoundTripsViaPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -151,7 +197,7 @@ func TestMakePatch_DefaultUsesDBNamesAndRoundTripsViaPatch(t *testing.T) {
 
 	mustSetAPIRec(t, db, 1, oldVal)
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	if _, ok := fields["name"]; !ok {
@@ -199,7 +245,7 @@ func TestMakePatch_PatchJSON_UsesJSONOrGoNamesAndRoundTripsViaPatch(t *testing.T
 
 	mustSetAPIRec(t, db, 1, oldVal)
 
-	patch := db.MakePatch(oldVal, newVal, PatchJSON)
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
 	fields := patchFieldsByName(patch)
 
 	if _, ok := fields["Name"]; !ok {
@@ -233,6 +279,183 @@ func TestMakePatch_PatchJSON_UsesJSONOrGoNamesAndRoundTripsViaPatch(t *testing.T
 	}
 }
 
+type PatchJSONPromotedLeftRec struct {
+	ID string `db:"left_id"`
+}
+
+type PatchJSONPromotedRightRec struct {
+	ID string `db:"right_id"`
+}
+
+type patchJSONPromotedRec struct {
+	PatchJSONPromotedLeftRec
+	PatchJSONPromotedRightRec
+}
+
+func TestMakePatch_PatchJSON_RejectsAmbiguousPromotedGoNameWithoutJSONTags(t *testing.T) {
+	db := openTempDBUint64Reflect[patchJSONPromotedRec](t, "patch_json_promoted_db_names.db")
+
+	oldVal := &patchJSONPromotedRec{
+		PatchJSONPromotedLeftRec:  PatchJSONPromotedLeftRec{ID: "left-old"},
+		PatchJSONPromotedRightRec: PatchJSONPromotedRightRec{ID: "right-old"},
+	}
+	newVal := &patchJSONPromotedRec{
+		PatchJSONPromotedLeftRec:  PatchJSONPromotedLeftRec{ID: "left-new"},
+		PatchJSONPromotedRightRec: PatchJSONPromotedRightRec{ID: "right-new"},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	if fields["left_id"] != "left-new" || fields["right_id"] != "right-new" {
+		t.Fatalf("MakePatch did not use db names for promoted fields: %#v", patch)
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatch PatchJSON err=%v want unsafe json name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+	scratch := []Field{{Name: "stale", Value: "value"}}
+	patch, err = db.MakePatchInto(oldVal, newVal, scratch, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatchInto PatchJSON err=%v want unsafe json name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatchInto PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+type PatchUnaliasedPromotedLeftRec struct {
+	ID string
+}
+
+type PatchUnaliasedPromotedRightRec struct {
+	ID string
+}
+
+type patchUnaliasedPromotedRec struct {
+	PatchUnaliasedPromotedLeftRec
+	PatchUnaliasedPromotedRightRec
+}
+
+func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
+	db := openTempDBUint64Reflect[patchUnaliasedPromotedRec](t, "patch_unaliased_promoted_names.db")
+
+	oldVal := &patchUnaliasedPromotedRec{
+		PatchUnaliasedPromotedLeftRec:  PatchUnaliasedPromotedLeftRec{ID: "left-old"},
+		PatchUnaliasedPromotedRightRec: PatchUnaliasedPromotedRightRec{ID: "right-old"},
+	}
+	newVal := &patchUnaliasedPromotedRec{
+		PatchUnaliasedPromotedLeftRec:  PatchUnaliasedPromotedLeftRec{ID: "left-new"},
+		PatchUnaliasedPromotedRightRec: PatchUnaliasedPromotedRightRec{ID: "right-new"},
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
+		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
+	}
+
+	patch, err = db.MakePatch(oldVal, newVal, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatch PatchJSON err=%v want unsafe json name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+type PatchJSONPromotedTaggedLeftRec struct {
+	ID string `db:"left_id" json:"leftId"`
+}
+
+type PatchJSONPromotedTaggedRightRec struct {
+	ID string `db:"right_id" json:"rightId"`
+}
+
+type patchJSONPromotedTaggedRec struct {
+	PatchJSONPromotedTaggedLeftRec
+	PatchJSONPromotedTaggedRightRec
+}
+
+func TestMakePatch_PatchJSON_UsesExplicitJSONTagsForPromotedGoName(t *testing.T) {
+	db := openTempDBUint64Reflect[patchJSONPromotedTaggedRec](t, "patch_json_promoted_json_names.db")
+
+	oldVal := &patchJSONPromotedTaggedRec{
+		PatchJSONPromotedTaggedLeftRec:  PatchJSONPromotedTaggedLeftRec{ID: "left-old"},
+		PatchJSONPromotedTaggedRightRec: PatchJSONPromotedTaggedRightRec{ID: "right-old"},
+	}
+	newVal := &patchJSONPromotedTaggedRec{
+		PatchJSONPromotedTaggedLeftRec:  PatchJSONPromotedTaggedLeftRec{ID: "left-new"},
+		PatchJSONPromotedTaggedRightRec: PatchJSONPromotedTaggedRightRec{ID: "right-new"},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	fields := patchFieldsByName(patch)
+	if fields["leftId"] != "left-new" || fields["rightId"] != "right-new" {
+		t.Fatalf("PatchJSON patch did not use explicit json names for promoted fields: %#v", patch)
+	}
+
+	got := applyPatchForTest(t, db, oldVal, patch)
+	if got.PatchJSONPromotedTaggedLeftRec.ID != "left-new" || got.PatchJSONPromotedTaggedRightRec.ID != "right-new" {
+		t.Fatalf("PatchJSON patch round-trip failed: %#v", got)
+	}
+}
+
+type PatchJSONShadowedEmptyTagEmbeddedRec struct {
+	ID string `db:"inner_id" json:",omitempty"`
+}
+
+type patchJSONShadowedEmptyTagRec struct {
+	ID string
+	PatchJSONShadowedEmptyTagEmbeddedRec
+}
+
+func TestMakePatch_PatchJSON_RejectsShadowedEmptyNameJSONTag(t *testing.T) {
+	db := openTempDBUint64Reflect[patchJSONShadowedEmptyTagRec](t, "patch_json_shadowed_empty_name_tag.db")
+
+	oldVal := &patchJSONShadowedEmptyTagRec{
+		ID:                                   "outer",
+		PatchJSONShadowedEmptyTagEmbeddedRec: PatchJSONShadowedEmptyTagEmbeddedRec{ID: "inner-old"},
+	}
+	newVal := &patchJSONShadowedEmptyTagRec{
+		ID:                                   "outer",
+		PatchJSONShadowedEmptyTagEmbeddedRec: PatchJSONShadowedEmptyTagEmbeddedRec{ID: "inner-new"},
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatch PatchJSON err=%v want unsafe json name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+type patchJSONOmittedRec struct {
+	Visible string
+	Hidden  string `json:"-"`
+}
+
+func TestMakePatch_PatchJSON_RejectsChangedJSONOmittedField(t *testing.T) {
+	db := openTempDBUint64Reflect[patchJSONOmittedRec](t, "patch_json_omitted_field.db")
+
+	oldVal := &patchJSONOmittedRec{Visible: "same", Hidden: "old"}
+	newVal := &patchJSONOmittedRec{Visible: "same", Hidden: "new"}
+
+	patch, err := db.MakePatch(oldVal, newVal, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatch PatchJSON err=%v want omitted field error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
 func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -257,7 +480,11 @@ func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *tes
 	}
 
 	if err := db.BatchSet(ids, updated, BeforeCommit(func(_ *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
-		patchByID[key] = db.MakePatch(oldValue, newValue)
+		patch, err := db.MakePatch(oldValue, newValue)
+		if err != nil {
+			return err
+		}
+		patchByID[key] = patch
 		return nil
 	})); err != nil {
 		t.Fatalf("BatchSet(update): %v", err)
@@ -355,7 +582,7 @@ func TestAPI_MakePatchInto_ResetsDstAndDeepCopiesMutableValues(t *testing.T) {
 	mustSetAPIRec(t, db, 1, oldVal)
 
 	scratch := []Field{{Name: "stale", Value: "sentinel"}}
-	patch := db.MakePatchInto(oldVal, newVal, scratch)
+	patch := mustMakePatchInto(t, db, oldVal, newVal, scratch)
 	if len(patch) == 0 {
 		t.Fatalf("expected non-empty patch")
 	}
@@ -590,7 +817,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeValue(t *testing.T) {
 		When: time.Date(2025, time.January, 2, 3, 4, 5, 678901234, loc),
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotWhen, ok := fields["When"].(time.Time)
@@ -620,7 +847,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeSlice(t *testing.T) {
 		},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotSlots, ok := fields["Slots"].([]time.Time)
@@ -655,7 +882,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeMapKeys(t *testing.T) {
 		},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotWindows, ok := fields["Windows"].(map[time.Time]string)
@@ -696,7 +923,7 @@ func TestReflectExt_MakePatch_PreservesNamedSliceType(t *testing.T) {
 		Tags: reflectNamedTags{"go", "db"},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotTags, ok := fields["tags"].(reflectNamedTags)
@@ -724,7 +951,7 @@ func TestReflectExt_MakePatch_UsesFullFieldEqualityForValueIndexer(t *testing.T)
 	oldVal := &reflectMapVIRec{Key: reflectMapVI{"id": "A", "note": "old"}}
 	newVal := &reflectMapVIRec{Key: reflectMapVI{"id": "a", "note": "new"}}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
 	gotKey, ok := fields["key"].(reflectMapVI)
@@ -763,7 +990,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesStructReferences(t *testing.T) {
 		},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	newVal.Nested.Tags[0] = "after"
 	newVal.Nested.Attrs["x"] = 9
 	newVal.Nested.Child.Label = "mutated"
@@ -816,7 +1043,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesPointerStructReferences(t *testin
 		},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	newVal.NestedPtr.Tags[0] = "after"
 	newVal.NestedPtr.Attrs["x"] = 9
 	newVal.NestedPtr.Child.Label = "mutated"
@@ -877,7 +1104,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesSliceStructReferences(t *testing.
 		},
 	}
 
-	patch := db.MakePatch(oldVal, newVal)
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	newVal.Items[0].Nested.Tags[0] = "after"
 	newVal.Items[0].Nested.Attrs["x"] = 9
 	newVal.Items[0].Nested.Child.Label = "mutated"

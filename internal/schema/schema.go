@@ -14,17 +14,19 @@ import (
 )
 
 type Field struct {
-	Name      string
-	Unique    bool
-	IndexKind IndexKind
-	Kind      reflect.Kind
-	Ptr       bool
-	Slice     bool
-	UseVI     bool
-	KeyKind   FieldKeyKind
-	DBName    string
-	JSONName  string
-	Index     []int
+	Name       string
+	Unique     bool
+	IndexKind  IndexKind
+	Kind       reflect.Kind
+	Ptr        bool
+	Slice      bool
+	UseVI      bool
+	KeyKind    FieldKeyKind
+	DBName     string
+	DBTagged   bool
+	JSONName   string
+	JSONTagged bool
+	Index      []int
 }
 
 // IndexKind declares how a struct Field participates in RBI secondary storage.
@@ -478,13 +480,19 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 		if collector.measureFields == nil {
 			collector.measureFields = make(map[string]*Field)
 		}
+		if existing, ok := collector.measureFields[f.DBName]; ok {
+			return fmt.Errorf("ambiguous measure field name %q used by fields %v and %v", f.DBName, existing.Name, f.Name)
+		}
 		collector.measureFields[f.DBName] = f
 		return nil
 	}
 	if collector.indexFields == nil {
 		collector.indexFields = make(map[string]*Field)
 	}
-	collector.indexFields[f.DBName] = f // last wins
+	if existing, ok := collector.indexFields[f.DBName]; ok {
+		return fmt.Errorf("ambiguous index field name %q used by fields %v and %v", f.DBName, existing.Name, f.Name)
+	}
+	collector.indexFields[f.DBName] = f
 	return nil
 }
 
@@ -637,7 +645,7 @@ type (
 	StringValidationAccessorFn       func(ptr unsafe.Pointer) error
 )
 
-func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, single []int) error {
+func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguous map[string]int, t reflect.Type, idx []int, single []int) error {
 	for i := 0; i < t.NumField(); i++ {
 
 		rf := t.Field(i)
@@ -649,7 +657,7 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 		if rf.Anonymous {
 			if rf.Type.Kind() == reflect.Struct {
 				nidx := append(idx, i)
-				if err := populatePatcher(patchMap, rf.Type, nidx, single); err != nil {
+				if err := populatePatcher(patchMap, patchFields, ambiguous, rf.Type, nidx, single); err != nil {
 					return err
 				}
 			}
@@ -670,6 +678,7 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 			Kind:     rf.Type.Kind(),
 			Index:    fieldIndex,
 		}
+		*patchFields = append(*patchFields, f)
 
 		f.UseVI = rf.Type.Implements(viType)
 
@@ -687,35 +696,100 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 			f.UseVI = elem.Implements(viType)
 		}
 
-		if existing, ok := patchMap[rf.Name]; ok && existing.Name != f.Name {
-			return fmt.Errorf("ambiguous patch field name '%v' used by fields %v and %v", rf.Name, existing.Name, f.Name)
+		fieldDepth := len(f.Index)
+		dbNameUnsafe := false
+		jsonNameUnsafe := false
+
+		if depth, ok := ambiguous[rf.Name]; ok {
+			if fieldDepth < depth {
+				delete(ambiguous, rf.Name)
+				patchMap[rf.Name] = f
+			} else {
+				dbNameUnsafe = true
+				jsonNameUnsafe = true
+			}
+
+		} else {
+			if existing, ok := patchMap[rf.Name]; ok {
+				if existing.Name != f.Name {
+					return fmt.Errorf("ambiguous patch field name '%v' used by fields %v and %v", rf.Name, existing.Name, f.Name)
+				}
+				existingDepth := len(existing.Index)
+				switch {
+
+				case existingDepth < fieldDepth:
+					dbNameUnsafe = true
+					jsonNameUnsafe = true
+
+				case existingDepth > fieldDepth:
+					if !existing.DBTagged && existing.DBName == existing.Name {
+						existing.DBName = ""
+					}
+					if !existing.JSONTagged && existing.JSONName == existing.Name {
+						existing.JSONName = ""
+					}
+					patchMap[rf.Name] = f
+
+				case !slices.Equal(existing.Index, f.Index):
+					if !existing.DBTagged && existing.DBName == existing.Name {
+						existing.DBName = ""
+					}
+					if !existing.JSONTagged && existing.JSONName == existing.Name {
+						existing.JSONName = ""
+					}
+					delete(patchMap, rf.Name)
+					ambiguous[rf.Name] = fieldDepth
+					dbNameUnsafe = true
+					jsonNameUnsafe = true
+
+				default:
+					patchMap[rf.Name] = f
+				}
+			} else {
+				patchMap[rf.Name] = f
+			}
 		}
-		patchMap[rf.Name] = f
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 			if dbTag == ReservedKeyFieldName {
 				return fmt.Errorf("field %v uses reserved db tag %q", rf.Name, dbTag)
 			}
+			if _, ok := ambiguous[dbTag]; ok {
+				return fmt.Errorf("ambiguous db tag '%v' used by field %v and promoted field name", dbTag, f.Name)
+			}
 			f.DBName = dbTag
-			if existing, ok := patchMap[dbTag]; ok && existing.Name != f.Name {
+			f.DBTagged = true
+			if existing, ok := patchMap[dbTag]; ok && existing != f {
 				return fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", dbTag, existing.Name, f.Name)
 			}
 			patchMap[dbTag] = f
 		}
 
-		if jsonTag := rf.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+		jsonTag := rf.Tag.Get("json")
+		if jsonTag == "-" {
+			f.JSONName = ""
+		} else if jsonTag != "" {
 			jsonName, _, _ := strings.Cut(jsonTag, ",")
-			if jsonName == "" {
-				continue
+			if jsonName != "" {
+				if jsonName == ReservedKeyFieldName {
+					return fmt.Errorf("field %v uses reserved json tag %q", rf.Name, jsonName)
+				}
+				if _, ok := ambiguous[jsonName]; ok {
+					return fmt.Errorf("ambiguous json tag '%v' used by field %v and promoted field name", jsonName, f.Name)
+				}
+				f.JSONName = jsonName
+				f.JSONTagged = true
+				if existing, ok := patchMap[jsonName]; ok && existing != f {
+					return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
+				}
+				patchMap[jsonName] = f
 			}
-			if jsonName == ReservedKeyFieldName {
-				return fmt.Errorf("field %v uses reserved json tag %q", rf.Name, jsonName)
-			}
-			f.JSONName = jsonName
-			if existing, ok := patchMap[jsonName]; ok && existing.Name != f.Name {
-				return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
-			}
-			patchMap[jsonName] = f
+		}
+		if dbNameUnsafe && !f.DBTagged && f.DBName == f.Name {
+			f.DBName = ""
+		}
+		if jsonNameUnsafe && !f.JSONTagged && f.JSONName == f.Name {
+			f.JSONName = ""
 		}
 	}
 	return nil
@@ -723,10 +797,37 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 
 func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
 	patchMap := make(map[string]*Field, vtype.NumField()*2)
-	if err := populatePatcher(patchMap, vtype, nil, make([]int, vtype.NumField())); err != nil {
+	patchFields := make([]*Field, 0, vtype.NumField())
+	if err := populatePatcher(patchMap, &patchFields, make(map[string]int), vtype, nil, make([]int, vtype.NumField())); err != nil {
 		return PatchRuntime{}, err
 	}
-	access := makePatchFieldAccessors(vtype, patchMap)
+	for _, f := range patchFields {
+		if f.DBName != "" {
+			existing := patchMap[f.DBName]
+			if existing != f {
+				if f.DBTagged {
+					if existing == nil {
+						return PatchRuntime{}, fmt.Errorf("ambiguous db tag '%v' used by field %v and promoted field name", f.DBName, f.Name)
+					}
+					return PatchRuntime{}, fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", f.DBName, f.Name, existing.Name)
+				}
+				f.DBName = ""
+			}
+		}
+		if f.JSONName != "" {
+			existing := patchMap[f.JSONName]
+			if existing != f {
+				if f.JSONTagged {
+					if existing == nil {
+						return PatchRuntime{}, fmt.Errorf("ambiguous json tag '%v' used by field %v and promoted field name", f.JSONName, f.Name)
+					}
+					return PatchRuntime{}, fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", f.JSONName, f.Name, existing.Name)
+				}
+				f.JSONName = ""
+			}
+		}
+	}
+	access := makePatchFieldAccessors(vtype, patchFields)
 	return PatchRuntime{
 		Fields: patchMap,
 		Access: access,
@@ -734,15 +835,12 @@ func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
 	}, nil
 }
 
-func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) []PatchFieldAccessor {
+func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) []PatchFieldAccessor {
 	if len(fields) == 0 {
 		return nil
 	}
 
-	patchFields := make([]*Field, 0, len(fields))
-	for _, f := range fields {
-		patchFields = append(patchFields, f)
-	}
+	patchFields := fields
 	slices.SortFunc(patchFields, func(a, b *Field) int {
 		return slices.Compare(a.Index, b.Index)
 	})

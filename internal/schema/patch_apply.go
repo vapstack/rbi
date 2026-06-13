@@ -53,6 +53,10 @@ func setReflectValue(fv reflect.Value, val any) error {
 		if sv.Kind() != reflect.Slice {
 			return fmt.Errorf("source is not a slice, but destination is")
 		}
+		if sv.IsNil() {
+			fv.Set(reflect.Zero(fv.Type()))
+			return nil
+		}
 
 		vt := fv.Type()
 		et := vt.Elem()

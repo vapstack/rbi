@@ -606,7 +606,10 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
 		return nil
 	})
 	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-		patch := db.MakePatch(oldValue, newValue)
+		patch, err := db.MakePatch(oldValue, newValue)
+		if err != nil {
+			return err
+		}
 		payload, err := msgpack.Marshal(patch)
 		if err != nil {
 			return fmt.Errorf("marshal patch: %w", err)
@@ -637,7 +640,10 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testi
 		return nil
 	})
 	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-		patch := db.MakePatch(oldValue, newValue)
+		patch, err := db.MakePatch(oldValue, newValue)
+		if err != nil {
+			return err
+		}
 		payload, err := msgpack.Marshal(patch)
 		if err != nil {
 			return fmt.Errorf("marshal patch: %w", err)
@@ -721,7 +727,10 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 				return nil
 			})
 			beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-				patch := db.MakePatch(oldValue, newValue)
+				patch, err := db.MakePatch(oldValue, newValue)
+				if err != nil {
+					return err
+				}
 				payload, err := msgpack.Marshal(patch)
 				if err != nil {
 					return fmt.Errorf("marshal patch: %w", err)
@@ -835,6 +844,10 @@ func Benchmark_Write_Helper_MakePatch(b *testing.B) {
 	buf := make([]Field, 0, 8)
 	b.ResetTimer()
 	for b.Loop() {
-		buf = db.MakePatchInto(v1, v2, buf)
+		var err error
+		buf, err = db.MakePatchInto(v1, v2, buf)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

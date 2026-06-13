@@ -15,7 +15,10 @@ type PatchOption uint8
 
 const (
 	// PatchJSON makes MakePatch emit json tag names when present.
-	// Fields without a json tag fall back to their Go struct field name.
+	// Fields without a json tag fall back to their Go struct field name only
+	// when that name is an unambiguous patch identifier for the field.
+	// A changed field with `json:"-"` or without a safe JSON name makes
+	// MakePatch return an error instead of silently omitting the change.
 	PatchJSON PatchOption = 1 << iota
 )
 
@@ -23,16 +26,23 @@ const (
 // oldVal and newVal.
 //
 // The patch includes both indexed and non-indexed fields. For every modified
-// field it adds a Field entry whose Name uses the db tag when present or
-// Go struct field name otherwise.
+// field it adds a Field entry whose Name uses the db tag when present.
+// Fields without a db tag use Go struct field name only when that name
+// is an unambiguous patch identifier for the field. If a modified field cannot
+// be represented by a safe patch name, MakePatch returns an error.
 //
-// When PatchJSON is passed, Name uses the json tag when present or
-// Go struct field name otherwise.
+// When PatchJSON is passed, Name uses the json tag when present.
+// Fields without an explicit json name use their Go struct field name
+// only if that name is an unambiguous patch identifier for the field.
+// If a modified field cannot be represented by a safe JSON patch name,
+// including fields tagged json:"-", MakePatch returns an error.
+// PatchJSON still builds a full patch,
+// it does not silently drop changes outside the JSON representation.
 //
 // Value is always a deep copy taken from newVal.
 //
 // If newVal is nil, it returns an empty slice.
-func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) []Field {
+func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, error) {
 	useJSON := false
 	for _, opt := range opts {
 		if opt == PatchJSON {
@@ -50,7 +60,8 @@ func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) []Field {
 // array or a grown one if capacity is insufficient.
 //
 // If newVal is nil, it returns an empty slice.
-func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) []Field {
+// On error, returned slice is reset to length 0.
+func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) ([]Field, error) {
 	useJSON := false
 	for _, opt := range opts {
 		if opt == PatchJSON {
@@ -71,11 +82,11 @@ var patchScratchPool = pooled.Pointers[patchScratch]{
 	},
 }
 
-func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) []Field {
+func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) ([]Field, error) {
 	target = target[:0]
 
 	if newVal == nil {
-		return target
+		return target, nil
 	}
 
 	var rvOld, rvNew reflect.Value
@@ -95,20 +106,28 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 		oldPtr = unsafe.Pointer(oldVal)
 	}
 
+	var patchErr error
 	db.forEachModifiedIndexedField(oldVal, newVal, func(acc schema.IndexedFieldAccessor) bool {
 		if acc.PatchOrdinal < 0 {
 			return true
 		}
 		patchAcc := patchAccess[acc.PatchOrdinal]
+		name := patchAcc.Field.DBName
+		if useJSON {
+			name = patchAcc.Field.JSONName
+			if name == "" {
+				patchErr = fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
+				return false
+			}
+		} else if name == "" {
+			patchErr = fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
+			return false
+		}
 		var value any
 		if patchAcc.CopyValue != nil {
 			value = patchAcc.CopyValue(newPtr)
 		} else {
 			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
-		}
-		name := patchAcc.Field.DBName
-		if useJSON {
-			name = patchAcc.Field.JSONName
 		}
 		scratch.seen[acc.PatchOrdinal] = true
 		target = append(target, Field{
@@ -117,6 +136,9 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 		})
 		return true
 	})
+	if patchErr != nil {
+		return target[:0], patchErr
+	}
 
 	for ordinal, patchAcc := range patchAccess {
 		if scratch.seen[ordinal] {
@@ -137,16 +159,23 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 				}
 			}
 		}
+
+		name := patchAcc.Field.DBName
+		if useJSON {
+			name = patchAcc.Field.JSONName
+			if name == "" {
+				return target[:0], fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
+			}
+		} else if name == "" {
+			return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
+		}
+
 		if patchAcc.CopyValue != nil {
 			newValue = patchAcc.CopyValue(newPtr)
 		} else if newValue == nil {
 			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
 		} else {
 			newValue = deepCopyValue(newValue)
-		}
-		name := patchAcc.Field.DBName
-		if useJSON {
-			name = patchAcc.Field.JSONName
 		}
 
 		target = append(target, Field{
@@ -155,7 +184,7 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 		})
 	}
 
-	return target
+	return target, nil
 }
 
 func patchItemsForWrite(fields []Field) []schema.PatchItem {

@@ -32,6 +32,24 @@ type schemaTestTagRec struct {
 	Plain    string
 }
 
+type schemaTestDuplicateTagDBNameRec struct {
+	Left  string `db:"dup" rbi:"index"`
+	Right string `db:"dup" rbi:"index"`
+}
+
+type SchemaTestDuplicateTagLeft struct {
+	ID string `rbi:"index"`
+}
+
+type SchemaTestDuplicateTagRight struct {
+	ID string `rbi:"index"`
+}
+
+type schemaTestDuplicateTagPromotedRec struct {
+	SchemaTestDuplicateTagLeft
+	SchemaTestDuplicateTagRight
+}
+
 func TestCompileTagsCollectsIndexedUniqueMeasureAndPatch(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestTagRec](), Config{})
 	if err != nil {
@@ -57,6 +75,24 @@ func TestCompileTagsCollectsIndexedUniqueMeasureAndPatch(t *testing.T) {
 	}
 	if !rt.HasUnique {
 		t.Fatal("expected HasUnique")
+	}
+}
+
+func TestCompileTagsRejectDuplicateIndexNames(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{name: "db_tag", typ: reflect.TypeFor[schemaTestDuplicateTagDBNameRec]()},
+		{name: "promoted_go_name", typ: reflect.TypeFor[schemaTestDuplicateTagPromotedRec]()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Compile(tc.typ, Config{}); err == nil || !strings.Contains(err.Error(), "ambiguous index field name") {
+				t.Fatalf("Compile err=%v want ambiguous index field name rejection", err)
+			}
+		})
 	}
 }
 
@@ -111,6 +147,37 @@ type schemaTestPatchJSONAliasGoNameCollisionRec struct {
 	Name   string
 }
 
+type SchemaTestPatchShadowedDBTagEmbedded struct {
+	ID string `db:"ID"`
+}
+
+type schemaTestPatchShadowedDBTagRec struct {
+	SchemaTestPatchShadowedDBTagEmbedded
+	ID string
+}
+
+type SchemaTestPatchShadowedJSONTagEmbedded struct {
+	ID string `json:"ID"`
+}
+
+type schemaTestPatchShadowedJSONTagRec struct {
+	SchemaTestPatchShadowedJSONTagEmbedded
+	ID string
+}
+
+type SchemaTestPatchSameNameLeft struct {
+	ID string
+}
+
+type SchemaTestPatchSameNameRight struct {
+	ID string
+}
+
+type schemaTestPatchSameNamePromotedRec struct {
+	SchemaTestPatchSameNameLeft
+	SchemaTestPatchSameNameRight
+}
+
 func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestShadowedPatchRec](), Config{})
 	if err != nil {
@@ -140,19 +207,51 @@ func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	}
 }
 
+func TestCompileOmitsSameNamePromotedPatchFields(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestPatchSameNamePromotedRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if _, ok := rt.Patch.Fields["ID"]; ok {
+		t.Fatal("ambiguous promoted Go name was registered as patch field")
+	}
+	if len(rt.Patch.Access) != 2 {
+		t.Fatalf("ambiguous promoted fields were not retained for MakePatch access: %d", len(rt.Patch.Access))
+	}
+	for _, acc := range rt.Patch.Access {
+		if acc.Field.DBName != "" || acc.Field.JSONName != "" {
+			t.Fatalf("ambiguous promoted field was left with unsafe names: %+v", acc.Field)
+		}
+	}
+
+	rec := schemaTestPatchSameNamePromotedRec{
+		SchemaTestPatchSameNameLeft:  SchemaTestPatchSameNameLeft{ID: "left"},
+		SchemaTestPatchSameNameRight: SchemaTestPatchSameNameRight{ID: "right"},
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "ID", Value: "mutated"}}, false); err == nil || !strings.Contains(err.Error(), "cannot patch field ID") {
+		t.Fatalf("Apply ambiguous promoted Go name err=%v", err)
+	}
+	if rec.SchemaTestPatchSameNameLeft.ID != "left" || rec.SchemaTestPatchSameNameRight.ID != "right" {
+		t.Fatalf("ambiguous promoted Go name changed record: %+v", rec)
+	}
+}
+
 func TestCompileRejectsPatchAliasGoNameCollisions(t *testing.T) {
 	tests := []struct {
 		name string
 		typ  reflect.Type
+		want string
 	}{
-		{name: "db", typ: reflect.TypeFor[schemaTestPatchDBAliasGoNameCollisionRec]()},
-		{name: "json", typ: reflect.TypeFor[schemaTestPatchJSONAliasGoNameCollisionRec]()},
+		{name: "db", typ: reflect.TypeFor[schemaTestPatchDBAliasGoNameCollisionRec](), want: "ambiguous patch field name"},
+		{name: "json", typ: reflect.TypeFor[schemaTestPatchJSONAliasGoNameCollisionRec](), want: "ambiguous patch field name"},
+		{name: "shadowed_db", typ: reflect.TypeFor[schemaTestPatchShadowedDBTagRec](), want: "ambiguous db tag"},
+		{name: "shadowed_json", typ: reflect.TypeFor[schemaTestPatchShadowedJSONTagRec](), want: "ambiguous json tag"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Compile(tc.typ, Config{}); err == nil || !strings.Contains(err.Error(), "ambiguous patch field name") {
-				t.Fatalf("Compile err=%v want ambiguous patch field name rejection", err)
+			if _, err := Compile(tc.typ, Config{}); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Compile err=%v want %q rejection", err, tc.want)
 			}
 		})
 	}
@@ -202,6 +301,22 @@ func TestCompileOptionsNilEmptyAndNameResolution(t *testing.T) {
 	}
 	if _, ok := rt.Fields["name"]; !ok {
 		t.Fatal("nil Options.Index must collect tags")
+	}
+	if _, ok := rt.Patch.Fields["ID"]; ok {
+		t.Fatal("ambiguous embedded Go patch name was registered")
+	}
+	if rt.Patch.Fields["left_id"] == nil || rt.Patch.Fields["right_id"] == nil {
+		t.Fatal("db aliases for ambiguous embedded Go patch name were not registered")
+	}
+	if rt.Patch.Fields["left_id"].JSONName != "" || rt.Patch.Fields["right_id"].JSONName != "" {
+		t.Fatalf("PatchJSON names for ambiguous embedded Go name were marked safe: left=%q right=%q", rt.Patch.Fields["left_id"].JSONName, rt.Patch.Fields["right_id"].JSONName)
+	}
+	var patched schemaTestOptionRec
+	if err = rt.Patch.Apply(unsafe.Pointer(&patched), []PatchItem{{Name: "left_id", Value: "left"}, {Name: "right_id", Value: "right"}}, false); err != nil {
+		t.Fatalf("Apply db aliases for ambiguous embedded Go name: %v", err)
+	}
+	if patched.SchemaTestOptionLeft.ID != "left" || patched.SchemaTestOptionRight.ID != "right" {
+		t.Fatalf("db aliases patched wrong embedded fields: %+v", patched)
 	}
 
 	rt, err = Compile(vtype, Config{Index: map[string]IndexKind{}})
@@ -808,6 +923,13 @@ func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
 	}
 	if rec.Ptr != nil || rec.Tags != nil {
 		t.Fatalf("nil nillable assignment failed: %+v", rec)
+	}
+	rec.Tags = []int16{1}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Tags", Value: []int16(nil)}}, false); err != nil {
+		t.Fatalf("Apply typed nil slice: %v", err)
+	}
+	if rec.Tags != nil {
+		t.Fatalf("typed nil slice assignment failed: %#v", rec.Tags)
 	}
 	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "GoName", Value: nil}}, false); err == nil || !strings.Contains(err.Error(), "cannot assign nil to non-nillable field") {
 		t.Fatalf("nil non-nillable error=%v", err)
