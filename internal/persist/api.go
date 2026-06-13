@@ -249,6 +249,9 @@ func loadPayloadWithKey(reader *bufio.Reader, s *schema.Schema, strKey, strKeyIn
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading key index section: %w", err)
 	}
+	if keyIndexLoaded && keyIndex.KeyCount() == 0 && !universe.IsEmpty() {
+		return LoadResult{}, fmt.Errorf("decode: empty key index with non-empty universe")
+	}
 	keyIndexOwned := true
 	defer func() {
 		if keyIndexOwned {

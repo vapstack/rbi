@@ -466,6 +466,158 @@ func TestMeasureStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 	chunkedRound.Release()
 }
 
+func TestReadFieldStorageRejectsUnsortedFlatKeys(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 2); err != nil {
+		t.Fatalf("write count: %v", err)
+	}
+	if err := writeKey(writer, keycodec.FromString("b")); err != nil {
+		t.Fatalf("write first key: %v", err)
+	}
+	if err := posting.WriteSingleton(writer, 1); err != nil {
+		t.Fatalf("write first posting: %v", err)
+	}
+	if err := writeKey(writer, keycodec.FromString("a")); err != nil {
+		t.Fatalf("write second key: %v", err)
+	}
+	if err := posting.WriteSingleton(writer, 2); err != nil {
+		t.Fatalf("write second posting: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if storage.KeyCount() != 0 {
+		storage.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "flat entry keys must be strictly increasing") {
+		t.Fatalf("ReadFieldStorage err=%v, want sorted-key error", err)
+	}
+}
+
+func TestReadFieldStorageRejectsUnsortedChunkKeys(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write page count: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write ref count: %v", err)
+	}
+	writeNumericFieldChunkForTest(t, writer, 2, 1)
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if storage.KeyCount() != 0 {
+		storage.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "numeric chunk keys must be strictly increasing") {
+		t.Fatalf("ReadFieldStorage err=%v, want chunk sorted-key error", err)
+	}
+}
+
+func TestReadFieldStorageRejectsUnsortedChunkRefs(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write page count: %v", err)
+	}
+	if err := writeUvarint(writer, 2); err != nil {
+		t.Fatalf("write ref count: %v", err)
+	}
+	writeNumericFieldChunkForTest(t, writer, 2)
+	writeNumericFieldChunkForTest(t, writer, 1)
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if storage.KeyCount() != 0 {
+		storage.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "chunk keys must be strictly increasing") {
+		t.Fatalf("ReadFieldStorage err=%v, want chunk-ref sorted-key error", err)
+	}
+}
+
+func TestReadMeasureStorageRejectsUnsortedRows(t *testing.T) {
+	t.Run("Flat", func(t *testing.T) {
+		var raw bytes.Buffer
+		writer := bufio.NewWriter(&raw)
+		if err := writeUvarint(writer, 2); err != nil {
+			t.Fatalf("write count: %v", err)
+		}
+		if err := writeUvarint(writer, 2); err != nil {
+			t.Fatalf("write first id: %v", err)
+		}
+		if err := writeUvarint(writer, 20); err != nil {
+			t.Fatalf("write first value: %v", err)
+		}
+		if err := writeUvarint(writer, 1); err != nil {
+			t.Fatalf("write second id: %v", err)
+		}
+		if err := writeUvarint(writer, 10); err != nil {
+			t.Fatalf("write second value: %v", err)
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+
+		storage, err := ReadMeasureStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true)
+		if storage.Rows() != 0 {
+			storage.Release()
+		}
+		if err == nil || !strings.Contains(err.Error(), "measure rows must be strictly increasing") {
+			t.Fatalf("ReadMeasureStorage err=%v, want sorted-row error", err)
+		}
+	})
+
+	t.Run("Chunked", func(t *testing.T) {
+		rows := MeasureChunkThreshold + 1
+		var raw bytes.Buffer
+		writer := bufio.NewWriter(&raw)
+		if err := writeUvarint(writer, uint64(rows)); err != nil {
+			t.Fatalf("write count: %v", err)
+		}
+		for i := 0; i < rows; i++ {
+			id := uint64(i + 1)
+			if i == MeasureChunkTargetRows {
+				id = uint64(MeasureChunkTargetRows)
+			}
+			if err := writeUvarint(writer, id); err != nil {
+				t.Fatalf("write id %d: %v", i, err)
+			}
+			if err := writeUvarint(writer, uint64(i*10)); err != nil {
+				t.Fatalf("write value %d: %v", i, err)
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+
+		storage, err := ReadMeasureStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true)
+		if storage.Rows() != 0 {
+			storage.Release()
+		}
+		if err == nil || !strings.Contains(err.Error(), "measure rows must be strictly increasing") {
+			t.Fatalf("ReadMeasureStorage err=%v, want sorted-row error", err)
+		}
+	})
+}
+
 func fieldStorageRoundTripForTest(storage FieldStorage) (FieldStorage, error) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
@@ -488,4 +640,22 @@ func measureStorageRoundTripForTest(storage MeasureStorage) (MeasureStorage, err
 		return MeasureStorage{}, err
 	}
 	return ReadMeasureStorage(bufio.NewReader(bytes.NewReader(buf.Bytes())), true)
+}
+
+func writeNumericFieldChunkForTest(t *testing.T, writer *bufio.Writer, keys ...uint64) {
+	t.Helper()
+	if err := writer.WriteByte(fieldIndexChunkEncodingRaw8); err != nil {
+		t.Fatalf("write chunk tag: %v", err)
+	}
+	if err := writeUvarint(writer, uint64(len(keys))); err != nil {
+		t.Fatalf("write chunk count: %v", err)
+	}
+	for i, key := range keys {
+		if err := writeBEUint64(writer, key); err != nil {
+			t.Fatalf("write chunk key %d: %v", i, err)
+		}
+		if err := posting.WriteSingleton(writer, uint64(i+1)); err != nil {
+			t.Fatalf("write chunk posting %d: %v", i, err)
+		}
+	}
 }

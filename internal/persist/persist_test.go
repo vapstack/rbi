@@ -73,9 +73,67 @@ func TestReadFieldRejectsOutOfRangePersistedIndexKind(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	_, _, err := readField(bufio.NewReader(&buf))
+	_, _, err := readFieldCompatibilityEntry(bufio.NewReader(&buf), nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid IndexKind 256") {
 		t.Fatalf("readField err=%v, want invalid IndexKind 256", err)
+	}
+}
+
+func TestReadFieldCompatibilitySkipsLongMismatchedIndex(t *testing.T) {
+	current := &schema.Field{
+		IndexKind: schema.IndexDefault,
+		Kind:      reflect.Int,
+		DBName:    "field",
+		Index:     []int{0},
+	}
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := writeSidecarString(writer, "field"); err != nil {
+		t.Fatalf("write name: %v", err)
+	}
+	if err := writeSidecarBool(writer, false); err != nil {
+		t.Fatalf("write unique: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, uint64(schema.IndexDefault)); err != nil {
+		t.Fatalf("write index kind: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, uint64(reflect.Int)); err != nil {
+		t.Fatalf("write kind: %v", err)
+	}
+	if err := writeSidecarBool(writer, false); err != nil {
+		t.Fatalf("write ptr: %v", err)
+	}
+	if err := writeSidecarBool(writer, false); err != nil {
+		t.Fatalf("write slice: %v", err)
+	}
+	if err := writeSidecarBool(writer, false); err != nil {
+		t.Fatalf("write use vi: %v", err)
+	}
+	if err := writeSidecarString(writer, "field"); err != nil {
+		t.Fatalf("write db name: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, 2); err != nil {
+		t.Fatalf("write index len: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, 0); err != nil {
+		t.Fatalf("write index 0: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, 1); err != nil {
+		t.Fatalf("write index 1: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	name, compatible, err := readFieldCompatibilityEntry(bufio.NewReader(&buf), map[string]*schema.Field{"field": current})
+	if err != nil {
+		t.Fatalf("readFieldCompatibilityEntry: %v", err)
+	}
+	if name != "field" {
+		t.Fatalf("name=%q, want field", name)
+	}
+	if compatible {
+		t.Fatalf("compatible=true, want false")
 	}
 }
 
@@ -697,6 +755,44 @@ func TestStoreLoadStringKeyIndexEmptyState(t *testing.T) {
 	}
 	if result.Storage.KeyIndex.KeyCount() != 0 {
 		t.Fatalf("empty key index key count=%d, want 0", result.Storage.KeyIndex.KeyCount())
+	}
+}
+
+func TestLoadRejectsEmptyStringKeyIndexWithUniverse(t *testing.T) {
+	rt := &schema.Schema{}
+	universe := (posting.List{}).BuildAdded(42)
+	defer universe.Release()
+	snap := &snapshot.View{
+		Universe: universe,
+	}
+
+	file := filepath.Join(t.TempDir(), "empty-key-index-nonempty-universe.rbi")
+	if err := Store(StoreConfig{
+		File:           file,
+		BucketSeq:      4,
+		Schema:         rt,
+		StrKey:         true,
+		StrKeyIndex:    true,
+		KeyIndexLoaded: true,
+		Snapshot:       snap,
+	}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	_, err := Load(LoadConfig{
+		File:        file,
+		DBPath:      "test.db",
+		Bucket:      []byte("bucket"),
+		CurrentSeq:  4,
+		Schema:      rt,
+		StrKey:      true,
+		StrKeyIndex: true,
+	})
+	if !errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
+		t.Fatalf("Load err=%v, want invalid sentinel", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "empty key index with non-empty universe") {
+		t.Fatalf("Load err=%v, want empty key index diagnostic", err)
 	}
 }
 

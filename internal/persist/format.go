@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"slices"
 	"sort"
 	"unsafe"
 
@@ -85,71 +84,78 @@ func writeField(writer *bufio.Writer, name string, f *schema.Field) error {
 	return nil
 }
 
-func readField(reader *bufio.Reader) (string, *schema.Field, error) {
+func readFieldCompatibilityEntry(reader *bufio.Reader, current map[string]*schema.Field) (string, bool, error) {
 	name, err := readSidecarString(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
+	cur := current[name]
+	compatible := cur != nil
 	unique, err := readSidecarBool(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	indexKind, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	if indexKind > uint64(^schema.IndexKind(0)) {
-		return "", nil, fmt.Errorf("invalid IndexKind %d", indexKind)
+		return "", false, fmt.Errorf("invalid IndexKind %d", indexKind)
 	}
 	fieldIndexKind := schema.IndexKind(indexKind)
 	if err := schema.ValidateIndexKind(fieldIndexKind); err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	kind, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	ptr, err := readSidecarBool(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	slice, err := readSidecarBool(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	useVI, err := readSidecarBool(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	dbName, err := readSidecarString(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	valIndexLen, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
-	valIndex := make([]int, 0, valIndexLen)
+	if valIndexLen > uint64(^uint(0)>>1) {
+		return "", false, fmt.Errorf("field index len overflows int")
+	}
+	if compatible && (cur.Unique != unique ||
+		cur.IndexKind != fieldIndexKind ||
+		cur.Kind != reflect.Kind(kind) ||
+		cur.Ptr != ptr ||
+		cur.Slice != slice ||
+		cur.UseVI != useVI ||
+		cur.DBName != dbName ||
+		len(cur.Index) != int(valIndexLen)) {
+		compatible = false
+	}
 	for i := uint64(0); i < valIndexLen; i++ {
 		v, err := binary.ReadUvarint(reader)
 		if err != nil {
-			return "", nil, err
+			return "", false, err
 		}
 		if v > uint64(^uint(0)>>1) {
-			return "", nil, fmt.Errorf("field index element overflows int")
+			return "", false, fmt.Errorf("field index element overflows int")
 		}
-		valIndex = append(valIndex, int(v))
+		if compatible && cur.Index[i] != int(v) {
+			compatible = false
+		}
 	}
-	return name, &schema.Field{
-		Unique:    unique,
-		IndexKind: fieldIndexKind,
-		Kind:      reflect.Kind(kind),
-		Ptr:       ptr,
-		Slice:     slice,
-		UseVI:     useVI,
-		DBName:    dbName,
-		Index:     valIndex,
-	}, nil
+	return name, compatible, nil
 }
 
 func readFieldCompatibility(reader *bufio.Reader, current map[string]*schema.Field) (map[string]bool, error) {
@@ -164,7 +170,7 @@ func readFieldCompatibility(reader *bufio.Reader, current map[string]*schema.Fie
 	seen := make(map[string]struct{}, max(0, min(int(count), len(current))))
 
 	for i := uint64(0); i < count; i++ {
-		name, stored, err := readField(reader)
+		name, ok, err := readFieldCompatibilityEntry(reader, current)
 		if err != nil {
 			return nil, fmt.Errorf("decode: reading field %d/%d: %w", i+1, count, err)
 		}
@@ -172,29 +178,11 @@ func readFieldCompatibility(reader *bufio.Reader, current map[string]*schema.Fie
 			return nil, fmt.Errorf("decode: duplicate field %q at entry %d/%d", name, i+1, count)
 		}
 		seen[name] = struct{}{}
-		cur := current[name]
-		if sameFieldDefinition(cur, stored) {
+		if ok {
 			compatible[name] = true
 		}
 	}
 	return compatible, nil
-}
-
-func sameFieldDefinition(a, b *schema.Field) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	if a.Unique != b.Unique ||
-		a.IndexKind != b.IndexKind ||
-		a.Kind != b.Kind ||
-		a.Ptr != b.Ptr ||
-		a.Slice != b.Slice ||
-		a.UseVI != b.UseVI ||
-		a.DBName != b.DBName ||
-		!slices.Equal(a.Index, b.Index) {
-		return false
-	}
-	return true
 }
 
 func readIndexSections(reader *bufio.Reader, compatible map[string]bool, section string) (map[string]indexdata.FieldStorage, error) {
