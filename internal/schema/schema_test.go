@@ -1119,6 +1119,45 @@ func TestInsertStateResetDropsPreviousLogicalEntries(t *testing.T) {
 	state.discard()
 }
 
+func TestInsertStateSliceCleanupDropsPreviousLogicalEntries(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	oldRec := schemaTestAccessorRec{Tags: []string{"old"}}
+	newRec := schemaTestAccessorRec{Tags: []string{"new", "next"}}
+	acc := rt.IndexedByName["tags"]
+	states := make([]InsertState, len(rt.Indexed))
+	state := &states[acc.Ordinal]
+
+	acc.CollectInsertValue(unsafe.Pointer(&oldRec), 1, false, state)
+	cleanupSnapshotFieldInsertStateSlice(states)
+	if state.Changed() {
+		t.Fatal("insert state cleanup kept changed flag")
+	}
+	acc.CollectInsertValue(unsafe.Pointer(&newRec), 2, false, state)
+
+	storage := acc.MergeInsertStorageOwned(indexdata.FieldStorage{}, state, false)
+	defer storage.Release()
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(state.LenDiff())
+	defer lenStorage.Release()
+	state.Reset()
+
+	if schemaTestIndexViewContains(storage, "old", 1) {
+		t.Fatal("insert state cleanup kept old string posting")
+	}
+	if !schemaTestIndexViewContains(storage, "new", 2) || !schemaTestIndexViewContains(storage, "next", 2) {
+		t.Fatal("insert state cleanup lost new string postings")
+	}
+	if schemaTestIndexViewContainsKey(lenStorage, 1, 1) {
+		t.Fatal("insert state cleanup kept old len posting")
+	}
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 2) {
+		t.Fatal("insert state cleanup lost new len posting")
+	}
+	state.discard()
+}
+
 func TestBatchStateCollectApplyReset(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
 	if err != nil {
@@ -1243,6 +1282,47 @@ func TestBatchStateResetDropsPreviousLogicalEntries(t *testing.T) {
 	}
 	if !schemaTestIndexViewContainsKey(lenStorage, 1, 2) {
 		t.Fatal("batch state reset lost new len diff")
+	}
+	state.discard()
+}
+
+func TestBatchStateSliceCleanupDropsPreviousLogicalEntries(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	oldRec := schemaTestAccessorRec{Tags: []string{"old"}}
+	newRec := schemaTestAccessorRec{Tags: []string{"old", "stale"}}
+	resetOld := schemaTestAccessorRec{Tags: []string{"drop", "other"}}
+	resetNew := schemaTestAccessorRec{Tags: []string{"fresh"}}
+	acc := rt.IndexedByName["tags"]
+	states := make([]BatchState, len(rt.Indexed))
+	state := &states[acc.Ordinal]
+
+	acc.CollectBatchDiff(1, unsafe.Pointer(&oldRec), unsafe.Pointer(&newRec), false, state)
+	cleanupSnapshotFieldBatchStateSlice(states)
+	if state.Changed() || state.old.ok || state.new.ok || state.old.length != 0 || state.new.length != 0 {
+		t.Fatalf("batch state cleanup kept logical state: %+v", state)
+	}
+	acc.CollectBatchDiff(2, unsafe.Pointer(&resetOld), unsafe.Pointer(&resetNew), false, state)
+
+	storage := acc.ApplyBatchStorageOwned(indexdata.FieldStorage{}, state, false)
+	defer storage.Release()
+	lenStorage := (indexdata.FieldStorage{}).ApplyLenPostingDiff(state.LenDiff())
+	defer lenStorage.Release()
+	state.Reset()
+
+	if schemaTestIndexViewContains(storage, "stale", 1) {
+		t.Fatal("batch state cleanup kept old string diff")
+	}
+	if !schemaTestIndexViewContains(storage, "fresh", 2) {
+		t.Fatal("batch state cleanup lost new string diff")
+	}
+	if schemaTestIndexViewContainsKey(lenStorage, 2, 1) {
+		t.Fatal("batch state cleanup kept old len diff")
+	}
+	if !schemaTestIndexViewContainsKey(lenStorage, 1, 2) {
+		t.Fatal("batch state cleanup lost new len diff")
 	}
 	state.discard()
 }

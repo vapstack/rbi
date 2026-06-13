@@ -496,7 +496,6 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 			}
 			changed[i] = true
 		}
-		state.Reset()
 	}
 	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.Measure)
 	measureDeltas.Release()
@@ -746,7 +745,6 @@ func buildPreparedSnapshotAggregatedNormalized(
 			changedAny = true
 			deltas.changed[ordinal] = true
 		}
-		state.Reset()
 	}
 	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.Measure)
 	measureDeltas.Release()
@@ -765,7 +763,7 @@ func buildPreparedSnapshotAggregatedNormalized(
 			})
 		}
 	}
-	schema.ReleaseBatchStates(deltas.fields)
+	schema.ReleaseTouchedBatchStates(deltas.fields, deltas.touched)
 	pooled.ReleaseBoolSlice(deltas.changed)
 	pooled.ReleaseIntSlice(deltas.touched)
 	next.retainSharedOwnedStorageFrom(prev)

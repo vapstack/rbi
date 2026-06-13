@@ -106,6 +106,20 @@ func ReleaseBatchStates(states []BatchState) {
 	snapshotFieldBatchStateSlicePool.Put(states)
 }
 
+func ReleaseTouchedBatchStates(states []BatchState, touched []int) {
+	// touched must contain every state modified since GetBatchStates.
+	if cap(states) > snapshotFieldStateSlicePoolMaxCap {
+		for i := range touched {
+			states[touched[i]].discard()
+		}
+	} else {
+		for i := range touched {
+			states[touched[i]].Reset()
+		}
+	}
+	snapshotFieldBatchStateSlicePool.Put(states[:0])
+}
+
 func (state *IndexState) Changed() bool {
 	return state.changed
 }
@@ -797,12 +811,14 @@ func collectFieldBatchLenDiff(fieldDelta *indexdata.LenPostingDiff, idx uint64, 
 }
 
 func cleanupSnapshotFieldInsertStateSlice(states []InsertState) {
-	if cap(states) <= snapshotFieldStateSlicePoolMaxCap {
+	if cap(states) > snapshotFieldStateSlicePoolMaxCap {
+		for i := range states {
+			states[i].discard()
+		}
 		return
 	}
-	states = states[:cap(states)]
 	for i := range states {
-		states[i].discard()
+		states[i].Reset()
 	}
 }
 
@@ -813,11 +829,13 @@ func cleanupSnapshotFieldIndexStateSlice(states []IndexState) {
 }
 
 func cleanupSnapshotFieldBatchStateSlice(states []BatchState) {
-	if cap(states) <= snapshotFieldStateSlicePoolMaxCap {
+	if cap(states) > snapshotFieldStateSlicePoolMaxCap {
+		for i := range states {
+			states[i].discard()
+		}
 		return
 	}
-	states = states[:cap(states)]
 	for i := range states {
-		states[i].discard()
+		states[i].Reset()
 	}
 }
