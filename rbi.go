@@ -86,7 +86,7 @@ type Options struct {
 	// When set, queries and filters can reference "$key".
 	//
 	// It affects only DB[string,V] and ignored by numeric-key databases
-	// (as they expose "$key" automatically).
+	// (as they expose "$key" automatically in indexed mode).
 	//
 	// It is disabled by default to minimize memory usage.
 	EnableStringKeyIndex bool
