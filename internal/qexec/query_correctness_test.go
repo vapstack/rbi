@@ -13,7 +13,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/internal/strmap"
 	"github.com/vapstack/rbi/rbitrace"
 )
 
@@ -1059,13 +1058,9 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 		exec:     exec,
 		cfg:      cfg,
 	}
-	sm := strmap.New(0, 256)
-
-	keys := []string{"id-1", "id-2", "id-3", "id-4", "id-5", "id-6", "id-7"}
-	ids := make([]uint64, len(keys))
-	for i := range keys {
-		idx, _ := sm.Create(keys[i])
-		ids[i] = idx
+	ids := make([]uint64, 7)
+	for i := range ids {
+		ids[i] = uint64(i + 1)
 	}
 
 	stateA := []*Rec{
