@@ -61,17 +61,22 @@ func TestPrepareQuery_TrimmedManualOrderOpNameRejected(t *testing.T) {
 }
 
 func TestPrepareCountExpr_MalformedKindNoneRejected(t *testing.T) {
-	_, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.Expr{
-		Kind:  qx.KindNONE,
-		Name:  qx.OpEQ,
-		Value: "active",
-		Args: []qx.Expr{
-			qx.REF("status"),
-			qx.LIT("active"),
+	tests := []qx.Expr{
+		{
+			Kind:  qx.KindNONE,
+			Name:  qx.OpEQ,
+			Value: "active",
+			Args: []qx.Expr{
+				qx.REF("status"),
+				qx.LIT("active"),
+			},
 		},
-	})
-	if err == nil {
-		t.Fatal("expected PrepareCountExpr to reject malformed KindNONE expression")
+		{Alias: "status"},
+	}
+	for i := range tests {
+		if _, err := PrepareCountExprResolved(testPrepareFieldResolver, tests[i]); err == nil {
+			t.Fatal("expected PrepareCountExpr to reject malformed KindNONE expression")
+		}
 	}
 }
 
@@ -101,6 +106,9 @@ func TestPrepareQuery_KeyFieldSupportedShapes(t *testing.T) {
 }
 
 func TestPrepareQuery_KeyFieldRejectsInvalidShapes(t *testing.T) {
+	var nilString *string
+	var nilUint64 *uint64
+
 	tests := []struct {
 		name string
 		q    *qx.QX
@@ -109,9 +117,14 @@ func TestPrepareQuery_KeyFieldRejectsInvalidShapes(t *testing.T) {
 		{name: "has_any", q: qx.Query(qx.HASANY("$key", []string{"a"}))},
 		{name: "is_null", q: qx.Query(qx.ISNULL("$key"))},
 		{name: "eq_nil", q: qx.Query(qx.EQ("$key", nil))},
+		{name: "eq_typed_nil", q: qx.Query(qx.EQ("$key", nilString))},
 		{name: "ne_nil", q: qx.Query(qx.NE("$key", nil))},
+		{name: "ne_typed_nil", q: qx.Query(qx.NE("$key", nilString))},
+		{name: "gte_typed_nil", q: qx.Query(qx.GTE("$key", nilUint64))},
 		{name: "in_nil", q: qx.Query(qx.IN("$key", []any{nil, "a"}))},
+		{name: "in_typed_nil", q: qx.Query(qx.IN("$key", []any{nilString, "a"}))},
 		{name: "notin_nil", q: qx.Query(qx.NOTIN("$key", []any{nil, "a"}))},
+		{name: "prefix_typed_nil", q: qx.Query(qx.PREFIX("$key", nilString))},
 		{name: "len_order", q: qx.Query().SortBy(qx.LEN("$key"), qx.ASC)},
 		{name: "pos_order", q: qx.Query().SortBy(qx.POS("$key", []string{"a"}), qx.ASC)},
 	}
@@ -126,12 +139,68 @@ func TestPrepareQuery_KeyFieldRejectsInvalidShapes(t *testing.T) {
 	}
 }
 
+func TestPrepareCountExpr_TypedNilAllowedForNilPredicateField(t *testing.T) {
+	var value *string
+	q, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.EQ("status", value))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved: %v", err)
+	}
+	q.Release()
+}
+
 func TestPrepareCountExpr_EmptyBoolOpsRejected(t *testing.T) {
 	if _, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.AND()); err == nil {
 		t.Fatal("expected empty AND to be rejected")
 	}
 	if _, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.OR()); err == nil {
 		t.Fatal("expected empty OR to be rejected")
+	}
+}
+
+func TestPrepareFilter_EmptyRootCompilesAsTrue(t *testing.T) {
+	q, err := PrepareQuery(qx.Query(), testPrepareFieldResolver)
+	if err != nil {
+		t.Fatalf("PrepareQuery: %v", err)
+	}
+	defer q.Release()
+	if !IsTrueConst(q.Expr) {
+		t.Fatalf("expected empty query to compile as true, got %+v", q.Expr)
+	}
+
+	count, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.Expr{})
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved: %v", err)
+	}
+	defer count.Release()
+	if !IsTrueConst(count.Expr) {
+		t.Fatalf("expected empty count expr to compile as true, got %+v", count.Expr)
+	}
+}
+
+func TestPrepareFilter_NestedEmptyExprRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		expr qx.Expr
+	}{
+		{name: "and", expr: qx.AND(qx.Expr{}, qx.EQ("status", "active"))},
+		{name: "or", expr: qx.OR(qx.Expr{}, qx.EQ("status", "active"))},
+		{name: "not", expr: qx.NOT(qx.Expr{})},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if q, err := PrepareCountExprResolved(testPrepareFieldResolver, tc.expr); err == nil {
+				q.Release()
+				t.Fatal("expected nested empty expression to be rejected")
+			}
+		})
+	}
+}
+
+func TestPrepareCountExprs_NestedEmptyExprRejected(t *testing.T) {
+	if q, err := PrepareCountExprsResolved(testPrepareFieldResolver, qx.Expr{}, qx.EQ("status", "active")); err == nil {
+		q.Release()
+		t.Fatal("expected variadic empty expression to be rejected")
 	}
 }
 

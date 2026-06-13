@@ -1191,7 +1191,7 @@ func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
 	wrapped := &qx.QX{
 		Filter: qx.OR(
 			direct.Filter,
-			qx.NOT(qx.Expr{}),
+			testFalseFilterExpr(),
 		),
 		Order:  direct.Order,
 		Window: direct.Window,
@@ -1308,8 +1308,8 @@ func queryMetamorphicTransforms() []queryMetamorphicTransform {
 			name: "DuplicateAND",
 			apply: func(q *qx.QX) (*qx.QX, bool) {
 				out := cloneQuery(q)
-				left := cloneMetamorphicExpr(q.Filter)
-				right := cloneMetamorphicExpr(q.Filter)
+				left := cloneMetamorphicFilter(q.Filter)
+				right := cloneMetamorphicFilter(q.Filter)
 				out.Filter = qx.AND(left, right)
 				return out, true
 			},
@@ -1318,8 +1318,8 @@ func queryMetamorphicTransforms() []queryMetamorphicTransform {
 			name: "DuplicateOR",
 			apply: func(q *qx.QX) (*qx.QX, bool) {
 				out := cloneQuery(q)
-				left := cloneMetamorphicExpr(q.Filter)
-				right := cloneMetamorphicExpr(q.Filter)
+				left := cloneMetamorphicFilter(q.Filter)
+				right := cloneMetamorphicFilter(q.Filter)
 				out.Filter = qx.OR(left, right)
 				return out, true
 			},
@@ -1328,7 +1328,7 @@ func queryMetamorphicTransforms() []queryMetamorphicTransform {
 			name: "DoubleNegation",
 			apply: func(q *qx.QX) (*qx.QX, bool) {
 				out := cloneQuery(q)
-				out.Filter = qx.NOT(qx.NOT(cloneMetamorphicExpr(q.Filter)))
+				out.Filter = qx.NOT(qx.NOT(cloneMetamorphicFilter(q.Filter)))
 				return out, true
 			},
 		},
@@ -1361,6 +1361,13 @@ func queryMetamorphicTransforms() []queryMetamorphicTransform {
 			apply: metamorphicApplyDeMorgan,
 		},
 	}
+}
+
+func cloneMetamorphicFilter(expr qx.Expr) qx.Expr {
+	if expr.IsZero() {
+		return testTrueFilterExpr()
+	}
+	return cloneMetamorphicExpr(expr)
 }
 
 func cloneMetamorphicExpr(expr qx.Expr) qx.Expr {

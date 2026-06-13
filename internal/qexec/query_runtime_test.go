@@ -75,7 +75,7 @@ func TestRuntimeNumericKeyPredicatesAndOrderUseUniverse(t *testing.T) {
 		{name: "range_active", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 2), qx.LTE(schema.ReservedKeyFieldName, 7), qx.EQ("active", true)), want: []uint64{2, 4, 6}},
 		{name: "order_asc", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 3)).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: []uint64{3, 4, 5}},
 		{name: "order_desc", q: qx.Query(qx.LTE(schema.ReservedKeyFieldName, 6)).Sort(schema.ReservedKeyFieldName, qx.DESC).Limit(3), want: []uint64{6, 5, 4}},
-		{name: "order_const_false", q: qx.Query(qx.NOT(qx.Expr{})).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: nil},
+		{name: "order_contradictory_const_false", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, uint64(1)), qx.NOT(qx.EQ(schema.ReservedKeyFieldName, uint64(1)))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: nil},
 		{name: "order_contradictory_key", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, uint64(5)), qx.NOT(qx.EQ(schema.ReservedKeyFieldName, uint64(5)))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: nil},
 		{name: "order_or_residual", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 0), qx.OR(qx.EQ("active", true), qx.EQ("name", "name-03"))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(4), want: []uint64{2, 3, 4, 6}},
 		{name: "or_materialized_order", q: qx.Query(qx.OR(qx.EQ(schema.ReservedKeyFieldName, 2), qx.EQ("active", true))).Sort(schema.ReservedKeyFieldName, qx.DESC).Limit(3), want: []uint64{8, 6, 4}},

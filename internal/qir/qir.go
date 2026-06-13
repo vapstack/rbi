@@ -208,7 +208,7 @@ func PrepareQuery(src *qx.QX, resolve FieldResolver) (*Query, error) {
 	query := queryPool.Get()
 	compiler := prepareCompiler{resolve: resolve}
 
-	raw, err := compileFilter(query, &src.Filter, &compiler)
+	raw, err := compileRootFilter(query, &src.Filter, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -259,7 +259,7 @@ func PrepareCountExprResolved(resolve FieldResolver, expr qx.Expr) (*Query, erro
 	query := queryPool.Get()
 	compiler := prepareCompiler{resolve: resolve}
 
-	raw, err := compileFilter(query, &expr, &compiler)
+	raw, err := compileRootFilter(query, &expr, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -281,18 +281,23 @@ func (q *Query) setNormalizedExpr(raw Expr) {
 	q.Expr = raw
 }
 
+func compileRootFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, error) {
+	if src.IsZero() {
+		return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, nil
+	}
+	return compileFilter(q, src, compiler)
+}
+
 func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, error) {
 	if src.Kind == qx.KindNONE {
-		if src.Name != "" || src.Value != nil || len(src.Args) != 0 {
-			return Expr{}, fmt.Errorf("rbi: invalid empty filter expression")
-		}
-		return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, nil
+		return Expr{}, fmt.Errorf("rbi: invalid empty filter expression")
 	}
 	if src.Kind != qx.KindOP {
 		return Expr{}, fmt.Errorf("rbi does not support filter expression kind %q", src.Kind)
 	}
 
 	switch src.Name {
+
 	case qx.OpAND:
 		out := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal}
 		if len(src.Args) == 0 {
@@ -352,6 +357,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 		return compileLeaf(OpHASALL, false, src.Args, compiler)
 	case qx.OpHASANY:
 		return compileLeaf(OpHASANY, false, src.Args, compiler)
+
 	case qx.OpISNULL:
 		if len(src.Args) != 1 {
 			return Expr{}, fmt.Errorf("rbi: invalid %s expression", qx.OpISNULL)
@@ -368,6 +374,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 			FieldOrdinal: info.Ordinal,
 			Value:        nil,
 		}, nil
+
 	case qx.OpPREFIX:
 		return compileLeaf(OpPREFIX, false, src.Args, compiler)
 	case qx.OpSUFFIX:
@@ -391,26 +398,43 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 		return Expr{}, fmt.Errorf("rbi does not support computed predicate values for field %q", field)
 	}
 	if info.Caps&FieldCapNilPredicate == 0 {
-		if args[1].Value == nil {
+		value := args[1].Value
+		if value == nil {
 			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
 		}
 		if op == OpIN {
-			value := reflect.ValueOf(args[1].Value)
-			for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
-				if value.IsNil() {
+			v := reflect.ValueOf(value)
+			for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+				if v.IsNil() {
 					return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
 				}
-				value = value.Elem()
+				v = v.Elem()
 			}
-			if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
-				for i := 0; i < value.Len(); i++ {
-					elem := value.Index(i)
+			if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
+				for i := 0; i < v.Len(); i++ {
+					elem := v.Index(i)
 					for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
 						if elem.IsNil() {
 							return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
 						}
 						elem = elem.Elem()
 					}
+				}
+			}
+
+		} else {
+			switch value.(type) {
+			case string, bool,
+				int, int8, int16, int32, int64,
+				uint, uint8, uint16, uint32, uint64, uintptr,
+				float32, float64:
+			default:
+				v := reflect.ValueOf(value)
+				for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+					if v.IsNil() {
+						return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+					}
+					v = v.Elem()
 				}
 			}
 		}

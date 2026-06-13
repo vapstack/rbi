@@ -1248,20 +1248,33 @@ func normalizeQueryForTest(q *qx.QX) *qx.QX {
 	return qx.Normalize(cloneQuery(q))
 }
 
+func testTrueFilterExpr() qx.Expr {
+	e := qx.GTE("age", 0)
+	return qx.OR(e, qx.NOT(e))
+}
+
+func testFalseFilterExpr() qx.Expr {
+	e := qx.GTE("age", 0)
+	return qx.AND(e, qx.NOT(e))
+}
+
 func wrapExprWithNoise(e qx.Expr, mode int) qx.Expr {
+	if e.IsZero() {
+		e = testTrueFilterExpr()
+	}
 	switch mode % 4 {
 	case 0:
 		// e AND true
-		return qx.AND(e, qx.Expr{})
+		return qx.AND(e, testTrueFilterExpr())
 	case 1:
 		// e OR false
-		return qx.OR(e, qx.NOT(qx.Expr{}))
+		return qx.OR(e, testFalseFilterExpr())
 	case 2:
 		// (true AND e) AND true
-		return qx.AND(qx.AND(qx.Expr{}, e), qx.Expr{})
+		return qx.AND(qx.AND(testTrueFilterExpr(), e), testTrueFilterExpr())
 	default:
 		// e OR (false OR false)
-		return qx.OR(e, qx.OR(qx.NOT(qx.Expr{}), qx.NOT(qx.Expr{})))
+		return qx.OR(e, qx.OR(testFalseFilterExpr(), testFalseFilterExpr()))
 	}
 }
 
