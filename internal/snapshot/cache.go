@@ -39,12 +39,7 @@ func (v *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage i
 	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 	idx, _ := qcache.BuildNumericRangeBucketIndex(ov, bucketSize, minFieldKeys)
 	entry := qcache.GetNumericRangeBucketEntry(storage, idx, cache.MaxCardinality())
-	if cached, ok := cache.LoadSlot(field, ordinal); ok && cached.Storage() == storage {
-		entry.Release()
-		return cached
-	}
-	cache.StoreSlot(field, ordinal, entry)
-	return entry
+	return cache.LoadOrStoreSlot(field, ordinal, entry)
 }
 
 func (v *View) MaterializedPredCacheEntryCount() int {

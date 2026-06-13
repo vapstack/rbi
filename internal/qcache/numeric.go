@@ -169,6 +169,40 @@ func (c *NumericRangeBucketCache) StoreSlot(field string, ordinal int, entry *Nu
 	}
 }
 
+func (c *NumericRangeBucketCache) LoadOrStoreSlot(field string, ordinal int, entry *NumericRangeBucketEntry) *NumericRangeBucketEntry {
+	if ordinal < 0 || ordinal >= len(c.slots) {
+		return entry
+	}
+
+	c.mu.Lock()
+	slot := c.slots[ordinal]
+	if slot.entry != nil && slot.field == field && slot.entry.storage == entry.storage {
+		c.mu.Unlock()
+		entry.Release()
+		return slot.entry
+	}
+	replaced := slot.entry
+	if slot.entry == nil {
+		c.count++
+	}
+	if c.fieldIndex != nil {
+		if slot.field != "" {
+			delete(c.fieldIndex, slot.field)
+		}
+		if field != "" {
+			c.fieldIndex[field] = entry
+		}
+	}
+	slot.field = field
+	slot.entry = entry
+	c.slots[ordinal] = slot
+	c.mu.Unlock()
+	if replaced != nil && replaced != entry {
+		replaced.Release()
+	}
+	return entry
+}
+
 func (c *NumericRangeBucketCache) LoadField(field string) (*NumericRangeBucketEntry, bool) {
 	if len(c.slots) == 0 || field == "" {
 		return nil, false

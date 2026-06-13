@@ -145,6 +145,53 @@ func TestNumericRangeBucketCacheStoreSlotReleasesReplacedEntry(t *testing.T) {
 	}
 }
 
+func TestNumericRangeBucketCacheLoadOrStoreSlotConcurrentSameStorage(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	cache := GetNumericRangeBucketCache(1, 0)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	n := max(4, runtime.GOMAXPROCS(0)*2)
+	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
+	candidates := make([]*NumericRangeBucketEntry, n)
+	got := make([]*NumericRangeBucketEntry, n)
+	for i := range candidates {
+		candidates[i] = GetNumericRangeBucketEntry(storage, idx, 0)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range candidates {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			got[i] = cache.LoadOrStoreSlot("age", 0, candidates[i])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winner := got[0]
+	for i := range got {
+		if got[i] != winner {
+			t.Fatalf("concurrent numeric slot warm returned different entries: got[%d]=%p winner=%p", i, got[i], winner)
+		}
+	}
+	if got, ok := cache.LoadSlot("age", 0); !ok || got != winner {
+		t.Fatal("expected published numeric slot to contain the shared winner")
+	}
+	if winner.refs.Load() != 1 {
+		t.Fatalf("expected published numeric entry to keep one cache ref, got %d", winner.refs.Load())
+	}
+	for i := range candidates {
+		if candidates[i] != winner && candidates[i].refs.Load() != 0 {
+			t.Fatalf("expected losing candidate %d to be released, refs=%d", i, candidates[i].refs.Load())
+		}
+	}
+}
+
 func TestNumericRangeBucketCacheDrainRetiredSkipsSharedEntries(t *testing.T) {
 	cache := GetNumericRangeBucketCache(2, 0)
 	defer ReleaseNumericRangeBucketCache(cache)
