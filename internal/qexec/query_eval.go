@@ -533,7 +533,10 @@ func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []keycodec.Inde
 	}
 
 	ov := qv.indexViewRef(field, fieldOrdinal)
-	acc := lenBM.Clone()
+	acc := lenBM
+	if !useZeroComplement {
+		acc = lenBM.Clone()
+	}
 	for i := 0; i < valCount; i++ {
 		ids := lookupScalarPostingRetained(ov, vals[i])
 		if ids.IsEmpty() {

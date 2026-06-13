@@ -655,11 +655,11 @@ func plannerFilterPostingByPredicateChecks(
 
 	work = src.CloneInto(work)
 	for _, pi := range checks {
-		var ok bool
-		work, ok = preds[pi].applyToPosting(work)
+		next, ok := preds[pi].applyToPosting(work)
 		if !ok {
 			return plannerPredicateBucketFallback, posting.List{}, work, card
 		}
+		work = next
 		if work.IsEmpty() {
 			return plannerPredicateBucketEmpty, posting.List{}, work, card
 		}

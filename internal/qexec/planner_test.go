@@ -391,6 +391,51 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	}
 }
 
+func TestPlannerFilterPostingByPredicateChecks_PreservesWorkWhenApplyDeclines(t *testing.T) {
+	srcIDs := make([]uint64, 0, plannerPredicateBucketExactMinCard+8)
+	for i := 0; i < cap(srcIDs); i++ {
+		srcIDs = append(srcIDs, uint64(i*2+1))
+	}
+	src := posting.BuildFromSorted(srcIDs)
+	defer src.Release()
+
+	preds := newPredicateSet(1)
+	preds.Append(predicate{
+		kind: predicateKindCustom,
+		postingFilter: func(dst posting.List) (posting.List, bool) {
+			if dst.IsBorrowed() {
+				t.Fatalf("applyToPosting got borrowed work")
+			}
+			return posting.List{}, false
+		},
+	})
+	defer preds.Release()
+
+	mode, exact, work, card := plannerFilterPostingByPredicateChecks(preds.owner, []int{0}, src.Borrow(), posting.List{}, true)
+	defer work.Release()
+
+	if mode != plannerPredicateBucketFallback {
+		t.Fatalf("unexpected mode: got=%v want=%v", mode, plannerPredicateBucketFallback)
+	}
+	if !exact.IsEmpty() {
+		t.Fatalf("unexpected exact posting on fallback")
+	}
+	if card != src.Cardinality() {
+		t.Fatalf("unexpected source cardinality: got=%d want=%d", card, src.Cardinality())
+	}
+	if work.IsBorrowed() {
+		t.Fatalf("fallback work must stay owned")
+	}
+	if got := work.Cardinality(); got != card {
+		t.Fatalf("fallback work cardinality: got=%d want=%d", got, card)
+	}
+	for _, idx := range []uint64{srcIDs[0], srcIDs[len(srcIDs)/2], srcIDs[len(srcIDs)-1]} {
+		if !work.Contains(idx) {
+			t.Fatalf("fallback work is missing id %d", idx)
+		}
+	}
+}
+
 func TestTraceDisabled_BeginTraceReturnsNil(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
