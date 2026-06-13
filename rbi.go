@@ -83,7 +83,8 @@ type Options struct {
 	Index map[string]IndexKind
 
 	// EnableStringKeyIndex enables synthetic string primary-key index.
-	// When set, queries and filters can reference "$key".
+	// When set on DB[string,V], queries and filters can reference "$key".
+	// This can be the only queryable field and still enables indexed mode.
 	//
 	// It affects only DB[string,V] and ignored by numeric-key databases
 	// (as they expose "$key" automatically in indexed mode).

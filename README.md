@@ -228,12 +228,11 @@ q := qx.Query(
 queries. It is not a struct field and cannot be declared with tags.
 `Options.Index["$key"]` is also invalid.
 
-For numeric-key databases, `$key` becomes available automatically when the
-database has at least one indexed field. It uses the runtime key universe
-and does not need separate key storage.
+For numeric-key databases, `$key` becomes available automatically in indexed mode.
+It uses the runtime key universe and does not need separate key storage.
 
 For string-key DB, support is opt-in using `EnableStringKeyIndex` option.
-A separate in-memory unique string index is automatically maintained when enabled.
+A separate in-memory unique string index is maintained when enabled.
 
 ### Aggregation
 
@@ -303,9 +302,10 @@ reuses bounded materialized range/predicate state on warm snapshots.
 
 ## Transparent mode
 
-If a value type has no indexed fields, RBI automatically switches 
-to a transparent mode. This can be useful as a strongly-typed generic API 
-over a bbolt bucket without maintaining secondary indexes.
+If a DB has no indexed fields and no enabled string key index, RBI
+automatically switches to transparent mode. This can be useful as a
+strongly-typed generic API over a bbolt bucket without maintaining secondary
+indexes.
 
 In transparent mode:
 - read/write/scan methods continue to work
