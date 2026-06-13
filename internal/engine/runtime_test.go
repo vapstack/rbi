@@ -12,8 +12,11 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vmihailenco/msgpack/v5"
@@ -25,6 +28,10 @@ type runtimeTestRec struct {
 	Tags   []string `db:"tags" rbi:"index"`
 	Score  uint64   `db:"score" rbi:"measure"`
 	Active bool     `db:"active" rbi:"index"`
+}
+
+type runtimeTestNoIndexRec struct {
+	Name string
 }
 
 func openRuntimeTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
@@ -141,6 +148,224 @@ func releaseRuntimeTestRec(ptr unsafe.Pointer) {
 	*(*runtimeTestRec)(ptr) = runtimeTestRec{}
 }
 
+func TestRuntimeStringKeyIndexOnlyCreatesRuntimeAndResolvesKey(t *testing.T) {
+	rt, err := schema.Compile(reflect.TypeOf(runtimeTestNoIndexRec{}), schema.Config{Index: map[string]schema.IndexKind{}})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	numeric, err := NewIndex(Config{Schema: rt, StrKey: false, StrKeyIndex: true})
+	if err != nil {
+		t.Fatalf("numeric NewIndex: %v", err)
+	}
+	if numeric != nil {
+		t.Fatal("numeric StringKeyIndex must not activate key-index-only runtime")
+	}
+
+	r, err := NewIndex(Config{Schema: rt, StrKey: true, StrKeyIndex: true})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	if r == nil {
+		t.Fatal("NewIndex returned nil for string key-index-only runtime")
+	}
+	if len(r.schema.Indexed) != 0 || len(r.schema.Fields) != 0 {
+		t.Fatalf("string key runtime must not add schema fields: indexed=%d fields=%d", len(r.schema.Indexed), len(r.schema.Fields))
+	}
+
+	prepared, shape, err := r.prepareQuery(qx.Query(qx.EQ(schema.ReservedKeyFieldName, "k")).Sort(schema.ReservedKeyFieldName, qx.ASC))
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+	if shape.Expr.FieldOrdinal < 0 {
+		t.Fatalf("$key expr ordinal=%d", shape.Expr.FieldOrdinal)
+	}
+	if !shape.HasOrder || shape.Order.FieldOrdinal != shape.Expr.FieldOrdinal {
+		t.Fatalf("$key order shape=%+v", shape)
+	}
+	if r.exec.FieldNameByOrdinal(shape.Expr.FieldOrdinal) != schema.ReservedKeyFieldName {
+		t.Fatalf("FieldNameByOrdinal($key)=%q", r.exec.FieldNameByOrdinal(shape.Expr.FieldOrdinal))
+	}
+}
+
+func runtimeTestStringKeyStorage(keys []string, ids []uint64) indexdata.FieldStorage {
+	var builder indexdata.SortedUniqueStringFieldStorageBuilder
+	builder.Init(len(keys))
+	for i := range keys {
+		builder.AppendBytes(keycodec.StringBytes(keys[i]), ids[i])
+	}
+	return builder.Finish()
+}
+
+func newRuntimeStringKeyIndexRuntime(t *testing.T) *Index {
+	t.Helper()
+
+	rt, err := schema.Compile(reflect.TypeOf(runtimeTestNoIndexRec{}), schema.Config{Index: map[string]schema.IndexKind{}})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	r, err := NewIndex(Config{Schema: rt, StrKey: true, StrKeyIndex: true})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	return r
+}
+
+func runtimeTestQueryKeys(t *testing.T, r *Index, q *qx.QX) []uint64 {
+	t.Helper()
+
+	var got []uint64
+	if err := r.QueryKeys(q, func(ids []uint64) error {
+		got = append(got, ids...)
+		return nil
+	}); err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	return got
+}
+
+func TestRuntimeScanStringKeysUsesKeyIndexSnapshot(t *testing.T) {
+	r := newRuntimeStringKeyIndexRuntime(t)
+
+	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+		KeyIndex: runtimeTestStringKeyStorage([]string{"a", "b", "c"}, []uint64{11, 12, 13}),
+		Universe: posting.BuildFromSorted([]uint64{
+			11, 12, 13,
+		}),
+	})
+
+	var got []string
+	var saved string
+	if err := r.ScanStringKeys("b", func(key string) (bool, error) {
+		got = append(got, key)
+		if key == "b" {
+			saved = key
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("ScanStringKeys: %v", err)
+	}
+	if !slices.Equal(got, []string{"b", "c"}) {
+		t.Fatalf("ScanStringKeys keys=%v want [b c]", got)
+	}
+
+	got = got[:0]
+	if err := r.ScanStringKeys("a", func(key string) (bool, error) {
+		got = append(got, key)
+		return false, nil
+	}); err != nil {
+		t.Fatalf("ScanStringKeys stop: %v", err)
+	}
+	if !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("ScanStringKeys stop keys=%v want [a]", got)
+	}
+
+	scanErr := errors.New("scan error")
+	err := r.ScanStringKeys("a", func(string) (bool, error) {
+		return true, scanErr
+	})
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("ScanStringKeys error=%v want %v", err, scanErr)
+	}
+
+	r.publishStorageSnapshotNoLock(4, snapshot.Storage{
+		KeyIndex: runtimeTestStringKeyStorage([]string{"z"}, []uint64{99}),
+		Universe: posting.BuildFromSorted([]uint64{
+			99,
+		}),
+	})
+	if saved != "b" {
+		t.Fatalf("callback key after snapshot replacement=%q want b", saved)
+	}
+}
+
+func TestRuntimeStringKeyPredicatesUseKeyIndex(t *testing.T) {
+	r := newRuntimeStringKeyIndexRuntime(t)
+	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha", "beta", "bravo", "carrot"}, []uint64{40, 10, 30, 20}),
+		Universe: posting.BuildFromSorted([]uint64{
+			10, 20, 30, 40,
+		}),
+	})
+
+	stats := r.IndexStats()
+	if stats.StringKeyIndex == nil {
+		t.Fatal("StringKeyIndex stats nil")
+	}
+	if stats.StringKeyIndex.KeyBytes != 20 || stats.StringKeyIndex.Cardinality != 4 {
+		t.Fatalf("StringKeyIndex stats keyBytes=%d card=%d want 20/4", stats.StringKeyIndex.KeyBytes, stats.StringKeyIndex.Cardinality)
+	}
+	if _, ok := stats.FieldTotalCardinality[schema.ReservedKeyFieldName]; ok {
+		t.Fatalf("IndexStats field maps must not contain %q", schema.ReservedKeyFieldName)
+	}
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+		want []uint64
+	}{
+		{name: "eq", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, "beta")), want: []uint64{10}},
+		{name: "in", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []string{"carrot", "alpha", "missing"})), want: []uint64{20, 40}},
+		{name: "gte", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, "bravo")), want: []uint64{20, 30}},
+		{name: "prefix", q: qx.Query(qx.PREFIX(schema.ReservedKeyFieldName, "br")), want: []uint64{30}},
+		{name: "suffix", q: qx.Query(qx.SUFFIX(schema.ReservedKeyFieldName, "ta")), want: []uint64{10}},
+		{name: "contains", q: qx.Query(qx.CONTAINS(schema.ReservedKeyFieldName, "arr")), want: []uint64{20}},
+	}
+	for _, tc := range cases {
+		got := runtimeTestQueryKeys(t, r, tc.q)
+		slices.Sort(got)
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s QueryKeys=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRuntimeStringKeyOrderUsesKeyIndex(t *testing.T) {
+	r := newRuntimeStringKeyIndexRuntime(t)
+	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha", "beta", "bravo", "carrot"}, []uint64{40, 10, 30, 20}),
+		Universe: posting.BuildFromSorted([]uint64{
+			10, 20, 30, 40,
+		}),
+	})
+
+	got := runtimeTestQueryKeys(t, r, qx.Query().Sort(schema.ReservedKeyFieldName, qx.ASC))
+	if !slices.Equal(got, []uint64{40, 10, 30, 20}) {
+		t.Fatalf("ASC QueryKeys=%v want [40 10 30 20]", got)
+	}
+	got = runtimeTestQueryKeys(t, r, qx.Query().Sort(schema.ReservedKeyFieldName, qx.DESC))
+	if !slices.Equal(got, []uint64{20, 30, 10, 40}) {
+		t.Fatalf("DESC QueryKeys=%v want [20 30 10 40]", got)
+	}
+	got = runtimeTestQueryKeys(t, r, qx.Query(qx.GTE(schema.ReservedKeyFieldName, "beta")).Sort(schema.ReservedKeyFieldName, qx.ASC).Offset(1).Limit(2))
+	if !slices.Equal(got, []uint64{30, 20}) {
+		t.Fatalf("bounded ordered QueryKeys=%v want [30 20]", got)
+	}
+}
+
+func TestRuntimeStringKeyRejectsNonStringValues(t *testing.T) {
+	r := newRuntimeStringKeyIndexRuntime(t)
+	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha"}, []uint64{1}),
+		Universe: posting.BuildFromSorted([]uint64{1}),
+	})
+
+	cases := []*qx.QX{
+		qx.Query(qx.EQ(schema.ReservedKeyFieldName, 1)),
+		qx.Query(qx.EQ(schema.ReservedKeyFieldName, nil)),
+		qx.Query(qx.IN(schema.ReservedKeyFieldName, []int{1})),
+		qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{nil})),
+		qx.Query(qx.PREFIX(schema.ReservedKeyFieldName, 1)),
+		qx.Query(qx.CONTAINS(schema.ReservedKeyFieldName, true)),
+	}
+	for i, q := range cases {
+		err := r.QueryKeys(q, func([]uint64) error { return nil })
+		if err == nil {
+			t.Fatalf("case %d QueryKeys succeeded, want error", i)
+		}
+	}
+}
+
 func buildRuntimeTestIndex(t *testing.T, r *Index, db *bbolt.DB, bucket []byte) {
 	t.Helper()
 
@@ -218,7 +443,7 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatal("Query callback was not called")
 	}
 
-	dbStats, err := r.DBStats(db, bucket)
+	dbStats, err := r.DBStats(db, bucket, nil)
 	if err != nil {
 		t.Fatalf("DBStats: %v", err)
 	}
@@ -232,6 +457,9 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	indexStats := r.IndexStats()
 	if indexStats.FieldTotalCardinality["name"] != 3 || indexStats.FieldTotalCardinality["active"] != 3 {
 		t.Fatalf("IndexStats.FieldTotalCardinality=%v", indexStats.FieldTotalCardinality)
+	}
+	if indexStats.StringKeyIndex != nil {
+		t.Fatalf("IndexStats.StringKeyIndex=%+v, want nil", indexStats.StringKeyIndex)
 	}
 
 	if err = r.RefreshPlannerStats(func() error { return nil }); err != nil {
@@ -272,7 +500,7 @@ func TestRuntimeStringQueryKeysReturnIDs(t *testing.T) {
 		t.Fatalf("QueryKeys IDs=%v want [1 3]", got)
 	}
 
-	st, err := r.DBStats(db, bucket)
+	st, err := r.DBStats(db, bucket, nil)
 	if err != nil {
 		t.Fatalf("DBStats: %v", err)
 	}
@@ -336,7 +564,7 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 	if len(keys) != 0 {
 		t.Fatalf("QueryKeys after truncate=%v want empty", keys)
 	}
-	stats, err := r.DBStats(db, bucket)
+	stats, err := r.DBStats(db, bucket, nil)
 	if err != nil {
 		t.Fatalf("DBStats after truncate: %v", err)
 	}
@@ -396,6 +624,22 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	}
 	if len(currentKeys) != 0 {
 		t.Fatalf("current snapshot query IDs=%v want empty", currentKeys)
+	}
+}
+
+func TestRuntimeDBStatsMissingSnapshotReturnsUnavailable(t *testing.T) {
+	bucket := []byte("runtime_stats_missing_snapshot")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice"})
+	setRuntimeTestSequence(t, db, bucket, 2)
+
+	r := newRuntimeTestRuntime(t, false, true)
+	errUnavailable := errors.New("unavailable")
+	_, err := r.DBStats(db, bucket, func() error {
+		return errUnavailable
+	})
+	if !errors.Is(err, errUnavailable) {
+		t.Fatalf("DBStats err=%v want %v", err, errUnavailable)
 	}
 }
 

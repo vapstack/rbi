@@ -225,7 +225,7 @@ func (q *Query) Release() {
 	aggregateQueryPool.Put(q)
 }
 
-func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
+func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, error) {
 	if src == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
@@ -235,8 +235,7 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	if len(src.Projection) > 0 {
 		return nil, fmt.Errorf("%w: aggregate projection is not supported", rbierrors.ErrInvalidQuery)
 	}
-
-	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, s.IndexedByName)
+	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, resolve)
 	if err != nil {
 		return nil, err
 	}
@@ -255,6 +254,10 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	defer aggregateOutputPositionMapPool.Put(outputPositions)
 
 	for i := range src.Reduction.Group {
+		if err = rejectReservedKeyExpr(src.Reduction.Group[i], "GROUP BY"); err != nil {
+			out.Release()
+			return nil, err
+		}
 		group, err := prepareAggregateGroup(s, src.Reduction.Group[i])
 		if err != nil {
 			out.Release()
@@ -268,6 +271,10 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	}
 
 	for i := range src.Reduction.Metrics {
+		if err = rejectReservedKeyExpr(src.Reduction.Metrics[i], "aggregate metric"); err != nil {
+			out.Release()
+			return nil, err
+		}
 		metric, err := prepareAggregateMetric(s, src.Reduction.Metrics[i])
 		if err != nil {
 			out.Release()
@@ -296,6 +303,10 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 	}
 
 	if !src.Reduction.Having.IsZero() {
+		if err = rejectReservedKeyExpr(src.Reduction.Having, "HAVING"); err != nil {
+			out.Release()
+			return nil, err
+		}
 		havingArgs, havingValues, err := aggregateHavingStorageSize(src.Reduction.Having, outputPositions)
 		if err != nil {
 			out.Release()
@@ -321,6 +332,10 @@ func Prepare(src *qx.QX, s *schema.Schema) (*Query, error) {
 			out.order = make([]aggregateOrder, 0, len(src.Order))
 		}
 		for i := range src.Order {
+			if err = rejectReservedKeyExpr(src.Order[i].By, "ORDER"); err != nil {
+				out.Release()
+				return nil, err
+			}
 			by := src.Order[i].By
 			if by.Kind != qx.KindOUT || by.Name == "" {
 				out.Release()
@@ -362,6 +377,18 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 		return fmt.Errorf("%w: duplicate aggregate output %q", rbierrors.ErrInvalidQuery, name)
 	}
 	seen[name] = pos
+	return nil
+}
+
+func rejectReservedKeyExpr(expr qx.Expr, context string) error {
+	if expr.Kind == qx.KindREF && expr.Name == schema.ReservedKeyFieldName {
+		return fmt.Errorf("%w: %v is not supported in %s", rbierrors.ErrInvalidQuery, schema.ReservedKeyFieldName, context)
+	}
+	for i := range expr.Args {
+		if err := rejectReservedKeyExpr(expr.Args[i], context); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -626,6 +653,9 @@ func prepareAggregateGroup(s *schema.Schema, expr qx.Expr) (aggregateFieldRef, e
 	if expr.Kind != qx.KindREF || expr.Name == "" {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", rbierrors.ErrInvalidQuery)
 	}
+	if expr.Name == schema.ReservedKeyFieldName {
+		return aggregateFieldRef{}, fmt.Errorf("%w: %v is not supported in GROUP BY", rbierrors.ErrInvalidQuery, schema.ReservedKeyFieldName)
+	}
 
 	acc, ok := s.IndexedByName[expr.Name]
 	if !ok {
@@ -710,6 +740,9 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 }
 
 func prepareAggregateMetricField(s *schema.Schema, name string, op aggregateMetricOp) (aggregateFieldRef, error) {
+	if name == schema.ReservedKeyFieldName {
+		return aggregateFieldRef{}, fmt.Errorf("%w: %v is not supported in aggregate metric", rbierrors.ErrInvalidQuery, schema.ReservedKeyFieldName)
+	}
 	if acc, ok := s.MeasuresByName[name]; ok {
 		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
 			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", rbierrors.ErrInvalidQuery, name)
@@ -838,7 +871,7 @@ func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, 
 	var decision aggregateRouteDecision
 	switch family {
 	case aggregateSelectorCount:
-		decision = selectCountAggregate()
+		decision = selectCountAggregate(aggregateCountFacts{filterCardinality: ids.Cardinality()})
 	case aggregateSelectorDistinct:
 		decision = selectDistinctAggregate(ae.collectDistinctFacts(q, ids))
 	case aggregateSelectorUngrouped:
@@ -851,30 +884,19 @@ func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, 
 	if trace != nil {
 		trace.SetAggregateRoute(decision.traceRoute())
 	}
-	if family == aggregateSelectorCount {
-		if decision.route != aggregateRouteRowCount {
-			return Result{}, dispatchInvalidAggregateRoute(decision.route)
-		}
-		return aggregateCountResult(q.metrics[0].out, ids.Cardinality()), nil
-	}
 	return ae.dispatchAggregateRoute(q, ids, decision)
 }
 
 func (ae *aggregateExecutor) executeCountAggregateFamily(view *qexec.View, q *Query, trace *qexec.Trace) (Result, error) {
-	decision := selectCountAggregate()
-	if trace != nil {
-		trace.SetAggregateRoute(decision.traceRoute())
-	}
 	count, err := Count(view, q.filter, false)
 	if err != nil {
 		return Result{}, err
 	}
-	decision.expectedFilterRows = count
-	decision.selectedCost = float64(count)
+	decision := selectCountAggregate(aggregateCountFacts{filterCardinality: count})
 	if trace != nil {
 		trace.SetAggregateRoute(decision.traceRoute())
 	}
-	return aggregateCountResult(q.metrics[0].out, count), nil
+	return ae.dispatchAggregateRoute(q, posting.List{}, decision)
 }
 
 func aggregateCountResult(out string, count uint64) Result {
@@ -888,6 +910,8 @@ func aggregateCountResult(out string, count uint64) Result {
 
 func (ae *aggregateExecutor) dispatchAggregateRoute(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
 	switch decision.route {
+	case aggregateRouteRowCount:
+		return aggregateCountResult(q.metrics[0].out, decision.expectedFilterRows), nil
 	case aggregateRouteDistinctUngrouped:
 		return ae.executeDistinctAggregate(q.metrics[0], ids)
 	case aggregateRouteCountDistinctUngrouped:

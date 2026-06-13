@@ -763,11 +763,11 @@ func countBucketPostsAllNotBuf(posts []posting.List, bucket posting.List) (uint6
 }
 
 func (qv *View) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice || fm.Ptr {
 		return false
 	}
-	if !qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o).HasData() {
+	if !qv.indexViewByOrdinal(o.FieldOrdinal).HasData() {
 		return false
 	}
 	if len(leaves) < 2 {
@@ -779,10 +779,10 @@ func (qv *View) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
 
 	for _, e := range leaves {
 		// keep candidate ORDER conservative: only scalar equality/set predicates
-		if e.FieldOrdinal < 0 || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
+		if !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
 			return false
 		}
-		if ef := qv.fieldMetaByExpr(e); ef == nil || ef.Slice {
+		if ef := qv.fieldMetaByOrdinal(e.FieldOrdinal); ef == nil || ef.Slice {
 			return false
 		}
 		if e.Not {
@@ -832,15 +832,15 @@ func (qv *View) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 		}
 		return predicate{expr: e, alwaysTrue: true}, true
 	}
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return predicate{}, false
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil {
 		return predicate{}, false
 	}
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 
 	switch e.Op {
 
@@ -869,6 +869,9 @@ func (qv *View) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 		return qv.buildPredHasAnyCandidate(e, fm, ov)
 
 	case qir.OpSUFFIX, qir.OpCONTAINS:
+		if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+			return predicate{}, false
+		}
 		return qv.buildPredMaterializedCandidate(e)
 
 	default:
@@ -898,7 +901,7 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 		}
 
 		if isNil {
-			ids := qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			if e.Not {
 				if ids.IsEmpty() {
 					return predicate{expr: e, alwaysTrue: true}, true
@@ -996,16 +999,16 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 }
 
 func (qv *View) buildPredEqCandidateWithEst(e qir.Expr, est uint64) (predicate, bool) {
-	if e.Op != qir.OpEQ || e.Not || e.FieldOrdinal < 0 || est == 0 {
+	if e.Op != qir.OpEQ || e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || est == 0 {
 		return qv.buildPredicateCandidate(e)
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return qv.buildPredicateCandidate(e)
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 	if !ov.HasData() {
 		return predicate{}, false
 	}
@@ -1021,7 +1024,7 @@ func (qv *View) buildPredEqCandidateWithEst(e qir.Expr, est uint64) (predicate, 
 
 	var ids posting.List
 	if isNil {
-		ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids = qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 	} else {
 		ids = lookupScalarPostingRetained(ov, key)
 	}
@@ -1497,7 +1500,7 @@ func (qv *View) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcac
 	}
 
 	if raw.Op.IsScalarRangeOrPrefix() {
-		fm := qv.fieldMetaByExpr(raw)
+		fm := qv.fieldMetaByOrdinal(raw.FieldOrdinal)
 		var core preparedScalarRangePredicate
 		pred, done, ok := qv.initPreparedScalarRangePredicate(&core, raw, fm)
 		if ok {
@@ -1507,7 +1510,7 @@ func (qv *View) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcac
 				}
 				return posting.List{}
 			}
-			ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, raw)
+			ov := qv.indexViewByOrdinal(raw.FieldOrdinal)
 			if !ov.HasData() {
 				if !cacheKey.IsZero() {
 					qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
@@ -1721,14 +1724,14 @@ func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, 
 			return nil, true
 		}
 		e := lead.expr
-		if !isSimpleScalarRangeOrPrefixLeaf(e) {
+		if !qv.isSimpleScalarRangeOrPrefixLeaf(e) {
 			return nil, false
 		}
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			return nil, false
 		}
-		span.ov = qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		span.ov = qv.indexViewByOrdinal(e.FieldOrdinal)
 		if !span.ov.HasData() {
 			return nil, true
 		}
@@ -1762,12 +1765,12 @@ func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, 
 func (qv *View) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader, trace *Trace) []uint64 {
 	o := q.Order
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() {
 		return nil
 	}
@@ -2879,7 +2882,7 @@ func (qv *View) orderedPredicateScalarRangeRouting(
 	universe uint64,
 ) orderedScalarRangeRouting {
 
-	if universe == 0 || p.expr.Not || p.expr.FieldOrdinal < 0 || !p.expr.Op.IsNumericRange() {
+	if universe == 0 || p.expr.Not || !qv.hasFieldOrdinal(p.expr.FieldOrdinal) || !p.expr.Op.IsNumericRange() {
 		return orderedScalarRangeRouting{}
 	}
 
@@ -2902,7 +2905,7 @@ func (qv *View) orderedPredicateScalarRangeRouting(
 
 	route.broadComplement = candidate.broadComplementCardinality(universe)
 	route.forceComplement = candidate.plan.useComplement &&
-		candidate.core.qv.fieldIndexViewFromSlotsForExpr(candidate.core.qv.snap.NilIndex, candidate.core.expr).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+		candidate.core.qv.nilIndexViewByOrdinal(candidate.core.expr.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 
 	return route
 }
@@ -2957,7 +2960,7 @@ func (qv *View) tryMaterializeBroadRangeComplementPredicateForOrdered(
 		return false
 	}
 
-	fm := qv.fieldMetaByExpr(p.expr)
+	fm := qv.fieldMetaByOrdinal(p.expr.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return false
 	}
@@ -3049,10 +3052,10 @@ func (qv *View) loadWarmComplementPredicateForOrdered(p *predicate, useComplemen
 }
 
 func (qv *View) isPositiveOrderedMergedScalarRangeLeaf(e qir.Expr, orderField string) bool {
-	if e.Not || e.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	return fm != nil && !fm.Slice
 }
 
@@ -3076,14 +3079,14 @@ func (qv *View) buildMergedScalarRangePredicateWithColdModeAndWarmLoad(
 	allowMaterialize, lazyColdMaterialize, allowWarmLoad bool,
 ) (predicate, bool) {
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return predicate{}, false
 	}
 
 	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 	if !ov.HasData() {
 		return predicate{}, false
 	}
@@ -3408,17 +3411,17 @@ func (qv *View) buildPredicateWithColdModeAndWarmLoad(
 		return predicate{expr: e, alwaysTrue: true}, true
 	}
 
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return predicate{}, false
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil {
 		return predicate{}, false
 	}
 
 	if e.Op.IsScalarRangeOrPrefix() {
-		ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 		if !ov.HasData() {
 			return predicate{}, false
 		}
@@ -4000,7 +4003,7 @@ func chooseOrderedAnchorLeadReader(qv *View, orderField string, preds predicateR
 			continue
 		}
 		weight := orderedAnchorLeadOpWeight(p.expr.Op)
-		if p.expr.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
+		if qv.hasFieldOrdinal(p.expr.FieldOrdinal) && qv.exec.FieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
 			// Predicates on the order field usually provide weak anchor signal.
 			weight *= 2.8
 		}
@@ -4384,12 +4387,12 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateReader, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
 	o := q.Order
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false
 	}
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
-	nilOV := qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
+	nilOV := qv.nilIndexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() && !nilOV.HasData() {
 		return nil, false
 	}
@@ -4517,7 +4520,7 @@ func (qv *View) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []pr
 func (qv *View) scanOrderedIndexViewNoPredicatesWithNilTail(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *Trace) []uint64 {
 	extraRows := uint64(0)
 	if nilTailField != "" {
-		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 	}
 	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 	if exhausted {
@@ -4555,7 +4558,7 @@ func (qv *View) scanOrderedIndexViewNoPredicatesWithNilTail(q *qir.Shape, ov ind
 	}
 
 	if cursor.need > 0 && nilTailField != "" {
-		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		orderedScanEmitBucketNoPredicates(&cursor, ids, trace, &scanWidth)
 	}
 
@@ -4578,7 +4581,7 @@ func (qv *View) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, pred
 
 	extraRows := uint64(0)
 	if nilTailField != "" {
-		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 	}
 	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 	if exhausted {
@@ -4650,7 +4653,7 @@ func (qv *View) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, pred
 	}
 
 	if cursor.need > 0 && nilTailField != "" {
-		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		_, exactWork = orderedScanEmitBucketWithPredicates(
 			&cursor,
 			preds,

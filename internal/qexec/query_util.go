@@ -142,9 +142,9 @@ func (s *u64set) grow() {
 }
 
 func (qv *View) isPositiveUniqueEqExpr(e qir.Expr) bool {
-	if !isPositiveScalarEqLeaf(e) {
+	if !qv.isPositiveScalarEqLeaf(e) {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	return fm != nil && !fm.Slice && fm.Unique
 }

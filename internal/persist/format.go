@@ -15,11 +15,17 @@ import (
 	"github.com/vapstack/rbi/rbistats"
 )
 
-const persistedIndexVersion byte = 28
+const currentPersistedIndexVersion = 29
 
 const (
 	keyStorageNumeric byte = iota
 	keyStorageStringDurableID
+)
+
+const (
+	keyIndexStateAbsent byte = iota
+	keyIndexStateEmpty
+	keyIndexStatePresent
 )
 
 func writeFields(writer *bufio.Writer, fields map[string]*schema.Field) error {

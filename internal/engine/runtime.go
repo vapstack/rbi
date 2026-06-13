@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -33,7 +34,10 @@ type Index struct {
 	snapshot               *snapshot.Registry
 	schema                 *schema.Schema
 	strKey                 bool
+	keyMode                qexec.KeyMode
 	index                  []indexdata.FieldStorage
+	keyIndex               indexdata.FieldStorage
+	keyIndexLoaded         bool
 	nilIndex               []indexdata.FieldStorage
 	lenIndex               []indexdata.FieldStorage
 	lenZeroComplement      []bool
@@ -47,8 +51,9 @@ type Index struct {
 }
 
 type Config struct {
-	Schema *schema.Schema
-	StrKey bool
+	Schema      *schema.Schema
+	StrKey      bool
+	StrKeyIndex bool
 
 	SnapshotStats bool
 
@@ -93,19 +98,27 @@ type (
 )
 
 func NewIndex(cfg Config) (*Index, error) {
-	if !cfg.Schema.HasQueryFields() {
+	keyMode := qexec.KeyModeNone
+	if cfg.StrKey && cfg.StrKeyIndex {
+		keyMode = qexec.KeyModeString
+	} else if !cfg.StrKey && cfg.Schema.HasQueryFields() {
+		keyMode = qexec.KeyModeNumeric
+	}
+	if !cfg.Schema.HasQueryFields() && keyMode == qexec.KeyModeNone {
 		return nil, nil
 	}
 
 	r := &Index{
 		schema:                 cfg.Schema,
 		strKey:                 cfg.StrKey,
+		keyMode:                keyMode,
 		universe:               posting.List{},
 		matPredCacheMaxEntries: max(0, cfg.SnapshotMaterializedPredCacheMaxEntries),
 		matPredCacheMaxCard:    qcache.MaterializedPredMaxCardinality(cfg.SnapshotMaterializedPredCacheMaxCardinality),
 		snapshot:               snapshot.NewRegistry(cfg.SnapshotStats),
 		exec: qexec.NewRuntime(qexec.Config{
 			StrKey:                         cfg.StrKey,
+			KeyMode:                        keyMode,
 			Schema:                         cfg.Schema,
 			NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
 			NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
@@ -144,6 +157,7 @@ func (index *Index) ConfigureWrite(cfg *wexec.Config, broken *atomic.Bool, logge
 		Schema:      index.schema,
 		CacheConfig: index.SnapshotCacheConfig(),
 		PatchFields: index.schema.Patch.Fields,
+		StrKeyIndex: index.keyMode == qexec.KeyModeString,
 	}
 	cfg.PublishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
 		return index.PublishCommittedView(broken, logger, seq, op, snap)
@@ -177,8 +191,33 @@ func (index *Index) ScanKeys(seek uint64, fn func(uint64) (bool, error)) error {
 	return nil
 }
 
+func (index *Index) HasStringKeyIndex() bool {
+	return index.keyMode == qexec.KeyModeString
+}
+
+func (index *Index) ScanStringKeys(seek string, fn func(string) (bool, error)) error {
+	snap, seq, ref := index.snapshot.PinCurrent()
+	defer index.snapshot.Unpin(seq, ref)
+
+	view := indexdata.NewFieldIndexViewFromStorage(snap.KeyIndex)
+	cur := view.NewCursor(view.RangeByRanks(view.LowerBound(seek), view.KeyCount()), false)
+	for {
+		key, ids, _, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			return nil
+		}
+		more, err := fn(strings.Clone(key.UnsafeString()))
+		if !single {
+			ids.Release()
+		}
+		if err != nil || !more {
+			return err
+		}
+	}
+}
+
 func (index *Index) Count(exprs ...qx.Expr) (uint64, error) {
-	prepared, err := qagg.PrepareCount(index.schema, exprs...)
+	prepared, err := qagg.PrepareCount(index.exec, exprs...)
 	if err != nil {
 		return 0, err
 	}
@@ -194,7 +233,7 @@ func (index *Index) Count(exprs ...qx.Expr) (uint64, error) {
 }
 
 func (index *Index) Aggregate(q *qx.QX) (qagg.Result, error) {
-	prepared, err := qagg.Prepare(q, index.schema)
+	prepared, err := qagg.Prepare(q, index.schema, index.exec)
 	if err != nil {
 		return qagg.Result{}, err
 	}
@@ -233,55 +272,61 @@ func (index *Index) Query(q *qx.QX, bolt *bbolt.DB, bucketName []byte, unavailab
 	}
 	defer prepared.Release()
 
-	guard := index.snapshot.PinGuardLock()
-	tx, err := bolt.Begin(false)
-	if err != nil {
-		guard.Unlock()
-		return fmt.Errorf("tx error: %w", err)
-	}
+	for {
+		tx, err := bolt.Begin(false)
+		if err != nil {
+			return fmt.Errorf("tx error: %w", err)
+		}
 
-	bucket := tx.Bucket(bucketName)
-	if bucket == nil {
-		guard.Unlock()
-		_ = tx.Rollback()
-		return fmt.Errorf("bucket does not exist")
-	}
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("bucket does not exist")
+		}
 
-	seq := bucket.Sequence()
+		seq := bucket.Sequence()
+		snap, ref, ok := index.snapshot.PinBySeq(seq)
+		if !ok {
+			_ = tx.Rollback()
+			if err = unavailable(); err != nil {
+				return err
+			}
+			continue
+		}
 
-	snap, ref, ok := guard.PinBySeq(seq)
-	if !ok {
-		guard.Unlock()
-		_ = tx.Rollback()
-		if err = unavailable(); err != nil {
+		// deferred unpin/rollback lead to heap escape and 2 more allocs
+
+		ids, err := index.queryKeysOnSnapshot(snap, &shape, true)
+		if err != nil {
+			index.snapshot.Unpin(seq, ref)
+			_ = tx.Rollback()
 			return err
 		}
-		return fmt.Errorf("snapshot sequence %d is not available", seq)
-	}
-	guard.Unlock()
-
-	defer index.snapshot.Unpin(seq, ref)
-	defer func() { _ = tx.Rollback() }()
-
-	ids, err := index.queryKeysOnSnapshot(snap, &shape, true)
-	if err != nil {
+		if len(ids) == 0 {
+			index.snapshot.Unpin(seq, ref)
+			_ = tx.Rollback()
+			return nil
+		}
+		err = fn(tx, ids)
+		index.snapshot.Unpin(seq, ref)
+		_ = tx.Rollback()
 		return err
 	}
-	if len(ids) == 0 {
-		return nil
-	}
-	return fn(tx, ids)
 }
 
 func (index *Index) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
 	if q == nil {
 		return nil, qir.Shape{}, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQuery(q, index.schema.IndexedByName)
+	prepared, err := qir.PrepareQuery(q, index.exec)
 	if err != nil {
 		return nil, qir.Shape{}, err
 	}
 	return prepared, qir.NewShape(prepared), nil
+}
+
+func (index *Index) ResolveField(name string) (qir.FieldInfo, bool) {
+	return index.exec.ResolveField(name)
 }
 
 func (index *Index) queryKeysOnSnapshot(snap *snapshot.View, q *qir.Shape, tryEmpty bool) ([]uint64, error) {
@@ -323,12 +368,15 @@ func (index *Index) BuildIndex(
 		Schema:            index.schema,
 		Current:           index.snapshot.Current(),
 		StrKey:            index.strKey,
+		StrKeyIndex:       index.keyMode == qexec.KeyModeString,
+		KeyIndexLoaded:    index.keyIndexLoaded,
 		SkipFields:        skipFields,
 		SkipMeasureFields: skipMeasureFields,
 		Decode:            rebuild.DecodeFunc(decode),
 		Release:           rebuild.ReleaseFunc(release),
 	}, rebuild.State{
 		Index:             index.index,
+		KeyIndex:          index.keyIndex,
 		NilIndex:          index.nilIndex,
 		LenIndex:          index.lenIndex,
 		LenZeroComplement: index.lenZeroComplement,
@@ -343,6 +391,9 @@ func (index *Index) BuildIndex(
 		st := result.Storage
 		result.Storage = snapshot.Storage{}
 		index.publishStorageSnapshotNoLock(seq, st)
+		if index.keyMode == qexec.KeyModeString {
+			index.keyIndexLoaded = result.KeyIndexLoaded
+		}
 	}
 	index.lenIndexLoaded = result.LenLoaded
 	return BuildResult{
@@ -354,12 +405,13 @@ func (index *Index) BuildIndex(
 
 func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, currentSeq uint64) (LoadResult, error) {
 	result, err := persist.Load(persist.LoadConfig{
-		File:       file,
-		DBPath:     dbPath,
-		Bucket:     bucket,
-		CurrentSeq: currentSeq,
-		Schema:     index.schema,
-		StrKey:     index.strKey,
+		File:        file,
+		DBPath:      dbPath,
+		Bucket:      bucket,
+		CurrentSeq:  currentSeq,
+		Schema:      index.schema,
+		StrKey:      index.strKey,
+		StrKeyIndex: index.keyMode == qexec.KeyModeString,
 	})
 	if err != nil {
 		return LoadResult{}, err
@@ -373,6 +425,7 @@ func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, current
 
 	index.releaseCurrentStorage()
 	index.lenIndexLoaded = result.LenLoaded
+	index.keyIndexLoaded = result.KeyIndexLoaded
 
 	st := result.Storage
 	result.Storage = snapshot.Storage{}
@@ -405,12 +458,14 @@ func (index *Index) StoreIndex(file string, bolt *bbolt.DB, bucket []byte) error
 	}
 	plannerStats := index.exec.PlannerStatsSnapshotForPersist(snap, statsVersion)
 	return persist.Store(persist.StoreConfig{
-		File:         file,
-		BucketSeq:    seq,
-		Schema:       index.schema,
-		StrKey:       index.strKey,
-		Snapshot:     snap,
-		PlannerStats: plannerStats,
+		File:           file,
+		BucketSeq:      seq,
+		Schema:         index.schema,
+		StrKey:         index.strKey,
+		StrKeyIndex:    index.keyMode == qexec.KeyModeString,
+		KeyIndexLoaded: index.keyIndexLoaded,
+		Snapshot:       snap,
+		PlannerStats:   plannerStats,
 	})
 }
 
@@ -427,6 +482,7 @@ func (index *Index) PublishCurrentSnapshot(bolt *bbolt.DB, bucket []byte) error 
 		copy(lenZeroComplement, index.lenZeroComplement)
 		snap = snapshot.NewView(seq, prev, index.schema, index.SnapshotCacheConfig(), snapshot.Storage{
 			Index:             indexdata.CloneFieldStorageSlots(index.index, len(index.schema.Indexed)),
+			KeyIndex:          index.keyIndex,
 			NilIndex:          indexdata.CloneFieldStorageSlots(index.nilIndex, len(index.schema.Indexed)),
 			LenIndex:          indexdata.CloneFieldStorageSlots(index.lenIndex, len(index.schema.Indexed)),
 			LenZeroComplement: lenZeroComplement,
@@ -436,6 +492,7 @@ func (index *Index) PublishCurrentSnapshot(bolt *bbolt.DB, bucket []byte) error 
 	} else {
 		snap = snapshot.NewView(seq, nil, index.schema, index.SnapshotCacheConfig(), snapshot.Storage{
 			Index:             index.index,
+			KeyIndex:          index.keyIndex,
 			NilIndex:          index.nilIndex,
 			LenIndex:          index.lenIndex,
 			LenZeroComplement: index.lenZeroComplement,
@@ -454,6 +511,7 @@ func (index *Index) publishStorageSnapshotNoLock(seq uint64, st snapshot.Storage
 
 func (index *Index) installViewNoLock(s *snapshot.View) {
 	index.index = s.Index
+	index.keyIndex = s.KeyIndex
 	index.nilIndex = s.NilIndex
 	index.lenIndex = s.LenIndex
 	index.lenZeroComplement = s.LenZeroComplement
@@ -474,6 +532,7 @@ func (index *Index) StageTruncate(seq uint64) StagedSnapshot {
 	nextUniverse := posting.List{}
 	snap := snapshot.NewView(seq, index.snapshot.Current(), index.schema, index.SnapshotCacheConfig(), snapshot.Storage{
 		Index:             nextIndex,
+		KeyIndex:          indexdata.FieldStorage{},
 		NilIndex:          nextNilIndex,
 		LenIndex:          nextLenIndex,
 		LenZeroComplement: nextLenZeroComplement,
@@ -495,6 +554,9 @@ func (index *Index) PublishCommittedStaged(broken *atomic.Bool, logger *log.Logg
 func (index *Index) PublishCommittedView(broken *atomic.Bool, logger *log.Logger, seq uint64, op string, snap *snapshot.View) (err error) {
 	defer index.recoverCommittedPublishPanic(broken, logger, seq, op, &err)
 	index.installViewNoLock(snap)
+	if index.keyMode == qexec.KeyModeString {
+		index.keyIndexLoaded = true
+	}
 	return nil
 }
 
@@ -644,41 +706,47 @@ func addPositiveJitter(d time.Duration, rng *rand.Rand) time.Duration {
 	return d + time.Duration(rng.Int64N(int64(j)+1))
 }
 
-func (index *Index) DBStats(bolt *bbolt.DB, bucketName []byte) (DBStats, error) {
-	guard := index.snapshot.PinGuardLock()
-	tx, err := bolt.Begin(false)
-	if err != nil {
-		guard.Unlock()
-		return DBStats{}, fmt.Errorf("tx error: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	bucket := tx.Bucket(bucketName)
-	if bucket == nil {
-		guard.Unlock()
-		return DBStats{}, fmt.Errorf("bucket does not exist")
-	}
-
-	seq := bucket.Sequence()
-	snap, ref, ok := guard.PinBySeq(seq)
-	if !ok {
-		guard.Unlock()
-		return DBStats{}, fmt.Errorf("snapshot sequence %d is not available", seq)
-	}
-	guard.Unlock()
-	defer index.snapshot.Unpin(seq, ref)
-
-	out := DBStats{Sequence: seq}
-	out.KeyCount = snap.UniverseCardinality()
-	key, _ := bucket.Cursor().Last()
-	if key != nil {
-		out.HasLast = true
-		if !index.strKey && len(key) != 8 {
-			return DBStats{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
+func (index *Index) DBStats(bolt *bbolt.DB, bucketName []byte, unavailable func() error) (DBStats, error) {
+	for {
+		tx, err := bolt.Begin(false)
+		if err != nil {
+			return DBStats{}, fmt.Errorf("tx error: %w", err)
 		}
-		out.LastKey = keycodec.DataKeyFromBytes(key, index.strKey)
+
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			_ = tx.Rollback()
+			return DBStats{}, fmt.Errorf("bucket does not exist")
+		}
+
+		seq := bucket.Sequence()
+		snap, ref, ok := index.snapshot.PinBySeq(seq)
+		if !ok {
+			_ = tx.Rollback()
+			if unavailable == nil {
+				return DBStats{}, fmt.Errorf("snapshot sequence %d is not available", seq)
+			}
+			if err = unavailable(); err != nil {
+				return DBStats{}, err
+			}
+			continue
+		}
+
+		defer index.snapshot.Unpin(seq, ref)
+		defer func() { _ = tx.Rollback() }()
+
+		out := DBStats{Sequence: seq}
+		out.KeyCount = snap.UniverseCardinality()
+		key, _ := bucket.Cursor().Last()
+		if key != nil {
+			out.HasLast = true
+			if !index.strKey && len(key) != 8 {
+				return DBStats{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
+			}
+			out.LastKey = keycodec.DataKeyFromBytes(key, index.strKey)
+		}
+		return out, nil
 	}
-	return out, nil
 }
 
 func (index *Index) IndexStats() rbistats.Index {
@@ -733,6 +801,16 @@ func (index *Index) indexStats(snap *snapshot.View) rbistats.Index {
 		idx.ApproxStructBytes += fieldStructBytes
 	}
 	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
+	if index.keyMode == qexec.KeyModeString {
+		keyStats := snap.KeyIndex.Stats(true)
+		idx.StringKeyIndex = &rbistats.StringKeyIndex{
+			Size:              keyStats.PostingBytes,
+			KeyBytes:          keyStats.KeyBytes,
+			Cardinality:       keyStats.PostingCardinality,
+			ApproxStructBytes: keyStats.ApproxStructBytes,
+			ApproxHeapBytes:   keyStats.PostingBytes + keyStats.KeyBytes + keyStats.ApproxStructBytes,
+		}
+	}
 	return idx
 }
 
@@ -776,6 +854,9 @@ func (index *Index) SnapshotStats() rbistats.Snapshot {
 
 func (index *Index) releaseCurrentStorage() {
 	indexdata.ReleaseFieldStorageSlots(index.index)
+	index.keyIndex.Release()
+	index.keyIndex = indexdata.FieldStorage{}
+	index.keyIndexLoaded = false
 	indexdata.ReleaseFieldStorageSlots(index.nilIndex)
 	indexdata.ReleaseFieldStorageSlots(index.lenIndex)
 	indexdata.ReleaseMeasureStorageSlots(index.measure)

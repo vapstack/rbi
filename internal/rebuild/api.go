@@ -17,6 +17,7 @@ type ReleaseFunc func(unsafe.Pointer)
 
 type State struct {
 	Index             []indexdata.FieldStorage
+	KeyIndex          indexdata.FieldStorage
 	NilIndex          []indexdata.FieldStorage
 	LenIndex          []indexdata.FieldStorage
 	LenZeroComplement []bool
@@ -32,6 +33,8 @@ type Config struct {
 	Schema            *schema.Schema
 	Current           *snapshot.View
 	StrKey            bool
+	StrKeyIndex       bool
+	KeyIndexLoaded    bool
 	SkipFields        map[string]struct{}
 	SkipMeasureFields map[string]struct{}
 	Decode            DecodeFunc
@@ -39,12 +42,13 @@ type Config struct {
 }
 
 type Result struct {
-	Storage   snapshot.Storage
-	Publish   bool
-	Stats     bool
-	BuildTime time.Duration
-	BuildRPS  int
-	LenLoaded bool
+	Storage        snapshot.Storage
+	Publish        bool
+	Stats          bool
+	BuildTime      time.Duration
+	BuildRPS       int
+	LenLoaded      bool
+	KeyIndexLoaded bool
 }
 
 func Build(cfg Config, state State) (Result, error) {
@@ -70,6 +74,9 @@ func Build(cfg Config, state State) (Result, error) {
 	}
 
 	if len(active) == 0 && len(activeMeasures) == 0 {
+		if cfg.StrKey && cfg.StrKeyIndex && !cfg.KeyIndexLoaded {
+			return buildKeyOnly(cfg, state)
+		}
 		return buildNoActive(cfg, state)
 	}
 

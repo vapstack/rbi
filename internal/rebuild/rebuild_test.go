@@ -13,6 +13,7 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vmihailenco/msgpack/v5"
@@ -23,6 +24,10 @@ type rebuildTestRec struct {
 	Name  string   `db:"name" rbi:"index"`
 	Tags  []string `db:"tags" rbi:"index"`
 	Score uint64   `db:"score" rbi:"measure"`
+}
+
+type rebuildNoIndexRec struct {
+	Name string
 }
 
 func openRebuildTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
@@ -108,6 +113,16 @@ func compileRebuildTestSchema(t *testing.T) *schema.Schema {
 	t.Helper()
 
 	rt, err := schema.Compile(reflect.TypeOf(rebuildTestRec{}), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	return rt
+}
+
+func compileRebuildNoIndexSchema(t *testing.T) *schema.Schema {
+	t.Helper()
+
+	rt, err := schema.Compile(reflect.TypeOf(rebuildNoIndexRec{}), schema.Config{})
 	if err != nil {
 		t.Fatalf("schema.Compile: %v", err)
 	}
@@ -584,15 +599,221 @@ func TestBuildStringKeysUseDurableIDs(t *testing.T) {
 	cfg := baseRebuildTestConfig(db, bucket, rt)
 	cfg.StrKey = true
 	cfg.StrMapBucket = mapBucket
+	cfg.StrKeyIndex = true
 	result, err := Build(cfg, newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	defer result.Storage.Release()
 	if result.Storage.Universe.Cardinality() != 1 {
 		t.Fatalf("universe cardinality=%d want 1", result.Storage.Universe.Cardinality())
 	}
 	if !result.Storage.Universe.Contains(1) {
 		t.Fatalf("universe does not contain durable id 1")
+	}
+	ids := indexdata.NewFieldIndexViewFromStorage(result.Storage.KeyIndex).LookupPostingRetained("user-1")
+	if ids.Cardinality() != 1 || !ids.Contains(1) {
+		t.Fatalf("key index for user-1 mismatch")
+	}
+	ids.Release()
+}
+
+func TestBuildStringKeyOnlyIndexScansKeysWithoutDecode(t *testing.T) {
+	bucket := []byte("rebuild_key_only")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildNoIndexSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	bID := putRebuildTestStringRec(t, db, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
+	aaID := putRebuildTestStringRec(t, db, bucket, mapBucket, "aa", rebuildTestRec{Name: "ignored-aa"})
+	cID := putRebuildTestStringRec(t, db, bucket, mapBucket, "c", rebuildTestRec{Name: "ignored-c"})
+
+	result, err := Build(Config{
+		Bolt:         db,
+		DataBucket:   bucket,
+		StrMapBucket: mapBucket,
+		Schema:       rt,
+		StrKey:       true,
+		StrKeyIndex:  true,
+		Decode: func([]byte) (unsafe.Pointer, error) {
+			t.Fatalf("decode called")
+			return nil, nil
+		},
+		Release: func(unsafe.Pointer) {
+			t.Fatalf("release called")
+		},
+	}, newRebuildTestState(rt))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer result.Storage.Release()
+
+	if !result.Publish || !result.Stats || result.LenLoaded {
+		t.Fatalf("unexpected result flags: publish=%v stats=%v lenLoaded=%v", result.Publish, result.Stats, result.LenLoaded)
+	}
+
+	ov := indexdata.NewFieldIndexViewFromStorage(result.Storage.KeyIndex)
+	if ov.KeyCount() != 3 || ov.Rows() != 3 {
+		t.Fatalf("key index shape keys=%d rows=%d", ov.KeyCount(), ov.Rows())
+	}
+
+	wantKeys := []string{"aa", "b", "c"}
+	wantIDs := []uint64{aaID, bID, cID}
+	for i := range wantKeys {
+		if got := ov.KeyAt(i).UnsafeString(); got != wantKeys[i] {
+			t.Fatalf("key[%d]=%q want %q", i, got, wantKeys[i])
+		}
+		ids := ov.LookupPostingRetained(wantKeys[i])
+		if ids.Cardinality() != 1 || !ids.Contains(wantIDs[i]) {
+			t.Fatalf("posting[%q] cardinality=%d contains_id=%v", wantKeys[i], ids.Cardinality(), ids.Contains(wantIDs[i]))
+		}
+		ids.Release()
+		if !result.Storage.Universe.Contains(wantIDs[i]) {
+			t.Fatalf("universe does not contain durable id %d", wantIDs[i])
+		}
+	}
+}
+
+func TestBuildStringKeyOnlyPreservesLoadedUniverse(t *testing.T) {
+	bucket := []byte("rebuild_key_only_preserve_universe")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildNoIndexSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	aID := putRebuildTestStringRec(t, db, bucket, mapBucket, "a", rebuildTestRec{Name: "ignored-a"})
+	bID := putRebuildTestStringRec(t, db, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
+	loadedUniverse := posting.BuildFromSorted([]uint64{aID, bID})
+	state := newRebuildTestState(rt)
+	state.Universe = loadedUniverse
+
+	result, err := Build(Config{
+		Bolt:         db,
+		DataBucket:   bucket,
+		StrMapBucket: mapBucket,
+		Schema:       rt,
+		StrKey:       true,
+		StrKeyIndex:  true,
+		Decode: func([]byte) (unsafe.Pointer, error) {
+			t.Fatalf("decode called")
+			return nil, nil
+		},
+		Release: func(unsafe.Pointer) {
+			t.Fatalf("release called")
+		},
+	}, state)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer result.Storage.Release()
+
+	if !result.Storage.Universe.SharesPayload(loadedUniverse) {
+		t.Fatalf("key-only rebuild replaced loaded compatible universe")
+	}
+	if result.Storage.Universe.Cardinality() != 2 || !result.Storage.Universe.Contains(aID) || !result.Storage.Universe.Contains(bID) {
+		t.Fatalf("preserved universe cardinality=%d contains a/b=%v/%v", result.Storage.Universe.Cardinality(), result.Storage.Universe.Contains(aID), result.Storage.Universe.Contains(bID))
+	}
+	ov := indexdata.NewFieldIndexViewFromStorage(result.Storage.KeyIndex)
+	if ov.KeyCount() != 2 || ov.Rows() != 2 {
+		t.Fatalf("key index shape keys=%d rows=%d", ov.KeyCount(), ov.Rows())
+	}
+}
+
+func TestBuildStringKeyOnlyRejectsMalformedValuePrefix(t *testing.T) {
+	bucket := []byte("rebuild_key_only_bad_prefix")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildNoIndexSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucket).Put(keycodec.StringBytes("bad-key"), []byte{0xff})
+	}); err != nil {
+		t.Fatalf("put malformed string record: %v", err)
+	}
+
+	_, err := Build(Config{
+		Bolt:         db,
+		DataBucket:   bucket,
+		StrMapBucket: mapBucket,
+		Schema:       rt,
+		StrKey:       true,
+		StrKeyIndex:  true,
+		Decode: func([]byte) (unsafe.Pointer, error) {
+			t.Fatalf("decode called")
+			return nil, nil
+		},
+	}, newRebuildTestState(rt))
+	if err == nil {
+		t.Fatalf("expected malformed value prefix error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"scan error", `id="bad-key"`, "value_len=1", "value_prefix_hex=ff", "value shorter"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("malformed prefix error missing %q: %v", want, err)
+		}
+	}
+}
+
+func TestBuildStringKeyOnlyRejectsZeroStringID(t *testing.T) {
+	bucket := []byte("rebuild_key_only_zero_idx")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildNoIndexSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucket).Put(keycodec.StringBytes("zero-key"), make([]byte, 8))
+	}); err != nil {
+		t.Fatalf("put zero-id string record: %v", err)
+	}
+
+	_, err := Build(Config{
+		Bolt:         db,
+		DataBucket:   bucket,
+		StrMapBucket: mapBucket,
+		Schema:       rt,
+		StrKey:       true,
+		StrKeyIndex:  true,
+		Decode: func([]byte) (unsafe.Pointer, error) {
+			t.Fatalf("decode called")
+			return nil, nil
+		},
+	}, newRebuildTestState(rt))
+	if err == nil {
+		t.Fatalf("expected zero string id error")
+	}
+	if msg := err.Error(); !strings.Contains(msg, `id="zero-key"`) || !strings.Contains(msg, "zero string id") {
+		t.Fatalf("unexpected zero string id error: %v", err)
+	}
+}
+
+func TestBuildStringKeyOnlyRejectsStringMapSequenceBelowLiveID(t *testing.T) {
+	bucket := []byte("rebuild_key_only_bad_sequence")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildNoIndexSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucket).Put(keycodec.StringBytes("orphan-key"), keycodec.AppendU64Bytes(nil, 7))
+	}); err != nil {
+		t.Fatalf("put orphan string record: %v", err)
+	}
+
+	_, err := Build(Config{
+		Bolt:         db,
+		DataBucket:   bucket,
+		StrMapBucket: mapBucket,
+		Schema:       rt,
+		StrKey:       true,
+		StrKeyIndex:  true,
+		Decode: func([]byte) (unsafe.Pointer, error) {
+			t.Fatalf("decode called")
+			return nil, nil
+		},
+	}, newRebuildTestState(rt))
+	if err == nil {
+		t.Fatalf("expected string map sequence error")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "string map sequence 0 lower than max live idx 7") {
+		t.Fatalf("unexpected string map sequence error: %v", err)
 	}
 }
 

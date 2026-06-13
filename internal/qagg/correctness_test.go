@@ -43,6 +43,7 @@ func TestGroupedRecursiveEqualsGroupedByIDForDenseOrdinaryInput(t *testing.T) {
 			qx.MAX("age").AS("age_max"),
 		),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -75,7 +76,7 @@ func TestGroupedRecursiveEqualsGroupedByIDForDenseOrdinaryInput(t *testing.T) {
 
 func TestGroupedSparseHighIDSelectsRecursiveAndMatchesReference(t *testing.T) {
 	db := newQaggSparseIDTestDB(t)
-	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt)
+	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -132,6 +133,7 @@ func TestGroupedOrdinaryMapRouteMatchesRecursive(t *testing.T) {
 			Group("group").
 			Metrics(qx.ROWCOUNT().AS("rows"), qx.SUM("value").AS("sum")),
 		rt,
+		rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -182,6 +184,7 @@ func TestGroupedOrdinaryByIDSharedFieldOverflowReturnsError(t *testing.T) {
 	prepared, err := Prepare(
 		qx.Group("group").Metrics(qx.SUM("value").AS("sum"), qx.AVG("value").AS("avg")),
 		rt,
+		rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -234,6 +237,7 @@ func TestGroupedOrdinaryByIDMapSharedFieldOverflowReturnsError(t *testing.T) {
 	prepared, err := Prepare(
 		qx.Group("group").Metrics(qx.SUM("value").AS("sum"), qx.AVG("value").AS("avg")),
 		rt,
+		rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -281,7 +285,7 @@ func TestGroupedMeasureLookupRoutesMatchRecursive(t *testing.T) {
 	exec := aggregateExecutor{snap: db.snap}
 	for i := range tests {
 		tc := tests[i]
-		prepared, err := Prepare(tc.q, db.rt)
+		prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare: %v", tc.name, err)
 		}
@@ -381,7 +385,7 @@ func TestAggregateExecuteReleaseReuseKeepsResultsOwned(t *testing.T) {
 	for iter := 0; iter < 8; iter++ {
 		for i := range cases {
 			tc := cases[i]
-			prepared, err := Prepare(tc.q, db.rt)
+			prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 			if err != nil {
 				t.Fatalf("%s Prepare: %v", tc.name, err)
 			}
@@ -418,7 +422,7 @@ func TestRowCountAggregateEqualsCountForRepresentativeFilters(t *testing.T) {
 	defer db.exec.ReleaseView(view)
 	for i := range tests {
 		tc := tests[i]
-		countQuery, err := PrepareCount(db.rt, tc.exprs...)
+		countQuery, err := PrepareCount(db.rt.IndexedByName, tc.exprs...)
 		if err != nil {
 			t.Fatalf("%s PrepareCount: %v", tc.name, err)
 		}
@@ -428,7 +432,7 @@ func TestRowCountAggregateEqualsCountForRepresentativeFilters(t *testing.T) {
 			t.Fatalf("%s Count: %v", tc.name, err)
 		}
 
-		prepared, err := Prepare(qx.Query(tc.exprs...).Metrics(qx.ROWCOUNT().AS("rows")), db.rt)
+		prepared, err := Prepare(qx.Query(tc.exprs...).Metrics(qx.ROWCOUNT().AS("rows")), db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare aggregate: %v", tc.name, err)
 		}
@@ -447,7 +451,7 @@ func TestRowCountAggregateEqualsCountForRepresentativeFilters(t *testing.T) {
 func TestDistinctNullHandlingIsPinned(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 
-	prepared, err := Prepare(qx.Aggregate(qx.DISTINCT("segment").AS("segment")), db.rt)
+	prepared, err := Prepare(qx.Aggregate(qx.DISTINCT("segment").AS("segment")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare distinct: %v", err)
 	}
@@ -473,7 +477,7 @@ func TestDistinctNullHandlingIsPinned(t *testing.T) {
 		t.Fatalf("DISTINCT segment rows=%#v", result.Rows)
 	}
 
-	prepared, err = Prepare(qx.Aggregate(qx.COUNT(qx.DISTINCT("segment")).AS("segments")), db.rt)
+	prepared, err = Prepare(qx.Aggregate(qx.COUNT(qx.DISTINCT("segment")).AS("segments")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		db.exec.ReleaseView(view)
 		t.Fatalf("Prepare count distinct: %v", err)
@@ -507,7 +511,7 @@ func TestCountDistinctUniqueFieldUsesNonNullFilterCardinality(t *testing.T) {
 	view := execRuntime.AcquireView(snap)
 	defer execRuntime.ReleaseView(view)
 
-	prepared, err := Prepare(qx.Query(qx.EQ("keep", true)).Metrics(qx.COUNT(qx.DISTINCT("value")).AS("values")), rt)
+	prepared, err := Prepare(qx.Query(qx.EQ("keep", true)).Metrics(qx.COUNT(qx.DISTINCT("value")).AS("values")), rt, rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -530,6 +534,7 @@ func TestUngroupedOrdinarySharedFieldMetricsMatchReference(t *testing.T) {
 			qx.MAX("age").AS("age_max"),
 		),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -588,7 +593,7 @@ func TestUngroupedMeasureMetricsMatchReference(t *testing.T) {
 	for i := range tests {
 		tc := tests[i]
 		db := newQaggTestDB(t, nil)
-		prepared, err := Prepare(tc.q, db.rt)
+		prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare: %v", tc.name, err)
 		}
@@ -611,6 +616,7 @@ func TestGroupedHybridMetricsMatchReference(t *testing.T) {
 			qx.SUM("amount").AS("amount_sum"),
 		),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -640,6 +646,7 @@ func TestGroupedHavingOrderWindowMatchesReference(t *testing.T) {
 			Offset(1).
 			Limit(2),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -660,7 +667,7 @@ func TestAggregateMetamorphicCounts(t *testing.T) {
 	view := db.view()
 	defer db.exec.ReleaseView(view)
 
-	grouped, err := Prepare(qx.Query(qx.GTE("age", 30)).Group("country").Metrics(qx.ROWCOUNT().AS("rows")), db.rt)
+	grouped, err := Prepare(qx.Query(qx.GTE("age", 30)).Group("country").Metrics(qx.ROWCOUNT().AS("rows")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare grouped: %v", err)
 	}
@@ -678,7 +685,7 @@ func TestAggregateMetamorphicCounts(t *testing.T) {
 		groupedSum += v
 	}
 
-	ungrouped, err := Prepare(qx.Query(qx.GTE("age", 30)).Metrics(qx.ROWCOUNT().AS("rows")), db.rt)
+	ungrouped, err := Prepare(qx.Query(qx.GTE("age", 30)).Metrics(qx.ROWCOUNT().AS("rows")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare ungrouped: %v", err)
 	}
@@ -695,7 +702,7 @@ func TestAggregateMetamorphicCounts(t *testing.T) {
 		t.Fatalf("sum grouped rows=%d, ungrouped rows=%d", groupedSum, want)
 	}
 
-	countSegment, err := Prepare(qx.Aggregate(qx.COUNT("segment").AS("segment_count")), db.rt)
+	countSegment, err := Prepare(qx.Aggregate(qx.COUNT("segment").AS("segment_count")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare count segment: %v", err)
 	}
@@ -793,6 +800,7 @@ func TestPrepareAggregateOrderUniqueRequiresGroupCoverage(t *testing.T) {
 			SortOut("rows").
 			Limit(2),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare metric order: %v", err)
@@ -809,6 +817,7 @@ func TestPrepareAggregateOrderUniqueRequiresGroupCoverage(t *testing.T) {
 			SortOut("segment").
 			Limit(2),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare group order: %v", err)

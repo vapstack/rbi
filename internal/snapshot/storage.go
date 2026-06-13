@@ -129,6 +129,7 @@ func (v *View) retainSharedOwnedStorageFrom(prev *View) {
 	}
 	if prev != nil {
 		indexdata.RetainSharedFieldStorageSlots(v.Index, prev.Index)
+		indexdata.RetainSharedFieldStorage(v.KeyIndex, prev.KeyIndex)
 		indexdata.RetainSharedFieldStorageSlots(v.NilIndex, prev.NilIndex)
 		indexdata.RetainSharedFieldStorageSlots(v.LenIndex, prev.LenIndex)
 		indexdata.RetainSharedMeasureStorageSlots(v.Measure, prev.Measure)
@@ -140,6 +141,7 @@ func (v *View) releaseStorage() {
 		v.universeOwner.release()
 	}
 	indexdata.ReleaseFieldStorageSlots(v.Index)
+	v.KeyIndex.Release()
 	indexdata.ReleaseFieldStorageSlots(v.NilIndex)
 	indexdata.ReleaseFieldStorageSlots(v.LenIndex)
 	indexdata.ReleaseMeasureStorageSlots(v.Measure)
@@ -147,6 +149,7 @@ func (v *View) releaseStorage() {
 		pooled.ReleaseBoolSlice(v.LenZeroComplement)
 	}
 	v.Index = nil
+	v.KeyIndex = indexdata.FieldStorage{}
 	v.NilIndex = nil
 	v.LenIndex = nil
 	v.Measure = nil

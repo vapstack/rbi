@@ -85,7 +85,7 @@ func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 // ScanKeys iterates over live keys greater than or equal to seek and calls fn
 // for each key. Scan stops when fn returns false or a non-nil error.
 //
-// Numeric indexed DB iterates the current runtime universe snapshot.
+// Indexed DB iterates the current in-memory snapshot.
 // Other modes scan the data bucket inside a read-only transaction which remains
 // open for the duration of the scan.
 //
@@ -100,6 +100,9 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 
 	if !db.strKey && db.index != nil {
 		return db.index.ScanKeys(keycodec.UserKeyUint(seek), keycodec.UserKeyUintScanFunc(fn))
+	}
+	if db.strKey && db.index != nil && db.index.HasStringKeyIndex() {
+		return db.index.ScanStringKeys(keycodec.UserKeyString(seek), keycodec.UserKeyStringScanFunc(fn))
 	}
 
 	tx, err := db.bolt.Begin(false)

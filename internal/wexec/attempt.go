@@ -22,8 +22,11 @@ type prepared struct {
 	idx      uint64
 	idxNew   bool
 	oldVal   unsafe.Pointer
+	snapOld  unsafe.Pointer
 	newVal   unsafe.Pointer
 }
+
+var snapshotOldValueExists byte
 
 func assignPreparedErr(ops []prepared, err error) {
 	for _, op := range ops {
@@ -60,6 +63,7 @@ type attemptState struct {
 
 	preparedSnapshots []snapshot.BatchEntry
 	acceptedSnapshots []snapshot.BatchEntry
+	acceptedKeyDeltas []snapshot.KeyDelta
 
 	stateByUintID      map[uint64]int
 	stateByUintIDCap   int
@@ -116,7 +120,7 @@ func (b *Batcher) ensureIdx(att *attemptState, state *recordState, id keycodec.D
 }
 
 func (b *Batcher) prepareSet(att *attemptState, req *request) {
-	needOldValue := b.indexed || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0
+	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0
 	state, err := b.loadState(att, req, b.strKey || needOldValue, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
@@ -124,6 +128,10 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 	}
 
 	oldVal := state.value
+	snapOld := oldVal
+	if snapOld == nil && state.exists && b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() {
+		snapOld = unsafe.Pointer(&snapshotOldValueExists)
+	}
 	newVal := req.setValue
 	payload := req.payloadBytes()
 	physical := payload
@@ -184,6 +192,10 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 	}
 
+	if b.strKey && !state.exists {
+		state.idxKnown = false
+		state.idxNew = false
+	}
 	if b.strKey || b.indexed {
 		if err = b.ensureIdx(att, state, req.id, true); err != nil {
 			req.Err = err
@@ -191,10 +203,6 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 	}
 	idxNew := state.idxNew
-	if b.strKey && !state.exists {
-		idxNew = true
-		state.idxNew = true
-	}
 
 	att.prepared = append(att.prepared, prepared{
 		req:      req,
@@ -204,12 +212,13 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		idx:      state.idx,
 		idxNew:   idxNew,
 		oldVal:   oldVal,
+		snapOld:  snapOld,
 		newVal:   newVal,
 	})
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
 			ID:  state.idx,
-			Old: oldVal,
+			Old: snapOld,
 			New: newVal,
 		})
 	}
@@ -237,6 +246,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	}
 
 	oldVal := state.value
+	snapOld := oldVal
 	newVal, err := b.ops.Decode(state.payloadBytes())
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrRedecodeValue, err)
@@ -295,12 +305,13 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 		idx:      state.idx,
 		idxNew:   state.idxNew,
 		oldVal:   oldVal,
+		snapOld:  snapOld,
 		newVal:   newVal,
 	})
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
 			ID:        state.idx,
-			Old:       oldVal,
+			Old:       snapOld,
 			New:       newVal,
 			Patch:     req.patch,
 			PatchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
@@ -312,16 +323,24 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 }
 
 func (b *Batcher) prepareDelete(att *attemptState, req *request) {
-	state, err := b.loadState(att, req, true, true)
+	needOldValue := true
+	if b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() && len(req.beforeCommit) == 0 {
+		needOldValue = false
+	}
+	state, err := b.loadState(att, req, true, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
 	}
-	if state.value == nil {
+	if !state.exists {
 		return
 	}
 
 	oldVal := state.value
+	snapOld := oldVal
+	if snapOld == nil && !needOldValue {
+		snapOld = unsafe.Pointer(&snapshotOldValueExists)
+	}
 	if b.strKey || b.indexed {
 		if err = b.ensureIdx(att, state, req.id, false); err != nil {
 			req.Err = err
@@ -330,17 +349,18 @@ func (b *Batcher) prepareDelete(att *attemptState, req *request) {
 	}
 
 	att.prepared = append(att.prepared, prepared{
-		req:    req,
-		key:    state.key,
-		idx:    state.idx,
-		idxNew: state.idxNew,
-		oldVal: oldVal,
-		newVal: nil,
+		req:     req,
+		key:     state.key,
+		idx:     state.idx,
+		idxNew:  state.idxNew,
+		oldVal:  oldVal,
+		snapOld: snapOld,
+		newVal:  nil,
 	})
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
 			ID:  state.idx,
-			Old: oldVal,
+			Old: snapOld,
 		})
 	}
 	state.value = nil
@@ -668,13 +688,36 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	snap := snapshot.BuildInPlace(
+	var keyDeltas []snapshot.KeyDelta
+	if b.strKey && b.snapshotOps.StrKeyIndex {
+		if cap(att.acceptedKeyDeltas) < len(att.accepted) {
+			att.acceptedKeyDeltas = slices.Grow(att.acceptedKeyDeltas, len(att.accepted))
+		}
+		keyDeltas = att.acceptedKeyDeltas[:0]
+		for i := range att.accepted {
+			op := att.accepted[i]
+			switch op.req.op {
+			case opSet:
+				if op.idxNew && op.newVal != nil {
+					keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String(), Add: true})
+				}
+			case opDelete:
+				if op.snapOld != nil {
+					keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String()})
+				}
+			}
+		}
+		att.acceptedKeyDeltas = keyDeltas
+	}
+
+	snap := snapshot.BuildInPlaceWithKeyDeltas(
 		seq,
 		b.snapshotOps.Manager.Current(),
 		b.snapshotOps.Schema,
 		b.snapshotOps.CacheConfig,
 		b.snapshotOps.PatchFields,
 		att.acceptedSnapshots,
+		keyDeltas,
 	)
 	b.snapshotOps.Manager.Stage(snap)
 
@@ -748,6 +791,9 @@ func (st *attemptState) cleanup() {
 
 	clear(st.acceptedSnapshots)
 	st.acceptedSnapshots = st.acceptedSnapshots[:0]
+
+	clear(st.acceptedKeyDeltas)
+	st.acceptedKeyDeltas = st.acceptedKeyDeltas[:0]
 
 	st.uniqueIdxs = st.uniqueIdxs[:0]
 

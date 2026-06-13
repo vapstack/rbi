@@ -19,12 +19,13 @@ import (
 )
 
 type LoadConfig struct {
-	File       string
-	DBPath     string
-	Bucket     []byte
-	CurrentSeq uint64
-	Schema     *schema.Schema
-	StrKey     bool
+	File        string
+	DBPath      string
+	Bucket      []byte
+	CurrentSeq  uint64
+	Schema      *schema.Schema
+	StrKey      bool
+	StrKeyIndex bool
 }
 
 type LoadResult struct {
@@ -33,15 +34,18 @@ type LoadResult struct {
 	SkipFields        map[string]struct{}
 	SkipMeasureFields map[string]struct{}
 	LenLoaded         bool
+	KeyIndexLoaded    bool
 }
 
 type StoreConfig struct {
-	File         string
-	BucketSeq    uint64
-	Schema       *schema.Schema
-	StrKey       bool
-	Snapshot     *snapshot.View
-	PlannerStats *rbistats.PlannerSnapshot
+	File           string
+	BucketSeq      uint64
+	Schema         *schema.Schema
+	StrKey         bool
+	StrKeyIndex    bool
+	KeyIndexLoaded bool
+	Snapshot       *snapshot.View
+	PlannerStats   *rbistats.PlannerSnapshot
 }
 
 const fileBufferSize = 64 << 10
@@ -88,16 +92,16 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 	diag.versionKnown = true
 
 	switch ver {
-	case persistedIndexVersion:
-		result, err = loadV28(reader, cfg)
+	case 29:
+		result, err = loadV29(reader, cfg)
 	default:
 		return LoadResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", rbierrors.ErrPersistedIndexInvalid, ver))
 	}
 	if err != nil {
 		if errors.Is(err, rbierrors.ErrPersistedIndexStale) || errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
-			return LoadResult{}, diag.wrap("load_v28", err)
+			return LoadResult{}, diag.wrap("load_index", err)
 		}
-		return LoadResult{}, diag.wrap("load_v28", fmt.Errorf("error loading index: %w", err))
+		return LoadResult{}, diag.wrap("load_index", fmt.Errorf("error loading index: %w", err))
 	}
 	return result, nil
 }
@@ -129,7 +133,7 @@ func Store(cfg StoreConfig) (err error) {
 	}()
 
 	buf := bufio.NewWriterSize(f, fileBufferSize)
-	if err = storeV28(buf, cfg); err != nil {
+	if err = storeV29(buf, cfg); err != nil {
 		return err
 	}
 
@@ -155,7 +159,7 @@ func Store(cfg StoreConfig) (err error) {
 	return nil
 }
 
-func loadV28(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
+func loadV29(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading bucket sequence: %w", err)
@@ -168,7 +172,7 @@ func loadV28(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 		return LoadResult{}, err
 	}
 
-	result, err := loadPayload(reader, cfg.Schema)
+	result, err := loadPayloadWithKey(reader, cfg.Schema, cfg.StrKey, cfg.StrKeyIndex)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("%w: %w", rbierrors.ErrPersistedIndexInvalid, err)
 	}
@@ -193,6 +197,10 @@ func readKeyStorageHeader(reader *bufio.Reader, cfg LoadConfig) error {
 }
 
 func loadPayload(reader *bufio.Reader, s *schema.Schema) (LoadResult, error) {
+	return loadPayloadWithKey(reader, s, false, false)
+}
+
+func loadPayloadWithKey(reader *bufio.Reader, s *schema.Schema, strKey, strKeyIndex bool) (LoadResult, error) {
 	universe, err := posting.ReadFrom(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("decode: reading universe: %w", err)
@@ -236,6 +244,17 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema) (LoadResult, error) {
 		return LoadResult{}, fmt.Errorf("decode: reading measure index sections: %w", err)
 	}
 	defer indexdata.ReleaseMeasureStorageMap(measureIndexes)
+
+	keyIndex, keyIndexLoaded, err := readKeyIndexSection(reader, strKey, strKeyIndex)
+	if err != nil {
+		return LoadResult{}, fmt.Errorf("decode: reading key index section: %w", err)
+	}
+	keyIndexOwned := true
+	defer func() {
+		if keyIndexOwned {
+			keyIndex.Release()
+		}
+	}()
 
 	plannerStats, err := readPlannerStatsSnapshot(reader, compatible)
 	if err != nil {
@@ -316,6 +335,7 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema) (LoadResult, error) {
 
 	storage := snapshot.Storage{
 		Index:             index,
+		KeyIndex:          keyIndex,
 		NilIndex:          nilIndex,
 		LenIndex:          lenIndex,
 		LenZeroComplement: lenZeroComplement,
@@ -323,17 +343,19 @@ func loadPayload(reader *bufio.Reader, s *schema.Schema) (LoadResult, error) {
 		Universe:          universe,
 	}
 	universeOwned = false
+	keyIndexOwned = false
 	return LoadResult{
 		Storage:           storage,
 		PlannerStats:      plannerStats,
 		SkipFields:        skipFields,
 		SkipMeasureFields: skipMeasureFields,
 		LenLoaded:         lenLoaded,
+		KeyIndexLoaded:    keyIndexLoaded,
 	}, nil
 }
 
-func storeV28(writer *bufio.Writer, cfg StoreConfig) error {
-	if err := writer.WriteByte(persistedIndexVersion); err != nil {
+func storeV29(writer *bufio.Writer, cfg StoreConfig) error {
+	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
 	if err := writeSidecarUvarint(writer, cfg.BucketSeq); err != nil {
@@ -342,7 +364,7 @@ func storeV28(writer *bufio.Writer, cfg StoreConfig) error {
 	if err := writeKeyStorageHeader(writer, cfg); err != nil {
 		return err
 	}
-	return storePayload(writer, cfg.Schema, cfg.Snapshot, cfg.PlannerStats)
+	return storePayloadWithKey(writer, cfg.Schema, cfg.Snapshot, cfg.PlannerStats, cfg.StrKey && cfg.StrKeyIndex, cfg.KeyIndexLoaded)
 }
 
 func writeKeyStorageHeader(writer *bufio.Writer, cfg StoreConfig) error {
@@ -359,6 +381,10 @@ func writeKeyStorageHeader(writer *bufio.Writer, cfg StoreConfig) error {
 }
 
 func storePayload(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, plannerStats *rbistats.PlannerSnapshot) error {
+	return storePayloadWithKey(writer, s, snap, plannerStats, false, false)
+}
+
+func storePayloadWithKey(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, plannerStats *rbistats.PlannerSnapshot, strKeyIndex, keyIndexLoaded bool) error {
 	universe := snap.Universe.Borrow()
 	if err := universe.WriteTo(writer); err != nil {
 		return fmt.Errorf("encode: writing universe: %w", err)
@@ -428,7 +454,61 @@ func storePayload(writer *bufio.Writer, s *schema.Schema, snap *snapshot.View, p
 		}
 	}
 
+	if err := writeKeyIndexSection(writer, snap.KeyIndex, strKeyIndex, keyIndexLoaded); err != nil {
+		return err
+	}
+
 	return writePlannerStatsSnapshot(writer, plannerStats)
+}
+
+func readKeyIndexSection(reader *bufio.Reader, strKey, strKeyIndex bool) (indexdata.FieldStorage, bool, error) {
+	state, err := reader.ReadByte()
+	if err != nil {
+		return indexdata.FieldStorage{}, false, fmt.Errorf("reading key index state: %w", err)
+	}
+	if !strKey && state != keyIndexStateAbsent {
+		return indexdata.FieldStorage{}, false, fmt.Errorf("numeric key storage cannot have key index state %d", state)
+	}
+	keep := strKey && strKeyIndex
+	switch state {
+	case keyIndexStateAbsent:
+		return indexdata.FieldStorage{}, false, nil
+	case keyIndexStateEmpty:
+		return indexdata.FieldStorage{}, keep, nil
+	case keyIndexStatePresent:
+		storage, err := indexdata.ReadFieldStorage(reader, keep, "key index", schema.ReservedKeyFieldName)
+		if err != nil {
+			return indexdata.FieldStorage{}, false, err
+		}
+		if keep && storage.KeyCount() == 0 {
+			return indexdata.FieldStorage{}, false, fmt.Errorf("present key index section decoded empty storage")
+		}
+		return storage, keep, nil
+	default:
+		return indexdata.FieldStorage{}, false, fmt.Errorf("invalid key index state %d", state)
+	}
+}
+
+func writeKeyIndexSection(writer *bufio.Writer, storage indexdata.FieldStorage, strKeyIndex, keyIndexLoaded bool) error {
+	if !strKeyIndex || !keyIndexLoaded {
+		if err := writer.WriteByte(keyIndexStateAbsent); err != nil {
+			return fmt.Errorf("encode: writing key index state: %w", err)
+		}
+		return nil
+	}
+	if storage.KeyCount() == 0 {
+		if err := writer.WriteByte(keyIndexStateEmpty); err != nil {
+			return fmt.Errorf("encode: writing key index state: %w", err)
+		}
+		return nil
+	}
+	if err := writer.WriteByte(keyIndexStatePresent); err != nil {
+		return fmt.Errorf("encode: writing key index state: %w", err)
+	}
+	if err := storage.WriteInto(writer); err != nil {
+		return fmt.Errorf("encode: writing key index: %w", err)
+	}
+	return nil
 }
 
 func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []schema.IndexedFieldAccessor) []bool {

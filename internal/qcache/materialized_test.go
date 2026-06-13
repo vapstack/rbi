@@ -821,7 +821,7 @@ func TestMaterializedPredCache_InheritNegativeEntry(t *testing.T) {
 	key := MaterializedPredKeyForScalar("name", qir.OpPREFIX, "a")
 	prev.Store(key, posting.List{})
 
-	next.InheritFrom(prev, nil, nil)
+	next.InheritFrom(prev, FieldChangeSet{})
 
 	if got := next.EntryCount(); got != 1 {
 		t.Fatalf("expected negative cache entry to be inherited, got=%d", got)
@@ -843,7 +843,7 @@ func TestMaterializedPredCache_InheritedPostingSurvivesSourceCacheRelease(t *tes
 	prev.Store(key, base.Borrow())
 	base.Release()
 
-	next.InheritFrom(prev, nil, nil)
+	next.InheritFrom(prev, FieldChangeSet{})
 	prev.ReleaseRef()
 
 	cached, ok := next.Load(key)
@@ -875,7 +875,7 @@ func TestMaterializedPredCache_InheritedPostingSurvivesSourceCacheRelease(t *tes
 	}
 }
 
-func TestMaterializedPredCache_InheritClampsOversizedCount(t *testing.T) {
+func TestMaterializedPredCache_InheritCapsOversizedEntries(t *testing.T) {
 	prev := GetMaterializedPredCache(8, 0)
 	next := GetMaterializedPredCache(8, 1)
 	defer prev.ReleaseRef()
@@ -898,13 +898,24 @@ func TestMaterializedPredCache_InheritClampsOversizedCount(t *testing.T) {
 		prev.mu.Unlock()
 	}
 
-	next.InheritFrom(prev, nil, nil)
+	next.InheritFrom(prev, FieldChangeSet{})
 
-	if got := next.EntryCount(); got != 3 {
-		t.Fatalf("expected all entries to be inherited before oversized clamp, got=%d", got)
+	limit := MaterializedPredOversizedLimit(next.Limit())
+	if got := int32(next.EntryCount()); got != limit {
+		t.Fatalf("expected inherited oversized entries to be capped at %d, got=%d", limit, got)
 	}
-	if want, got := MaterializedPredOversizedLimit(next.Limit()), next.OversizedCount(); got != want {
-		t.Fatalf("expected oversized counter clamp to %d, got=%d", want, got)
+	if got := next.OversizedCount(); got != limit {
+		t.Fatalf("expected oversized counter to match inherited entries: got=%d want=%d", got, limit)
+	}
+
+	for _, field := range [...]string{"a", "b", "c"} {
+		next.EvictField(field)
+	}
+	if got := next.EntryCount(); got != 0 {
+		t.Fatalf("expected inherited oversized entries to be evicted, got=%d", got)
+	}
+	if got := next.OversizedCount(); got != 0 {
+		t.Fatalf("expected oversized counter to settle at zero after eviction, got=%d", got)
 	}
 }
 
@@ -930,7 +941,7 @@ func TestMaterializedPredCache_InheritPreservesRecencyStamps(t *testing.T) {
 	prev.count.Add(2)
 	prev.mu.Unlock()
 
-	next.InheritFrom(prev, nil, nil)
+	next.InheritFrom(prev, FieldChangeSet{})
 
 	next.mu.RLock()
 	gotA, okA := next.lookupLocked(&keyA)

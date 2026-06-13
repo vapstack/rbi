@@ -13,6 +13,26 @@ import (
 
 const normalizedScalarBoundCacheMaxEntries = 8
 
+var stringKeyField = schema.Field{
+	Name:      schema.ReservedKeyFieldName,
+	Unique:    true,
+	IndexKind: schema.IndexUnique,
+	Kind:      reflect.String,
+	KeyKind:   schema.FieldWriteKeysString,
+	DBName:    schema.ReservedKeyFieldName,
+	JSONName:  schema.ReservedKeyFieldName,
+}
+
+var numericKeyField = schema.Field{
+	Name:      schema.ReservedKeyFieldName,
+	Unique:    true,
+	IndexKind: schema.IndexUnique,
+	Kind:      reflect.Uint64,
+	KeyKind:   schema.FieldWriteKeysOrderedU64,
+	DBName:    schema.ReservedKeyFieldName,
+	JSONName:  schema.ReservedKeyFieldName,
+}
+
 type normalizedScalarBoundCacheKind uint8
 
 const (
@@ -102,7 +122,7 @@ func normalizedScalarBoundCacheValue(v reflect.Value, fm *schema.Field) (normali
 }
 
 func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (normalizedScalarBound, bool) {
-	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
+	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
 	if !ok {
 		return normalizedScalarBound{}, false
 	}
@@ -145,7 +165,7 @@ func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (norma
 }
 
 func (qv *View) storeNormalizedScalarBound(expr qir.Expr, v reflect.Value, bound normalizedScalarBound) {
-	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
+	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
 	if !ok {
 		return
 	}
@@ -173,6 +193,13 @@ func (qv *View) indexedFieldAccessorByName(field string) (schema.IndexedFieldAcc
 	return acc, ok
 }
 
+func (qv *View) fieldByOrdinal(ordinal int) (queryField, bool) {
+	if ordinal < 0 || ordinal >= len(qv.exec.fields) {
+		return queryField{}, false
+	}
+	return qv.exec.fields[ordinal], true
+}
+
 func (qv *View) indexedFieldAccessor(field string, ordinal int) (schema.IndexedFieldAccessor, bool) {
 	if acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal); ok {
 		return acc, true
@@ -184,117 +211,146 @@ func (qv *View) indexedFieldAccessor(field string, ordinal int) (schema.IndexedF
 }
 
 func (qv *View) fieldOrdinalByName(field string) int {
-	acc, ok := qv.indexedFieldAccessorByName(field)
+	ordinal, ok := qv.exec.fieldByName[field]
 	if !ok {
-		return -1
+		return qir.NoFieldOrdinal
 	}
-	return acc.Ordinal
+	return ordinal
 }
 
 func (qv *View) indexedFieldAccessorByOrdinal(ordinal int) (schema.IndexedFieldAccessor, bool) {
-	if ordinal < 0 || ordinal >= len(qv.exec.Schema.Indexed) {
+	field, ok := qv.fieldByOrdinal(ordinal)
+	if !ok || field.kind != queryFieldOrdinary {
 		return schema.IndexedFieldAccessor{}, false
 	}
-	return qv.exec.Schema.Indexed[ordinal], true
+	return qv.exec.Schema.Indexed[field.storageOrdinal], true
 }
 
 func (qv *View) fieldMeta(field string, ordinal int) *schema.Field {
-	acc, ok := qv.indexedFieldAccessor(field, ordinal)
-	if !ok {
-		return nil
+	if f, ok := qv.fieldByOrdinal(ordinal); ok {
+		return f.meta
 	}
-	return acc.Field
+	if field != "" {
+		if f, ok := qv.fieldByOrdinal(qv.fieldOrdinalByName(field)); ok {
+			return f.meta
+		}
+	}
+	return nil
 }
 
-func (qv *View) fieldMetaByExpr(expr qir.Expr) *schema.Field {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
+func (qv *View) fieldMetaByOrdinal(ordinal int) *schema.Field {
+	field, ok := qv.fieldByOrdinal(ordinal)
 	if !ok {
 		return nil
 	}
-	return acc.Field
-}
-
-func (qv *View) fieldMetaByOrder(order qir.Order) *schema.Field {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
-	if !ok {
-		return nil
-	}
-	return acc.Field
+	return field.meta
 }
 
 func (qv *View) SnapshotUniverseCardinality() uint64 {
 	return qv.snap.Universe.Cardinality()
 }
 
-func fieldIndexViewFromSlots(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldIndexView {
-	if acc.Ordinal >= len(slots) {
-		return indexdata.FieldIndexView{}
-	}
-	return indexdata.NewFieldIndexViewFromStorage(slots[acc.Ordinal])
-}
-
-func (qv *View) fieldIndexViewFromSlotsByOrdinal(slots []indexdata.FieldStorage, ordinal int) indexdata.FieldIndexView {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
+func (qv *View) fieldNameByOrdinal(ordinal int) string {
+	field, ok := qv.fieldByOrdinal(ordinal)
 	if !ok {
-		return indexdata.FieldIndexView{}
+		return ""
 	}
-	return fieldIndexViewFromSlots(slots, acc)
+	return field.name
 }
 
-func (qv *View) fieldIndexViewFromSlotsRef(slots []indexdata.FieldStorage, field string, ordinal int) indexdata.FieldIndexView {
-	acc, ok := qv.indexedFieldAccessor(field, ordinal)
-	if !ok {
-		return indexdata.FieldIndexView{}
-	}
-	return fieldIndexViewFromSlots(slots, acc)
-}
-
-func (qv *View) fieldIndexViewFromSlotsByName(slots []indexdata.FieldStorage, field string) indexdata.FieldIndexView {
-	acc, ok := qv.indexedFieldAccessorByName(field)
-	if !ok {
-		return indexdata.FieldIndexView{}
-	}
-	return fieldIndexViewFromSlots(slots, acc)
-}
-
-func (qv *View) fieldIndexViewFromSlotsForExpr(slots []indexdata.FieldStorage, expr qir.Expr) indexdata.FieldIndexView {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
-	if !ok {
-		return indexdata.FieldIndexView{}
-	}
-	return fieldIndexViewFromSlots(slots, acc)
-}
-
-func (qv *View) fieldIndexViewFromSlotsForOrder(slots []indexdata.FieldStorage, order qir.Order) indexdata.FieldIndexView {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
-	if !ok {
-		return indexdata.FieldIndexView{}
-	}
-	return fieldIndexViewFromSlots(slots, acc)
-}
-
-func (qv *View) hasIndexedFieldForExpr(expr qir.Expr) bool {
-	_, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
+func (qv *View) hasFieldOrdinal(ordinal int) bool {
+	_, ok := qv.fieldByOrdinal(ordinal)
 	return ok
 }
 
-func (qv *View) hasIndexedFieldForOrder(order qir.Order) bool {
-	_, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
-	return ok
+func (qv *View) hasIndexedFieldOrdinal(ordinal int) bool {
+	return qv.hasFieldOrdinal(ordinal)
+}
+
+func (qv *View) indexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	field, ok := qv.fieldByOrdinal(ordinal)
+	if !ok {
+		return indexdata.FieldIndexView{}
+	}
+	switch field.kind {
+	case queryFieldOrdinary:
+		return indexdata.NewFieldIndexViewFromStorage(qv.snap.Index[field.storageOrdinal])
+	case queryFieldStringKey:
+		return indexdata.NewFieldIndexViewFromStorage(qv.snap.KeyIndex)
+	default:
+		return indexdata.FieldIndexView{}
+	}
+}
+
+func (qv *View) nilIndexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	field, ok := qv.fieldByOrdinal(ordinal)
+	if !ok || field.kind != queryFieldOrdinary {
+		return indexdata.FieldIndexView{}
+	}
+	return indexdata.NewFieldIndexViewFromStorage(qv.snap.NilIndex[field.storageOrdinal])
+}
+
+func (qv *View) lenIndexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	field, ok := qv.fieldByOrdinal(ordinal)
+	if !ok || field.kind != queryFieldOrdinary {
+		return indexdata.FieldIndexView{}
+	}
+	return indexdata.NewFieldIndexViewFromStorage(qv.snap.LenIndex[field.storageOrdinal])
+}
+
+func (qv *View) indexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	if qv.hasFieldOrdinal(ordinal) {
+		return qv.indexViewByOrdinal(ordinal)
+	}
+	if field == "" {
+		return indexdata.FieldIndexView{}
+	}
+	return qv.indexViewByOrdinal(qv.fieldOrdinalByName(field))
+}
+
+func (qv *View) nilIndexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	if qv.hasFieldOrdinal(ordinal) {
+		return qv.nilIndexViewByOrdinal(ordinal)
+	}
+	if field == "" {
+		return indexdata.FieldIndexView{}
+	}
+	return qv.nilIndexViewByOrdinal(qv.fieldOrdinalByName(field))
+}
+
+func (qv *View) lenIndexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	if qv.hasFieldOrdinal(ordinal) {
+		return qv.lenIndexViewByOrdinal(ordinal)
+	}
+	if field == "" {
+		return indexdata.FieldIndexView{}
+	}
+	return qv.lenIndexViewByOrdinal(qv.fieldOrdinalByName(field))
+}
+
+func (qv *View) indexViewByName(field string) indexdata.FieldIndexView {
+	return qv.indexViewByOrdinal(qv.fieldOrdinalByName(field))
+}
+
+func (qv *View) nilIndexViewByName(field string) indexdata.FieldIndexView {
+	return qv.nilIndexViewByOrdinal(qv.fieldOrdinalByName(field))
+}
+
+func (qv *View) lenIndexViewByName(field string) indexdata.FieldIndexView {
+	return qv.lenIndexViewByOrdinal(qv.fieldOrdinalByName(field))
 }
 
 func (qv *View) isLenZeroComplementOrdinal(ordinal int) bool {
-	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
-	if !ok || acc.Ordinal >= len(qv.lenZeroComplement) {
+	field, ok := qv.fieldByOrdinal(ordinal)
+	if !ok || field.kind != queryFieldOrdinary {
 		return false
 	}
-	return qv.lenZeroComplement[acc.Ordinal]
+	return qv.lenZeroComplement[field.storageOrdinal]
 }
 
 func (qv *View) isLenZeroComplementRef(field string, ordinal int) bool {
-	acc, ok := qv.indexedFieldAccessor(field, ordinal)
-	if !ok {
-		return false
+	if qv.hasFieldOrdinal(ordinal) {
+		return qv.isLenZeroComplementOrdinal(ordinal)
 	}
-	return qv.isLenZeroComplementOrdinal(acc.Ordinal)
+	return qv.isLenZeroComplementOrdinal(qv.fieldOrdinalByName(field))
 }

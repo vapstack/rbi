@@ -80,6 +80,10 @@ type aggregateRouteDecision struct {
 	groupMapLen         uint64
 }
 
+type aggregateCountFacts struct {
+	filterCardinality uint64
+}
+
 type aggregateDistinctFacts struct {
 	filterCardinality uint64
 	ordinaryKeyCount  uint64
@@ -127,10 +131,12 @@ type aggregateGroupedFacts struct {
 	byIDMapLen    uint64
 }
 
-func selectCountAggregate() aggregateRouteDecision {
+func selectCountAggregate(facts aggregateCountFacts) aggregateRouteDecision {
 	return aggregateRouteDecision{
-		route:       aggregateRouteRowCount,
-		filterInput: aggregateFilterInputCardinality,
+		route:              aggregateRouteRowCount,
+		filterInput:        aggregateFilterInputCardinality,
+		selectedCost:       float64(facts.filterCardinality),
+		expectedFilterRows: facts.filterCardinality,
 	}
 }
 
@@ -262,7 +268,7 @@ func (ae *aggregateExecutor) collectGroupedFacts(q *Query, ids posting.List) agg
 				fieldRows := universe
 				nilOV := indexdata.NewFieldIndexViewFromStorage(ae.snap.NilIndex[ordinal])
 				if nilOV.KeyCount() != 0 {
-					fieldRows -= nilOV.LookupPostingRetained(indexdata.NilIndexEntryKey).Cardinality()
+					fieldRows -= nilOV.LookupCardinality(indexdata.NilIndexEntryKey)
 				}
 				facts.ordinaryKeyCount += uint64(ov.KeyCount())
 				facts.metricRows += fieldRows

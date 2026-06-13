@@ -481,7 +481,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 		}
 	}
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	isSliceOrderField := fm != nil && fm.Slice
 	if !result.neg && !isSliceOrderField && !all && need > 0 && resultCard <= 4096 {
 		if (fm == nil || !fm.Ptr) && uint64(ov.KeyCount()) >= resultCard*8 {
@@ -504,7 +504,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 		if includeNilTail && fm != nil && fm.Ptr {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
-				qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, o).LookupPostingRetained(indexdata.NilIndexEntryKey),
+				qv.nilIndexViewByOrdinal(o.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey),
 				result,
 			)
 		}
@@ -534,7 +534,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 	}
 
 	if includeNilTail && fm != nil && fm.Ptr {
-		nilIDs := qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, o).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		nilIDs := qv.nilIndexViewByOrdinal(o.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
@@ -704,14 +704,14 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 		return nil, nil
 	}
 
-	vals, err := qv.orderDataValues(o.Data, qv.fieldMetaByOrder(o))
+	vals, err := qv.orderDataValues(o.Data, qv.fieldMetaByOrdinal(o.FieldOrdinal))
 	if err != nil {
 		return nil, err
 	}
 	if vals != nil {
 		defer keycodec.ReleaseIndexLookupKeySlice(vals)
 	}
-	if fm := qv.fieldMetaByOrder(o); fm != nil && !fm.Slice {
+	if fm := qv.fieldMetaByOrdinal(o.FieldOrdinal); fm != nil && !fm.Slice {
 		return qv.queryOrderArrayPosScalarIndexView(result, qv.exec.FieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
 
@@ -807,7 +807,7 @@ func (qv *View) collectArrayPosOrderFacts(q *qir.Shape, facts *plannerArrayPosOr
 		return false
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || !fm.Slice {
 		return false
 	}
@@ -815,7 +815,7 @@ func (qv *View) collectArrayPosOrderFacts(q *qir.Shape, facts *plannerArrayPosOr
 	facts.expr = e
 	facts.order = q.Order
 	facts.fm = fm
-	facts.ov = qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, q.Order)
+	facts.ov = qv.indexViewByOrdinal(q.Order.FieldOrdinal)
 	return true
 }
 
@@ -920,7 +920,7 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 	defer keycodec.ReleaseIndexLookupKeySlice(orderVals)
 
 	ov := facts.ov
-	if !ov.HasData() && !qv.hasIndexedFieldForOrder(facts.order) {
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(facts.order.FieldOrdinal) {
 		return nil, false, nil
 	}
 
@@ -1021,7 +1021,7 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 
 	nilOV := indexdata.FieldIndexView{}
 	if fm := qv.fieldMeta(field, fieldOrdinal); fm != nil && fm.Ptr {
-		nilOV = qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, fieldOrdinal)
+		nilOV = qv.nilIndexViewRef(field, fieldOrdinal)
 	}
 
 	orderedVals := orderedDistinctLookupKeys(vals, desc)

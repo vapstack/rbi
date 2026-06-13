@@ -464,7 +464,7 @@ func BenchmarkLoadRejects(b *testing.B) {
 	b.Run("StaleSequence", func(b *testing.B) {
 		var buf bytes.Buffer
 		writer := bufio.NewWriter(&buf)
-		if err := writer.WriteByte(persistedIndexVersion); err != nil {
+		if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
 			b.Fatalf("write version: %v", err)
 		}
 		if err := writeSidecarUvarint(writer, benchPersistSeq); err != nil {

@@ -30,8 +30,9 @@ func (qv *View) tryEvalNumericRangeBuckets(field string, fieldOrdinal int, fm *s
 		return postingResult{}, false
 	}
 
-	storage := qv.snap.Index[fieldOrdinal]
-	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
+	desc := qv.exec.fields[fieldOrdinal]
+	storage := qv.snap.Index[desc.storageOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -127,8 +128,9 @@ func (qv *View) tryLoadNumericRangeBuckets(field string, fieldOrdinal int, fm *s
 		return postingResult{}, false
 	}
 
-	storage := qv.snap.Index[fieldOrdinal]
-	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
+	desc := qv.exec.fields[fieldOrdinal]
+	storage := qv.snap.Index[desc.storageOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -187,7 +189,8 @@ func (qv *View) trySnapshotNumericRangeCardinality(field string, fieldOrdinal in
 		return 0, false
 	}
 
-	storage := qv.snap.Index[fieldOrdinal]
+	desc := qv.exec.fields[fieldOrdinal]
+	storage := qv.snap.Index[desc.storageOrdinal]
 	keyCount := storage.KeyCount()
 	if keyCount == 0 || keyCount != ov.KeyCount() {
 		return 0, false

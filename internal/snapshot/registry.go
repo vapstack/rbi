@@ -24,10 +24,6 @@ type Ref struct {
 	refs    atomic.Int64
 }
 
-type PinGuard struct {
-	m *Registry
-}
-
 func NewRegistry(statsEnabled bool) *Registry {
 	return &Registry{
 		bySeq:        make(map[uint64]*Ref, 128),
@@ -149,19 +145,6 @@ func (sm *Registry) PinBySeq(seq uint64) (*View, *Ref, bool) {
 	snap, ref, ok := sm.pinBySeqLocked(seq)
 	sm.mu.RUnlock()
 	return snap, ref, ok
-}
-
-func (sm *Registry) PinGuardLock() PinGuard {
-	sm.mu.RLock()
-	return PinGuard{m: sm}
-}
-
-func (g PinGuard) PinBySeq(seq uint64) (*View, *Ref, bool) {
-	return g.m.pinBySeqLocked(seq)
-}
-
-func (g PinGuard) Unlock() {
-	g.m.mu.RUnlock()
 }
 
 func (sm *Registry) pinBySeqLocked(seq uint64) (*View, *Ref, bool) {

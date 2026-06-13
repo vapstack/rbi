@@ -3,12 +3,15 @@ package wexec
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
@@ -158,6 +161,163 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 	if &op.payload[0] != &op.physical[stringValuePrefixLen] {
 		t.Fatalf("logical payload does not share physical buffer")
 	}
+}
+
+func TestStringKeyIndexDeleteThenReinsertUsesNewDurableID(t *testing.T) {
+	var events []string
+	ex, raw, bucketName, mapBucketName := newStringAttemptTestExecutor(t, &events, "user", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	ex.snapshotOps.StrKeyIndex = true
+	oldIdx := uint64(1)
+	keyMap := indexdata.GetPostingMap()
+	keyMap["user"] = (posting.List{}).BuildAdded(oldIdx)
+	ex.snapshotOps.Manager.Current().KeyIndex = indexdata.NewRegularFieldStorageFromPostingMapOwned(keyMap)
+
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil)
+	setReq := stringSetAttemptReq("user", 9)
+	executeBatchForTest(ex, []*request{delReq, setReq})
+
+	if err := <-delReq.Done; err != nil {
+		t.Fatalf("delete request error = %v", err)
+	}
+	if err := <-setReq.Done; err != nil {
+		t.Fatalf("set request error = %v", err)
+	}
+
+	var newIdx uint64
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(bucketName).Get(keycodec.StringBytes("user"))
+		if len(v) < stringValuePrefixLen {
+			return errors.New("short string value")
+		}
+		newIdx = keycodec.U64FromBytes(v[:stringValuePrefixLen])
+		return nil
+	}); err != nil {
+		t.Fatalf("read string idx: %v", err)
+	}
+	if newIdx == oldIdx {
+		t.Fatalf("reinsert reused durable id %d", oldIdx)
+	}
+	if got := readStringAttemptMap(t, raw, mapBucketName, oldIdx); got != "" {
+		t.Fatalf("old string map entry=%q, want empty", got)
+	}
+	if got := readStringAttemptMap(t, raw, mapBucketName, newIdx); got != "user" {
+		t.Fatalf("new string map entry=%q, want user", got)
+	}
+	ids := indexdata.NewFieldIndexViewFromStorage(ex.snapshotOps.Manager.Current().KeyIndex).LookupPostingRetained("user")
+	if ids.Cardinality() != 1 || ids.Contains(oldIdx) || !ids.Contains(newIdx) {
+		t.Fatalf("key index cardinality=%d old=%v new=%v", ids.Cardinality(), ids.Contains(oldIdx), ids.Contains(newIdx))
+	}
+	ids.Release()
+}
+
+func TestStringKeyIndexSetThenDeleteSameBatchLeavesNoKeyDelta(t *testing.T) {
+	var events []string
+	ex, raw, bucketName, mapBucketName := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	ex.snapshotOps.StrKeyIndex = true
+
+	setReq := stringSetAttemptReq("ghost", 9)
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("ghost", true), nil)
+	executeBatchForTest(ex, []*request{setReq, delReq})
+
+	if err := <-setReq.Done; err != nil {
+		t.Fatalf("set request error = %v", err)
+	}
+	if err := <-delReq.Done; err != nil {
+		t.Fatalf("delete request error = %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		if v := tx.Bucket(bucketName).Get(keycodec.StringBytes("ghost")); v != nil {
+			return fmt.Errorf("ghost data remained: %x", v)
+		}
+		c := tx.Bucket(mapBucketName).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if string(v) == "ghost" {
+				return fmt.Errorf("ghost reverse map remained at idx %d", keycodec.U64FromBytes(k))
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read committed state: %v", err)
+	}
+
+	ids := indexdata.NewFieldIndexViewFromStorage(ex.snapshotOps.Manager.Current().KeyIndex).LookupPostingRetained("ghost")
+	if !ids.IsEmpty() {
+		t.Fatalf("ghost key index posting cardinality=%d", ids.Cardinality())
+	}
+	ids.Release()
+}
+
+func TestStringKeyIndexKeyOnlyExistingSetThenDeleteRemovesSnapshotState(t *testing.T) {
+	var events []string
+	ex, raw, bucketName, mapBucketName := newStringAttemptTestExecutor(t, &events, "user", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	rt, err := schema.Compile(reflect.TypeFor[attemptRec](), schema.Config{Index: map[string]schema.IndexKind{}})
+	if err != nil {
+		t.Fatalf("Compile key-only schema: %v", err)
+	}
+
+	var oldIdx uint64
+	if err = raw.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(bucketName).Get(keycodec.StringBytes("user"))
+		if len(v) < stringValuePrefixLen {
+			return fmt.Errorf("short string value")
+		}
+		oldIdx = keycodec.U64FromBytes(v[:stringValuePrefixLen])
+		return nil
+	}); err != nil {
+		t.Fatalf("read old string idx: %v", err)
+	}
+
+	seed := attemptRec{V: 1}
+	current := snapshot.BuildWithKeyDeltas(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, []snapshot.BatchEntry{
+		{ID: oldIdx, New: unsafe.Pointer(&seed)},
+	}, []snapshot.KeyDelta{{ID: oldIdx, Key: "user", Add: true}})
+	ex.snapshotOps.Manager.Publish(current)
+	ex.schema = rt
+	ex.unique = UniqueContext{}
+	ex.snapshotOps.Schema = rt
+	ex.snapshotOps.PatchFields = rt.Patch.Fields
+	ex.snapshotOps.StrKeyIndex = true
+
+	setReq := stringSetAttemptReq("user", 9)
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil)
+	executeBatchForTest(ex, []*request{setReq, delReq})
+
+	if err := <-setReq.Done; err != nil {
+		t.Fatalf("set request error = %v", err)
+	}
+	if err := <-delReq.Done; err != nil {
+		t.Fatalf("delete request error = %v", err)
+	}
+
+	if err = raw.View(func(tx *bbolt.Tx) error {
+		if v := tx.Bucket(bucketName).Get(keycodec.StringBytes("user")); v != nil {
+			return fmt.Errorf("user data remained: %x", v)
+		}
+		var mapKey [8]byte
+		if v := tx.Bucket(mapBucketName).Get(keycodec.U64BytesWithBuf(oldIdx, &mapKey)); v != nil {
+			return fmt.Errorf("user reverse map remained: %q", v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read committed state: %v", err)
+	}
+
+	snap := ex.snapshotOps.Manager.Current()
+	if got := snap.Universe.Cardinality(); got != 0 {
+		t.Fatalf("snapshot universe cardinality=%d want 0", got)
+	}
+	ids := indexdata.NewFieldIndexViewFromStorage(snap.KeyIndex).LookupPostingRetained("user")
+	if !ids.IsEmpty() {
+		t.Fatalf("user key index posting cardinality=%d", ids.Cardinality())
+	}
+	ids.Release()
 }
 
 func TestSharedRetrySkipsBeforeCommitFailureAndCommitsRest(t *testing.T) {

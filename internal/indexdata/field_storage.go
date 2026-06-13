@@ -525,6 +525,70 @@ func (b *fieldStorageBuilder) finish() FieldStorage {
 	return newChunkedFieldStorage(b.builder.root())
 }
 
+func (b *fieldStorageBuilder) releaseOwned() {
+	b.stream.releaseOwned()
+	b.builder.releaseOwned()
+}
+
+type SortedUniqueStringFieldStorageBuilder struct {
+	entries []Entry
+	builder fieldStorageBuilder
+	capHint int
+	chunked bool
+}
+
+func (b *SortedUniqueStringFieldStorageBuilder) Init(capHint int) {
+	b.capHint = capHint
+	entryCap := min(max(capHint, 1), fieldIndexChunkThreshold)
+	b.entries = GetFieldEntrySlice(entryCap)
+}
+
+func (b *SortedUniqueStringFieldStorageBuilder) AppendBytes(key []byte, id uint64) {
+	ids := (posting.List{}).BuildAdded(id)
+	if b.chunked {
+		b.builder.append(keycodec.FromBytes(key), ids)
+		return
+	}
+	b.entries = append(b.entries, Entry{Key: keycodec.FromBytes(key), IDs: ids})
+	if len(b.entries) < fieldIndexChunkThreshold {
+		return
+	}
+	b.builder.init(max(b.capHint, len(b.entries)), false)
+	for i := range b.entries {
+		b.builder.append(b.entries[i].Key, b.entries[i].IDs)
+	}
+	ReleaseFieldEntrySlice(b.entries)
+	b.entries = nil
+	b.chunked = true
+}
+
+func (b *SortedUniqueStringFieldStorageBuilder) Finish() FieldStorage {
+	if b.chunked {
+		storage := b.builder.finish()
+		*b = SortedUniqueStringFieldStorageBuilder{}
+		return storage
+	}
+	if len(b.entries) == 0 {
+		ReleaseFieldEntrySlice(b.entries)
+		*b = SortedUniqueStringFieldStorageBuilder{}
+		return FieldStorage{}
+	}
+	storage := newFlatFieldStorage(b.entries, nil)
+	*b = SortedUniqueStringFieldStorageBuilder{}
+	return storage
+}
+
+func (b *SortedUniqueStringFieldStorageBuilder) Release() {
+	if b.entries != nil {
+		for i := range b.entries {
+			b.entries[i].IDs.Release()
+		}
+		ReleaseFieldEntrySlice(b.entries)
+	}
+	b.builder.releaseOwned()
+	*b = SortedUniqueStringFieldStorageBuilder{}
+}
+
 func newRegularFieldStorage(entries []Entry) FieldStorage {
 	if len(entries) == 0 {
 		return FieldStorage{}
@@ -607,6 +671,12 @@ func RetainSharedFieldStorageSlots(next, prev []FieldStorage) {
 		if storage == prev[i] {
 			storage.retain()
 		}
+	}
+}
+
+func RetainSharedFieldStorage(next, prev FieldStorage) {
+	if next == prev {
+		next.retain()
 	}
 }
 
@@ -1576,6 +1646,7 @@ func (b *fieldIndexChunkStreamBuilder) publishPendingChunk(builder *fieldIndexCh
 
 func (b *fieldIndexChunkStreamBuilder) releaseActiveScratch() {
 	if b.posts != nil {
+		posting.ReleaseAll(b.posts)
 		posting.ReleaseSlice(b.posts)
 		b.posts = nil
 	}
@@ -1591,6 +1662,24 @@ func (b *fieldIndexChunkStreamBuilder) releaseActiveScratch() {
 	}
 	b.stringKeys = nil
 	b.freeStringKeys = nil
+}
+
+func (b *fieldIndexChunkStreamBuilder) releaseOwned() {
+	if b.pendingPosts != nil {
+		posting.ReleaseAll(b.pendingPosts)
+		posting.ReleaseSlice(b.pendingPosts)
+		b.pendingPosts = nil
+	}
+	if b.pendingNumericKey != nil {
+		pooled.ReleaseUint64Slice(b.pendingNumericKey)
+		b.pendingNumericKey = nil
+	}
+	if b.pendingStringKeys != nil {
+		keycodec.ReleaseIndexKeySlice(b.pendingStringKeys)
+		b.pendingStringKeys = nil
+	}
+	b.pendingRows = 0
+	b.releaseActiveScratch()
 }
 
 func (b *fieldIndexChunkStreamBuilder) sealActiveChunk(builder *fieldIndexChunkBuilder) {

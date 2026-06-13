@@ -2,7 +2,10 @@ package qexec
 
 import (
 	"testing"
+	"unsafe"
 
+	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/rbistats"
 )
 
@@ -69,5 +72,67 @@ func TestPlannerStatsSnapshot_BuildPersistAndPublish(t *testing.T) {
 	}
 	if persisted.Fields["age"] != age {
 		t.Fatalf("loaded persist age stats mismatch: got=%+v want=%+v", persisted.Fields["age"], age)
+	}
+}
+
+func TestPlannerStatsSnapshotIncludesStringKeyIndex(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.enableStringKeyCatalog()
+
+	vals := []testRec{
+		{Name: "alice", Age: 30},
+		{Name: "bob", Age: 31},
+		{Name: "carol", Age: 32},
+	}
+	entries := make([]snapshot.BatchEntry, len(vals))
+	keyDeltas := []snapshot.KeyDelta{
+		{ID: 1, Key: "sku-001", Add: true},
+		{ID: 2, Key: "sku-002", Add: true},
+		{ID: 3, Key: "sku-003", Add: true},
+	}
+	for i := range vals {
+		entries[i] = snapshot.BatchEntry{ID: uint64(i + 1), New: unsafe.Pointer(&vals[i])}
+	}
+	db.seq++
+	db.snap = snapshot.BuildWithKeyDeltas(db.seq, db.snap, db.rt, db.cfg, nil, entries, keyDeltas)
+
+	built := db.exec.BuildPlannerStatsSnapshot(db.snap, 21)
+	assertStringKeyPlannerStats(t, built, uint64(len(vals)))
+
+	loadedFields := make(map[string]rbistats.PlannerField, len(built.Fields)-1)
+	for field, stats := range built.Fields {
+		if field != schema.ReservedKeyFieldName {
+			loadedFields[field] = stats
+		}
+	}
+	db.exec.Stats.Store(&rbistats.PlannerSnapshot{
+		Version: 20,
+		Fields:  loadedFields,
+	})
+	persisted := db.exec.PlannerStatsSnapshotForPersist(db.snap, 22)
+	assertStringKeyPlannerStats(t, persisted, uint64(len(vals)))
+
+	db.exec.PublishLoadedPlannerStats(&rbistats.PlannerSnapshot{
+		Version: 21,
+		Fields:  loadedFields,
+	}, db.snap)
+	loaded := db.exec.Stats.Load()
+	if loaded == nil {
+		t.Fatal("loaded planner stats snapshot is nil")
+	}
+	assertStringKeyPlannerStats(t, loaded, uint64(len(vals)))
+}
+
+func assertStringKeyPlannerStats(t testing.TB, snap *rbistats.PlannerSnapshot, rows uint64) {
+	t.Helper()
+	stats, ok := snap.Fields[schema.ReservedKeyFieldName]
+	if !ok {
+		t.Fatalf("planner stats missing %q", schema.ReservedKeyFieldName)
+	}
+	if stats.DistinctKeys != rows || stats.NonEmptyKeys != rows || stats.TotalBucketCard != rows {
+		t.Fatalf("unexpected $key cardinalities: %+v rows=%d", stats, rows)
+	}
+	if stats.AvgBucketCard != 1 || stats.MaxBucketCard != 1 || stats.P50BucketCard != 1 || stats.P95BucketCard != 1 {
+		t.Fatalf("unexpected $key bucket distribution: %+v", stats)
 	}
 }

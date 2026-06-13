@@ -424,10 +424,10 @@ func (qv *View) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranches) (
 		return analysis, false
 	}
 	order := q.Order
-	if order.Kind != qir.OrderKindBasic || order.FieldOrdinal < 0 {
+	if order.Kind != qir.OrderKindBasic || !qv.hasFieldOrdinal(order.FieldOrdinal) {
 		return analysis, false
 	}
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
+	ov := qv.indexViewByOrdinal(order.FieldOrdinal)
 	if !ov.HasData() {
 		return analysis, false
 	}
@@ -1177,10 +1177,10 @@ func (qv *View) collectMergedBaseScalarRangeFields(
 
 	for _, e := range leaves {
 		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-		if e.Not || e.FieldOrdinal < 0 || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 			continue
 		}
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			continue
 		}
@@ -1221,7 +1221,7 @@ func (qv *View) estimateMergedScalarRangeOrderCost(
 	if qv.exec.Schema.Fields[field] == nil {
 		return 0, 0, false
 	}
-	if !qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field).HasData() {
+	if !qv.indexViewByName(field).HasData() {
 		return 0, 0, false
 	}
 	if bounds.Empty {
@@ -1232,7 +1232,7 @@ func (qv *View) estimateMergedScalarRangeOrderCost(
 	}
 
 	rawSel := 0.0
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
+	ov := qv.indexViewByName(field)
 	br := ov.RangeForBounds(bounds)
 	if br.BaseStart >= br.BaseEnd {
 		return 0, 0, true
@@ -1280,12 +1280,12 @@ func (qv *View) executionOrderShapeInfo(orderField string, leaves []qir.Expr) (h
 		}
 		if e.Not {
 			fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-			if e.FieldOrdinal < 0 || fieldName == orderField {
+			if !qv.hasFieldOrdinal(e.FieldOrdinal) || fieldName == orderField {
 				return false, false
 			}
 			continue
 		}
-		if e.FieldOrdinal < 0 {
+		if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			return false, false
 		}
 		switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
@@ -1323,17 +1323,17 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 	}
 
 	o := q.Order
-	if o.Kind != qir.OrderKindBasic || o.FieldOrdinal < 0 {
+	if o.Kind != qir.OrderKindBasic || !qv.hasFieldOrdinal(o.FieldOrdinal) {
 		return d
 	}
 	orderField := qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return d
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() {
 		return d
 	}
@@ -1549,11 +1549,11 @@ func (qv *View) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Ex
 	restCount := 0
 
 	for _, e := range leaves {
-		if e.Op == qir.OpConst || e.Not || e.FieldOrdinal < 0 {
+		if e.Op == qir.OpConst || e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			return false
 		}
 
-		if isPositiveScalarPrefixLeaf(e) {
+		if qv.isPositiveScalarPrefixLeaf(e) {
 			prefix, ok, err := qv.prepareScalarPrefixRoute(e)
 			if err != nil || !ok {
 				return false
@@ -1583,7 +1583,7 @@ func (qv *View) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Ex
 
 		switch e.Op {
 		case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
-			fm := qv.fieldMetaByExpr(e)
+			fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 			if fm == nil {
 				return false
 			}
@@ -1661,11 +1661,11 @@ func (qv *View) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrde
 	}
 	orderField := qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return d
 	}
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() {
 		return d
 	}
@@ -1826,7 +1826,7 @@ func (qv *View) estimateOrderedAnchorSetupCost(
 
 	for _, e := range leaves {
 		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-		if e.Not || e.FieldOrdinal < 0 || e.Op == qir.OpConst {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || e.Op == qir.OpConst {
 			continue
 		}
 		if fieldName == orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
@@ -1976,7 +1976,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 	}
 
 	for i, e := range leaves {
-		if !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && qv.hasFieldOrdinal(e.FieldOrdinal) && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2153,13 +2153,13 @@ func (qv *View) estimateLeafOrderCost(
 		return 1, 0, false, false, true
 	}
 
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return 0, 0, false, false, false
 	}
-	if qv.fieldMetaByExpr(e) == nil {
+	if qv.fieldMetaByOrdinal(e.FieldOrdinal) == nil {
 		return 0, 0, false, false, false
 	}
-	if !qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e).HasData() {
+	if !qv.indexViewByOrdinal(e.FieldOrdinal).HasData() {
 		return 0, 0, false, false, false
 	}
 
@@ -2179,7 +2179,7 @@ func (qv *View) estimateLeafOrderCost(
 		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(fieldName, e.Value, universe, true)
 
 	default:
-		if !isSimpleScalarRangeOrPrefixLeaf(e) {
+		if !qv.isSimpleScalarRangeOrPrefixLeaf(e) {
 			return 0, 0, false, false, false
 		}
 		rawSel, ok = qv.estimateRangeSelectivity(e, universe, fieldStats)
@@ -2250,13 +2250,13 @@ func (qv *View) estimateEqSelectivity(field string, value any, universe uint64, 
 	}
 
 	if isNil {
-		card := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, field).LookupCardinality(indexdata.NilIndexEntryKey)
+		card := qv.nilIndexViewByName(field).LookupCardinality(indexdata.NilIndexEntryKey)
 		if card == 0 {
 			return 0, true
 		}
 		return float64(card) / float64(universe), true
 	}
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
+	ov := qv.indexViewByName(field)
 	if ov.HasData() {
 		card := lookupScalarCardinality(ov, key)
 		if card == 0 {
@@ -2300,7 +2300,7 @@ func (qv *View) estimateInLikeSelectivity(field string, value any, universe uint
 	sum := uint64(0)
 	minCard := uint64(0)
 
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
+	ov := qv.indexViewByName(field)
 	if !ov.HasData() {
 		if !hasNil {
 			return 0, 0, false
@@ -2319,7 +2319,7 @@ func (qv *View) estimateInLikeSelectivity(field string, value any, universe uint
 	}
 
 	if fm := qv.exec.Schema.Fields[field]; hasNil && fm != nil && !fm.Slice {
-		card := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, field).LookupCardinality(indexdata.NilIndexEntryKey)
+		card := qv.nilIndexViewByName(field).LookupCardinality(indexdata.NilIndexEntryKey)
 		sum += card
 		if minCard == 0 || card < minCard {
 			minCard = card
@@ -2367,7 +2367,7 @@ func (qv *View) estimateRangeSelectivity(e qir.Expr, universe uint64, stats rbis
 		return 1, true
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 	if ov.HasData() {
 		br := ov.RangeForBounds(rb)
 		if br.BaseStart >= br.BaseEnd {
@@ -2400,7 +2400,7 @@ func (qv *View) estimateRangeSelectivity(e qir.Expr, universe uint64, stats rbis
 }
 
 func (qv *View) plannerFieldStats(field string, snap *rbistats.PlannerSnapshot, universe uint64) rbistats.PlannerField {
-	distinct := uint64(qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field).KeyCount())
+	distinct := uint64(qv.indexViewByName(field).KeyCount())
 	return qv.plannerOrderFieldStats(field, snap, universe, distinct)
 }
 

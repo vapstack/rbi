@@ -264,7 +264,7 @@ func plannerGuardrailRunForcedNoOrderRange(
 			return nil, false, err
 		}
 		for _, e := range leaves {
-			if e.Not || !isBoundOp(e.Op) || e.FieldOrdinal < 0 {
+			if e.Not || !isBoundOp(e.Op) || !view.hasFieldOrdinal(e.FieldOrdinal) {
 				continue
 			}
 			f = view.exec.FieldNameByOrdinal(e.FieldOrdinal)
@@ -604,7 +604,7 @@ func plannerGuardrailOrderedLimitBaseCandidate(
 		view.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, 5_000, uint64(viewQ.Limit))
 	}
 
-	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
+	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, viewQ.Order.FieldOrdinal)
 	if ov.RangeForBounds(bounds).Empty() {
 		t.Fatalf("expected non-empty order range")
 	}

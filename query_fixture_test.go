@@ -413,28 +413,28 @@ func fieldValue(rec *Rec, field string) any {
 
 type testExprFieldResolver struct{}
 
-func (testExprFieldResolver) ResolveField(name string) (int, bool) {
+func (testExprFieldResolver) ResolveField(name string) (qir.FieldInfo, bool) {
 	switch name {
 	case "country":
-		return 0, true
+		return qir.FieldInfo{Ordinal: 0, Caps: qir.FieldCapAll}, true
 	case "name":
-		return 1, true
+		return qir.FieldInfo{Ordinal: 1, Caps: qir.FieldCapAll}, true
 	case "email":
-		return 2, true
+		return qir.FieldInfo{Ordinal: 2, Caps: qir.FieldCapAll}, true
 	case "age":
-		return 3, true
+		return qir.FieldInfo{Ordinal: 3, Caps: qir.FieldCapAll}, true
 	case "score":
-		return 4, true
+		return qir.FieldInfo{Ordinal: 4, Caps: qir.FieldCapAll}, true
 	case "active":
-		return 5, true
+		return qir.FieldInfo{Ordinal: 5, Caps: qir.FieldCapAll}, true
 	case "tags":
-		return 6, true
+		return qir.FieldInfo{Ordinal: 6, Caps: qir.FieldCapAll}, true
 	case "full_name", "fullName":
-		return 7, true
+		return qir.FieldInfo{Ordinal: 7, Caps: qir.FieldCapAll}, true
 	case "opt":
-		return 8, true
+		return qir.FieldInfo{Ordinal: 8, Caps: qir.FieldCapAll}, true
 	default:
-		return 0, false
+		return qir.FieldInfo{Ordinal: qir.NoFieldOrdinal}, false
 	}
 }
 

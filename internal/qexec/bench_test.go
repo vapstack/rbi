@@ -2671,11 +2671,11 @@ func benchmarkExecPlanOrderedBasicAnchor(b *testing.B, db *testDB, q *qx.QX) {
 	}
 	view := db.view()
 	order := shape.Order
-	fm := view.fieldMetaByOrder(order)
+	fm := view.fieldMetaByOrdinal(order.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		b.Fatal("ordered basic anchor requires a scalar order field")
 	}
-	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, order)
+	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, order.FieldOrdinal)
 	if !ov.HasData() {
 		b.Fatal("ordered basic anchor requires order index data")
 	}

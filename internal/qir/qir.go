@@ -87,6 +87,22 @@ const (
 
 const NoFieldOrdinal = -1
 
+type FieldCaps uint8
+
+const (
+	FieldCapNilPredicate FieldCaps = 1 << iota
+	FieldCapArrayPredicate
+	FieldCapLenOrder
+	FieldCapPosOrder
+)
+
+const FieldCapAll = FieldCapNilPredicate | FieldCapArrayPredicate | FieldCapLenOrder | FieldCapPosOrder
+
+type FieldInfo struct {
+	Ordinal int
+	Caps    FieldCaps
+}
+
 type Expr struct {
 	Op           Op
 	Not          bool
@@ -113,7 +129,7 @@ type Query struct {
 }
 
 type FieldResolver interface {
-	ResolveField(name string) (int, bool)
+	ResolveField(name string) (FieldInfo, bool)
 }
 
 const (
@@ -151,7 +167,7 @@ func (q *Query) releaseOwned() {
 	q.Limit = 0
 }
 
-func (c *prepareCompiler) fieldOrdinal(name string) (int, bool) {
+func (c *prepareCompiler) fieldInfo(name string) (FieldInfo, bool) {
 	return c.resolve.ResolveField(name)
 }
 
@@ -340,13 +356,16 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 		if len(src.Args) != 1 {
 			return Expr{}, fmt.Errorf("rbi: invalid %s expression", qx.OpISNULL)
 		}
-		_, fieldOrdinal, err := compileFieldRef(&src.Args[0], compiler)
+		field, info, err := compileFieldRef(&src.Args[0], compiler)
 		if err != nil {
 			return Expr{}, err
 		}
+		if info.Caps&FieldCapNilPredicate == 0 {
+			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+		}
 		return Expr{
 			Op:           OpEQ,
-			FieldOrdinal: fieldOrdinal,
+			FieldOrdinal: info.Ordinal,
 			Value:        nil,
 		}, nil
 	case qx.OpPREFIX:
@@ -364,42 +383,70 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 	if len(args) != 2 {
 		return Expr{}, fmt.Errorf("rbi: invalid %v expression", op)
 	}
-	field, fieldOrdinal, err := compileFieldRef(&args[0], compiler)
+	field, info, err := compileFieldRef(&args[0], compiler)
 	if err != nil {
 		return Expr{}, err
 	}
 	if args[1].Kind != qx.KindLIT {
 		return Expr{}, fmt.Errorf("rbi does not support computed predicate values for field %q", field)
 	}
+	if info.Caps&FieldCapNilPredicate == 0 {
+		if args[1].Value == nil {
+			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+		}
+		if op == OpIN {
+			value := reflect.ValueOf(args[1].Value)
+			for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+				if value.IsNil() {
+					return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+				}
+				value = value.Elem()
+			}
+			if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
+				for i := 0; i < value.Len(); i++ {
+					elem := value.Index(i)
+					for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
+						if elem.IsNil() {
+							return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+						}
+						elem = elem.Elem()
+					}
+				}
+			}
+		}
+	}
+	if (op == OpHASALL || op == OpHASANY) && info.Caps&FieldCapArrayPredicate == 0 {
+		return Expr{}, fmt.Errorf("rbi does not support array predicates for %s", field)
+	}
 	return Expr{
 		Op:           op,
 		Not:          not,
-		FieldOrdinal: fieldOrdinal,
+		FieldOrdinal: info.Ordinal,
 		Value:        args[1].Value,
 	}, nil
 }
 
-func compileFieldRef(src *qx.Expr, compiler *prepareCompiler) (string, int, error) {
+func compileFieldRef(src *qx.Expr, compiler *prepareCompiler) (string, FieldInfo, error) {
 	if src.Kind != qx.KindREF || src.Name == "" {
-		return "", NoFieldOrdinal, fmt.Errorf("rbi supports only source-field refs in filters/order")
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("rbi supports only source-field refs in filters/order")
 	}
-	fieldOrdinal, ok := compiler.fieldOrdinal(src.Name)
+	info, ok := compiler.fieldInfo(src.Name)
 	if !ok {
-		return "", NoFieldOrdinal, fmt.Errorf("no index for field: %v", src.Name)
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("no index for field: %v", src.Name)
 	}
-	return src.Name, fieldOrdinal, nil
+	return src.Name, info, nil
 }
 
 func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 	by := &src.By
 	switch by.Kind {
 	case qx.KindREF:
-		_, ordinal, err := compileFieldRef(by, compiler)
+		_, info, err := compileFieldRef(by, compiler)
 		if err != nil {
 			return Order{}, err
 		}
 		return Order{
-			FieldOrdinal: ordinal,
+			FieldOrdinal: info.Ordinal,
 			Kind:         OrderKindBasic,
 			Desc:         src.Desc,
 		}, nil
@@ -410,12 +457,15 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 			if len(by.Args) != 1 {
 				return Order{}, fmt.Errorf("rbi: invalid LEN order expression")
 			}
-			_, ordinal, err := compileFieldRef(&by.Args[0], compiler)
+			field, info, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
 				return Order{}, err
 			}
+			if info.Caps&FieldCapLenOrder == 0 {
+				return Order{}, fmt.Errorf("rbi does not support LEN order for %s", field)
+			}
 			return Order{
-				FieldOrdinal: ordinal,
+				FieldOrdinal: info.Ordinal,
 				Kind:         OrderKindArrayCount,
 				Desc:         src.Desc,
 			}, nil
@@ -424,9 +474,12 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 			if len(by.Args) != 2 {
 				return Order{}, fmt.Errorf("rbi: invalid POS order expression")
 			}
-			field, ordinal, err := compileFieldRef(&by.Args[0], compiler)
+			field, info, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
 				return Order{}, err
+			}
+			if info.Caps&FieldCapPosOrder == 0 {
+				return Order{}, fmt.Errorf("rbi does not support POS order for %s", field)
 			}
 			if by.Args[1].Kind != qx.KindLIT {
 				return Order{}, fmt.Errorf("rbi does not support computed POS order values for field %q", field)
@@ -435,7 +488,7 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 				return Order{}, fmt.Errorf("rbi does not support scalar-string POS order values for field %q", field)
 			}
 			return Order{
-				FieldOrdinal: ordinal,
+				FieldOrdinal: info.Ordinal,
 				Kind:         OrderKindArrayPos,
 				Data:         by.Args[1].Value,
 				Desc:         src.Desc,

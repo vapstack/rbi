@@ -7,15 +7,41 @@ import (
 	"time"
 
 	"github.com/vapstack/pooled"
+	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/rbistats"
 	"github.com/vapstack/rbi/rbitrace"
 )
 
+type KeyMode uint8
+
+const (
+	KeyModeNone KeyMode = iota
+	KeyModeString
+	KeyModeNumeric
+)
+
+type queryFieldKind uint8
+
+const (
+	queryFieldOrdinary queryFieldKind = iota
+	queryFieldStringKey
+	queryFieldNumericKey
+)
+
+type queryField struct {
+	name           string
+	kind           queryFieldKind
+	ordinal        int
+	storageOrdinal int
+	meta           *schema.Field
+}
+
 type Config struct {
-	Schema *schema.Schema
-	StrKey bool
+	Schema  *schema.Schema
+	StrKey  bool
+	KeyMode KeyMode
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -28,8 +54,9 @@ type Config struct {
 }
 
 type Runtime struct {
-	Schema *schema.Schema
-	StrKey bool
+	Schema  *schema.Schema
+	StrKey  bool
+	KeyMode KeyMode
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -38,6 +65,10 @@ type Runtime struct {
 	StatsVersion atomic.Uint64
 	Stats        atomic.Pointer[rbistats.PlannerSnapshot]
 
+	fields      []queryField
+	fieldByName map[string]int
+	keyOrdinal  int
+
 	Analyzer *Analyzer
 	Tracer   *Tracer
 
@@ -45,20 +76,77 @@ type Runtime struct {
 }
 
 func NewRuntime(cfg Config) *Runtime {
+	fields, fieldByName, keyOrdinal := buildQueryFieldCatalog(cfg.Schema, cfg.KeyMode)
 	return &Runtime{
 		Schema:                         cfg.Schema,
 		StrKey:                         cfg.StrKey,
+		KeyMode:                        cfg.KeyMode,
 		NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
 		NumericRangeBucketMinSpanKeys:  cfg.NumericRangeBucketMinSpanKeys,
 		Analyzer: &Analyzer{
 			Interval: cfg.AnalyzeInterval,
 		},
-		Tracer: NewTracer(cfg.TraceSink, cfg.TraceSampleEvery),
+		Tracer:      NewTracer(cfg.TraceSink, cfg.TraceSampleEvery),
+		fields:      fields,
+		fieldByName: fieldByName,
+		keyOrdinal:  keyOrdinal,
 		viewPool: pooled.Pointers[View]{
 			Clear: true,
 		},
 	}
+}
+
+func buildQueryFieldCatalog(s *schema.Schema, mode KeyMode) ([]queryField, map[string]int, int) {
+	if s == nil {
+		return nil, nil, -1
+	}
+	n := len(s.Indexed)
+	extra := 0
+	keyOrdinal := -1
+	if mode == KeyModeString || mode == KeyModeNumeric {
+		extra = 1
+		keyOrdinal = n
+	}
+	fields := make([]queryField, n+extra)
+	fieldByName := make(map[string]int, n+extra)
+
+	for i := range s.Indexed {
+		acc := s.Indexed[i]
+		fields[i] = queryField{
+			name:           acc.Name,
+			kind:           queryFieldOrdinary,
+			ordinal:        i,
+			storageOrdinal: acc.Ordinal,
+			meta:           acc.Field,
+		}
+		fieldByName[acc.Name] = i
+	}
+
+	switch mode {
+
+	case KeyModeString:
+		fields[keyOrdinal] = queryField{
+			name:           schema.ReservedKeyFieldName,
+			kind:           queryFieldStringKey,
+			ordinal:        keyOrdinal,
+			storageOrdinal: -1,
+			meta:           &stringKeyField,
+		}
+		fieldByName[schema.ReservedKeyFieldName] = keyOrdinal
+
+	case KeyModeNumeric:
+		fields[keyOrdinal] = queryField{
+			name:           schema.ReservedKeyFieldName,
+			kind:           queryFieldNumericKey,
+			ordinal:        keyOrdinal,
+			storageOrdinal: -1,
+			meta:           &numericKeyField,
+		}
+		fieldByName[schema.ReservedKeyFieldName] = keyOrdinal
+	}
+
+	return fields, fieldByName, keyOrdinal
 }
 
 func (r *Runtime) AcquireView(snap *snapshot.View) *View {
@@ -72,10 +160,23 @@ func (r *Runtime) ReleaseView(view *View) {
 }
 
 func (r *Runtime) FieldNameByOrdinal(ordinal int) string {
-	if ordinal < 0 || ordinal >= len(r.Schema.Indexed) {
+	if ordinal < 0 || ordinal >= len(r.fields) {
 		return ""
 	}
-	return r.Schema.Indexed[ordinal].Name
+	return r.fields[ordinal].name
+}
+
+func (r *Runtime) ResolveField(name string) (qir.FieldInfo, bool) {
+	ordinal, ok := r.fieldByName[name]
+	if !ok {
+		return qir.FieldInfo{Ordinal: qir.NoFieldOrdinal}, false
+	}
+	field := r.fields[ordinal]
+	info := qir.FieldInfo{Ordinal: field.ordinal}
+	if field.kind == queryFieldOrdinary {
+		info.Caps = qir.FieldCapAll
+	}
+	return info, true
 }
 
 type Analyzer struct {

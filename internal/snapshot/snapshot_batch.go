@@ -6,6 +6,7 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
@@ -17,13 +18,23 @@ type BatchEntry struct {
 	PatchOnly bool
 }
 
+type KeyDelta struct {
+	ID  uint64
+	Key string
+	Add bool
+}
+
 // Build treats entries as caller-owned and does not mutate them.
 func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	return BuildWithKeyDeltas(seq, prev, s, cfg, patchFields, entries, nil)
+}
+
+func BuildWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry, keyDeltas []KeyDelta) *View {
 	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, entries); ok {
-		return snap
+		return applySnapshotKeyDeltas(snap, keyDeltas)
 	}
 	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, entries); ok {
-		return snap
+		return applySnapshotKeyDeltas(snap, keyDeltas)
 	}
 	var normalized []BatchEntry
 	var scratch []BatchEntry
@@ -36,18 +47,51 @@ func Build(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchField
 	if scratch != nil {
 		batchEntrySlicePool.Put(scratch)
 	}
-	return snap
+	return applySnapshotKeyDeltas(snap, keyDeltas)
 }
 
 // BuildInPlace consumes entries and may compact or rewrite them.
 func BuildInPlace(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry) *View {
+	return BuildInPlaceWithKeyDeltas(seq, prev, s, cfg, patchFields, entries, nil)
+}
+
+func BuildInPlaceWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, patchFields map[string]*schema.Field, entries []BatchEntry, keyDeltas []KeyDelta) *View {
 	if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, entries); ok {
-		return snap
+		return applySnapshotKeyDeltas(snap, keyDeltas)
 	}
 	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, entries); ok {
+		return applySnapshotKeyDeltas(snap, keyDeltas)
+	}
+	return applySnapshotKeyDeltas(
+		buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalizePreparedBatchForSnapshotInPlace(entries)),
+		keyDeltas,
+	)
+}
+
+func applySnapshotKeyDeltas(snap *View, keyDeltas []KeyDelta) *View {
+	if len(keyDeltas) == 0 {
 		return snap
 	}
-	return buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalizePreparedBatchForSnapshotInPlace(entries))
+	states := keyDeltaStateMapPool.Get()
+	for i := range keyDeltas {
+		delta := keyDeltas[i]
+		states[keyDeltaStateKey{Key: delta.Key, ID: delta.ID}] = delta.Add
+	}
+	var arena indexdata.PostingDiffArena
+	deltas := keyPostingDeltaMapPool.Get()
+	for state, add := range states {
+		deltas = indexdata.AddStringPostingDiff(deltas, &arena, state.Key, state.ID, add)
+	}
+	keyDeltaStateMapPool.Put(states)
+	next := snap.KeyIndex.ApplyStringPostingDiff(deltas, &arena, true)
+	keyPostingDeltaMapPool.Put(deltas)
+	arena.Reset()
+	if next != snap.KeyIndex {
+		snap.KeyIndex.Release()
+		snap.KeyIndex = next
+		snap.evictRuntimeMaterializedPredField(schema.ReservedKeyFieldName)
+	}
+	return snap
 }
 
 func cloneFieldIndexBoolSlots(src []bool, size int) []bool {
@@ -351,7 +395,11 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, s *schema.Schema
 				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(snap, prev, s.IndexedByName, changed)
+		inheritMaterializedPredCache(snap, prev, qcache.FieldChangeSet{
+			Fields:          s.IndexedByName,
+			OrdinaryChanged: changed,
+			KeyChanged:      len(entries) != 0,
+		})
 		if changed != nil {
 			pooled.ReleaseBoolSlice(changed)
 		}
@@ -385,6 +433,7 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 		Seq: seq,
 
 		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(s.Indexed)),
+		KeyIndex:           prev.KeyIndex,
 		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(s.Indexed)),
 		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(s.Indexed)),
 		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(s.Indexed)),
@@ -454,7 +503,11 @@ func buildPreparedSnapshotInsertOnly(seq uint64, prev *View, s *schema.Schema, c
 	inheritNumericRangeBucketCache(next, prev)
 
 	if inheritMatPred {
-		inheritMaterializedPredCache(next, prev, s.IndexedByName, changed)
+		inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{
+			Fields:          s.IndexedByName,
+			OrdinaryChanged: changed,
+			KeyChanged:      true,
+		})
 		if changed != nil {
 			pooled.ReleaseBoolSlice(changed)
 		}
@@ -557,6 +610,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, s *schema.Schema, 
 		Seq: seq,
 
 		Index:              nextIndex,
+		KeyIndex:           prev.KeyIndex,
 		NilIndex:           nextNilIndex,
 		LenIndex:           nextLenIndex,
 		LenZeroComplement:  nextLenZeroComplement,
@@ -617,6 +671,7 @@ func buildPreparedSnapshotAggregatedNormalized(
 		Seq: seq,
 
 		Index:              indexdata.CloneFieldStorageSlots(prev.Index, len(s.Indexed)),
+		KeyIndex:           prev.KeyIndex,
 		NilIndex:           indexdata.CloneFieldStorageSlots(prev.NilIndex, len(s.Indexed)),
 		LenIndex:           indexdata.CloneFieldStorageSlots(prev.LenIndex, len(s.Indexed)),
 		LenZeroComplement:  cloneFieldIndexBoolSlots(prev.LenZeroComplement, len(s.Indexed)),
@@ -636,14 +691,17 @@ func buildPreparedSnapshotAggregatedNormalized(
 	measureDeltas := indexdata.NewMeasureDeltaBatch(len(s.Measures))
 
 	universeOwned := false
+	keyChanged := false
 
 	for i := range normalized {
 		op := normalized[i]
 		switch {
 		case op.Old == nil && op.New != nil:
+			keyChanged = true
 			ensureSnapshotUniverseOwned(next, &universeOwned)
 			next.Universe = next.Universe.BuildAdded(op.ID)
 		case op.Old != nil && op.New == nil:
+			keyChanged = true
 			ensureSnapshotUniverseOwned(next, &universeOwned)
 			next.Universe = next.Universe.BuildRemoved(op.ID)
 		}
@@ -695,9 +753,16 @@ func buildPreparedSnapshotAggregatedNormalized(
 	inheritNumericRangeBucketCache(next, prev)
 	if inheritMatPred {
 		if changedAny {
-			inheritMaterializedPredCache(next, prev, s.IndexedByName, deltas.changed)
+			inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{
+				Fields:          s.IndexedByName,
+				OrdinaryChanged: deltas.changed,
+				KeyChanged:      keyChanged,
+			})
 		} else {
-			inheritMaterializedPredCache(next, prev, s.IndexedByName, nil)
+			inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{
+				Fields:     s.IndexedByName,
+				KeyChanged: keyChanged,
+			})
 		}
 	}
 	schema.ReleaseBatchStates(deltas.fields)

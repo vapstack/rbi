@@ -798,7 +798,7 @@ func TestQuery_OrderBasicBaseFastPathCapsLargeLimitByBaseCard(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evalExpr: %v", err)
 			}
-			ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, shape.Order)
+			ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, shape.Order.FieldOrdinal)
 			br := ov.RangeForBounds(indexdata.Bounds{Has: true})
 
 			got, used, err := view.runOrderBasicBaseQuery(&shape, "score", nil, 0, shape.Order, ov, br, "", base, nil, nil, plannerOrderedLimitRuntimeGuard{}, nil)

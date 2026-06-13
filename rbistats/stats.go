@@ -104,6 +104,10 @@ type Index struct {
 	// FieldApproxStructBytes, and the map sums to ApproxHeapBytes.
 	FieldApproxHeapBytes map[string]uint64
 
+	// StringKeyIndex contains synthetic string primary-key index diagnostics.
+	// It is nil when string key indexing is disabled.
+	StringKeyIndex *StringKeyIndex
+
 	// EntryCount is the total number of non-empty index entries across the
 	// covered field index families.
 	//
@@ -134,6 +138,21 @@ type Index struct {
 	// Coverage is limited to regular field value indexes plus synthetic
 	// nil-family indexes. It excludes slice-length helper indexes, universe
 	// bitmap state, string-key mapping state, and runtime query caches.
+	ApproxHeapBytes uint64
+}
+
+// StringKeyIndex contains storage stats for synthetic string primary-key index.
+type StringKeyIndex struct {
+	// Size contains posting payload bytes retained by index.
+	Size uint64
+	// KeyBytes contains raw bytes retained by the index.
+	KeyBytes uint64
+	// Cardinality is the sum of posting-list cardinalities in the index.
+	Cardinality uint64
+	// ApproxStructBytes contains approximate structural/layout overhead
+	// for the synthetic string primary-key index.
+	ApproxStructBytes uint64
+	// ApproxHeapBytes is Size + KeyBytes + ApproxStructBytes.
 	ApproxHeapBytes uint64
 }
 

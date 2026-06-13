@@ -8,9 +8,12 @@ import (
 
 type prepareBenchFieldResolver map[string]int
 
-func (r prepareBenchFieldResolver) ResolveField(name string) (int, bool) {
+func (r prepareBenchFieldResolver) ResolveField(name string) (FieldInfo, bool) {
 	ordinal, ok := r[name]
-	return ordinal, ok
+	if !ok {
+		return FieldInfo{Ordinal: NoFieldOrdinal}, false
+	}
+	return FieldInfo{Ordinal: ordinal, Caps: FieldCapAll}, true
 }
 
 var prepareBenchFieldOrdinals = prepareBenchFieldResolver{

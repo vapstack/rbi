@@ -265,6 +265,9 @@ func TestLoadPayloadSkipsIncompatibleFieldStorage(t *testing.T) {
 	if err := writeSidecarUvarint(writer, 0); err != nil {
 		t.Fatalf("write measure section count: %v", err)
 	}
+	if err := writer.WriteByte(keyIndexStateAbsent); err != nil {
+		t.Fatalf("write key index state: %v", err)
+	}
 	if err := writePlannerStatsSnapshot(writer, &rbistats.PlannerSnapshot{
 		Version: 1,
 		Fields: map[string]rbistats.PlannerField{
@@ -307,7 +310,7 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(persistedIndexVersion); err != nil {
+	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
 		t.Fatalf("write version: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 11); err != nil {
@@ -414,7 +417,7 @@ func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 func TestLoadRejectsStaleSequence(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(persistedIndexVersion); err != nil {
+	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
 		t.Fatalf("write version: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 10); err != nil {
@@ -612,10 +615,155 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreLoadStringKeyIndexRoundTrip(t *testing.T) {
+	keyStorage := persistTestRegularStorage("user-1", 42)
+	defer keyStorage.Release()
+	universe := (posting.List{}).BuildAdded(42)
+	defer universe.Release()
+	rt := &schema.Schema{}
+	snap := &snapshot.View{
+		KeyIndex: keyStorage,
+		Universe: universe,
+	}
+
+	file := filepath.Join(t.TempDir(), "key-index.rbi")
+	if err := Store(StoreConfig{
+		File:           file,
+		BucketSeq:      9,
+		Schema:         rt,
+		StrKey:         true,
+		StrKeyIndex:    true,
+		KeyIndexLoaded: true,
+		Snapshot:       snap,
+	}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	result, err := Load(LoadConfig{
+		File:        file,
+		DBPath:      "test.db",
+		Bucket:      []byte("bucket"),
+		CurrentSeq:  9,
+		Schema:      rt,
+		StrKey:      true,
+		StrKeyIndex: true,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer result.Storage.Release()
+	if !result.KeyIndexLoaded {
+		t.Fatalf("KeyIndexLoaded=false, want true")
+	}
+	ids := indexdata.NewFieldIndexViewFromStorage(result.Storage.KeyIndex).LookupPostingRetained("user-1")
+	if ids.Cardinality() != 1 || !ids.Contains(42) {
+		t.Fatalf("loaded key index mismatch")
+	}
+	ids.Release()
+}
+
+func TestStoreLoadStringKeyIndexEmptyState(t *testing.T) {
+	rt := &schema.Schema{}
+	snap := &snapshot.View{}
+
+	file := filepath.Join(t.TempDir(), "empty-key-index.rbi")
+	if err := Store(StoreConfig{
+		File:           file,
+		BucketSeq:      3,
+		Schema:         rt,
+		StrKey:         true,
+		StrKeyIndex:    true,
+		KeyIndexLoaded: true,
+		Snapshot:       snap,
+	}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	result, err := Load(LoadConfig{
+		File:        file,
+		DBPath:      "test.db",
+		Bucket:      []byte("bucket"),
+		CurrentSeq:  3,
+		Schema:      rt,
+		StrKey:      true,
+		StrKeyIndex: true,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer result.Storage.Release()
+	if !result.KeyIndexLoaded {
+		t.Fatalf("KeyIndexLoaded=false, want true")
+	}
+	if result.Storage.KeyIndex.KeyCount() != 0 {
+		t.Fatalf("empty key index key count=%d, want 0", result.Storage.KeyIndex.KeyCount())
+	}
+}
+
+func TestLoadStringKeyIndexAbsentPreservesNormalIndexes(t *testing.T) {
+	field := persistTestField("field", 0)
+	rt := &schema.Schema{
+		Fields:        map[string]*schema.Field{"field": field},
+		MeasureFields: map[string]*schema.Field{},
+		Indexed:       []schema.IndexedFieldAccessor{{Ordinal: 0, Name: "field", Field: field}},
+		IndexedByName: schema.IndexedFieldMap{"field": {Ordinal: 0, Name: "field", Field: field}},
+	}
+	fieldStorage := persistTestRegularStorage("value", 1)
+	defer fieldStorage.Release()
+	universe := (posting.List{}).BuildAdded(1)
+	defer universe.Release()
+	snap := &snapshot.View{
+		Index:              []indexdata.FieldStorage{fieldStorage},
+		IndexedFieldByName: rt.IndexedByName,
+		Universe:           universe,
+	}
+
+	file := filepath.Join(t.TempDir(), "absent-key-index.rbi")
+	if err := Store(StoreConfig{
+		File:      file,
+		BucketSeq: 5,
+		Schema:    rt,
+		StrKey:    true,
+		Snapshot:  snap,
+	}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	result, err := Load(LoadConfig{
+		File:        file,
+		DBPath:      "test.db",
+		Bucket:      []byte("bucket"),
+		CurrentSeq:  5,
+		Schema:      rt,
+		StrKey:      true,
+		StrKeyIndex: true,
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer result.Storage.Release()
+	if result.KeyIndexLoaded {
+		t.Fatalf("KeyIndexLoaded=true, want false")
+	}
+	if _, ok := result.SkipFields["field"]; !ok {
+		t.Fatalf("normal field was not preserved")
+	}
+	if result.Storage.Index[0].KeyCount() == 0 {
+		t.Fatalf("normal field storage was not loaded")
+	}
+}
+
+func TestReadKeyIndexSectionRejectsInvalidState(t *testing.T) {
+	_, _, err := readKeyIndexSection(bufio.NewReader(bytes.NewReader([]byte{7})), true, true)
+	if err == nil || !strings.Contains(err.Error(), "invalid key index state 7") {
+		t.Fatalf("readKeyIndexSection err=%v, want invalid state", err)
+	}
+}
+
 func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(persistedIndexVersion); err != nil {
+	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
 		t.Fatalf("write version: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 1); err != nil {

@@ -54,6 +54,7 @@ const (
 	plannerOrderedLimitCandidateColdRetainedBaseCore
 	plannerOrderedLimitCandidateColdUnretainedBaseCore
 	plannerOrderedLimitCandidateCandidateOrder
+	plannerOrderedLimitCandidateNumericKeyScan
 	plannerOrderedLimitCandidateMaterializedFallback
 )
 
@@ -73,6 +74,8 @@ func (k plannerOrderedLimitCandidateKind) String() string {
 		return "cold_unretained_base_core"
 	case plannerOrderedLimitCandidateCandidateOrder:
 		return "candidate_order"
+	case plannerOrderedLimitCandidateNumericKeyScan:
+		return "numeric_key_scan"
 	case plannerOrderedLimitCandidateMaterializedFallback:
 		return "materialized_fallback"
 	default:
@@ -233,7 +236,7 @@ func (qv *View) orderedLimitCandidateTraceWork(q *qir.Shape, facts *orderedLimit
 		return c.traceWork()
 	}
 	switch c.kind {
-	case plannerOrderedLimitCandidateOrderScan, plannerOrderedLimitCandidateOrderedBasic, plannerOrderedLimitCandidateCandidateOrder:
+	case plannerOrderedLimitCandidateOrderScan, plannerOrderedLimitCandidateOrderedBasic, plannerOrderedLimitCandidateCandidateOrder, plannerOrderedLimitCandidateNumericKeyScan:
 		return qv.orderedLimitScanTraceWork(facts, c)
 	default:
 		return c.traceWork()
@@ -280,6 +283,71 @@ func (qv *View) orderedLimitScanTraceWork(facts *orderedLimitFacts, c plannerOrd
 
 	work.PostingContains = remaining
 	return work
+}
+
+func (qv *View) collectNumericKeyOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts) (bool, error) {
+	bounds, residuals, ok, err := qv.numericKeyBoundsAndResiduals(q.Expr, q.Order.FieldOrdinal, facts.baseOpsBuf)
+	if err != nil || !ok {
+		return ok, err
+	}
+	facts.bounds = bounds
+	facts.baseOpsBuf = residuals
+	facts.baseOps = residuals
+	return true, nil
+}
+
+func (qv *View) supportsNumericKeyOrderedLimitResidual(e qir.Expr) bool {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
+		return false
+	}
+	if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+		return !e.Not && len(e.Operands) == 0 && (isScalarRangeEqOp(e.Op) || e.Op == qir.OpIN)
+	}
+	return qv.supportsLimitLeafPredExpr(e)
+}
+
+func (qv *View) numericKeyOrderedLimitResidualsSupported(baseOps []qir.Expr) bool {
+	for i := 0; i < len(baseOps); i++ {
+		if !qv.supportsNumericKeyOrderedLimitResidual(baseOps[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (qv *View) numericKeyOrderedLimitScanCandidate(facts *orderedLimitFacts) plannerOrderedLimitCandidate {
+	expected := uint64(facts.needWindow)
+	if universe := qv.snap.Universe.Cardinality(); expected > universe {
+		expected = universe
+	}
+	if facts.bounds.Empty {
+		expected = 0
+	}
+	costRows := expected
+	if costRows == 0 {
+		costRows = 1
+	}
+	return plannerOrderedLimitCandidate{
+		kind:         plannerOrderedLimitCandidateNumericKeyScan,
+		cost:         float64(costRows) * (1.0 + float64(len(facts.baseOps))*0.35),
+		expectedRows: expected,
+		checks:       uint64(len(facts.baseOps)),
+		cacheState:   plannerMaterializedCacheDisabled,
+	}
+}
+
+func (qv *View) selectNumericKeyOrderedLimit(q *qir.Shape, facts *orderedLimitFacts) (plannerOrderedLimitDecision, bool, error) {
+	scan := qv.numericKeyOrderedLimitScanCandidate(facts)
+	fallback := orderedLimitMaterializedFallbackCandidate(q, facts.ops, scan.cost, plannerOrderedDecision{})
+	if !qv.numericKeyOrderedLimitResidualsSupported(facts.baseOps) {
+		return plannerOrderedLimitDecision{
+			selected:             fallback,
+			materializedFallback: fallback,
+			rejected:             scan,
+		}, true, nil
+	}
+	candidates := [...]plannerOrderedLimitCandidate{scan, fallback}
+	return plannerOrderedLimitPick(candidates[:]), true, nil
 }
 
 func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLimitRuntimeGuard {
@@ -516,7 +584,7 @@ func (set *plannerMaterializedCacheRouteSet) pressurePenalty() float64 {
 }
 
 func (qv *View) orderedLimitCollapsedRangeStats(op preparedScalarExactRange) (scalarMaterializationStats, bool) {
-	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, op.fieldOrdinal)
+	ov := qv.indexViewByOrdinal(op.fieldOrdinal)
 	if !ov.HasData() {
 		return scalarMaterializationStats{}, false
 	}
@@ -777,13 +845,13 @@ func (qv *View) orderedLimitScalarRangeHasCheapBucketFilter(
 	var plan preparedFieldIndexRangePredicatePlan
 	useRuntimeComplement := false
 	if useBounds {
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			return false
 		}
 		var core preparedScalarRangePredicate
 		qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
-		ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 		if !ov.HasData() {
 			return false
 		}
@@ -879,7 +947,7 @@ func (qv *View) orderedLimitBoundsScanCandidate(
 	}
 	for i := 0; i < len(facts.baseOps); i++ {
 		e := facts.baseOps[i]
-		if !e.Not && e.FieldOrdinal >= 0 && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && qv.hasFieldOrdinal(e.FieldOrdinal) && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
 			if fieldName != facts.orderField {
 				idx := findOrderedMergedScalarRangeField(mergedRanges, fieldName)
@@ -1098,15 +1166,15 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 			expr: op,
 		}
 
-		fm := qv.fieldMetaByExpr(op)
-		if isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
+		fm := qv.fieldMetaByOrdinal(op.FieldOrdinal)
+		if qv.isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
 			fieldName := qv.exec.FieldNameByOrdinal(op.FieldOrdinal)
 			var rb indexdata.Bounds
 			groupCount := 0
 			first := true
 			for j := 0; j < len(baseOps); j++ {
 				other := baseOps[j]
-				if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
+				if other.FieldOrdinal != op.FieldOrdinal || !qv.isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
 					continue
 				}
 				if j < i {
@@ -1285,7 +1353,7 @@ func (qv *View) collectOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts)
 	facts.needWindow = needWindow
 	facts.orderField = qv.exec.FieldNameByOrdinal(order.FieldOrdinal)
 
-	fm := qv.fieldMetaByOrder(order)
+	fm := qv.fieldMetaByOrdinal(order.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return false, nil
 	}
@@ -1298,6 +1366,10 @@ func (qv *View) collectOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts)
 	} else {
 		facts.opsBuf = append(facts.opsBuf[:0], q.Expr)
 		facts.ops = facts.opsBuf
+	}
+
+	if qv.isNumericKeyOrdinal(order.FieldOrdinal) {
+		return qv.collectNumericKeyOrderedLimitFacts(q, facts)
 	}
 
 	orderFirst := -1
@@ -1418,9 +1490,9 @@ func (qv *View) collectOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts)
 		facts.nilTailField = facts.orderField
 	}
 
-	facts.ov = qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
+	facts.ov = qv.indexViewByOrdinal(order.FieldOrdinal)
 	if !facts.ov.HasData() && facts.nilTailField == "" {
-		if !qv.hasIndexedFieldForOrder(order) {
+		if !qv.hasIndexedFieldOrdinal(order.FieldOrdinal) {
 			return false, nil
 		}
 		facts.empty = true
@@ -1442,6 +1514,10 @@ func (qv *View) selectOrderedLimit(
 	q *qir.Shape,
 	facts *orderedLimitFacts,
 ) (plannerOrderedLimitDecision, bool, error) {
+	if qv.isNumericKeyOrdinal(facts.order.FieldOrdinal) {
+		return qv.selectNumericKeyOrderedLimit(q, facts)
+	}
+
 	if facts.empty {
 		return plannerOrderedLimitDecision{
 			selected: plannerOrderedLimitCandidate{
@@ -1462,11 +1538,11 @@ func (qv *View) selectOrderedLimit(
 		fastPrefix := true
 		for i := 0; i < len(facts.baseOps); i++ {
 			e := facts.baseOps[i]
-			if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
+			if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
 				fastPrefix = false
 				break
 			}
-			fm := qv.fieldMetaByExpr(e)
+			fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 			if fm == nil || fm.Slice {
 				fastPrefix = false
 				break

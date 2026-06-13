@@ -676,7 +676,7 @@ func (qv *View) execSelectedNoOrderUniqueEq(q *qir.Shape, leaves []qir.Expr, tra
 
 func (qv *View) execSelectedNoOrderDirectUniqueEq(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 	e := q.Expr
-	if e.Not || e.Op != qir.OpEQ || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+	if e.Not || e.Op != qir.OpEQ || !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 {
 		return nil, false, nil
 	}
 	if !qv.isPositiveUniqueEqExpr(e) {
@@ -692,10 +692,20 @@ func (qv *View) execSelectedNoOrderDirectUniqueEq(q *qir.Shape, trace *Trace) ([
 	}
 
 	var ids posting.List
-	if isNil {
-		ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+	if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+		if !key.IsNumeric() {
+			if trace != nil {
+				trace.SetPlan(rbitrace.PlanUniqueEq)
+				trace.AddExamined(0)
+				trace.SetEarlyStopReason("input_exhausted")
+			}
+			return nil, true, nil
+		}
+		ids = qv.numericKeyPostingForID(key.U64())
+	} else if isNil {
+		ids = qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 	} else {
-		ids = lookupScalarPostingRetained(qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e), key)
+		ids = lookupScalarPostingRetained(qv.indexViewByOrdinal(e.FieldOrdinal), key)
 	}
 	if ids.IsEmpty() {
 		if trace != nil {
@@ -765,15 +775,12 @@ func hasPrefixBoundForFieldOrdinal(leaves []qir.Expr, fieldOrdinal int) bool {
 }
 
 func (qv *View) execNoOrderBounds(q *qir.Shape, field string, fieldOrdinal int, bounds indexdata.Bounds, leaves []qir.Expr, guard plannerNoOrderLimitRuntimeGuard, trace *Trace) ([]uint64, bool, bool, error) {
-	if fieldOrdinal < 0 || fieldOrdinal >= len(qv.exec.Schema.Indexed) {
-		return nil, false, false, nil
-	}
-	fm := qv.exec.Schema.Indexed[fieldOrdinal].Field
+	fm := qv.fieldMeta(field, fieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false, false, nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, fieldOrdinal)
+	ov := qv.indexViewByOrdinal(fieldOrdinal)
 	if !ov.HasData() {
 		return nil, true, false, nil
 	}
@@ -1013,7 +1020,7 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 	var extraRows uint64
 	if nilTailField != "" {
-		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 	}
 	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 	if exhausted {
@@ -1271,7 +1278,7 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 			releaseLeafPostingScanCursors(postingCursors)
 			postingCursorActive = false
 		}
-		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			if trackScanWidth {
 				scanWidth++
@@ -1434,7 +1441,7 @@ func (qv *View) extractBoundsForField(field string, leaves []qir.Expr) (indexdat
 		if !isBoundOp(e.Op) {
 			continue
 		}
-		if e.Not || e.FieldOrdinal < 0 {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			return b, false, nil
 		}
 		if qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != field {
@@ -1456,17 +1463,32 @@ func (qv *View) extractBoundsForField(field string, leaves []qir.Expr) (indexdat
 }
 
 func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return leafPred{}, false, nil
 	}
 
 	fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
-	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
+	if qv.isNumericKeyOrdinal(e.FieldOrdinal) && !e.Not {
+		res, err := qv.evalNumericKeySimple(e)
+		if err != nil {
+			return leafPred{}, true, err
+		}
+		if res.ids.IsEmpty() {
+			return emptyLeaf(), true, nil
+		}
+		return leafPred{
+			kind:    leafPredKindPosting,
+			posting: res.ids,
+			estCard: res.ids.Cardinality(),
+		}, true, nil
+	}
+
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(e.FieldOrdinal) {
 		return leafPred{}, false, nil
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil {
 		return leafPred{}, false, nil
 	}
@@ -1520,7 +1542,7 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 		if isNil {
-			ids := qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			if ids.IsEmpty() {
 				return emptyLeaf(), true, nil
 			}
@@ -1680,7 +1702,7 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 
 func (qv *View) buildLimitLeafPred(e qir.Expr, orderedWindow int) (leafPred, bool, error) {
 
-	if orderedWindow > 0 && isSimpleScalarRangeOrPrefixLeaf(e) && !e.Not {
+	if orderedWindow > 0 && qv.isSimpleScalarRangeOrPrefixLeaf(e) && !e.Not {
 
 		if candidate, ok := qv.prepareScalarRangeRoutingCandidate(e); ok &&
 			candidate.plan.orderedEagerMaterializeUseful(orderedWindow, qv.snap.Universe.Cardinality()) {
@@ -1708,7 +1730,7 @@ func (qv *View) buildLimitLeafPred(e qir.Expr, orderedWindow int) (leafPred, boo
 }
 
 func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, orderedWindow int) (leafPred, bool, error) {
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return leafPred{}, false, nil
 	}
@@ -1756,15 +1778,15 @@ func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, or
 }
 
 func (qv *View) supportsLimitLeafPredExpr(e qir.Expr) bool {
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil {
 		return false
 	}
 
-	if !qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e).HasData() && !qv.hasIndexedFieldForExpr(e) {
+	if !qv.indexViewByOrdinal(e.FieldOrdinal).HasData() && !qv.hasIndexedFieldOrdinal(e.FieldOrdinal) {
 		return false
 	}
 

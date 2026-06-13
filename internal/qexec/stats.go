@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/rbistats"
 )
@@ -33,12 +34,21 @@ func (r *Runtime) PlannerStatsSnapshotForPersist(snap *snapshot.View, version ui
 	if current == nil {
 		return r.BuildPlannerStatsSnapshot(snap, version)
 	}
-	return &rbistats.PlannerSnapshot{
+	fields := r.sortedPlannerFieldNames()
+	out := &rbistats.PlannerSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: snap.UniverseCardinality(),
-		Fields:              current.Fields,
+		Fields:              make(map[string]rbistats.PlannerField, len(fields)),
 	}
+	for _, f := range fields {
+		if stats, ok := current.Fields[f]; ok {
+			out.Fields[f] = stats
+			continue
+		}
+		out.Fields[f] = r.collectPlannerFieldStatsFromIndexView(snap, f)
+	}
+	return out
 }
 
 func (r *Runtime) BuildPlannerStatsSnapshot(snap *snapshot.View, version uint64) *rbistats.PlannerSnapshot {
@@ -62,27 +72,58 @@ func (r *Runtime) PublishLoadedPlannerStats(s *rbistats.PlannerSnapshot, snap *s
 		Version:             s.Version,
 		GeneratedAt:         s.GeneratedAt,
 		UniverseCardinality: snap.UniverseCardinality(),
-		Fields:              make(map[string]rbistats.PlannerField, len(r.Schema.Indexed)),
 	}
+	fields := r.sortedPlannerFieldNames()
+	out.Fields = make(map[string]rbistats.PlannerField, len(fields))
 	if out.Version == 0 {
 		out.Version = 1
 	}
 	if out.GeneratedAt.IsZero() {
 		out.GeneratedAt = time.Now()
 	}
-	for _, f := range r.sortedPlannerFieldNames() {
-		out.Fields[f] = s.Fields[f]
+	for _, f := range fields {
+		if stats, ok := s.Fields[f]; ok {
+			out.Fields[f] = stats
+			continue
+		}
+		out.Fields[f] = r.collectPlannerFieldStatsFromIndexView(snap, f)
 	}
 	r.StatsVersion.Store(out.Version)
 	r.Stats.Store(out)
 }
 
 func (r *Runtime) collectPlannerFieldStatsFromIndexView(s *snapshot.View, fieldName string) rbistats.PlannerField {
-	acc, ok := r.Schema.IndexedByName[fieldName]
-	if !ok || s.Index == nil || acc.Ordinal >= len(s.Index) {
+	ordinal, ok := r.fieldByName[fieldName]
+	if !ok || ordinal < 0 || ordinal >= len(r.fields) {
 		return rbistats.PlannerField{}
 	}
-	ov := indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal])
+	field := r.fields[ordinal]
+	var ov indexdata.FieldIndexView
+	switch field.kind {
+	case queryFieldOrdinary:
+		if s.Index == nil || field.storageOrdinal >= len(s.Index) {
+			return rbistats.PlannerField{}
+		}
+		ov = indexdata.NewFieldIndexViewFromStorage(s.Index[field.storageOrdinal])
+	case queryFieldStringKey:
+		ov = indexdata.NewFieldIndexViewFromStorage(s.KeyIndex)
+	case queryFieldNumericKey:
+		rows := s.UniverseCardinality()
+		if rows == 0 {
+			return rbistats.PlannerField{}
+		}
+		return rbistats.PlannerField{
+			DistinctKeys:    rows,
+			NonEmptyKeys:    rows,
+			TotalBucketCard: rows,
+			AvgBucketCard:   1,
+			MaxBucketCard:   1,
+			P50BucketCard:   1,
+			P95BucketCard:   1,
+		}
+	default:
+		return rbistats.PlannerField{}
+	}
 	if !ov.HasData() {
 		return rbistats.PlannerField{}
 	}
@@ -157,12 +198,18 @@ func plannerFieldIndexViewStats(o indexdata.FieldIndexView) rbistats.PlannerFiel
 }
 
 func (r *Runtime) sortedPlannerFieldNames() []string {
-	if len(r.Schema.Indexed) == 0 {
+	if len(r.fields) == 0 {
 		return nil
 	}
-	fields := make([]string, 0, len(r.Schema.Indexed))
-	for _, acc := range r.Schema.Indexed {
-		fields = append(fields, acc.Name)
+	fields := make([]string, 0, len(r.fields))
+	for i := range r.fields {
+		if r.fields[i].name == "" {
+			continue
+		}
+		if r.fields[i].kind != queryFieldOrdinary && r.fields[i].name != schema.ReservedKeyFieldName {
+			continue
+		}
+		fields = append(fields, r.fields[i].name)
 	}
 	sort.Strings(fields)
 	return fields

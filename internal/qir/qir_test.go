@@ -9,16 +9,18 @@ import (
 
 type testPrepareResolver struct{}
 
-func (testPrepareResolver) ResolveField(name string) (int, bool) {
+func (testPrepareResolver) ResolveField(name string) (FieldInfo, bool) {
 	switch name {
+	case "$key":
+		return FieldInfo{Ordinal: 4}, true
 	case "status":
-		return 1, true
+		return FieldInfo{Ordinal: 1, Caps: FieldCapAll}, true
 	case "tags":
-		return 2, true
+		return FieldInfo{Ordinal: 2, Caps: FieldCapAll}, true
 	case "country":
-		return 3, true
+		return FieldInfo{Ordinal: 3, Caps: FieldCapAll}, true
 	default:
-		return 0, false
+		return FieldInfo{Ordinal: NoFieldOrdinal}, false
 	}
 }
 
@@ -80,6 +82,47 @@ func TestPrepareQuery_POSScalarStringRejected(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected PrepareQuery to reject scalar-string POS order literal")
+	}
+}
+
+func TestPrepareQuery_KeyFieldSupportedShapes(t *testing.T) {
+	q, err := PrepareQuery(qx.Query(qx.EQ("$key", "a")).Sort("$key", qx.ASC), testPrepareFieldResolver)
+	if err != nil {
+		t.Fatalf("PrepareQuery: %v", err)
+	}
+	defer q.Release()
+
+	if q.Expr.FieldOrdinal < 0 {
+		t.Fatalf("$key expr ordinal=%d", q.Expr.FieldOrdinal)
+	}
+	if !q.HasOrder || q.Order.FieldOrdinal != q.Expr.FieldOrdinal || q.Order.Kind != OrderKindBasic {
+		t.Fatalf("$key order=%+v has=%v", q.Order, q.HasOrder)
+	}
+}
+
+func TestPrepareQuery_KeyFieldRejectsInvalidShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{name: "has_all", q: qx.Query(qx.HASALL("$key", []string{"a"}))},
+		{name: "has_any", q: qx.Query(qx.HASANY("$key", []string{"a"}))},
+		{name: "is_null", q: qx.Query(qx.ISNULL("$key"))},
+		{name: "eq_nil", q: qx.Query(qx.EQ("$key", nil))},
+		{name: "ne_nil", q: qx.Query(qx.NE("$key", nil))},
+		{name: "in_nil", q: qx.Query(qx.IN("$key", []any{nil, "a"}))},
+		{name: "notin_nil", q: qx.Query(qx.NOTIN("$key", []any{nil, "a"}))},
+		{name: "len_order", q: qx.Query().SortBy(qx.LEN("$key"), qx.ASC)},
+		{name: "pos_order", q: qx.Query().SortBy(qx.POS("$key", []string{"a"}), qx.ASC)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if q, err := PrepareQuery(tc.q, testPrepareFieldResolver); err == nil {
+				q.Release()
+				t.Fatal("expected PrepareQuery to reject invalid $key shape")
+			}
+		})
 	}
 }
 

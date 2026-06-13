@@ -13,6 +13,7 @@ type View struct {
 	Seq uint64
 
 	Index              []indexdata.FieldStorage
+	KeyIndex           indexdata.FieldStorage
 	NilIndex           []indexdata.FieldStorage
 	LenIndex           []indexdata.FieldStorage
 	LenZeroComplement  []bool
@@ -36,6 +37,7 @@ type CacheConfig struct {
 
 type Storage struct {
 	Index             []indexdata.FieldStorage
+	KeyIndex          indexdata.FieldStorage
 	NilIndex          []indexdata.FieldStorage
 	LenIndex          []indexdata.FieldStorage
 	LenZeroComplement []bool
@@ -45,6 +47,7 @@ type Storage struct {
 
 func (st *Storage) Release() {
 	indexdata.ReleaseFieldStorageSlots(st.Index)
+	st.KeyIndex.Release()
 	indexdata.ReleaseFieldStorageSlots(st.NilIndex)
 	indexdata.ReleaseFieldStorageSlots(st.LenIndex)
 	indexdata.ReleaseMeasureStorageSlots(st.Measure)
@@ -59,6 +62,7 @@ func NewView(seq uint64, prev *View, s *schema.Schema, cfg CacheConfig, st Stora
 	v := &View{
 		Seq:                seq,
 		Index:              st.Index,
+		KeyIndex:           st.KeyIndex,
 		NilIndex:           st.NilIndex,
 		LenIndex:           st.LenIndex,
 		LenZeroComplement:  st.LenZeroComplement,

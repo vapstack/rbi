@@ -190,7 +190,7 @@ func (qv *View) noOrderLimitCandidateTraceWork(q *qir.Shape, facts *noOrderLimit
 	if needWindow < q.Offset {
 		return c.traceWork()
 	}
-	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, facts.directOrdinal)
+	ov := qv.indexViewByOrdinal(facts.directOrdinal)
 	if !ov.HasData() {
 		return c.traceWork()
 	}
@@ -367,7 +367,7 @@ func (g plannerNoOrderLimitRuntimeGuard) shouldFallback(examined uint64, emitted
 }
 
 func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts) (bool, error) {
-	if q.Expr.Not && (q.Expr.FieldOrdinal < 0 || len(q.Expr.Operands) != 0) {
+	if q.Expr.Not && (!qv.hasFieldOrdinal(q.Expr.FieldOrdinal) || len(q.Expr.Operands) != 0) {
 		return false, nil
 	}
 	if qir.IsTrueConst(q.Expr) {
@@ -417,13 +417,13 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 
 	if len(leaves) == 1 {
 		e := leaves[0]
-		if isPositiveScalarPrefixLeaf(e) {
-			if fm := qv.fieldMetaByExpr(e); fm != nil && !fm.Slice {
+		if qv.isPositiveScalarPrefixLeaf(e) {
+			if fm := qv.fieldMetaByOrdinal(e.FieldOrdinal); fm != nil && !fm.Slice {
 				facts.singlePrefix = true
 			}
 		}
-		if !e.Not && e.FieldOrdinal >= 0 && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
-			if fm := qv.fieldMetaByExpr(e); fm != nil && !fm.Slice {
+		if !e.Not && qv.hasFieldOrdinal(e.FieldOrdinal) && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			if fm := qv.fieldMetaByOrdinal(e.FieldOrdinal); fm != nil && !fm.Slice {
 				facts.singleRange = true
 			}
 		}
@@ -441,7 +441,7 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 			continue
 		}
 		boundLeaves++
-		if e.Not || e.FieldOrdinal < 0 {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			sameField = false
 			continue
 		}
@@ -452,7 +452,7 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 		}
 	}
 
-	if boundLeaves > 0 && sameField && fieldOrdinal >= 0 {
+	if boundLeaves > 0 && sameField && qv.hasFieldOrdinal(fieldOrdinal) {
 		field := qv.exec.FieldNameByOrdinal(fieldOrdinal)
 		bounds, ok, err := qv.extractBoundsForField(field, leaves)
 		if err != nil {
@@ -471,7 +471,7 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 	if !facts.directBoundsOK {
 		for i := 0; i < len(leaves); i++ {
 			e := leaves[i]
-			if e.Not || e.FieldOrdinal < 0 {
+			if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 				continue
 			}
 			switch e.Op {
@@ -630,13 +630,13 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	directRangeOK := false
 	directRangeEmpty := false
 	if facts.directBoundsOK {
-		fm := qv.exec.Schema.Indexed[facts.directOrdinal].Field
-		ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, facts.directOrdinal)
+		fm := qv.fieldMeta(facts.directField, facts.directOrdinal)
+		ov := qv.indexViewByOrdinal(facts.directOrdinal)
 		if fm != nil && !fm.Slice && ov.HasData() {
 			directBR = ov.RangeForBounds(facts.directBounds)
 			directBucketTotal = ov.KeyCount()
 			directHasNilTail = fm.Ptr &&
-				qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.NilIndex, facts.directOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+				qv.nilIndexViewByOrdinal(facts.directOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 			directRangeOK = true
 			if directBR.Empty() {
 				directRangeEmpty = true

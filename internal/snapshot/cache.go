@@ -124,23 +124,30 @@ func (v *View) CanRetainMaterializedPredRoute(potentialKeys int, universe uint64
 	return int(qcache.MaterializedPredOversizedLimit(limit)) >= potentialKeys
 }
 
-func inheritMaterializedPredCache(next, prev *View, fields schema.IndexedFieldMap, changedFields []bool) {
+func inheritMaterializedPredCache(next, prev *View, changes qcache.FieldChangeSet) {
 	if prev == nil || next.matPredCache == nil || prev.matPredCache == nil {
 		return
 	}
-	next.matPredCache.InheritFrom(prev.matPredCache, fields, changedFields)
+	next.matPredCache.InheritFrom(prev.matPredCache, changes)
 	next.runtimeMatPredObserved.InheritObservedWorkFrom(
 		&prev.runtimeMatPredObserved,
-		fields,
-		changedFields,
+		changes,
 		qcache.RecentKeyLimit(next.MaterializedPredCacheLimit()),
 	)
 	next.runtimeMatPredDirty.InheritChangedObservedWorkFrom(
 		&prev.runtimeMatPredObserved,
-		fields,
-		changedFields,
+		changes,
 		qcache.RecentKeyLimit(next.MaterializedPredCacheLimit()),
 	)
+}
+
+func (v *View) evictRuntimeMaterializedPredField(field string) {
+	if v.matPredCache != nil {
+		v.matPredCache.EvictField(field)
+	}
+	v.runtimeMatPredSeen.EvictField(field)
+	v.runtimeMatPredObserved.EvictField(field)
+	v.runtimeMatPredDirty.EvictField(field)
 }
 
 func (v *View) LoadMaterializedPredKey(key qcache.MaterializedPredKey) (posting.List, bool) {

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/qx"
@@ -15,6 +16,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/rbistats"
 	"github.com/vapstack/rbi/rbitrace"
 )
@@ -602,7 +604,7 @@ func TestPlannerOrderedProfileCountsNonOrderPrefixResidual(t *testing.T) {
 	snap := view.exec.Stats.Load()
 	universe := view.plannerUniverseCardinality(snap)
 	orderField := view.exec.FieldNameByOrdinal(viewQ.Order.FieldOrdinal)
-	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
+	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, viewQ.Order.FieldOrdinal)
 	profile, ok := view.estimateOrderedProfileIndexView(orderField, leaves, ov, snap, universe)
 	if !ok {
 		t.Fatalf("estimateOrderedProfileIndexView: ok=false")
@@ -1515,6 +1517,209 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 }
 
+func TestPlannerOROrderStringKeyAdvancedPaths(t *testing.T) {
+	db := newTestDB(t, testOptions{
+		MatPredCacheMaxEntries: testMatPredCacheMaxEntries,
+		MatPredCacheMaxCard:    testMatPredCacheMaxCard,
+	})
+	db.enableStringKeyCatalog()
+
+	const n = 40
+	vals := make([]testRec, n)
+	entries := make([]snapshot.BatchEntry, n)
+	keyDeltas := make([]snapshot.KeyDelta, n)
+	for i := 0; i < n; i++ {
+		id := uint64(i + 1)
+		country := "US"
+		if i%3 == 0 {
+			country = "NL"
+		}
+		vals[i] = testRec{
+			Meta:   Meta{Country: country},
+			Name:   fmt.Sprintf("name-%02d", i),
+			Age:    20 + i,
+			Score:  float64(i),
+			Active: i&1 == 0,
+		}
+		key := fmt.Sprintf("sku-%03d", i)
+		entries[i] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i])}
+		keyDeltas[i] = snapshot.KeyDelta{ID: id, Key: key, Add: true}
+	}
+	db.seq++
+	db.snap = snapshot.BuildWithKeyDeltas(db.seq, db.snap, db.rt, db.cfg, nil, entries, keyDeltas)
+
+	resolver := testQIRResolver{"$key": db.exec.keyOrdinal}
+	for _, acc := range db.rt.Indexed {
+		resolver[acc.Name] = acc.Ordinal
+	}
+	q := qx.Query(
+		qx.OR(
+			qx.PREFIX("$key", "sku-00"),
+			qx.AND(
+				qx.GTE("$key", "sku-020"),
+				qx.LT("$key", "sku-025"),
+			),
+			qx.AND(
+				qx.GTE("$key", "sku-030"),
+				qx.EQ("country", "NL"),
+			),
+		),
+	).Sort("$key", qx.ASC).Limit(12)
+	prepared, err := qir.PrepareQuery(q, resolver)
+	if err != nil {
+		t.Fatalf("PrepareQuery: %v", err)
+	}
+	defer prepared.Release()
+	shape := qir.NewShape(prepared)
+	view := db.view()
+	window, ok := orderWindow(&shape)
+	if !ok {
+		t.Fatalf("orderWindow: ok=false")
+	}
+	orderField := view.exec.FieldNameByOrdinal(shape.Order.FieldOrdinal)
+	want := []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 21, 22}
+
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(shape.Expr.Operands, orderField, window, shape.Offset)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+	analysis, ok := view.buildOROrderAnalysis(&shape, branches)
+	if !ok {
+		branches.Release()
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	if routeCost, ok := view.estimateOROrderMergeRouteCost(&shape, branches, window, analysis.mergeStats); !ok || routeCost.fallback <= 0 {
+		branches.Release()
+		t.Fatalf("estimateOROrderMergeRouteCost: ok=%v route=%+v", ok, routeCost)
+	}
+	gotBasic, ok := view.execPlanOROrderBasic(&shape, branches, &analysis, nil, nil)
+	branches.Release()
+	if !ok {
+		t.Fatalf("execPlanOROrderBasic: ok=false")
+	}
+	if !slices.Equal(gotBasic, want) {
+		t.Fatalf("ordered OR basic mismatch:\ngot=%v\nwant=%v", gotBasic, want)
+	}
+
+	branches, alwaysFalse, ok = view.buildORBranchesOrdered(shape.Expr.Operands, orderField, window, shape.Offset)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered fallback: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected fallback alwaysFalse")
+	}
+	gotFallback, ok, err := view.execPlanOROrderMergeFallback(&shape, branches, nil)
+	branches.Release()
+	if err != nil {
+		t.Fatalf("execPlanOROrderMergeFallback: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	}
+	if !slices.Equal(gotFallback, want) {
+		t.Fatalf("ordered OR fallback mismatch:\ngot=%v\nwant=%v", gotFallback, want)
+	}
+
+	branches, alwaysFalse, ok = view.buildORBranchesOrdered(shape.Expr.Operands, orderField, window, shape.Offset)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered collect: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected collect alwaysFalse")
+	}
+	orderOV := view.indexViewByOrdinal(shape.Order.FieldOrdinal)
+	candidateSet := newPostingLazySetBuilder(3)
+	emitted, _, _, ok := view.collectOROrderFallbackBranchCandidates(&branches.owner[0], shape.Order, 3, orderOV, &candidateSet)
+	candidateSet.release()
+	branches.Release()
+	if !ok || emitted != 3 {
+		t.Fatalf("collectOROrderFallbackBranchCandidates emitted=%d ok=%v", emitted, ok)
+	}
+}
+
+func TestCardinalityStringKeyFastPaths(t *testing.T) {
+	db := newTestDB(t, testOptions{
+		MatPredCacheMaxEntries: testMatPredCacheMaxEntries,
+		MatPredCacheMaxCard:    testMatPredCacheMaxCard,
+	})
+	db.enableStringKeyCatalog()
+
+	const n = 4
+	vals := make([]testRec, n)
+	entries := make([]snapshot.BatchEntry, n)
+	keyDeltas := make([]snapshot.KeyDelta, n)
+	for i := 0; i < n; i++ {
+		id := uint64(i + 1)
+		vals[i] = testRec{
+			Name:   fmt.Sprintf("name-%02d", i),
+			Age:    20 + i,
+			Active: true,
+		}
+		key := fmt.Sprintf("sku-%03d", i)
+		entries[i] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&vals[i])}
+		keyDeltas[i] = snapshot.KeyDelta{ID: id, Key: key, Add: true}
+	}
+	db.seq++
+	db.snap = snapshot.BuildWithKeyDeltas(db.seq, db.snap, db.rt, db.cfg, nil, entries, keyDeltas)
+	view := db.view()
+	keyOrdinal := db.exec.keyOrdinal
+
+	eq := qir.Expr{Op: qir.OpEQ, FieldOrdinal: keyOrdinal, Value: "sku-002"}
+	got, ok, err := view.TryFilterCardinalityByScalarLookup(eq, nil)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByScalarLookup EQ: %v", err)
+	}
+	if !ok || got != 1 {
+		t.Fatalf("TryFilterCardinalityByScalarLookup EQ=(%d,%v) want (1,true)", got, ok)
+	}
+	got, err = view.exactExprCardinality(eq)
+	if err != nil {
+		t.Fatalf("exactExprCardinality EQ: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("exactExprCardinality EQ=%d want 1", got)
+	}
+
+	in := qir.Expr{Op: qir.OpIN, FieldOrdinal: keyOrdinal, Value: []string{"sku-000", "sku-003", "missing"}}
+	got, ok, err = view.TryFilterCardinalityByScalarLookup(in, nil)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByScalarLookup IN: %v", err)
+	}
+	if !ok || got != 2 {
+		t.Fatalf("TryFilterCardinalityByScalarLookup IN=(%d,%v) want (2,true)", got, ok)
+	}
+
+	nameOrdinal := db.rt.IndexedByName["name"].Ordinal
+	andExpr := qir.Expr{
+		Op: qir.OpAND,
+		Operands: []qir.Expr{
+			{Op: qir.OpPREFIX, FieldOrdinal: nameOrdinal, Value: "name-"},
+			eq,
+		},
+	}
+	got, err = view.exactExprCardinality(andExpr)
+	if err != nil {
+		t.Fatalf("exactExprCardinality AND: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("exactExprCardinality AND=%d want 1", got)
+	}
+
+	orExpr := qir.Expr{
+		Op: qir.OpOR,
+		Operands: []qir.Expr{
+			{Op: qir.OpEQ, FieldOrdinal: keyOrdinal, Value: "sku-001"},
+			{Op: qir.OpEQ, FieldOrdinal: keyOrdinal, Value: "sku-003"},
+		},
+	}
+	if !view.cardinalityORBranchesDisjointByScalarEQ(orExpr) {
+		t.Fatal("expected $key scalar-EQ OR branches to be recognized as disjoint")
+	}
+}
+
 func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.T) {
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5, 6, 7, 8})
 	defer bucket.Release()
@@ -1569,7 +1774,7 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 	var residualExamined uint64
 	var emitted uint64
 	for {
-		examinedDelta, residualDelta, emittedDelta, ok := iter.advance()
+		examinedDelta, residualDelta, emittedDelta, ok := iter.advance(nil)
 		examined += examinedDelta
 		residualExamined += residualDelta
 		emitted += emittedDelta
@@ -2428,7 +2633,7 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 	}
 	defer analysis.release()
 
-	orderOV := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
+	orderOV := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, viewQ.Order.FieldOrdinal)
 	if analysis.branches[0].rangeStart != 0 || analysis.branches[0].rangeEnd != orderOV.KeyCount() {
 		t.Fatalf(
 			"expected non-range order predicate branch to keep full-span order coverage, got start=%d end=%d want_end=%d",
@@ -2995,11 +3200,11 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
-	fm := view.fieldMetaByExpr(expr)
+	fm := view.fieldMetaByOrdinal(expr.FieldOrdinal)
 	if fm == nil {
 		t.Fatal("expected field metadata")
 	}
-	ov := view.fieldIndexViewFromSlotsForExpr(view.snap.Index, expr)
+	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, expr.FieldOrdinal)
 	if !ov.HasData() {
 		t.Fatal("expected index view data")
 	}

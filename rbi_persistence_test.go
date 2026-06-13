@@ -286,10 +286,10 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	if !strings.Contains(gotLog, "bucket=\"Rec\"") {
 		t.Fatalf("expected corrupted persisted index log to include bucket context, got: %q", gotLog)
 	}
-	if !strings.Contains(gotLog, "stage=load_v28") {
+	if !strings.Contains(gotLog, "stage=load_index") {
 		t.Fatalf("expected corrupted persisted index log to include load stage, got: %q", gotLog)
 	}
-	if !strings.Contains(gotLog, "version=28") {
+	if !strings.Contains(gotLog, "version=") {
 		t.Fatalf("expected corrupted persisted index log to include format version, got: %q", gotLog)
 	}
 	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
@@ -572,14 +572,17 @@ func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
 	if got.UniverseCardinality != 2 {
 		t.Fatalf("planner universe=%d want=2", got.UniverseCardinality)
 	}
-	if got.FieldCount != 2 {
-		t.Fatalf("planner field count=%d want=2", got.FieldCount)
+	if got.FieldCount != 3 {
+		t.Fatalf("planner field count=%d want=3", got.FieldCount)
 	}
 	if stats, ok := got.Fields["name"]; !ok || stats.DistinctKeys != 2 {
 		t.Fatalf("planner name stats=%+v want distinct=2", stats)
 	}
 	if stats, ok := got.Fields["age"]; !ok || stats.DistinctKeys == 0 {
 		t.Fatalf("planner age stats=%+v want non-zero rebuilt stats", stats)
+	}
+	if stats, ok := got.Fields["$key"]; !ok || stats.DistinctKeys != 2 || stats.TotalBucketCard != 2 || stats.MaxBucketCard != 1 {
+		t.Fatalf("planner $key stats=%+v want unique rows", stats)
 	}
 }
 

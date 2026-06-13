@@ -14,14 +14,16 @@ import (
 
 func buildNoActive(cfg Config, state State) (Result, error) {
 	if state.LenLoaded {
-		return Result{}, nil
+		return Result{KeyIndexLoaded: cfg.KeyIndexLoaded}, nil
 	}
 	nextLenIndex, nextLenZeroComplement := buildLenIndexStorage(cfg.Schema, state.Index, state.Universe)
 	return Result{
-		Publish:   true,
-		LenLoaded: false,
+		Publish:        true,
+		LenLoaded:      false,
+		KeyIndexLoaded: cfg.KeyIndexLoaded,
 		Storage: snapshot.Storage{
 			Index:             indexdata.CloneFieldStorageSlots(state.Index, len(cfg.Schema.Indexed)),
+			KeyIndex:          state.KeyIndex,
 			NilIndex:          indexdata.CloneFieldStorageSlots(state.NilIndex, len(cfg.Schema.Indexed)),
 			LenIndex:          nextLenIndex,
 			LenZeroComplement: nextLenZeroComplement,
@@ -117,6 +119,14 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 		build.localUniverse[i] = posting.List{}
 	}
 
+	nextKeyIndex := state.KeyIndex
+	keyIndexLoaded := cfg.KeyIndexLoaded
+	if cfg.StrKey && cfg.StrKeyIndex && !cfg.KeyIndexLoaded {
+		nextKeyIndex = build.keyIndex
+		build.keyIndex = indexdata.FieldStorage{}
+		keyIndexLoaded = true
+	}
+
 	for i := range build.fieldStates {
 		ordinal := active[i].acc.Ordinal
 		if storage := build.fieldStates[i].MaterializeStorage(); storage.KeyCount() > 0 {
@@ -191,17 +201,19 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 	return Result{
 		Storage: snapshot.Storage{
 			Index:             nextIndex,
+			KeyIndex:          nextKeyIndex,
 			NilIndex:          nextNilIndex,
 			LenIndex:          nextLenIndex,
 			LenZeroComplement: nextLenZeroComplement,
 			Measure:           nextMeasure,
 			Universe:          nextUniverse,
 		},
-		Publish:   true,
-		Stats:     true,
-		BuildTime: buildTime,
-		BuildRPS:  buildRPS,
-		LenLoaded: false,
+		Publish:        true,
+		Stats:          true,
+		BuildTime:      buildTime,
+		BuildRPS:       buildRPS,
+		LenLoaded:      false,
+		KeyIndexLoaded: keyIndexLoaded,
 	}
 }
 

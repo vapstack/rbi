@@ -80,6 +80,16 @@ type recentKeyCacheSlot struct {
 	used  bool
 }
 
+type FieldChangeSet struct {
+	Fields          schema.IndexedFieldMap
+	OrdinaryChanged []bool
+	KeyChanged      bool
+}
+
+func (changes FieldChangeSet) hasChangedFields() bool {
+	return changes.KeyChanged || len(changes.OrdinaryChanged) != 0
+}
+
 func MaterializedPredMaxCardinality(v int) uint64 {
 	if v < 0 {
 		return 0
@@ -358,17 +368,18 @@ func (c *MaterializedPredCache) TryLoadOrStoreOversized(key MaterializedPredKey,
 	return stored.Borrow(), true
 }
 
-func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, fields schema.IndexedFieldMap, changedFields []bool) {
+func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, changes FieldChangeSet) {
 	limit := c.maxEntries
 	if limit <= 0 || prev.count.Load() == 0 || len(prev.slots) == 0 || len(c.slots) == 0 {
 		return
 	}
 
-	var oversized int32
+	oversizedLimit := MaterializedPredOversizedLimit(limit)
 	var maxStamp uint64
 
 	prev.mu.RLock()
 	c.mu.Lock()
+	oversized := c.oversizedCount.Load()
 	for i := range prev.slots {
 		if int(c.count.Load()) >= limit {
 			break
@@ -382,38 +393,87 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, fields 
 		if f == "" {
 			continue
 		}
-		if changedFields != nil {
-			acc, ok := fields[f]
-			if !ok || changedFields[acc.Ordinal] {
-				continue
-			}
+		if !materializedPredFieldMatchesChange(changes, f, false) {
+			continue
 		}
 		if _, exists := c.lookupLocked(&key); exists {
 			continue
 		}
-		slot.entry.retain()
-		stamp := slot.entry.stamp.Load()
+		entry := slot.entry
+		entryOversized := entry.oversized
+		if entryOversized && oversized >= oversizedLimit {
+			continue
+		}
+		entry.retain()
+		stamp := entry.stamp.Load()
 		if stamp > maxStamp {
 			maxStamp = stamp
 		}
-		if slot.entry.oversized {
-			oversized++
-		}
-		if !c.insertLocked(key, slot.entry) {
-			slot.entry.release()
+		if !c.insertLocked(key, entry) {
+			entry.release()
 			break
 		}
 		c.count.Add(1)
+		if entryOversized {
+			oversized++
+		}
 	}
+	c.oversizedCount.Store(oversized)
 
 	c.mu.Unlock()
 	prev.mu.RUnlock()
-	if oversized > 0 {
-		c.oversizedCount.Store(min(oversized, MaterializedPredOversizedLimit(limit)))
-	}
 	if maxStamp > c.clock.Load() {
 		c.clock.Store(maxStamp)
 	}
+}
+
+func materializedPredFieldMatchesChange(changes FieldChangeSet, field string, changedOnly bool) bool {
+	if field == schema.ReservedKeyFieldName {
+		return changes.KeyChanged == changedOnly
+	}
+	changedFields := changes.OrdinaryChanged
+	if changedFields == nil {
+		return !changedOnly
+	}
+	acc, ok := changes.Fields[field]
+	if !ok || acc.Ordinal >= len(changedFields) {
+		return false
+	}
+	return changedFields[acc.Ordinal] == changedOnly
+}
+
+func (c *MaterializedPredCache) EvictField(field string) {
+	if field == "" || len(c.slots) == 0 {
+		return
+	}
+	c.mu.Lock()
+	for i := range c.slots {
+		slot := c.slots[i]
+		if !slot.used || slot.key.Field() != field {
+			continue
+		}
+		c.slots[i] = materializedPredCacheSlot{}
+		if len(c.slots) > materializedPredCacheLinearMaxEntries && c.index != nil {
+			if c.index[slot.hash] == i {
+				delete(c.index, slot.hash)
+				for j := range c.slots {
+					if j != i && c.slots[j].used && c.slots[j].hash == slot.hash {
+						c.index[slot.hash] = j
+						break
+					}
+				}
+			}
+		}
+		if i < c.freeHint {
+			c.freeHint = i
+		}
+		c.count.Add(-1)
+		if slot.entry.oversized {
+			c.oversizedCount.Add(-1)
+		}
+		c.retireEntryLocked(slot.entry)
+	}
+	c.mu.Unlock()
 }
 
 func (c *MaterializedPredCache) Clear() {
@@ -798,19 +858,19 @@ func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit 
 	return delta >= threshold, false
 }
 
-func (c *RecentKeyCache) InheritObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, limit int) {
-	c.inheritObservedWorkFrom(prev, fields, changedFields, false, limit)
+func (c *RecentKeyCache) InheritObservedWorkFrom(prev *RecentKeyCache, changes FieldChangeSet, limit int) {
+	c.inheritObservedWorkFrom(prev, changes, false, limit)
 }
 
-func (c *RecentKeyCache) InheritChangedObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, limit int) {
-	c.inheritObservedWorkFrom(prev, fields, changedFields, true, limit)
+func (c *RecentKeyCache) InheritChangedObservedWorkFrom(prev *RecentKeyCache, changes FieldChangeSet, limit int) {
+	c.inheritObservedWorkFrom(prev, changes, true, limit)
 }
 
-func (c *RecentKeyCache) inheritObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, changedOnly bool, limit int) {
+func (c *RecentKeyCache) inheritObservedWorkFrom(prev *RecentKeyCache, changes FieldChangeSet, changedOnly bool, limit int) {
 	if limit <= 0 {
 		return
 	}
-	if changedOnly && len(changedFields) == 0 {
+	if changedOnly && !changes.hasChangedFields() {
 		return
 	}
 
@@ -833,12 +893,7 @@ func (c *RecentKeyCache) inheritObservedWorkFrom(prev *RecentKeyCache, fields sc
 		if f == "" {
 			continue
 		}
-		if changedFields != nil {
-			acc, ok := fields[f]
-			if !ok || changedFields[acc.Ordinal] != changedOnly {
-				continue
-			}
-		} else if changedOnly {
+		if !materializedPredFieldMatchesChange(changes, f, changedOnly) {
 			continue
 		}
 		idx := c.selectVictimSlot()
@@ -867,6 +922,24 @@ func (c *RecentKeyCache) inheritObservedWorkFrom(prev *RecentKeyCache, fields sc
 	c.clock = maxStamp
 	c.mu.Unlock()
 	prev.mu.Unlock()
+}
+
+func (c *RecentKeyCache) EvictField(field string) {
+	if field == "" {
+		return
+	}
+	c.mu.Lock()
+	for i := range c.slots {
+		slot := c.slots[i]
+		if !slot.used || slot.key.Field() != field {
+			continue
+		}
+		if len(c.slots) > materializedPredCacheLinearMaxEntries && c.index != nil {
+			c.removeRecentIndexLocked(slot.hash, i)
+		}
+		c.slots[i] = recentKeyCacheSlot{}
+	}
+	c.mu.Unlock()
 }
 
 func (c *RecentKeyCache) initSlots(limit int) {

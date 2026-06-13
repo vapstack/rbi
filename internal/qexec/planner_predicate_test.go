@@ -10,6 +10,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 func predicateMatchIDs(pred predicate, universe posting.List) []uint64 {
@@ -83,7 +84,9 @@ func TestExecPlanLeadScanNoOrderUsesSelectedLead(t *testing.T) {
 		},
 	}
 
-	var qv View
+	db := newTestDB(t, testOptions{})
+	db.snap = &snapshot.View{LenZeroComplement: make([]bool, len(db.rt.Indexed))}
+	qv := db.view()
 	q := qir.Shape{Limit: 1}
 	var trace Trace
 	out := qv.execPlanLeadScanNoOrder(&q, preds, 1, &trace)
@@ -666,11 +669,11 @@ func TestBuildPredRange_NumericBucketsRunWhenPredicateCacheDisabled(t *testing.T
 
 	view := db.engine.currentQueryViewForTests()
 	expr := mustTestQIRExprForDB(t, db, qx.LT("age", 11_000))
-	fm := view.fieldMetaByExpr(expr)
+	fm := view.fieldMetaByOrdinal(expr.FieldOrdinal)
 	if fm == nil {
 		t.Fatal("expected field metadata")
 	}
-	ov := view.fieldIndexViewFromSlotsForExpr(view.snap.Index, expr)
+	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, expr.FieldOrdinal)
 	if !ov.HasData() {
 		t.Fatal("expected index view data")
 	}

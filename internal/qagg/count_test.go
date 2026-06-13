@@ -60,6 +60,36 @@ func newQaggTestDB(t testing.TB, traceSink func(rbitrace.Event)) *qaggTestDB {
 	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
 }
 
+func newQaggStringKeyTestDB(t testing.TB) *qaggTestDB {
+	t.Helper()
+
+	rt, err := schema.Compile(reflect.TypeFor[qaggTestRec](), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	exec := qexec.NewRuntime(qexec.Config{
+		Schema:  rt,
+		StrKey:  true,
+		KeyMode: qexec.KeyModeString,
+	})
+
+	rows := qaggDefaultRows()
+	entries := make([]snapshot.BatchEntry, len(rows))
+	keyDeltas := make([]snapshot.KeyDelta, len(rows))
+	keys := [...]string{"alpha", "beta", "alphabet", "delta", "zeta", "betamax"}
+	for i := range rows {
+		id := uint64(i + 1)
+		entries[i] = snapshot.BatchEntry{ID: id, New: unsafe.Pointer(&rows[i])}
+		keyDeltas[i] = snapshot.KeyDelta{ID: id, Key: keys[i], Add: true}
+	}
+	snap := snapshot.BuildWithKeyDeltas(1, nil, rt, snapshot.CacheConfig{
+		MatPredMaxEntries: 32,
+		MatPredMaxCard:    64 << 10,
+	}, nil, entries, keyDeltas)
+
+	return &qaggTestDB{rt: rt, exec: exec, snap: snap}
+}
+
 func qaggDefaultRows() []qaggTestRec {
 	return []qaggTestRec{
 		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go", "db"}, Amount: qaggI64(10)},
@@ -103,7 +133,7 @@ func TestCountDirectFastPathsReturnExactCardinality(t *testing.T) {
 	view := db.view()
 	defer db.exec.ReleaseView(view)
 	for i := range tests {
-		prepared, err := PrepareCount(db.rt, tests[i].exprs...)
+		prepared, err := PrepareCount(db.rt.IndexedByName, tests[i].exprs...)
 		if err != nil {
 			t.Fatalf("%s PrepareCount: %v", tests[i].name, err)
 		}
@@ -124,7 +154,7 @@ func TestCountDirectTraceFinishesCountEvent(t *testing.T) {
 		events = append(events, ev)
 	})
 
-	prepared, err := PrepareCount(db.rt)
+	prepared, err := PrepareCount(db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("PrepareCount: %v", err)
 	}
@@ -161,6 +191,7 @@ func TestExecuteGroupedMetricsHavingOrderAndWindow(t *testing.T) {
 			Offset(1).
 			Limit(2),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -186,12 +217,75 @@ func TestExecuteGroupedMetricsHavingOrderAndWindow(t *testing.T) {
 	requireQaggInt(t, result.Rows[1][2], 35)
 }
 
+func TestPrepareCountRejectsDisabledStringKey(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+	prepared, err := PrepareCount(db.rt.IndexedByName, qx.EQ(schema.ReservedKeyFieldName, "alpha"))
+	if prepared != nil {
+		prepared.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "no index for field") {
+		t.Fatalf("PrepareCount err=%v, want no index rejection", err)
+	}
+}
+
+func TestCountSupportsStringKeyFilter(t *testing.T) {
+	db := newQaggStringKeyTestDB(t)
+	prepared, err := PrepareCount(db.exec, qx.PREFIX(schema.ReservedKeyFieldName, "alpha"))
+	if err != nil {
+		t.Fatalf("PrepareCount: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	got, err := Count(view, prepared, false)
+	db.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("Count=%d, want 2", got)
+	}
+}
+
+func TestExecuteAggregateSupportsStringKeyFilter(t *testing.T) {
+	db := newQaggStringKeyTestDB(t)
+	prepared, err := Prepare(
+		qx.Query(qx.PREFIX(schema.ReservedKeyFieldName, "beta")).
+			Group("country").
+			Metrics(
+				qx.ROWCOUNT().AS("rows"),
+				qx.SUM("amount").AS("sum"),
+			),
+		db.rt,
+		db.exec,
+	)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"country", "rows", "sum"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireQaggString(t, result.Rows[0][0], "DE")
+	requireQaggUint(t, result.Rows[0][1], 2)
+	requireQaggInt(t, result.Rows[0][2], 35)
+}
+
 func TestExecuteRowCountUsesCountFilter(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 	prepared, err := Prepare(
 		qx.Query(qx.OR(qx.EQ("country", "NL"), qx.HASANY("tags", []string{"ops"}))).
 			Metrics(qx.ROWCOUNT().AS("rows")),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -215,7 +309,7 @@ func TestExecuteRowCountUsesCountFilter(t *testing.T) {
 func TestExecuteDistinctAndCountDistinct(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 
-	prepared, err := Prepare(qx.Aggregate(qx.DISTINCT("country").AS("country")), db.rt)
+	prepared, err := Prepare(qx.Aggregate(qx.DISTINCT("country").AS("country")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare distinct: %v", err)
 	}
@@ -243,6 +337,7 @@ func TestExecuteDistinctAndCountDistinct(t *testing.T) {
 	prepared, err = Prepare(
 		qx.Query(qx.EQ("active", true)).Metrics(qx.COUNT(qx.DISTINCT("country")).AS("countries")),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare count distinct: %v", err)
@@ -276,6 +371,7 @@ func TestExecuteNumericMetricsOverMeasureAndOrdinaryFields(t *testing.T) {
 			qx.MAX("age").AS("age_max"),
 		),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -318,6 +414,7 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 			qx.MIN("amount").AS("amount_min"),
 		),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare ungrouped: %v", err)
@@ -341,6 +438,7 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 	prepared, err = Prepare(
 		qx.Query(qx.EQ("country", "missing")).Group("country").Metrics(qx.ROWCOUNT().AS("rows")),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare grouped: %v", err)
@@ -360,6 +458,7 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 	prepared, err = Prepare(
 		qx.Query(qx.EQ("country", "missing")).Metrics(qx.DISTINCT("country").AS("country")),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare distinct: %v", err)
@@ -379,6 +478,7 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 	prepared, err = Prepare(
 		qx.Query(qx.EQ("country", "missing")).Metrics(qx.COUNT(qx.DISTINCT("country")).AS("countries")),
 		db.rt,
+		db.rt.IndexedByName,
 	)
 	if err != nil {
 		t.Fatalf("Prepare count distinct: %v", err)
@@ -399,7 +499,7 @@ func TestExecuteEmptyMatchesReturnAggregateShapes(t *testing.T) {
 
 func TestExecuteNullGroupProducesNoneKey(t *testing.T) {
 	db := newQaggTestDB(t, nil)
-	prepared, err := Prepare(qx.Group("segment").Metrics(qx.ROWCOUNT().AS("rows")), db.rt)
+	prepared, err := Prepare(qx.Group("segment").Metrics(qx.ROWCOUNT().AS("rows")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -437,7 +537,7 @@ func TestExecuteNullGroupProducesNoneKey(t *testing.T) {
 
 func TestExecuteSignedSumOverflowReturnsError(t *testing.T) {
 	db := newQaggTestDB(t, nil)
-	prepared, err := Prepare(qx.Aggregate(qx.SUM("big").AS("sum")), db.rt)
+	prepared, err := Prepare(qx.Aggregate(qx.SUM("big").AS("sum")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -467,7 +567,7 @@ func TestExecutePinnedSnapshotIsolation(t *testing.T) {
 		{ID: 1, Old: unsafe.Pointer(&oldRec), New: unsafe.Pointer(&newRec)},
 	})
 
-	prepared, err := Prepare(qx.Aggregate(qx.SUM("amount").AS("sum")), rt)
+	prepared, err := Prepare(qx.Aggregate(qx.SUM("amount").AS("sum")), rt, rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -547,10 +647,30 @@ func TestPrepareRejectsUnsupportedAggregateShapes(t *testing.T) {
 			q:    qx.Query(qx.EQ("amount", int64(10))).Metrics(qx.ROWCOUNT()),
 			want: "amount",
 		},
+		{
+			name: "filter_reserved_key",
+			q:    qx.Query(qx.EQ(schema.ReservedKeyFieldName, "alpha")).Metrics(qx.ROWCOUNT()),
+			want: schema.ReservedKeyFieldName,
+		},
+		{
+			name: "group_reserved_key",
+			q:    qx.Group(schema.ReservedKeyFieldName).Metrics(qx.ROWCOUNT()),
+			want: schema.ReservedKeyFieldName,
+		},
+		{
+			name: "metric_reserved_key",
+			q:    qx.Aggregate(qx.DISTINCT(schema.ReservedKeyFieldName)),
+			want: schema.ReservedKeyFieldName,
+		},
+		{
+			name: "having_reserved_key_ref",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.EQ(qx.REF(schema.ReservedKeyFieldName), "alpha")),
+			want: schema.ReservedKeyFieldName,
+		},
 	}
 
 	for i := range tests {
-		prepared, err := Prepare(tests[i].q, db.rt)
+		prepared, err := Prepare(tests[i].q, db.rt, db.rt.IndexedByName)
 		if prepared != nil {
 			prepared.Release()
 		}

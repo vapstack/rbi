@@ -2,12 +2,169 @@ package qexec
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbitrace"
 )
+
+func TestRuntimeQueryFieldCatalogResolvesStringKey(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	ageOrdinal := db.rt.IndexedByName["age"].Ordinal
+	info, ok := db.exec.ResolveField("age")
+	if !ok || info.Ordinal != ageOrdinal {
+		t.Fatalf("ResolveField(age)=(%+v,%v), want ordinal %d", info, ok, ageOrdinal)
+	}
+	if _, ok = db.exec.ResolveField(schema.ReservedKeyFieldName); ok {
+		t.Fatalf("disabled %s resolved", schema.ReservedKeyFieldName)
+	}
+
+	db.enableStringKeyCatalog()
+	info, ok = db.exec.ResolveField(schema.ReservedKeyFieldName)
+	if !ok {
+		t.Fatalf("ResolveField(%s) failed", schema.ReservedKeyFieldName)
+	}
+	if info.Ordinal < 0 || info.Ordinal != len(db.rt.Indexed) {
+		t.Fatalf("%s ordinal=%d want %d", schema.ReservedKeyFieldName, info.Ordinal, len(db.rt.Indexed))
+	}
+	if info.Caps != 0 {
+		t.Fatalf("%s caps=%d want 0", schema.ReservedKeyFieldName, info.Caps)
+	}
+	if db.exec.FieldNameByOrdinal(info.Ordinal) != schema.ReservedKeyFieldName {
+		t.Fatalf("FieldNameByOrdinal(%d)=%q", info.Ordinal, db.exec.FieldNameByOrdinal(info.Ordinal))
+	}
+	if _, ok = db.rt.IndexedByName[schema.ReservedKeyFieldName]; ok {
+		t.Fatalf("%s inserted into schema.IndexedByName", schema.ReservedKeyFieldName)
+	}
+	info, ok = db.exec.ResolveField("age")
+	if !ok || info.Ordinal != ageOrdinal {
+		t.Fatalf("ResolveField(age) after key catalog=(%+v,%v), want ordinal %d", info, ok, ageOrdinal)
+	}
+}
+
+func TestRuntimeNumericKeyPredicatesAndOrderUseUniverse(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.enableNumericKeyCatalog()
+	db.seedGeneratedData(t, 8, func(id uint64) testRec {
+		return testRec{
+			Name:   fmt.Sprintf("name-%02d", id),
+			Age:    int(20 + id),
+			Active: id%2 == 0,
+		}
+	})
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+		want []uint64
+	}{
+		{name: "eq", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, uint64(3))), want: []uint64{3}},
+		{name: "eq_negative_empty", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, -1)), want: nil},
+		{name: "eq_fraction_empty", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, 2.5)), want: nil},
+		{name: "eq_float_2_64_empty", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: nil},
+		{name: "in", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{uint64(1), int64(-1), 4.5, 6})), want: []uint64{1, 6}},
+		{name: "in_float_2_64_skipped", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{uint64(2), math.Ldexp(1, 64), math.Ldexp(1, 65), 8})), want: []uint64{2, 8}},
+		{name: "range", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 3), qx.LT(schema.ReservedKeyFieldName, 7)), want: []uint64{3, 4, 5, 6}},
+		{name: "range_gte_float_2_64_empty", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: nil},
+		{name: "range_lt_float_2_64_full", q: qx.Query(qx.LT(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: []uint64{1, 2, 3, 4, 5, 6, 7, 8}},
+		{name: "range_lte_float_above_2_64_full", q: qx.Query(qx.LTE(schema.ReservedKeyFieldName, math.Ldexp(1, 65))), want: []uint64{1, 2, 3, 4, 5, 6, 7, 8}},
+		{name: "range_active", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 2), qx.LTE(schema.ReservedKeyFieldName, 7), qx.EQ("active", true)), want: []uint64{2, 4, 6}},
+		{name: "order_asc", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 3)).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: []uint64{3, 4, 5}},
+		{name: "order_desc", q: qx.Query(qx.LTE(schema.ReservedKeyFieldName, 6)).Sort(schema.ReservedKeyFieldName, qx.DESC).Limit(3), want: []uint64{6, 5, 4}},
+		{name: "order_const_false", q: qx.Query(qx.NOT(qx.Expr{})).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: nil},
+		{name: "order_contradictory_key", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, uint64(5)), qx.NOT(qx.EQ(schema.ReservedKeyFieldName, uint64(5)))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(3), want: nil},
+		{name: "order_or_residual", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 0), qx.OR(qx.EQ("active", true), qx.EQ("name", "name-03"))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(4), want: []uint64{2, 3, 4, 6}},
+		{name: "or_materialized_order", q: qx.Query(qx.OR(qx.EQ(schema.ReservedKeyFieldName, 2), qx.EQ("active", true))).Sort(schema.ReservedKeyFieldName, qx.DESC).Limit(3), want: []uint64{8, 6, 4}},
+	}
+	for _, tc := range cases {
+		got, err := db.query(tc.q)
+		if err != nil {
+			t.Fatalf("%s query: %v", tc.name, err)
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s query=%v want %v", tc.name, got, tc.want)
+		}
+	}
+
+	if _, err := db.query(qx.Query(qx.EQ(schema.ReservedKeyFieldName, "3"))); err == nil {
+		t.Fatal("numeric $key string predicate succeeded")
+	}
+	if _, err := db.query(qx.Query(qx.PREFIX(schema.ReservedKeyFieldName, 3))); err == nil {
+		t.Fatal("numeric $key PREFIX predicate succeeded")
+	}
+}
+
+func TestRuntimeNumericKeyOrderedLimitSelectorRoutes(t *testing.T) {
+	recorder := &traceContractRecorder{}
+	db := newTestDB(t, testOptions{
+		TraceSink:        recorder.sink,
+		TraceSampleEvery: 1,
+	})
+	db.enableNumericKeyCatalog()
+	db.seedGeneratedData(t, 8, func(id uint64) testRec {
+		return testRec{
+			Name:   fmt.Sprintf("name-%02d", id),
+			Age:    int(20 + id),
+			Active: id%2 == 0,
+		}
+	})
+
+	cases := []struct {
+		name     string
+		q        *qx.QX
+		want     []uint64
+		plan     rbitrace.PlanName
+		selected string
+		rejected string
+	}{
+		{
+			name:     "supported_residual",
+			q:        qx.Query(qx.GTE(schema.ReservedKeyFieldName, 3), qx.EQ("active", true)).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(2),
+			want:     []uint64{4, 6},
+			plan:     rbitrace.PlanLimitOrderBasic,
+			selected: plannerOrderedLimitCandidateNumericKeyScan.String(),
+			rejected: plannerOrderedLimitCandidateMaterializedFallback.String(),
+		},
+		{
+			name:     "unsupported_or_residual",
+			q:        qx.Query(qx.GTE(schema.ReservedKeyFieldName, 0), qx.OR(qx.EQ("active", true), qx.EQ("name", "name-03"))).Sort(schema.ReservedKeyFieldName, qx.ASC).Limit(4),
+			want:     []uint64{2, 3, 4, 6},
+			plan:     rbitrace.PlanMaterialized,
+			selected: plannerOrderedLimitCandidateMaterializedFallback.String(),
+			rejected: plannerOrderedLimitCandidateNumericKeyScan.String(),
+		},
+	}
+
+	for _, tc := range cases {
+		prepared, shape, err := db.prepareQuery(tc.q)
+		if err != nil {
+			t.Fatalf("%s prepareQuery: %v", tc.name, err)
+		}
+		mark := recorder.mark()
+		got, err := db.view().Query(&shape, true)
+		prepared.Release()
+		if err != nil {
+			t.Fatalf("%s Query: %v", tc.name, err)
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s query=%v want %v", tc.name, got, tc.want)
+		}
+		ev := recorder.lastSince(t, mark)
+		if ev.Plan != tc.plan {
+			t.Fatalf("%s plan=%q want %q trace=%+v", tc.name, ev.Plan, tc.plan, ev)
+		}
+		if ev.OrderedLimitRoute.Selected != tc.selected {
+			t.Fatalf("%s selected=%q want %q route=%+v", tc.name, ev.OrderedLimitRoute.Selected, tc.selected, ev.OrderedLimitRoute)
+		}
+		if ev.OrderedLimitRoute.Rejected != tc.rejected {
+			t.Fatalf("%s rejected=%q want %q route=%+v", tc.name, ev.OrderedLimitRoute.Rejected, tc.rejected, ev.OrderedLimitRoute)
+		}
+	}
+}
 
 func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
 	db, _ := openTempDBUint64(t)

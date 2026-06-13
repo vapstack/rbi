@@ -222,11 +222,24 @@ q := qx.Query(
   Scalar-string `POS(field, "alice bob")` is not supported.
 - Projection is not supported, queries return whole records.
 
+### Primary-key queries
+
+`$key` is a reserved synthetic field that exposes record primary keys to
+queries. It is not a struct field and cannot be declared with tags.
+`Options.Index["$key"]` is also invalid.
+
+For numeric-key databases, `$key` becomes available automatically when the
+database has at least one indexed field. It uses the runtime key universe
+and does not need separate key storage.
+
+For string-key DB, support is opt-in using `EnableStringKeyIndex` option.
+A separate in-memory unique string index is automatically maintained when enabled.
+
 ### Aggregation
 
 `Aggregate` method evaluates simple reductions against the same in-memory
-snapshot model as queries. Filters use the same predicate subset 
-and must reference indexed fields.
+snapshot model as queries. Filters use the same predicate subset and must
+reference indexed fields or `$key`.
 
 ```go
 res, err := db.Aggregate(
@@ -262,6 +275,7 @@ not computed expressions.
 Aggregation does not support projection, computed expressions, grouping by
 measure fields, slice fields, `DISTINCT` over measure/slice fields, or
 standalone `DISTINCT(field)` combined with grouping or other metrics.
+`$key` is supported only in filters.
 
 ## Ordering limitations
 
@@ -685,7 +699,8 @@ For `DB[uint64, V]`, bbolt keys are 8-byte big-endian `uint64` values.
 
 For `DB[string, V]`, bbolt keys are the string keys themselves as raw bytes.
 The stored value has an 8-byte prefix with the internal numeric id,
-followed by the encoded record payload.
+followed by the encoded record payload. String-key DB also maintains a reverse
+mapping bucket, which has the same name as data bucket but with `.rbimap` suffix.
 
 ## Limitations
 

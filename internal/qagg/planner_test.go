@@ -88,7 +88,7 @@ func TestAggregateSelectorsChooseRouteContracts(t *testing.T) {
 
 	for i := range tests {
 		tc := tests[i]
-		prepared, err := Prepare(tc.q, db.rt)
+		prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare: %v", tc.name, err)
 		}
@@ -96,7 +96,7 @@ func TestAggregateSelectorsChooseRouteContracts(t *testing.T) {
 		var decision aggregateRouteDecision
 		family := selectAggregateFamily(prepared)
 		if family == aggregateSelectorCount {
-			decision = selectCountAggregate()
+			decision = selectCountAggregate(aggregateCountFacts{filterCardinality: db.snap.Universe.Cardinality()})
 		} else {
 			ids, err := view.Filter(prepared.filter)
 			if err != nil {
@@ -330,7 +330,7 @@ func TestExecuteAggregateEmitsSelectedRouteTrace(t *testing.T) {
 			events = append(events, ev)
 		})
 
-		prepared, err := Prepare(tc.q, db.rt)
+		prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare: %v", tc.name, err)
 		}
@@ -409,7 +409,7 @@ func TestExecuteGroupedRecursiveTraceIncludesRejectedByID(t *testing.T) {
 	db := newQaggSparseIDTestDB(t, func(ev rbitrace.Event) {
 		events = append(events, ev)
 	})
-	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt)
+	prepared, err := Prepare(qx.Group("country").Metrics(qx.SUM("age").AS("sum")), db.rt, db.rt.IndexedByName)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestExecuteAggregateMeasureTraceIncludesAccessMode(t *testing.T) {
 		db := newQaggTestDB(t, func(ev rbitrace.Event) {
 			events = append(events, ev)
 		})
-		prepared, err := Prepare(tc.q, db.rt)
+		prepared, err := Prepare(tc.q, db.rt, db.rt.IndexedByName)
 		if err != nil {
 			t.Fatalf("%s Prepare: %v", tc.name, err)
 		}

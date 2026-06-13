@@ -9,6 +9,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type benchmarkSchemaValue string
@@ -253,13 +254,13 @@ func BenchmarkRuntimeLookupHelpers(b *testing.B) {
 		benchmarkSchemaBoolSink = ok
 	})
 	b.Run("ResolveField", func(b *testing.B) {
-		ordinal := 0
+		info := qir.FieldInfo{}
 		ok := false
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			ordinal, ok = fieldMap.ResolveField("string")
+			info, ok = fieldMap.ResolveField("string")
 		}
-		benchmarkSchemaIntSink = ordinal
+		benchmarkSchemaIntSink = info.Ordinal
 		benchmarkSchemaBoolSink = ok
 	})
 	b.Run("FieldPredicates", func(b *testing.B) {

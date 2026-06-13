@@ -132,13 +132,13 @@ func (qv *View) execSelectedNoOrderUniverseScan(q *qir.Shape, leaves []qir.Expr,
 }
 
 func (qv *View) execSelectedNoOrderSingleNegativeScalarUniverseScan(q *qir.Shape, e qir.Expr, universe posting.List, expectedRows uint64, trace *Trace) ([]uint64, bool, error) {
-	if !e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+	if !e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 {
 		return nil, false, nil
 	}
 	if e.Op != qir.OpEQ && e.Op != qir.OpIN {
 		return nil, false, nil
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -155,9 +155,9 @@ func (qv *View) execSelectedNoOrderSingleNegativeScalarUniverseScan(q *qir.Shape
 		}
 		var ids posting.List
 		if isNil {
-			ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids = qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		} else {
-			ids = lookupScalarPostingRetained(qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e), key)
+			ids = lookupScalarPostingRetained(qv.indexViewByOrdinal(e.FieldOrdinal), key)
 		}
 		if !ids.IsEmpty() {
 			postsBuf = posting.GetSlice(1)
@@ -737,7 +737,7 @@ func (qv *View) runOrderBasicBaseQuery(
 	if trace == nil && !base.neg && nilTailField == "" {
 		baseCard := baseBM.Cardinality()
 		if len(residualActive) == 0 {
-			if fm := qv.fieldMetaByOrder(order); fm == nil || !fm.Ptr {
+			if fm := qv.fieldMetaByOrdinal(order.FieldOrdinal); fm == nil || !fm.Ptr {
 				keyCount := uint64(ov.KeyCount())
 				dense := baseCard >= (keyCount+3)/4
 				sparseWarm := baseCard > 128 && baseCard <= 512 && keyCount >= baseCard*8
@@ -816,7 +816,7 @@ func (qv *View) runOrderBasicBaseQuery(
 		scanWidth uint64
 	)
 
-	nilOV := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField)
+	nilOV := qv.nilIndexViewByName(nilTailField)
 
 	for {
 		ids, idx, single, ok := keyCur.NextPostingOrSingle()
@@ -1049,17 +1049,17 @@ func (qv *View) validateOrderBasicExpr(e qir.Expr) error {
 }
 
 func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return fmt.Errorf("%w: invalid expression, op: %v", rbierrors.ErrInvalidQuery, e.Op)
 	}
 	fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 
-	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(e.FieldOrdinal) {
 		return fmt.Errorf("no index for field: %v", fieldName)
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil {
 		return fmt.Errorf("no metadata for field: %v", fieldName)
 	}
@@ -1168,8 +1168,8 @@ type orderBasicBaseCore struct {
 	collapsed preparedScalarExactRange
 }
 
-func isOrderBasicCollapsibleScalarRangeExpr(op qir.Expr, fm *schema.Field) bool {
-	if op.Not || op.FieldOrdinal < 0 || fm == nil || fm.Slice || len(op.Operands) != 0 {
+func (qv *View) isOrderBasicCollapsibleScalarRangeExpr(op qir.Expr, fm *schema.Field) bool {
+	if op.Not || !qv.hasFieldOrdinal(op.FieldOrdinal) || fm == nil || fm.Slice || len(op.Operands) != 0 {
 		return false
 	}
 	return isScalarRangeEqOp(op.Op)
@@ -1180,7 +1180,7 @@ func (qv *View) shouldCollapseOrderBasicScalarRange(field string, fieldOrdinal i
 		return false
 	}
 
-	ov := qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, fieldOrdinal)
+	ov := qv.indexViewRef(field, fieldOrdinal)
 	if !ov.HasData() {
 		return true
 	}
@@ -1206,7 +1206,7 @@ func (qv *View) shouldCollapseOrderBasicScalarRange(field string, fieldOrdinal i
 	}
 
 	complementBuckets := ov.KeyCount() - bucketCount
-	if qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, fieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0 {
+	if qv.nilIndexViewRef(field, fieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0 {
 		complementBuckets++
 	}
 
@@ -1239,8 +1239,8 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 		if rawCoreIdxBuf[i] >= 0 {
 			continue
 		}
-		fm := qv.fieldMetaByExpr(op)
-		if !isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
+		fm := qv.fieldMetaByOrdinal(op.FieldOrdinal)
+		if !qv.isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
 			continue
 		}
 		fieldName := qv.exec.FieldNameByOrdinal(op.FieldOrdinal)
@@ -1252,7 +1252,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 				continue
 			}
 			other := baseOps[j]
-			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
+			if other.FieldOrdinal != op.FieldOrdinal || !qv.isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
 				continue
 			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
@@ -1293,7 +1293,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 		})
 		for j := i; j < len(baseOps); j++ {
 			other := baseOps[j]
-			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
+			if other.FieldOrdinal == op.FieldOrdinal && qv.isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
 				rawCoreIdxBuf[j] = coreIdx
 			}
 		}
@@ -1383,7 +1383,7 @@ func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core o
 
 	case orderBasicBaseCoreRawExpr:
 		op := core.expr
-		if op.Not || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField {
+		if op.Not || !qv.hasFieldOrdinal(op.FieldOrdinal) || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField {
 			return false
 		}
 		stats, ok := qv.orderBasicRawBaseOpStats(op, universe)
@@ -1456,7 +1456,7 @@ func (qv *View) hasLimitLeafPredObservationCandidate(orderField string, preds []
 			continue
 		}
 		op := pred.pred.expr
-		if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
+		if !qv.isSimpleScalarRangeOrPrefixLeaf(op) || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
 			continue
 		}
 		if qv.orderBasicBaseCoreObservationCandidate(orderField, orderBasicBaseCore{
@@ -1521,7 +1521,7 @@ func (qv *View) orderBasicRawBaseOpStats(
 	op qir.Expr,
 	universe uint64,
 ) (scalarMaterializationStats, bool) {
-	if !isSimpleScalarRangeOrPrefixLeaf(op) {
+	if !qv.isSimpleScalarRangeOrPrefixLeaf(op) {
 		return scalarMaterializationStats{}, false
 	}
 
@@ -1537,7 +1537,7 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 	op qir.Expr,
 	universe, observedRows, needWindow uint64,
 ) bool {
-	if universe == 0 || observedRows == 0 || op.Not || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField {
+	if universe == 0 || observedRows == 0 || op.Not || !qv.hasFieldOrdinal(op.FieldOrdinal) || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField {
 		return false
 	}
 	if needWindow == 0 {
@@ -1572,7 +1572,7 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 }
 
 func (qv *View) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey qcache.MaterializedPredKey) bool {
-	if cacheKey.IsZero() || op.FieldOrdinal < 0 {
+	if cacheKey.IsZero() || !qv.hasFieldOrdinal(op.FieldOrdinal) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
@@ -1630,12 +1630,12 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 	for i := 0; i < len(coresBuf); i++ {
 		core := coresBuf[i]
 		if core.kind == orderBasicBaseCoreRawExpr {
-			fm := qv.fieldMetaByExpr(core.expr)
-			if isOrderBasicCollapsibleScalarRangeExpr(core.expr, fm) {
+			fm := qv.fieldMetaByOrdinal(core.expr.FieldOrdinal)
+			if qv.isOrderBasicCollapsibleScalarRangeExpr(core.expr, fm) {
 				groupCount := 0
 				for j := 0; j < len(baseOps); j++ {
 					op := baseOps[j]
-					if op.FieldOrdinal == core.expr.FieldOrdinal && isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
+					if op.FieldOrdinal == core.expr.FieldOrdinal && qv.isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
 						groupCount++
 					}
 				}
@@ -1701,7 +1701,7 @@ func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPre
 			core = pred.baseCore
 		} else {
 			op := pred.pred.expr
-			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
+			if !qv.isSimpleScalarRangeOrPrefixLeaf(op) || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
 				continue
 			}
 			core = orderBasicBaseCore{
@@ -1889,6 +1889,16 @@ DISPATCH:
 	case plannerOrderedLimitCandidateMaterializedFallback:
 		return qv.dispatchLimitMaterialized(q)
 
+	case plannerOrderedLimitCandidateNumericKeyScan:
+		out, used, err := qv.dispatchNumericKeyOrderedLimit(q, facts, trace)
+		if !used {
+			if err != nil {
+				return nil, true, "", err
+			}
+			return qv.dispatchOrderedLimitFallback(q, decision)
+		}
+		return out, true, rbitrace.PlanLimitOrderBasic, err
+
 	case plannerOrderedLimitCandidateCandidateOrder:
 		predSet, ok := qv.buildPredicatesCandidate(ops)
 		if !ok {
@@ -1913,9 +1923,9 @@ DISPATCH:
 		}
 		if trace == nil && len(baseOps) == 1 {
 			e := baseOps[0]
-			if e.Op == qir.OpEQ && e.FieldOrdinal >= 0 && len(e.Operands) == 0 {
-				residualMeta := qv.fieldMetaByExpr(e)
-				residualView := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+			if e.Op == qir.OpEQ && qv.hasFieldOrdinal(e.FieldOrdinal) && len(e.Operands) == 0 {
+				residualMeta := qv.fieldMetaByOrdinal(e.FieldOrdinal)
+				residualView := qv.indexViewByOrdinal(e.FieldOrdinal)
 				if residualMeta != nil && !residualMeta.Slice && residualView.HasData() && (!e.Not || (!residualMeta.UseVI && !residualMeta.Ptr && residualMeta.Kind == reflect.Bool)) {
 					filterExpr := e
 					if e.Not {
@@ -2301,7 +2311,7 @@ func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldInd
 func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *Trace) ([]uint64, bool) {
 	var extraRows uint64
 	if nilTailField != "" {
-		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 	}
 	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 	if exhausted {
@@ -2341,7 +2351,7 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 			}
 		}
 		if nilTailField != "" {
-			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			out, _, _ = appendPostingWindowNoTrace(out, ids, skip, limit)
 		}
 		return out, true
@@ -2394,7 +2404,7 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 	}
 
 	if nilTailField != "" {
-		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			if trackScanWidth {
 				scanWidth++
@@ -2471,7 +2481,7 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 
 		var extraRows uint64
 		if nilTailField != "" {
-			extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+			extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 		}
 		capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 		if exhausted {
@@ -2559,7 +2569,7 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 		}
 
 		if nilTailField != "" {
-			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			if !ids.IsEmpty() {
 				scanWidth++
 				stop, nextExactWork := orderPredicatesEmitPostingReader(
@@ -2635,7 +2645,7 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 
 	var extraRows uint64
 	if nilTailField != "" {
-		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		extraRows = qv.nilIndexViewByName(nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
 	}
 	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
 	if exhausted {
@@ -2723,7 +2733,7 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 	}
 
 	if nilTailField != "" {
-		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByName(nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			stop, nextExactWork := orderPredicatesEmitPostingReader(
@@ -3152,11 +3162,41 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 		return nil, false, nil
 	}
 
-	if e.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return nil, false, nil
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+		var bounds indexdata.Bounds
+		if e.Op == qir.OpEQ {
+			key, isSlice, _, err := qv.exprValueToLookupKey(e)
+			if err != nil {
+				return nil, true, err
+			}
+			if isSlice {
+				return nil, false, nil
+			}
+			if !key.IsNumeric() {
+				return nil, true, nil
+			}
+			bounds = indexdata.Bounds{Has: true}
+			bounds.ApplyLoIndex(key.IndexKey(), true)
+			bounds.ApplyHiIndex(key.IndexKey(), true)
+		} else {
+			next, ok, err := qv.rangeBoundsForScalarExpr(e)
+			if err != nil {
+				return nil, true, err
+			}
+			if !ok {
+				return nil, false, nil
+			}
+			bounds = next
+		}
+		out, _ := qv.scanNumericKeyRange(q, bounds, false, nil, trace)
+		return out, true, nil
+	}
+
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -3173,7 +3213,7 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 		}
 		isNil = eqNil
 		if isNil {
-			ids := qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -3232,7 +3272,7 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 		rb = nextRB
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 	if !ov.HasData() {
 		return nil, true, nil
 	}
@@ -3312,11 +3352,11 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 
 func (qv *View) execSelectedNoOrderDirectPrefix(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 	e := q.Expr
-	if !isPositiveScalarPrefixLeaf(e) {
+	if !qv.isPositiveScalarPrefixLeaf(e) {
 		return nil, false, nil
 	}
 
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -3329,7 +3369,7 @@ func (qv *View) execSelectedNoOrderDirectPrefix(q *qir.Shape, trace *Trace) ([]u
 		return nil, false, nil
 	}
 	if !prefixState.hasData {
-		if !qv.hasIndexedFieldForExpr(e) {
+		if !qv.hasIndexedFieldOrdinal(e.FieldOrdinal) {
 			return nil, true, fmt.Errorf("no index for field: %v", qv.exec.FieldNameByOrdinal(e.FieldOrdinal))
 		}
 		return nil, true, nil

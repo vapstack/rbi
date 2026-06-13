@@ -78,6 +78,9 @@ var leafPredSlicePool = pooled.Slices[leafPred]{
 			if pred.kind == leafPredKindPredicate {
 				releasePredicateOwnedState(&pred.pred)
 			}
+			if pred.kind == leafPredKindPosting {
+				pred.posting.Release()
+			}
 			if pred.postsAnyState != nil {
 				postsAnyFilterStatePool.Put(pred.postsAnyState)
 			}

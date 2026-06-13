@@ -202,7 +202,7 @@ func BenchmarkMaterializedPredCacheInheritFrom(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		next.Clear()
-		next.InheritFrom(prev, fields, nil)
+		next.InheritFrom(prev, FieldChangeSet{Fields: fields})
 		qcacheBenchInt = next.EntryCount()
 	}
 }

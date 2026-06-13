@@ -82,6 +82,15 @@ type Options struct {
 	// declared by rbi tags. A non-nil empty map disables all indexed fields.
 	Index map[string]IndexKind
 
+	// EnableStringKeyIndex enables synthetic string primary-key index.
+	// When set, queries and filters can reference "$key".
+	//
+	// It affects only DB[string,V] and ignored by numeric-key databases
+	// (as they expose "$key" automatically).
+	//
+	// It is disabled by default to minimize memory usage.
+	EnableStringKeyIndex bool
+
 	// DisableIndexLoad prevents indexer from loading previously persisted index
 	// data from the .rbi file on startup. If set, indexer rebuilds the index
 	// from the underlying bucket.
@@ -427,6 +436,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.strKey = true
 		db.strmapBucket = append(db.dataBucket, stringMapBucketSuffix...)
 	}
+	strKeyIndex := db.strKey && options.EnableStringKeyIndex
 
 	var schemaIndex map[string]schema.IndexKind
 	if options.Index != nil {
@@ -441,8 +451,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	db.index, err = engine.NewIndex(engine.Config{
-		Schema: db.schema,
-		StrKey: db.strKey,
+		Schema:      db.schema,
+		StrKey:      db.strKey,
+		StrKeyIndex: strKeyIndex,
 
 		SnapshotStats:                               db.options.EnableSnapshotStats,
 		SnapshotMaterializedPredCacheMaxEntries:     db.options.SnapshotMaterializedPredCacheMaxEntries,
@@ -764,7 +775,7 @@ func (db *DB[K, V]) Stats() (rbistats.DB[K], error) {
 
 	var seq uint64
 	if db.index != nil {
-		st, err := db.index.DBStats(db.bolt, db.dataBucket)
+		st, err := db.index.DBStats(db.bolt, db.dataBucket, db.unavailableErr)
 		if err != nil {
 			return rbistats.DB[K]{}, err
 		}
@@ -814,7 +825,10 @@ func (db *DB[K, V]) Stats() (rbistats.DB[K], error) {
 // In indexed mode it walks the published index snapshot and reports per-field
 // entry counts, key bytes, posting cardinalities, and approximate memory
 // usage for regular field value indexes plus synthetic nil-family indexes.
-// On large databases this can be expensive.
+// When the string key index is enabled, its stats are reported in
+// StringKeyIndex field.
+//
+// On large databases IndexStats can be expensive.
 //
 // In transparent mode it returns a zero-valued IndexStats because no secondary
 // indexes, universe bitmap, or string-key runtime mapping are maintained.

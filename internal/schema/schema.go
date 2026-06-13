@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type Field struct {
@@ -41,6 +42,8 @@ const (
 	FieldWriteKeysString FieldKeyKind = iota
 	FieldWriteKeysOrderedU64
 )
+
+const ReservedKeyFieldName = "$key"
 
 // ValueIndexer defines how a Field value is converted into a canonical string
 // representation used as an index key in rbi.
@@ -164,12 +167,12 @@ func (s *Schema) PatchNameTouchesUnique(name string) bool {
 
 type IndexedFieldMap map[string]IndexedFieldAccessor
 
-func (m IndexedFieldMap) ResolveField(name string) (int, bool) {
+func (m IndexedFieldMap) ResolveField(name string) (qir.FieldInfo, bool) {
 	acc, ok := m[name]
 	if !ok {
-		return -1, false
+		return qir.FieldInfo{Ordinal: qir.NoFieldOrdinal}, false
 	}
-	return acc.Ordinal, true
+	return qir.FieldInfo{Ordinal: acc.Ordinal, Caps: qir.FieldCapAll}, true
 }
 
 type MeasureFieldMap map[string]MeasureFieldAccessor
@@ -366,6 +369,9 @@ func (collector *fieldCollector) populateFieldsFromOptions(t reflect.Type) error
 
 	seen := make(map[string]string, len(collector.config.Index))
 	for name, indexKind := range collector.config.Index {
+		if name == ReservedKeyFieldName {
+			return fmt.Errorf("reserved index field %q", name)
+		}
 		if err := ValidateIndexKind(indexKind); err != nil {
 			return fmt.Errorf("field %q: %w", name, err)
 		}
@@ -415,6 +421,9 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 		dbName := sf.Name
 		hasDBName := false
 		if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+			if dbTag == ReservedKeyFieldName {
+				return fmt.Errorf("field %v uses reserved db tag %q", sf.Name, dbTag)
+			}
 			dbName = dbTag
 			hasDBName = true
 		}
@@ -482,6 +491,9 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	dbname := sf.Name
 	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 		dbname = dbTag
+	}
+	if dbname == ReservedKeyFieldName {
+		return nil, fmt.Errorf("field %v uses reserved db tag %q", sf.Name, dbname)
 	}
 
 	kind := sf.Type.Kind()
@@ -677,6 +689,9 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 		patchMap[rf.Name] = f
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+			if dbTag == ReservedKeyFieldName {
+				return fmt.Errorf("field %v uses reserved db tag %q", rf.Name, dbTag)
+			}
 			f.DBName = dbTag
 			if existing, ok := patchMap[dbTag]; ok && existing.Name != f.Name {
 				return fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", dbTag, existing.Name, f.Name)
@@ -688,6 +703,9 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 			jsonName, _, _ := strings.Cut(jsonTag, ",")
 			if jsonName == "" {
 				continue
+			}
+			if jsonName == ReservedKeyFieldName {
+				return fmt.Errorf("field %v uses reserved json tag %q", rf.Name, jsonName)
 			}
 			f.JSONName = jsonName
 			if existing, ok := patchMap[jsonName]; ok && existing.Name != f.Name {

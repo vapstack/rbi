@@ -1150,7 +1150,7 @@ func (qv *View) estimateOROrderMergeRouteCost(
 
 	order := q.Order
 	orderField := qv.exec.FieldNameByOrdinal(order.FieldOrdinal)
-	if order.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(order.FieldOrdinal) {
 		return plannerOROrderRouteCost{}, false
 	}
 
@@ -1159,7 +1159,7 @@ func (qv *View) estimateOROrderMergeRouteCost(
 	if universe == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
-	orderOV := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
+	orderOV := qv.indexViewByOrdinal(order.FieldOrdinal)
 	orderDistinct := uint64(orderOV.KeyCount())
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 
@@ -1473,15 +1473,15 @@ func (qv *View) collectORFacts(q *qir.Shape, facts *plannerORFacts) bool {
 	if o.Kind != qir.OrderKindBasic {
 		return false
 	}
-	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
+	if fm := qv.fieldMetaByOrdinal(o.FieldOrdinal); fm != nil && fm.Ptr {
 		return false
 	}
 	facts.ordered = true
 	facts.orderField = qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
-	facts.orderView = qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	facts.orderView = qv.indexViewByOrdinal(o.FieldOrdinal)
 	facts.orderDistinct = uint64(facts.orderView.KeyCount())
 	facts.orderStats = qv.plannerOrderFieldStats(facts.orderField, snap, facts.universe, facts.orderDistinct)
-	if fm := qv.fieldMetaByOrder(o); fm == nil || fm.Slice || !facts.orderView.HasData() {
+	if fm := qv.fieldMetaByOrdinal(o.FieldOrdinal); fm == nil || fm.Slice || !facts.orderView.HasData() {
 		facts.unsupported = true
 		return true
 	}
@@ -1561,7 +1561,7 @@ func (qv *View) collectORBranchFact(
 		if qir.IsTrueConst(e) {
 			continue
 		}
-		if e.FieldOrdinal < 0 {
+		if !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			return plannerORBranchFact{}, false, false
 		}
 
@@ -2200,7 +2200,7 @@ func (qv *View) orderedORSelectorCacheRoute(q *qir.Shape, facts *plannerORFacts)
 
 		for li := 0; li < len(leaves); li++ {
 			e := leaves[li]
-			if e.Not || e.FieldOrdinal < 0 {
+			if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 				continue
 			}
 			fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
@@ -2228,7 +2228,7 @@ func (qv *View) orderedORSelectorCacheRoute(q *qir.Shape, facts *plannerORFacts)
 						if key.IsZero() {
 							continue
 						}
-						ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, fieldName)
+						ov := qv.indexViewByName(fieldName)
 						if !ov.HasData() {
 							continue
 						}
@@ -3197,14 +3197,14 @@ func (qv *View) sampleOROrderStream(
 	}
 	o := q.Order
 	f := qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
-	if o.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(o.FieldOrdinal) {
 		return plannerOROrderStreamSample{}, false
 	}
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return plannerOROrderStreamSample{}, false
 	}
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() {
 		return plannerOROrderStreamSample{}, false
 	}
@@ -3407,21 +3407,21 @@ func (qv *View) orderedORMaterializedRangeLeafCosts(
 
 func (qv *View) orderedORMaterializedExactRangePredicateCosts(orderField string, p predicate) (qcache.MaterializedPredKey, uint64, uint64, uint64, bool) {
 
-	if !p.hasEffectiveBounds || p.expr.FieldOrdinal < 0 {
+	if !p.hasEffectiveBounds || !qv.hasFieldOrdinal(p.expr.FieldOrdinal) {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	fieldName := qv.exec.FieldNameByOrdinal(p.expr.FieldOrdinal)
 	if fieldName == orderField {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
-	fm := qv.fieldMetaByExpr(p.expr)
+	fm := qv.fieldMetaByOrdinal(p.expr.FieldOrdinal)
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 
 	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, p.expr, fm, p.effectiveBounds)
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, p.expr)
+	ov := qv.indexViewByOrdinal(p.expr.FieldOrdinal)
 	if !ov.HasData() {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
@@ -3494,7 +3494,7 @@ func (qv *View) orderedORMaterializedPrefixLeafBuildWork(orderField string, leaf
 	snap := qv.exec.Stats.Load()
 	universe := max(qv.snap.Universe.Cardinality(), uint64(1))
 
-	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.fieldIndexViewFromSlotsByName(qv.snap.Index, orderField).HasData())
+	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.indexViewByName(orderField).HasData())
 	if !ok || sel <= 0 {
 		return qcache.MaterializedPredKey{}, 0, false
 	}
@@ -3660,7 +3660,7 @@ func (qv *View) materializePositiveScalarRangePredicate(p *predicate) bool {
 }
 
 func (qv *View) materializePositiveScalarRangePredicateWithCandidate(p *predicate, candidate preparedScalarRangeRoutingCandidate) bool {
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, p.expr)
+	ov := qv.indexViewByOrdinal(p.expr.FieldOrdinal)
 	if !ov.HasData() {
 		hasEffectiveBounds := p.hasEffectiveBounds
 		effectiveBounds := p.effectiveBounds
@@ -4207,7 +4207,7 @@ func (qv *View) promoteOrderedORMaterializedBaseOps(
 		return
 	}
 	orderField := qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal)
-	if q.Order.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(q.Order.FieldOrdinal) {
 		return
 	}
 	branchCount := branches.Len()
@@ -4323,7 +4323,7 @@ func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
 		return
 	}
 	orderField := qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal)
-	if q.Order.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(q.Order.FieldOrdinal) {
 		return
 	}
 
@@ -4451,10 +4451,10 @@ func orderedORPredicateObservationEligible(info orderedORMaterializedPredicateBu
 }
 
 func (qv *View) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
-	if qv.snap == nil || e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
+	if qv.snap == nil || e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || !e.Op.IsNumericRange() {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
@@ -4481,14 +4481,14 @@ func (qv *View) shouldForceORBranchNumericRangeMaterializeWithCandidate(
 	_ uint64,
 ) bool {
 	return candidate.plan.useComplement &&
-		candidate.core.qv.fieldIndexViewFromSlotsForExpr(candidate.core.qv.snap.NilIndex, candidate.core.expr).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+		candidate.core.qv.nilIndexViewByOrdinal(candidate.core.expr.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 }
 
 func (qv *View) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool {
-	if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || !e.Op.IsNumericRange() {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
@@ -4503,10 +4503,10 @@ func (qv *View) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int) boo
 	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || branchLeafCount <= 1 {
 		return false
 	}
-	if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || !e.Op.IsNumericRange() {
 		return false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
@@ -4542,10 +4542,10 @@ func (qv *View) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 		return false
 	}
 	for _, e := range leaves {
-		if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || !e.Op.IsNumericRange() {
 			continue
 		}
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if schema.FieldUsesOrderedNumericKeys(fm) {
 			if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
 				return true
@@ -4743,7 +4743,7 @@ func (qv *View) buildORBranchesOrdered(
 	}
 
 	branches := out
-	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, orderField)
+	ov := qv.indexViewByName(orderField)
 	if !ov.HasData() {
 		return branches, false, true
 	}
@@ -4783,16 +4783,16 @@ func (qv *View) buildORBranchesOrdered(
 func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *Trace, observed *orderedORObservedStats) ([]uint64, bool) {
 	o := q.Order
 	f := qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
-	if o.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(o.FieldOrdinal) {
 		return nil, false
 	}
 
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
+	ov := qv.indexViewByOrdinal(o.FieldOrdinal)
 	if !ov.HasData() {
 		return nil, false
 	}
@@ -5136,11 +5136,11 @@ func (qv *View) decideOROrderKWayRuntimeFallbackWithAnalysisAndFallback(
 
 	order := q.Order
 	orderField := qv.exec.FieldNameByOrdinal(order.FieldOrdinal)
-	if order.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(order.FieldOrdinal) {
 		return plannerOROrderRuntimeGuardDecision{}, false
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
+	ov := qv.indexViewByOrdinal(order.FieldOrdinal)
 
 	var mergeStats [plannerORBranchLimit]plannerOROrderMergeBranchStats
 	if analysis != nil {
@@ -5595,7 +5595,6 @@ type plannerOROrderBranchIter struct {
 	curResidual   bool
 	curSplitExact bool
 	bucketWork    posting.List
-	bucketSeen    *u64set
 
 	has bool
 	cur uint64
@@ -5614,7 +5613,7 @@ func (v plannerOrderIndexView) close() {
 
 // plannerOrderIndexSnapshotViewByOrdinal returns the current immutable order-index slice.
 func (qv *View) plannerOrderIndexSnapshotViewByOrdinal(fieldOrdinal int) (plannerOrderIndexView, bool) {
-	ov := qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, fieldOrdinal)
+	ov := qv.indexViewByOrdinal(fieldOrdinal)
 	if !ov.HasData() {
 		return plannerOrderIndexView{}, false
 	}
@@ -5706,7 +5705,7 @@ func (it *plannerOROrderBranchIter) matchCurrentCandidate(idx uint64) (bool, boo
 	return it.matchesChecks(idx, it.curChecks, it.curSingle), it.curResidual
 }
 
-func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
+func (it *plannerOROrderBranchIter) advance(bucketSeen *u64set) (uint64, uint64, uint64, bool) {
 	examinedDelta := uint64(0)
 	residualExaminedDelta := uint64(0)
 	emittedDelta := uint64(0)
@@ -5753,8 +5752,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 				return examinedDelta, residualExaminedDelta, emittedDelta, false
 			}
 
-			if it.bucketSeen != nil {
-				it.bucketSeen.Add(uint64(b))
+			if bucketSeen != nil {
+				bucketSeen.Add(uint64(b))
 			}
 			it.curBucket = b
 			if single {
@@ -5842,8 +5841,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			return examinedDelta, residualExaminedDelta, emittedDelta, false
 		}
 
-		if it.bucketSeen != nil {
-			it.bucketSeen.Add(uint64(b))
+		if bucketSeen != nil {
+			bucketSeen.Add(uint64(b))
 		}
 
 		it.curBucket = b
@@ -5934,7 +5933,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 	}
 
 	o := q.Order
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -5987,10 +5986,8 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 		}
 	}
 
-	var (
-		bucketSeen    u64set
-		bucketSeenPtr *u64set
-	)
+	var bucketSeen u64set
+	var bucketSeenPtr *u64set
 	if fullTrace {
 		bucketSeen = getU64Set(max(64, needWindow*branches.Len()))
 		bucketSeenPtr = &bucketSeen
@@ -6112,11 +6109,10 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 			allChecksExact: len(checksBuf) > 0 && len(exactChecksBuf) == len(checksBuf),
 			startBucket:    branchStart,
 			endBucket:      branchEnd,
-			bucketSeen:     bucketSeenPtr,
 		}
 		iter.init()
 
-		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance()
+		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance(bucketSeenPtr)
 
 		examined += examinedDelta
 		if allowRuntimeFallback {
@@ -6187,7 +6183,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 		pops++
 
 		iter := iters.get(bi)
-		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance()
+		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance(bucketSeenPtr)
 		examined += examinedDelta
 		if allowRuntimeFallback {
 			branchExaminedRows[bi] = mathutil.SatAddUint64(branchExaminedRows[bi], examinedDelta)
@@ -6320,8 +6316,8 @@ func (qv *View) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBra
 	order := q.Order
 	directBranchCollect := false
 	var orderOV indexdata.FieldIndexView
-	if order.FieldOrdinal >= 0 {
-		orderOV = qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
+	if qv.hasFieldOrdinal(order.FieldOrdinal) {
+		orderOV = qv.indexViewByOrdinal(order.FieldOrdinal)
 		directBranchCollect = orderOV.HasData()
 	}
 
@@ -6408,7 +6404,7 @@ func (qv *View) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBra
 	}
 
 	o := q.Order
-	fm := qv.fieldMetaByOrder(o)
+	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		candidateIDs.Release()
 		return nil, false, nil
@@ -6686,16 +6682,16 @@ func (qv *View) collectOROrderFallbackBranchCandidates(
 	if branchLimit <= 0 {
 		return 0, 0, 0, false
 	}
-	if order.Kind != qir.OrderKindBasic || order.FieldOrdinal < 0 {
+	if order.Kind != qir.OrderKindBasic || !qv.hasFieldOrdinal(order.FieldOrdinal) {
 		return 0, 0, 0, false
 	}
 	fieldName := qv.exec.FieldNameByOrdinal(order.FieldOrdinal)
-	fm := qv.fieldMetaByOrder(order)
+	fm := qv.fieldMetaByOrdinal(order.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return 0, 0, 0, false
 	}
 	if !ov.HasData() {
-		ov = qv.fieldIndexViewFromSlotsByName(qv.snap.Index, fieldName)
+		ov = qv.indexViewByName(fieldName)
 	}
 	if !ov.HasData() {
 		return 0, 0, 0, false

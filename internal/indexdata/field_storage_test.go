@@ -435,6 +435,84 @@ func TestFieldStorageBuilderCopiesBorrowedStringKeyBytes(t *testing.T) {
 	fieldStorageAssertPostingContains(t, storage, "builder/0400", 401)
 }
 
+func TestSortedUniqueStringFieldStorageBuilderFlat(t *testing.T) {
+	keys := [][]byte{
+		[]byte("key-flat/alpha"),
+		[]byte("key-flat/bravo"),
+		[]byte("key-flat/charlie"),
+	}
+	var builder SortedUniqueStringFieldStorageBuilder
+	builder.Init(len(keys))
+	for i := range keys {
+		builder.AppendBytes(keys[i], uint64(i+11))
+	}
+
+	storage := builder.Finish()
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+	poisonBytes(keys...)
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	if ov.KeyCount() != len(keys) || ov.Rows() != uint64(len(keys)) {
+		t.Fatalf("storage shape keys=%d rows=%d", ov.KeyCount(), ov.Rows())
+	}
+	fieldStorageAssertPostingContains(t, storage, "key-flat/alpha", 11)
+	fieldStorageAssertPostingContains(t, storage, "key-flat/bravo", 12)
+	fieldStorageAssertPostingContains(t, storage, "key-flat/charlie", 13)
+}
+
+func TestSortedUniqueStringFieldStorageBuilderEmptyFinish(t *testing.T) {
+	var builder SortedUniqueStringFieldStorageBuilder
+	builder.Init(0)
+	storage := builder.Finish()
+	if storage.KeyCount() != 0 {
+		t.Fatalf("empty builder storage has data")
+	}
+	builder.Release()
+}
+
+func TestSortedUniqueStringFieldStorageBuilderChunked(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 17
+	keys := make([][]byte, total)
+	var builder SortedUniqueStringFieldStorageBuilder
+	builder.Init(total)
+	for i := 0; i < total; i++ {
+		keys[i] = []byte(fmt.Sprintf("key-chunk/%04d", i))
+		builder.AppendBytes(keys[i], uint64(i+1))
+	}
+
+	storage := builder.Finish()
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+	poisonBytes(keys...)
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	if ov.KeyCount() != total || ov.Rows() != total {
+		t.Fatalf("storage shape keys=%d rows=%d", ov.KeyCount(), ov.Rows())
+	}
+	cur := ov.NewCursor(ov.RangeByRanks(0, total), false)
+	for i := 0; i < total; i++ {
+		key, ids, id, single, ok := cur.NextKeyPostingOrSingle()
+		if !ok {
+			t.Fatalf("cursor stopped at %d", i)
+		}
+		if key.UnsafeString() != fmt.Sprintf("key-chunk/%04d", i) {
+			t.Fatalf("key[%d]=%q", i, key.UnsafeString())
+		}
+		if !single || id != uint64(i+1) || !ids.IsEmpty() {
+			t.Fatalf("posting[%d]: single=%v id=%d ids=%v", i, single, id, ids)
+		}
+	}
+
+	fieldStorageAssertPostingContains(t, storage, "key-chunk/0000", 1)
+	fieldStorageAssertPostingContains(t, storage, "key-chunk/0192", 193)
+	fieldStorageAssertPostingContains(t, storage, "key-chunk/0400", 401)
+}
+
 func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 	entries := make([]Entry, fieldIndexChunkThreshold)
 	for i := range entries {

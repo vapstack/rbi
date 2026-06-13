@@ -67,17 +67,57 @@ func (qv *View) FilterCardinalityByMaterializedExpr(expr qir.Expr, trace *Trace)
 }
 
 func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) (uint64, bool, error) {
-	if expr.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(expr.FieldOrdinal) {
 		return 0, false, nil
 	}
 
-	f := qv.fieldMetaByExpr(expr)
+	f := qv.fieldMetaByOrdinal(expr.FieldOrdinal)
 	if f == nil || f.Slice {
 		return 0, false, nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, expr)
-	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
+	if qv.isNumericKeyOrdinal(expr.FieldOrdinal) {
+		switch expr.Op {
+		case qir.OpEQ:
+			key, isSlice, _, err := qv.exprValueToLookupKey(expr)
+			if err != nil || isSlice {
+				return 0, false, err
+			}
+			var hit uint64
+			if key.IsNumeric() && qv.snap.Universe.Contains(key.U64()) {
+				hit = 1
+			}
+			if trace != nil {
+				trace.SetPlan(rbitrace.PlanCountScalarLookup)
+				trace.AddExamined(hit)
+			}
+			return cardinalityLookupComplement(qv.snap.Universe.Cardinality(), hit, expr.Not), true, nil
+
+		case qir.OpIN:
+			valsBuf, isSlice, _, err := qv.exprValueToDistinctLookupKeyBuf(expr)
+			if valsBuf != nil {
+				defer keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+			}
+			if err != nil || !isSlice {
+				return 0, false, err
+			}
+			var hit uint64
+			for i := 0; i < len(valsBuf); i++ {
+				if qv.snap.Universe.Contains(valsBuf[i].U64()) {
+					hit++
+				}
+			}
+			if trace != nil {
+				trace.SetPlan(rbitrace.PlanCountScalarLookup)
+				trace.AddExamined(hit)
+			}
+			return cardinalityLookupComplement(qv.snap.Universe.Cardinality(), hit, expr.Not), true, nil
+		}
+		return 0, false, nil
+	}
+
+	ov := qv.indexViewByOrdinal(expr.FieldOrdinal)
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(expr.FieldOrdinal) {
 		return 0, false, nil
 	}
 
@@ -89,7 +129,7 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 		}
 		hit := uint64(0)
 		if isNil {
-			hit = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, expr).LookupCardinality(indexdata.NilIndexEntryKey)
+			hit = qv.nilIndexViewByOrdinal(expr.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey)
 		} else {
 			hit = lookupScalarCardinality(ov, key)
 		}
@@ -114,7 +154,7 @@ func (qv *View) TryFilterCardinalityByScalarLookup(expr qir.Expr, trace *Trace) 
 			sum += lookupScalarCardinality(ov, valsBuf[i])
 		}
 		if hasNil {
-			sum += qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, expr).LookupCardinality(indexdata.NilIndexEntryKey)
+			sum += qv.nilIndexViewByOrdinal(expr.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey)
 		}
 		if trace != nil {
 			trace.SetPlan(rbitrace.PlanCountScalarLookup)
@@ -206,17 +246,17 @@ func postingAllMatchesCardinality(posts []posting.List) uint64 {
 }
 
 func (qv *View) TryFilterCardinalityBySliceLookup(expr qir.Expr, trace *Trace) (uint64, bool, error) {
-	if expr.FieldOrdinal < 0 {
+	if !qv.hasFieldOrdinal(expr.FieldOrdinal) {
 		return 0, false, nil
 	}
 
-	f := qv.fieldMetaByExpr(expr)
+	f := qv.fieldMetaByOrdinal(expr.FieldOrdinal)
 	if f == nil || !f.Slice {
 		return 0, false, nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, expr)
-	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
+	ov := qv.indexViewByOrdinal(expr.FieldOrdinal)
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(expr.FieldOrdinal) {
 		return 0, false, nil
 	}
 
@@ -812,15 +852,15 @@ func (qv *View) applyAndMergedExactRangePostingResult(
 }
 
 func (qv *View) evalMergedExactRangePostingResult(e qir.Expr, bounds indexdata.Bounds) (postingResult, bool) {
-	if e.Not || e.FieldOrdinal < 0 {
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 		return postingResult{}, false
 	}
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return postingResult{}, false
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 	if !ov.HasData() {
 		return postingResult{}, false
 	}
@@ -878,10 +918,10 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	leadVals := 0
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || e.Op != qir.OpIN || e.FieldOrdinal < 0 {
+		if e.Not || e.Op != qir.OpIN || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			continue
 		}
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			continue
 		}
@@ -912,7 +952,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	}
 
 	inLeaf := leaves[lead]
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, inLeaf)
+	ov := qv.indexViewByOrdinal(inLeaf.FieldOrdinal)
 	if !ov.HasData() {
 		return 0, false, nil
 	}
@@ -983,7 +1023,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	}
 
 	if hasNil {
-		ids := qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, inLeaf).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewByOrdinal(inLeaf.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			examined += ids.Cardinality()
 			if useFilter {
@@ -1159,7 +1199,7 @@ func shouldTryCardinalityByPredicates(leaves []qir.Expr) bool {
 		case qir.OpPREFIX, qir.OpSUFFIX, qir.OpCONTAINS, qir.OpHASALL, qir.OpHASANY, qir.OpIN:
 			hasComplex = true
 		case qir.OpEQ:
-			hasScalarEQ = e.FieldOrdinal >= 0 && len(e.Operands) == 0
+			hasScalarEQ = e.FieldOrdinal != qir.NoFieldOrdinal && len(e.Operands) == 0
 		default:
 			if e.Op.IsNumericRange() {
 				hasRange = true
@@ -2337,7 +2377,7 @@ func (qv *View) tryMaterializeBroadRangeComplementPredicateForCardinality(p *pre
 		return false
 	}
 
-	fm := qv.fieldMetaByExpr(p.expr)
+	fm := qv.fieldMetaByOrdinal(p.expr.FieldOrdinal)
 	if fm == nil || fm.Slice {
 		return false
 	}
@@ -2920,8 +2960,9 @@ func (qv *View) TryFilterCardinalityByPredicatesNumericBuckets(
 		return 0, 0, false
 	}
 
-	storage := qv.snap.Index[fieldOrdinal]
-	entry := qv.snap.NumericRangeBucketCacheEntry(field, fieldOrdinal, storage, bucketSize, minFieldKeys)
+	desc := qv.exec.fields[fieldOrdinal]
+	storage := qv.snap.Index[desc.storageOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return 0, 0, false
 	}
@@ -2999,7 +3040,7 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 	lead := &preds.owner[leadIdx]
 	e := lead.expr
 	field := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
-	fm := qv.fieldMetaByExpr(e)
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 
 	span, ok, err := qv.prepareScalarIndexSpan(e)
 	if err != nil || !ok {
@@ -3608,20 +3649,22 @@ func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
 		return false
 	}
 
-	fieldOrdinal := -1
+	fieldOrdinal := 0
+	fieldFound := false
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || e.Op != qir.OpEQ || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+		if e.Not || e.Op != qir.OpEQ || !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 {
 			continue
 		}
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			continue
 		}
 		fieldOrdinal = e.FieldOrdinal
+		fieldFound = true
 		break
 	}
-	if fieldOrdinal < 0 {
+	if !fieldFound {
 		return false
 	}
 
@@ -4360,7 +4403,7 @@ func (qv *View) exactExprCardinality(expr qir.Expr) (uint64, error) {
 		}
 		return qv.snap.Universe.Cardinality(), nil
 	}
-	if expr.FieldOrdinal >= 0 && len(expr.Operands) == 0 {
+	if qv.hasFieldOrdinal(expr.FieldOrdinal) && len(expr.Operands) == 0 {
 		if out, ok, err := qv.TryFilterCardinalityByScalarLookup(expr, nil); ok || err != nil {
 			return out, err
 		}
@@ -4529,7 +4572,7 @@ const evalAndComplementRangeApplyMinWorkGain = 2
 
 func (qv *View) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr qir.Expr) (bool, error) {
 	if *hasAcc {
-		if !acc.neg && !acc.ids.IsEmpty() && expr.FieldOrdinal >= 0 {
+		if !acc.neg && !acc.ids.IsEmpty() && qv.hasFieldOrdinal(expr.FieldOrdinal) {
 
 			usePostingApply := false
 
@@ -4666,7 +4709,7 @@ func (qv *View) tryFilterCardinalityPreparedAndReordered(expr qir.Expr) (uint64,
 				if fm == nil || fm.Slice {
 					continue
 				}
-				ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, merged.expr)
+				ov := qv.indexViewByOrdinal(merged.expr.FieldOrdinal)
 				if !ov.HasData() {
 					continue
 				}

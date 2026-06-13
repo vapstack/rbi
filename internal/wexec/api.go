@@ -29,4 +29,5 @@ type SnapshotOps struct {
 	Schema      *schema.Schema
 	CacheConfig snapshot.CacheConfig
 	PatchFields map[string]*schema.Field
+	StrKeyIndex bool
 }

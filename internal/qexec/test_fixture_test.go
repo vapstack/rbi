@@ -33,6 +33,29 @@ const (
 	nilIndexEntryKey           = indexdata.NilIndexEntryKey
 )
 
+func testFieldIndexViewFromSlots(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldIndexView {
+	if acc.Ordinal >= len(slots) {
+		return indexdata.FieldIndexView{}
+	}
+	return indexdata.NewFieldIndexViewFromStorage(slots[acc.Ordinal])
+}
+
+func (qv *View) fieldIndexViewFromSlotsByOrdinal(slots []indexdata.FieldStorage, ordinal int) indexdata.FieldIndexView {
+	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
+	if !ok {
+		return indexdata.FieldIndexView{}
+	}
+	return testFieldIndexViewFromSlots(slots, acc)
+}
+
+func (qv *View) fieldIndexViewFromSlotsByName(slots []indexdata.FieldStorage, field string) indexdata.FieldIndexView {
+	acc, ok := qv.indexedFieldAccessorByName(field)
+	if !ok {
+		return indexdata.FieldIndexView{}
+	}
+	return testFieldIndexViewFromSlots(slots, acc)
+}
+
 type Options struct {
 	AnalyzeInterval time.Duration
 
@@ -159,6 +182,20 @@ func firstOptions(options []Options) Options {
 	return options[0]
 }
 
+func newEmptySnapshotForTests(seq uint64, rt *schema.Schema, cfg snapshot.CacheConfig) *snapshot.View {
+	slotCount := len(rt.Indexed)
+	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
+	clear(nextLenZeroComplement)
+	measureSlotCount := len(rt.Measures)
+	return snapshot.NewView(seq, nil, rt, cfg, snapshot.Storage{
+		Index:             indexdata.GetFieldStorageSlice(slotCount)[:slotCount],
+		NilIndex:          indexdata.GetFieldStorageSlice(slotCount)[:slotCount],
+		LenIndex:          indexdata.GetFieldStorageSlice(slotCount)[:slotCount],
+		LenZeroComplement: nextLenZeroComplement,
+		Measure:           indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount],
+	})
+}
+
 func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, options Options) *DB[K, V] {
 	tb.Helper()
 	options.setDefaults()
@@ -179,15 +216,17 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		TraceSampleEvery:               options.TraceSampleEvery,
 	})
 
+	cfg := snapshot.CacheConfig{
+		MatPredMaxEntries: options.SnapshotMaterializedPredCacheMaxEntries,
+		MatPredMaxCard:    uint64(options.SnapshotMaterializedPredCacheMaxCardinality),
+	}
 	qe := &queryEngine{
 		snapshot: snapshot.NewRegistry(false),
 		schema:   rt,
 		exec:     exec,
-		cfg: snapshot.CacheConfig{
-			MatPredMaxEntries: options.SnapshotMaterializedPredCacheMaxEntries,
-			MatPredMaxCard:    uint64(options.SnapshotMaterializedPredCacheMaxCardinality),
-		},
+		cfg:      cfg,
 	}
+	qe.snapshot.Publish(newEmptySnapshotForTests(0, rt, cfg))
 	db := &DB[K, V]{
 		engine:  qe,
 		options: options,
@@ -321,7 +360,7 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 }
 
 func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
-	prepared, err := qir.PrepareCountExprsResolved(db.engine.schema.IndexedByName, exprs...)
+	prepared, err := qir.PrepareCountExprsResolved(db.engine.exec, exprs...)
 	if err != nil {
 		return 0, err
 	}
@@ -606,19 +645,32 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 		TraceSampleEvery:               opts.TraceSampleEvery,
 	})
 
+	cfg := snapshot.CacheConfig{
+		MatPredMaxEntries: opts.MatPredCacheMaxEntries,
+		MatPredMaxCard:    opts.MatPredCacheMaxCard,
+	}
 	return &testDB{
 		rt:   rt,
 		exec: exec,
-		cfg: snapshot.CacheConfig{
-			MatPredMaxEntries: opts.MatPredCacheMaxEntries,
-			MatPredMaxCard:    opts.MatPredCacheMaxCard,
-		},
+		snap: newEmptySnapshotForTests(0, rt, cfg),
+		cfg:  cfg,
 	}
 }
 
 func (db *testDB) view() *View {
 	view := newView(db.snap, db.exec)
 	return &view
+}
+
+func (db *testDB) enableStringKeyCatalog() {
+	db.exec.StrKey = true
+	db.exec.KeyMode = KeyModeString
+	db.exec.fields, db.exec.fieldByName, db.exec.keyOrdinal = buildQueryFieldCatalog(db.rt, KeyModeString)
+}
+
+func (db *testDB) enableNumericKeyCatalog() {
+	db.exec.KeyMode = KeyModeNumeric
+	db.exec.fields, db.exec.fieldByName, db.exec.keyOrdinal = buildQueryFieldCatalog(db.rt, KeyModeNumeric)
 }
 
 func (db *testDB) clearCurrentSnapshotCaches() {
@@ -684,7 +736,7 @@ func (db *testDB) seedGeneratedData(t testing.TB, n int, gen func(uint64) testRe
 }
 
 func (db *testDB) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {
-	prepared, err := qir.PrepareQuery(q, db.rt.IndexedByName)
+	prepared, err := qir.PrepareQuery(q, db.exec)
 	if err != nil {
 		return nil, qir.Shape{}, err
 	}
@@ -770,7 +822,7 @@ func (qv *View) extractNoOrderBounds(leaves []qir.Expr) (string, indexdata.Bound
 		if !isBoundOp(e.Op) {
 			continue
 		}
-		if e.Not || e.FieldOrdinal < 0 {
+		if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) {
 			return "", indexdata.Bounds{}, false, nil
 		}
 		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
@@ -809,18 +861,20 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 }
 
 func (qe *queryEngine) currentQueryViewForTests() *View {
-	if qe == nil || qe.snapshot == nil {
-		return &View{snap: &snapshot.View{}}
-	}
-	if snap := qe.snapshot.Current(); snap != nil {
+	if qe.snapshot != nil {
+		if snap := qe.snapshot.Current(); snap != nil {
+			return qe.queryViewForSnapshotForTests(snap)
+		}
+		snap := newEmptySnapshotForTests(0, qe.schema, qe.cfg)
+		qe.snapshot.Publish(snap)
 		return qe.queryViewForSnapshotForTests(snap)
 	}
-	return qe.queryViewForSnapshotForTests(&snapshot.View{})
+	return qe.queryViewForSnapshotForTests(nil)
 }
 
 func (qe *queryEngine) queryViewForSnapshotForTests(snap *snapshot.View) *View {
 	if snap == nil {
-		snap = &snapshot.View{}
+		snap = newEmptySnapshotForTests(0, qe.schema, qe.cfg)
 	}
 	view := newView(snap, qe.exec)
 	return &view
@@ -840,13 +894,17 @@ func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
 
 type testQIRResolver map[string]int
 
-func (r testQIRResolver) ResolveField(name string) (int, bool) {
+func (r testQIRResolver) ResolveField(name string) (qir.FieldInfo, bool) {
 	if ordinal, ok := r[name]; ok {
-		return ordinal, true
+		caps := qir.FieldCapAll
+		if name == schema.ReservedKeyFieldName {
+			caps = 0
+		}
+		return qir.FieldInfo{Ordinal: ordinal, Caps: caps}, true
 	}
 	ordinal := len(r)
 	r[name] = ordinal
-	return ordinal, true
+	return qir.FieldInfo{Ordinal: ordinal, Caps: qir.FieldCapAll}, true
 }
 
 func prepareTestQuery(qe *queryEngine, q *qx.QX) (*qir.Query, qir.Shape, error) {
@@ -857,7 +915,7 @@ func prepareTestQuery(qe *queryEngine, q *qx.QX) (*qir.Query, qir.Shape, error) 
 	if qe == nil {
 		prepared, err = qir.PrepareQuery(q, testQIRResolver{})
 	} else {
-		prepared, err = qir.PrepareQuery(q, qe.schema.IndexedByName)
+		prepared, err = qir.PrepareQuery(q, qe.exec)
 	}
 	if err != nil {
 		return nil, qir.Shape{}, err
@@ -873,7 +931,7 @@ func prepareTestExpr(qe *queryEngine, expr qx.Expr) (*qir.Query, qir.Expr, error
 	if qe == nil {
 		prepared, err = qir.PrepareCountExprsResolved(testQIRResolver{}, expr)
 	} else {
-		prepared, err = qir.PrepareCountExprsResolved(qe.schema.IndexedByName, expr)
+		prepared, err = qir.PrepareCountExprsResolved(qe.exec, expr)
 	}
 	if err != nil {
 		return nil, qir.Expr{}, err
@@ -1294,7 +1352,7 @@ func (qe *queryEngine) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) boo
 	if o.Desc {
 		dir = qx.DESC
 	}
-	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), qe.schema.IndexedByName)
+	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), qe.exec)
 	if err != nil {
 		return false
 	}

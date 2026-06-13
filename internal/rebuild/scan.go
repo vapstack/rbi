@@ -33,6 +33,7 @@ type buildData struct {
 	fieldStates        []*schema.BuildFieldState
 	localUniverse      []posting.List
 	localMeasureStates [][][]indexdata.MeasureEntry
+	keyIndex           indexdata.FieldStorage
 	workerErrs         []error
 	ok                 bool
 }
@@ -52,6 +53,17 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 	}
 	defer cleanupBuildFailure(&data.ok, data.fieldStates, data.localUniverse)
 	defer cleanupMeasureStates(&data.ok, data.localMeasureStates)
+
+	buildKeyIndex := cfg.StrKey && cfg.StrKeyIndex && !cfg.KeyIndexLoaded
+	keyBuilder := indexdata.SortedUniqueStringFieldStorageBuilder{}
+	if buildKeyIndex {
+		keyBuilder.Init(0)
+		defer func() {
+			if !data.ok {
+				keyBuilder.Release()
+			}
+		}()
+	}
 
 	jobs := make(chan rawdata, 10000)
 
@@ -162,6 +174,9 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 
 		b := tx.Bucket(cfg.DataBucket)
 		if b == nil {
+			if buildKeyIndex {
+				data.keyIndex = keyBuilder.Finish()
+			}
 			return nil
 		}
 		var stringMap *bbolt.Bucket
@@ -219,6 +234,9 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 				if idx > maxStringIdx {
 					maxStringIdx = idx
 				}
+				if buildKeyIndex {
+					keyBuilder.AppendBytes(k, idx)
+				}
 			} else {
 				idx = keycodec.U64FromBytes(k)
 			}
@@ -244,6 +262,9 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 		if cfg.StrKey && stringMap.Sequence() < maxStringIdx {
 			return fmt.Errorf("string storage format: string map sequence %d lower than max live idx %d", stringMap.Sequence(), maxStringIdx)
 		}
+		if buildKeyIndex {
+			data.keyIndex = keyBuilder.Finish()
+		}
 		return nil
 	})
 
@@ -252,6 +273,8 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 	}
 	for _, err = range data.workerErrs {
 		if err != nil {
+			data.keyIndex.Release()
+			data.keyIndex = indexdata.FieldStorage{}
 			return nil, fmt.Errorf("scan error: db=%q bucket=%q: %w", cfg.Bolt.Path(), string(cfg.DataBucket), err)
 		}
 	}

@@ -469,7 +469,7 @@ func BenchmarkMaterializedCacheInheritRelease(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		next := testMatPredView(128, 0)
-		inheritMaterializedPredCache(next, prev, nil, nil)
+		inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 		if got := next.matPredCache.EntryCount(); got != 128 {
 			b.Fatalf("inherited entries=%d", got)
 		}

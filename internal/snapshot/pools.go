@@ -19,3 +19,18 @@ var uint64IntMapPool = pooled.Maps[uint64, int]{
 	NewCap: 256,
 	MaxLen: uint64IntMapPoolMaxLen,
 }
+
+type keyDeltaStateKey struct {
+	Key string
+	ID  uint64
+}
+
+var keyDeltaStateMapPool = pooled.Maps[keyDeltaStateKey, bool]{
+	NewCap: 64,
+	MaxLen: 4 << 10,
+}
+
+var keyPostingDeltaMapPool = pooled.Maps[string, uint32]{
+	NewCap: 64,
+	MaxLen: 4 << 10,
+}

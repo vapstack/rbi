@@ -367,7 +367,7 @@ func TestViewInheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *tes
 	changed := testBoolSlots(map[string]bool{"name": true}, fields)
 	defer pooled.ReleaseBoolSlice(changed)
 
-	inheritMaterializedPredCache(next, prev, fields, changed)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{Fields: fields, OrdinaryChanged: changed})
 
 	if _, ok := testLoadMaterializedPred(next, nameKey); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")
@@ -385,7 +385,7 @@ func TestViewInheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T) {
 	testStoreMaterializedPred(prev, validKey, posting.List{})
 
 	next := testMatPredView(8, 0)
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	if got := next.matPredCache.EntryCount(); got != 1 {
 		t.Fatalf("expected exactly one valid inherited entry, got=%d", got)
@@ -403,7 +403,7 @@ func TestViewInheritMaterializedPredCacheKeepsOversizedCount(t *testing.T) {
 	testTryStoreMaterializedPredOversized(prev, testScalarMatPredKey("b", "2"), oversized)
 
 	next := testMatPredView(8, 1)
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	if got := next.matPredCache.EntryCount(); got != 2 {
 		t.Fatalf("expected oversized entries to be inherited, got=%d", got)
@@ -424,7 +424,7 @@ func TestViewInheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
 	}
 
 	next := testMatPredView(8, 0)
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	inheritedClock := next.matPredCache.Clock()
 	if _, ok := testLoadMaterializedPred(next, emailKey); !ok {
@@ -636,6 +636,19 @@ func buildCacheSeedView(t testing.TB, s *schema.Schema, rec *buildCacheRec) *Vie
 	return snap
 }
 
+func buildCacheSeedStringKeyView(t testing.TB, s *schema.Schema, rec *buildCacheRec, key string) *View {
+	t.Helper()
+	snap := BuildWithKeyDeltas(1, nil, s, CacheConfig{MatPredMaxEntries: 64}, s.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(rec)},
+	}, []KeyDelta{
+		{ID: 1, Key: key, Add: true},
+	})
+	if snap == nil {
+		t.Fatal("expected string-key seed snapshot")
+	}
+	return snap
+}
+
 func buildCachePatchView(t testing.TB, s *schema.Schema, prev *View, oldRec, newRec *buildCacheRec, patch []schema.PatchItem) *View {
 	t.Helper()
 	snap := Build(2, prev, s, CacheConfig{MatPredMaxEntries: 64}, s.Patch.Fields, []BatchEntry{{
@@ -717,6 +730,29 @@ func TestBuildPreparedPatchUnchangedFieldInheritsNegativeMaterializedPredCache(t
 	cached, ok := next.LoadMaterializedPredKey(key)
 	if !ok || !cached.IsEmpty() {
 		t.Fatal("expected negative untouched cache entry to be inherited")
+	}
+}
+
+func TestBuildPreparedPatchUnchangedFieldInheritsKeyMaterializedPredCache(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com", Age: 30}
+	prev := buildCacheSeedStringKeyView(t, rt, &oldRec, "sku-1")
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	key := qcache.MaterializedPredKeyForScalar(schema.ReservedKeyFieldName, qir.OpPREFIX, "sku")
+	ids := testPosting(1)
+	prev.StoreMaterializedPredKey(key, ids)
+
+	newRec := oldRec
+	newRec.Age = 31
+	next := buildCachePatchView(t, rt, prev, &oldRec, &newRec, []schema.PatchItem{{Name: "age", Value: 31}})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	cached, ok := next.LoadMaterializedPredKey(key)
+	if !ok || cached != ids {
+		t.Fatal("expected $key cache entry to survive ordinary field patch")
 	}
 }
 
@@ -837,6 +873,32 @@ func TestBuildPreparedPatchUnchangedFieldInheritsObservedMaterializedPredWork(t 
 	}
 }
 
+func TestBuildPreparedPatchUnchangedFieldInheritsKeyObservedMaterializedPredWork(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com", Age: 30}
+	prev := buildCacheSeedStringKeyView(t, rt, &oldRec, "sku-1")
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	key := qcache.MaterializedPredKeyForScalar(schema.ReservedKeyFieldName, qir.OpPREFIX, "sku")
+	if prev.ShouldPromoteObservedMaterializedPredKey(key, 10, 25) {
+		t.Fatal("expected initial $key observed work to stay below promotion threshold")
+	}
+
+	newRec := oldRec
+	newRec.Age = 31
+	next := buildCachePatchView(t, rt, prev, &oldRec, &newRec, []schema.PatchItem{{Name: "age", Value: 31}})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if got := next.DirtyObservedMaterializedPredWork(key); got != 0 {
+		t.Fatalf("expected $key observed work to stay clean, got dirty=%d", got)
+	}
+	if !next.ShouldPromoteObservedMaterializedPredKey(key, 15, 25) {
+		t.Fatal("expected unchanged $key observed work to inherit across snapshots")
+	}
+}
+
 func TestBuildPreparedPatchTouchedFieldSeparatesDirtyObservedMaterializedPredWork(t *testing.T) {
 	rt := buildCacheRuntime(t)
 	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com"}
@@ -893,6 +955,78 @@ func TestBuildPreparedPatchTouchedFieldSeparatesDirtyObservedMaterializedPredWor
 	}
 }
 
+func TestBuildPreparedKeyDeltaDropsKeyMaterializedPredCache(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com", Age: 30}
+	prev := buildCacheSeedStringKeyView(t, rt, &oldRec, "sku-1")
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	key := qcache.MaterializedPredKeyForScalar(schema.ReservedKeyFieldName, qir.OpPREFIX, "sku")
+	prev.StoreMaterializedPredKey(key, testPosting(1))
+
+	next := BuildWithKeyDeltas(2, prev, rt, CacheConfig{MatPredMaxEntries: 64}, rt.Patch.Fields, nil, []KeyDelta{
+		{ID: 1, Key: "sku-1"},
+		{ID: 1, Key: "sku-2", Add: true},
+	})
+	if next == nil {
+		t.Fatal("expected key-delta snapshot")
+	}
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if next.HasMaterializedPredKey(key) {
+		t.Fatal("expected key-index change to drop $key materialized predicate cache")
+	}
+}
+
+func TestBuildPreparedKeyDeltaKeepsOrdinaryMaterializedPredCache(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com", Age: 30}
+	prev := buildCacheSeedStringKeyView(t, rt, &oldRec, "sku-1")
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	keyKey := qcache.MaterializedPredKeyForScalar(schema.ReservedKeyFieldName, qir.OpPREFIX, "sku")
+	emailKey := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "alice")
+	prev.StoreMaterializedPredKey(keyKey, testPosting(1))
+	prev.StoreMaterializedPredKey(emailKey, testPosting(1))
+	if prev.ShouldPromoteObservedMaterializedPredKey(keyKey, 10, 25) {
+		t.Fatal("expected initial key observed work to stay below promotion threshold")
+	}
+	if prev.ShouldPromoteObservedMaterializedPredKey(emailKey, 10, 25) {
+		t.Fatal("expected initial email observed work to stay below promotion threshold")
+	}
+
+	next := BuildWithKeyDeltas(2, prev, rt, CacheConfig{MatPredMaxEntries: 64}, rt.Patch.Fields, nil, []KeyDelta{
+		{ID: 1, Key: "sku-1"},
+		{ID: 1, Key: "sku-2", Add: true},
+	})
+	if next == nil {
+		t.Fatal("expected key-delta snapshot")
+	}
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if next.HasMaterializedPredKey(keyKey) {
+		t.Fatal("expected key-index change to drop $key materialized predicate cache")
+	}
+	if got := next.ObservedMaterializedPredWork(keyKey); got != 0 {
+		t.Fatalf("expected key observed work to be dropped, got=%d", got)
+	}
+	if got := next.DirtyObservedMaterializedPredWork(keyKey); got != 0 {
+		t.Fatalf("expected key dirty observed work to be dropped, got=%d", got)
+	}
+	cached, ok := testLoadMaterializedPred(next, emailKey)
+	if !ok || cached.Cardinality() != 1 {
+		t.Fatalf("expected ordinary-field cache to survive key-index change: ok=%v card=%d", ok, cached.Cardinality())
+	}
+	cached.Release()
+	if !next.ShouldPromoteObservedMaterializedPredKey(emailKey, 15, 25) {
+		t.Fatal("expected ordinary-field observed work to survive key-index change")
+	}
+}
+
 func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	v := testMatPredView(64, 0)
 	defer v.releaseRuntimeCaches()
@@ -942,7 +1076,7 @@ func TestMaterializedPredInheritedBorrowedMutationDetaches(t *testing.T) {
 
 	next := testMatPredView(4, 0)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	fromPrev, ok := prev.LoadMaterializedPredKey(key)
 	if !ok || fromPrev.IsEmpty() {
@@ -1108,7 +1242,7 @@ func TestMaterializedPredInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T)
 
 	next := testMatPredView(4, 0)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	held, ok := next.LoadMaterializedPredKey(key)
 	if !ok || held.IsEmpty() {
@@ -1144,7 +1278,7 @@ func TestMaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotEntry(t *test
 
 	next := testMatPredView(1, 0)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache(next, prev, nil, nil)
+	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
 	held, ok := next.LoadMaterializedPredKey(key)
 	if !ok || held.IsEmpty() {

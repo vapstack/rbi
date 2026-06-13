@@ -175,12 +175,16 @@ func (qv *View) evalAndOperandsWithMergedNumericRanges(ops []qir.Expr, negate bo
 						continue
 					}
 					merged = true
-					b, err = qv.evalPreparedScalarExactRange(preparedScalarExactRange{
-						field:        group.field,
-						fieldOrdinal: group.expr.FieldOrdinal,
-						bounds:       group.bounds,
-						cacheKey:     qv.materializedPredKeyForExactScalarRange(group.field, group.bounds),
-					})
+					if qv.isNumericKeyOrdinal(group.expr.FieldOrdinal) {
+						b = postingResult{ids: qv.numericKeyRangePosting(group.bounds)}
+					} else {
+						b, err = qv.evalPreparedScalarExactRange(preparedScalarExactRange{
+							field:        group.field,
+							fieldOrdinal: group.expr.FieldOrdinal,
+							bounds:       group.bounds,
+							cacheKey:     qv.materializedPredKeyForExactScalarRange(group.field, group.bounds),
+						})
+					}
 				}
 			}
 		}
@@ -281,12 +285,16 @@ func (qv *View) evalAndOperandsDefault(ops []qir.Expr, negate bool) (postingResu
 func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 	fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
 
-	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
-	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
+	if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+		return qv.evalNumericKeySimple(e)
+	}
+
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
+	if !ov.HasData() && !qv.hasIndexedFieldOrdinal(e.FieldOrdinal) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
 	}
 
-	f := qv.fieldMetaByExpr(e)
+	f := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 	if f == nil {
 		return postingResult{}, fmt.Errorf("no metadata for field: %v", fieldName)
 	}
@@ -304,7 +312,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 
 			var ids posting.List
 			if isNil {
-				ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+				ids = qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			} else {
 				ids = lookupScalarPostingRetained(ov, key)
 			}
@@ -362,7 +370,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 			builder.addPosting(ids)
 		}
 		if hasNil {
-			ids := qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			ids := qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 			if !ids.IsEmpty() {
 				builder.addPosting(ids)
 			}
@@ -499,7 +507,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 // this path can stay read-only.
 func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []keycodec.IndexLookupKey) (postingResult, error) {
 	valCount := len(vals)
-	lenOV := qv.fieldIndexViewFromSlotsRef(qv.snap.LenIndex, field, fieldOrdinal)
+	lenOV := qv.lenIndexViewRef(field, fieldOrdinal)
 
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
 
@@ -524,7 +532,7 @@ func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []keycodec.Inde
 		return postingResult{}, nil
 	}
 
-	ov := qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, fieldOrdinal)
+	ov := qv.indexViewRef(field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
 		ids := lookupScalarPostingRetained(ov, vals[i])
@@ -551,7 +559,10 @@ func queryValueIsCollectionForField(v reflect.Value, fm *schema.Field) bool {
 	return true
 }
 
-const impossibleLookupKey = "\x00"
+const (
+	impossibleLookupKey     = "\x00"
+	maxUint64FloatExclusive = 18446744073709551616.0
+)
 
 type normalizedScalarBound struct {
 	op          qir.Op
@@ -708,7 +719,7 @@ func numericQueryValueToUint64Exact(v reflect.Value) (uint64, bool) {
 
 	case reflect.Float32, reflect.Float64:
 		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
-		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < 0 || f > float64(^uint64(0)) {
+		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < 0 || f >= maxUint64FloatExclusive {
 			return 0, false
 		}
 		u := uint64(f)
@@ -920,7 +931,7 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 			}
 
 		case f == math.Trunc(f):
-			if f > float64(^uint64(0)) {
+			if f >= maxUint64FloatExclusive {
 				switch op {
 				case qir.OpGT, qir.OpGTE:
 					return normalizedScalarBound{empty: true}
@@ -935,14 +946,14 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 
 		case op == qir.OpGT || op == qir.OpGTE:
 			floor := math.Floor(f)
-			if floor > float64(^uint64(0)) {
+			if floor >= maxUint64FloatExclusive {
 				return normalizedScalarBound{empty: true}
 			}
 			return normalizedScalarBoundFromIndexKey(qir.OpGT, keycodec.FromU64(uint64(floor)))
 
 		default:
 			ceil := math.Ceil(f)
-			if ceil > float64(^uint64(0)) {
+			if ceil >= maxUint64FloatExclusive {
 				return normalizedScalarBound{full: true}
 			}
 			return normalizedScalarBoundFromIndexKey(qir.OpLT, keycodec.FromU64(uint64(ceil)))
@@ -961,12 +972,103 @@ func normalizeFloatRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound 
 	return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedFloat64Key(f)))
 }
 
+func (qv *View) exprStringKeyValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
+	if expr.Value == nil {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() == reflect.Slice {
+		return normalizedScalarBound{}, true, nil
+	}
+	if v.Kind() != reflect.String {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if bound, ok := qv.loadNormalizedScalarBound(expr, v); ok {
+		return bound, false, nil
+	}
+	bound := normalizedScalarBound{op: expr.Op, key: v.String()}
+	qv.storeNormalizedScalarBound(expr, v, bound)
+	return bound, false, nil
+}
+
+func numericKeyValueToUint64Exact(v reflect.Value) (uint64, bool, bool) {
+	switch v.Kind() {
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i := v.Int()
+		if i < 0 {
+			return 0, true, true
+		}
+		return uint64(i), true, false
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return v.Uint(), true, false
+
+	case reflect.Float32, reflect.Float64:
+		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
+		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < 0 || f >= maxUint64FloatExclusive {
+			return 0, true, true
+		}
+		u := uint64(f)
+		if float64(u) != f {
+			return 0, true, true
+		}
+		return u, true, false
+
+	default:
+		return 0, false, false
+	}
+}
+
+func (qv *View) exprNumericKeyValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
+	if expr.Value == nil {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() == reflect.Slice {
+		return normalizedScalarBound{}, true, nil
+	}
+	if expr.Op == qir.OpPREFIX {
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v is not supported for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+	default:
+		return normalizedScalarBound{}, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if bound, ok := qv.loadNormalizedScalarBound(expr, v); ok {
+		return bound, false, nil
+	}
+	bound := normalizeUnsignedIntRangeBound(expr.Op, v)
+	qv.storeNormalizedScalarBound(expr, v, bound)
+	return bound, false, nil
+}
+
 func (qv *View) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
+	if field, ok := qv.fieldByOrdinal(expr.FieldOrdinal); ok {
+		switch field.kind {
+		case queryFieldStringKey:
+			return qv.exprStringKeyValueToNormalizedScalarBound(expr)
+		case queryFieldNumericKey:
+			return qv.exprNumericKeyValueToNormalizedScalarBound(expr)
+		}
+	}
 	if expr.Value == nil {
 		return normalizedScalarBound{empty: true}, false, nil
 	}
 
-	fm := qv.fieldMetaByExpr(expr)
+	fm := qv.fieldMetaByOrdinal(expr.FieldOrdinal)
 	v := reflect.ValueOf(expr.Value)
 
 	v, isNil := schema.UnwrapQueryValue(v)
@@ -1146,11 +1248,11 @@ func sliceValueToLookupKeyBuf(v reflect.Value, fm *schema.Field) ([]keycodec.Ind
 }
 
 func (qv *View) scalarLookupPostings(field string, fieldOrdinal int, keys []keycodec.IndexLookupKey, includeNil bool) ([]posting.List, uint64) {
-	ov := qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, fieldOrdinal)
+	ov := qv.indexViewRef(field, fieldOrdinal)
 	postsBuf, est := lookupScalarPostingsInView(ov, keys, btoi(includeNil))
 
 	if includeNil {
-		ids := qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, fieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		ids := qv.nilIndexViewRef(field, fieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			postsBuf = append(postsBuf, ids)
 			est += ids.Cardinality()
@@ -1171,12 +1273,61 @@ func (qv *View) exprValueToIdxScalar(expr qir.Expr) (string, bool, bool, error) 
 	return key.StringKey(), false, false, nil
 }
 
+func (qv *View) exprStringKeyValueToLookupKey(expr qir.Expr) (keycodec.IndexLookupKey, bool, bool, error) {
+	if expr.Value == nil {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() == reflect.Slice {
+		return keycodec.IndexLookupKey{}, true, false, nil
+	}
+	if v.Kind() != reflect.String {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a string value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	return keycodec.IndexLookupString(v.String()), false, false, nil
+}
+
+func (qv *View) exprNumericKeyValueToLookupKey(expr qir.Expr) (keycodec.IndexLookupKey, bool, bool, error) {
+	if expr.Value == nil {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() == reflect.Slice {
+		return keycodec.IndexLookupKey{}, true, false, nil
+	}
+	u, ok, empty := numericKeyValueToUint64Exact(v)
+	if !ok {
+		return keycodec.IndexLookupKey{}, false, false, fmt.Errorf("%w: %v expects a numeric value for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if empty {
+		return keycodec.IndexLookupString(impossibleLookupKey), false, false, nil
+	}
+	return keycodec.IndexLookupU64(u), false, false, nil
+}
+
 func (qv *View) exprValueToLookupKey(expr qir.Expr) (keycodec.IndexLookupKey, bool, bool, error) {
+	if field, ok := qv.fieldByOrdinal(expr.FieldOrdinal); ok {
+		switch field.kind {
+		case queryFieldStringKey:
+			return qv.exprStringKeyValueToLookupKey(expr)
+		case queryFieldNumericKey:
+			return qv.exprNumericKeyValueToLookupKey(expr)
+		}
+	}
 	if expr.Value == nil {
 		return keycodec.IndexLookupKey{}, false, true, nil
 	}
 
-	fm := qv.fieldMetaByExpr(expr)
+	fm := qv.fieldMetaByOrdinal(expr.FieldOrdinal)
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := schema.UnwrapQueryValue(v)
 	if isNil {
@@ -1202,7 +1353,15 @@ func (qv *View) diffPostingResult(acc, sub postingResult) (postingResult, error)
 // exprValueToDistinctLookupKeyBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
 func (qv *View) exprValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.IndexLookupKey, bool, bool, error) {
-	fm := qv.fieldMetaByExpr(expr)
+	if field, ok := qv.fieldByOrdinal(expr.FieldOrdinal); ok {
+		switch field.kind {
+		case queryFieldStringKey:
+			return qv.exprStringKeyValueToDistinctLookupKeyBuf(expr)
+		case queryFieldNumericKey:
+			return qv.exprNumericKeyValueToDistinctLookupKeyBuf(expr)
+		}
+	}
+	fm := qv.fieldMetaByOrdinal(expr.FieldOrdinal)
 
 	if expr.Value == nil {
 		if expr.Op == qir.OpIN {
@@ -1256,6 +1415,81 @@ func (qv *View) exprValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.Index
 	}
 
 	return nil, false, false, nil
+}
+
+func (qv *View) exprStringKeyValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.IndexLookupKey, bool, bool, error) {
+	if expr.Value == nil {
+		return nil, false, false, fmt.Errorf("%w: %v expects a string slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return nil, false, false, fmt.Errorf("%w: %v expects a string slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() != reflect.Slice {
+		return nil, false, false, nil
+	}
+	if v.Len() == 0 {
+		return nil, true, false, nil
+	}
+
+	valsBuf := keycodec.GetIndexLookupKeySlice(v.Len())
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		elem, elemNil := schema.UnwrapQueryValue(elem)
+		if elemNil || elem.Kind() != reflect.String {
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+			return nil, false, false, fmt.Errorf("%w: %v expects a string slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+		}
+		valsBuf = append(valsBuf, keycodec.IndexLookupString(elem.String()))
+	}
+	valsBuf = dedupLookupKeyBufInPlace(valsBuf)
+	if len(valsBuf) == 0 {
+		keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+		return nil, true, false, nil
+	}
+	return valsBuf, true, false, nil
+}
+
+func (qv *View) exprNumericKeyValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.IndexLookupKey, bool, bool, error) {
+	if expr.Value == nil {
+		return nil, false, false, fmt.Errorf("%w: %v expects a numeric slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	v := reflect.ValueOf(expr.Value)
+	v, isNil := schema.UnwrapQueryValue(v)
+	if isNil {
+		return nil, false, false, fmt.Errorf("%w: %v expects a numeric slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+	}
+	if v.Kind() != reflect.Slice {
+		return nil, false, false, nil
+	}
+	if v.Len() == 0 {
+		return nil, true, false, nil
+	}
+	valsBuf := keycodec.GetIndexLookupKeySlice(v.Len())
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		elem, elemNil := schema.UnwrapQueryValue(elem)
+		if elemNil {
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+			return nil, false, false, fmt.Errorf("%w: %v expects a numeric slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+		}
+		u, ok, empty := numericKeyValueToUint64Exact(elem)
+		if !ok {
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+			return nil, false, false, fmt.Errorf("%w: %v expects a numeric slice for %v", rbierrors.ErrInvalidQuery, expr.Op, schema.ReservedKeyFieldName)
+		}
+		if !empty {
+			valsBuf = append(valsBuf, keycodec.IndexLookupU64(u))
+		}
+	}
+	valsBuf = dedupLookupKeyBufInPlace(valsBuf)
+	if len(valsBuf) == 0 {
+		keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+		return nil, true, false, nil
+	}
+	return valsBuf, true, false, nil
 }
 
 func diffOwned(a, b posting.List) posting.List {

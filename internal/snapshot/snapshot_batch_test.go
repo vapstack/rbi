@@ -56,6 +56,12 @@ func snapshotBatchLenContains(s *View, field string, ln uint64, id uint64) bool 
 	return ok
 }
 
+func snapshotBatchKeyStorage(key string, id uint64) indexdata.FieldStorage {
+	m := indexdata.GetPostingMap()
+	m[key] = (posting.List{}).BuildAdded(id)
+	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m)
+}
+
 func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	var rec struct{}
 	snap := Build(1, nil, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
@@ -70,6 +76,101 @@ func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	if !snap.Universe.Contains(7) {
 		t.Fatal("expected prepared snapshot universe to contain inserted id")
 	}
+}
+
+func TestBuildPreparedAppliesKeyDeltas(t *testing.T) {
+	var rec struct{}
+	snap := BuildWithKeyDeltas(1, nil, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+	}, []KeyDelta{
+		{ID: 7, Key: "user-7", Add: true},
+	})
+	defer snap.releaseRuntimeCaches()
+	defer snap.releaseStorage()
+
+	ids := indexdata.NewFieldIndexViewFromStorage(snap.KeyIndex).LookupPostingRetained("user-7")
+	if ids.Cardinality() != 1 || !ids.Contains(7) {
+		t.Fatalf("key index posting cardinality=%d contains=%v", ids.Cardinality(), ids.Contains(7))
+	}
+	ids.Release()
+}
+
+func TestBuildPreparedKeyDeltasReplaceDurableID(t *testing.T) {
+	var oldRec, newRec struct{}
+	keyStorage := snapshotBatchKeyStorage("user", 1)
+	universe := (posting.List{}).BuildAdded(1)
+	universe = universe.BuildAdded(3)
+	prev := NewView(1, nil, &schema.Schema{}, CacheConfig{}, Storage{
+		KeyIndex: keyStorage,
+		Universe: universe,
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	next := BuildWithKeyDeltas(2, prev, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&oldRec)},
+		{ID: 3, New: unsafe.Pointer(&newRec)},
+	}, []KeyDelta{
+		{ID: 1, Key: "user"},
+		{ID: 3, Key: "user", Add: true},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	ids := indexdata.NewFieldIndexViewFromStorage(next.KeyIndex).LookupPostingRetained("user")
+	if ids.Cardinality() != 1 || ids.Contains(1) || !ids.Contains(3) {
+		t.Fatalf("key index replacement cardinality=%d old=%v new=%v", ids.Cardinality(), ids.Contains(1), ids.Contains(3))
+	}
+	ids.Release()
+}
+
+func TestBuildPreparedKeyDeltasLastOperationWinsForSameKeyID(t *testing.T) {
+	var rec struct{}
+	base := NewView(0, nil, &schema.Schema{}, CacheConfig{}, Storage{})
+	defer base.releaseRuntimeCaches()
+	defer base.releaseStorage()
+
+	snap := BuildWithKeyDeltas(1, base, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+		{ID: 7, Old: unsafe.Pointer(&rec)},
+	}, []KeyDelta{
+		{ID: 7, Key: "user", Add: true},
+		{ID: 7, Key: "user"},
+	})
+	defer snap.releaseRuntimeCaches()
+	defer snap.releaseStorage()
+
+	ids := indexdata.NewFieldIndexViewFromStorage(snap.KeyIndex).LookupPostingRetained("user")
+	if !ids.IsEmpty() {
+		t.Fatalf("add then remove key delta left posting cardinality=%d", ids.Cardinality())
+	}
+	ids.Release()
+
+	keyStorage := snapshotBatchKeyStorage("user", 7)
+	prev := NewView(1, nil, &schema.Schema{}, CacheConfig{}, Storage{
+		KeyIndex: keyStorage,
+		Universe: posting.BuildFromSorted([]uint64{
+			7,
+		}),
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	next := BuildWithKeyDeltas(2, prev, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
+		{ID: 7, Old: unsafe.Pointer(&rec)},
+		{ID: 7, New: unsafe.Pointer(&rec)},
+	}, []KeyDelta{
+		{ID: 7, Key: "user"},
+		{ID: 7, Key: "user", Add: true},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	ids = indexdata.NewFieldIndexViewFromStorage(next.KeyIndex).LookupPostingRetained("user")
+	if ids.Cardinality() != 1 || !ids.Contains(7) {
+		t.Fatalf("remove then add key delta cardinality=%d contains=%v", ids.Cardinality(), ids.Contains(7))
+	}
+	ids.Release()
 }
 
 func TestBuildPreparedFullReplaceRebuildsStorage(t *testing.T) {

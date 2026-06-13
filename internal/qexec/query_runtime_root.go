@@ -15,13 +15,13 @@ func (qv *View) TryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 	}
 
 	e := q.Expr
-	if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || len(e.Operands) != 0 {
 		return false, nil
 	}
 
 	switch e.Op {
 	case qir.OpEQ:
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			return false, nil
 		}
@@ -32,13 +32,19 @@ func (qv *View) TryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		if isSlice {
 			return false, nil
 		}
-		if isNil {
-			return qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupCardinality(indexdata.NilIndexEntryKey) == 0, nil
+		if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+			if !key.IsNumeric() {
+				return true, nil
+			}
+			return !qv.snap.Universe.Contains(key.U64()), nil
 		}
-		return lookupScalarCardinality(qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e), key) == 0, nil
+		if isNil {
+			return qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) == 0, nil
+		}
+		return lookupScalarCardinality(qv.indexViewByOrdinal(e.FieldOrdinal), key) == 0, nil
 
 	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
-		fm := qv.fieldMetaByExpr(e)
+		fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
 		if fm == nil || fm.Slice {
 			return false, nil
 		}
@@ -52,10 +58,25 @@ func (qv *View) TryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		var bounds indexdata.Bounds
 		bounds.Has = true
 		applyNormalizedScalarBound(&bounds, bound)
+		if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+			lo, hi, hasHi, empty := numericKeyRangeLimits(bounds)
+			if empty {
+				return true, nil
+			}
+			it := qv.snap.Universe.AdvancingIter()
+			it.AdvanceIfNeeded(lo)
+			if !it.HasNext() {
+				it.Release()
+				return true, nil
+			}
+			id := it.Next()
+			it.Release()
+			return hasHi && id > hi, nil
+		}
 		if bounds.Empty {
 			return true, nil
 		}
-		ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		ov := qv.indexViewByOrdinal(e.FieldOrdinal)
 		if !ov.HasData() {
 			return true, nil
 		}
@@ -276,14 +297,14 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 		switch order.Kind {
 
 		case qir.OrderKindArrayPos:
-			ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
-			if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
+			ov := qv.indexViewByOrdinal(order.FieldOrdinal)
+			if !ov.HasData() && !qv.hasIndexedFieldOrdinal(order.FieldOrdinal) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
 			return qv.queryOrderArrayPosIndexView(result, ov, order, skip, need, needAll)
 
 		case qir.OrderKindArrayCount:
-			lenOV := qv.fieldIndexViewFromSlotsForOrder(qv.snap.LenIndex, order)
+			lenOV := qv.lenIndexViewByOrdinal(order.FieldOrdinal)
 			useZeroComplement := qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
 			if !lenOV.HasData() && !useZeroComplement {
 				return nil, fmt.Errorf("no lenIndex for slice field: %v", orderField)
@@ -291,8 +312,12 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 			return qv.queryOrderArrayCount(result, lenOV, order, skip, need, needAll, useZeroComplement)
 		}
 
-		ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
-		if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
+		if qv.isNumericKeyOrdinal(order.FieldOrdinal) {
+			return qv.queryOrderNumericKey(result, order.Desc, skip, need, needAll)
+		}
+
+		ov := qv.indexViewByOrdinal(order.FieldOrdinal)
+		if !ov.HasData() && !qv.hasIndexedFieldOrdinal(order.FieldOrdinal) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 		}
 		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)

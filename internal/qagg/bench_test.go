@@ -488,7 +488,7 @@ func BenchmarkAggregatePrepare(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					prepared, err = Prepare(src, rt)
+					prepared, err = Prepare(src, rt, rt.IndexedByName)
 					if err != nil {
 						b.Fatalf("Prepare: %v", err)
 					}
@@ -510,7 +510,7 @@ func BenchmarkAggregateFilterOnly(b *testing.B) {
 				tc := cases[ci]
 				b.Run(qaggBenchName(tc, scale, layout), func(b *testing.B) {
 					db := qaggBenchCachedDB(b, scale, layout)
-					prepared, err := Prepare(tc.build(scale), db.rt)
+					prepared, err := Prepare(tc.build(scale), db.rt, db.rt.IndexedByName)
 					if err != nil {
 						b.Fatalf("Prepare: %v", err)
 					}
@@ -552,7 +552,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 				tc := cases[ci]
 				b.Run(qaggBenchName(tc, scale, layout), func(b *testing.B) {
 					db := qaggBenchCachedDB(b, scale, layout)
-					prepared, err := Prepare(tc.build(scale), db.rt)
+					prepared, err := Prepare(tc.build(scale), db.rt, db.rt.IndexedByName)
 					if err != nil {
 						b.Fatalf("Prepare: %v", err)
 					}
@@ -573,7 +573,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						switch selectAggregateFamily(prepared) {
 						case aggregateSelectorCount:
-							decision = selectCountAggregate()
+							decision = selectCountAggregate(aggregateCountFacts{filterCardinality: ids.Cardinality()})
 						case aggregateSelectorDistinct:
 							decision = selectDistinctAggregate(exec.collectDistinctFacts(prepared, ids))
 						case aggregateSelectorUngrouped:
@@ -600,7 +600,7 @@ func BenchmarkAggregateOnly(b *testing.B) {
 				tc := cases[ci]
 				b.Run(qaggBenchName(tc, scale, layout), func(b *testing.B) {
 					db := qaggBenchCachedDB(b, scale, layout)
-					prepared, err := Prepare(tc.build(scale), db.rt)
+					prepared, err := Prepare(tc.build(scale), db.rt, db.rt.IndexedByName)
 					if err != nil {
 						b.Fatalf("Prepare: %v", err)
 					}
@@ -647,7 +647,7 @@ func BenchmarkAggregatePreparedEndToEnd(b *testing.B) {
 				tc := cases[ci]
 				b.Run(qaggBenchName(tc, scale, layout), func(b *testing.B) {
 					db := qaggBenchCachedDB(b, scale, layout)
-					prepared, err := Prepare(tc.build(scale), db.rt)
+					prepared, err := Prepare(tc.build(scale), db.rt, db.rt.IndexedByName)
 					if err != nil {
 						b.Fatalf("Prepare: %v", err)
 					}
@@ -698,7 +698,7 @@ func BenchmarkAggregatePostprocessOnly(b *testing.B) {
 					SortOut("rows", qx.DESC).
 					Offset(8).
 					Limit(128)
-				prepared, err := Prepare(src, db.rt)
+				prepared, err := Prepare(src, db.rt, db.rt.IndexedByName)
 				if err != nil {
 					b.Fatalf("Prepare: %v", err)
 				}
@@ -794,7 +794,7 @@ func BenchmarkAggregateNullHeavyLeafGroup(b *testing.B) {
 	for i := range cases {
 		tc := cases[i]
 		b.Run(tc.name, func(b *testing.B) {
-			prepared, err := Prepare(tc.q, rt)
+			prepared, err := Prepare(tc.q, rt, rt.IndexedByName)
 			if err != nil {
 				b.Fatalf("Prepare: %v", err)
 			}

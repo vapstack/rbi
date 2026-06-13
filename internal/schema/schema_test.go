@@ -89,6 +89,18 @@ type schemaTestShadowedPatchRec struct {
 	Code string `db:"outer_code" json:"outerCode"`
 }
 
+type schemaTestReservedDBTagRec struct {
+	Key string `db:"$key"`
+}
+
+type schemaTestReservedJSONTagRec struct {
+	Key string `json:"$key,omitempty"`
+}
+
+type schemaTestReservedIndexedDBTagRec struct {
+	Key string `db:"$key" rbi:"index"`
+}
+
 func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestShadowedPatchRec](), Config{})
 	if err != nil {
@@ -115,6 +127,42 @@ func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	}
 	if rt.PatchNameTouchesUnique("outerCode") {
 		t.Fatal("outer non-indexed json alias was marked unique")
+	}
+}
+
+func TestCompileRejectsReservedKeyNames(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		cfg  Config
+	}{
+		{
+			name: "options_index",
+			typ:  reflect.TypeFor[schemaTestOptionRec](),
+			cfg: Config{Index: map[string]IndexKind{
+				ReservedKeyFieldName: IndexDefault,
+			}},
+		},
+		{
+			name: "db_tag_patch_alias",
+			typ:  reflect.TypeFor[schemaTestReservedDBTagRec](),
+		},
+		{
+			name: "json_tag_patch_alias",
+			typ:  reflect.TypeFor[schemaTestReservedJSONTagRec](),
+		},
+		{
+			name: "indexed_db_tag",
+			typ:  reflect.TypeFor[schemaTestReservedIndexedDBTagRec](),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Compile(tc.typ, tc.cfg); err == nil || !strings.Contains(err.Error(), ReservedKeyFieldName) {
+				t.Fatalf("Compile err=%v want reserved %q rejection", err, ReservedKeyFieldName)
+			}
+		})
 	}
 }
 
@@ -763,9 +811,9 @@ func TestRuntimeLookupHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	ordinal, ok := rt.IndexedByName.ResolveField("name")
-	if !ok || ordinal != rt.IndexedByName["name"].Ordinal {
-		t.Fatalf("ResolveField(name)=(%d,%v)", ordinal, ok)
+	info, ok := rt.IndexedByName.ResolveField("name")
+	if !ok || info.Ordinal != rt.IndexedByName["name"].Ordinal {
+		t.Fatalf("ResolveField(name)=(%d,%v)", info.Ordinal, ok)
 	}
 	if _, ok = rt.IndexedByName.ResolveField("missing"); ok {
 		t.Fatal("ResolveField(missing) succeeded")

@@ -719,6 +719,9 @@ func TestPlannerStats_ClosePersistsPublishedSnapshotWithoutRebuild(t *testing.T)
 		t.Fatalf("field count mismatch after persisted reuse: got=%d want=%d", len(got.Fields), len(before.Fields))
 	}
 	for field, wantStats := range before.Fields {
+		if field == "$key" {
+			continue
+		}
 		gotStats, ok := got.Fields[field]
 		if !ok {
 			t.Fatalf("missing persisted planner stats for %q", field)
@@ -726,6 +729,13 @@ func TestPlannerStats_ClosePersistsPublishedSnapshotWithoutRebuild(t *testing.T)
 		if gotStats != wantStats {
 			t.Fatalf("persisted planner stats changed for %q: got=%+v want=%+v", field, gotStats, wantStats)
 		}
+	}
+	keyStats, ok := got.Fields["$key"]
+	if !ok {
+		t.Fatalf("missing persisted planner stats for $key")
+	}
+	if keyStats.DistinctKeys != got.UniverseCardinality || keyStats.TotalBucketCard != got.UniverseCardinality || keyStats.MaxBucketCard != 1 {
+		t.Fatalf("persisted planner stats for $key=%+v universe=%d", keyStats, got.UniverseCardinality)
 	}
 }
 
