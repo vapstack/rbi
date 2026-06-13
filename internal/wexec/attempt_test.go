@@ -435,6 +435,11 @@ func TestSharedSetCloneValueRestartsFromBaselineOnRetry(t *testing.T) {
 		return tx.Commit()
 	})
 	ex.snapshotOps = SnapshotOps{}
+	released := 0
+	ex.ops.Release = func(ptr unsafe.Pointer) {
+		released++
+		(*attemptRec)(ptr).V = 0
+	}
 
 	goodBaseline := &attemptRec{V: 10}
 	goodReq := cloneSetAttemptReq(1, goodBaseline)
@@ -471,6 +476,9 @@ func TestSharedSetCloneValueRestartsFromBaselineOnRetry(t *testing.T) {
 	}
 	if goodBeforeStoreCalls != 2 {
 		t.Fatalf("good BeforeStore calls = %d, want 2", goodBeforeStoreCalls)
+	}
+	if released != 3 {
+		t.Fatalf("released clone values = %d, want 3", released)
 	}
 	if goodBaseline.V != 10 {
 		t.Fatalf("good baseline mutated: %v", goodBaseline.V)

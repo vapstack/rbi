@@ -123,7 +123,7 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 	}
 	if err := b.unavailable(); err != nil {
 		for i := 0; i < len(reqs); i++ {
-			requestPool.Put(reqs[i])
+			b.releaseRequest(reqs[i])
 		}
 		if stats {
 			b.sched.stats.FallbackClosed.Add(1)
@@ -137,7 +137,7 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 			if err := b.unavailable(); err != nil {
 				b.sched.mu.Unlock()
 				for i := 0; i < len(reqs); i++ {
-					requestPool.Put(reqs[i])
+					b.releaseRequest(reqs[i])
 				}
 				if stats {
 					b.sched.stats.FallbackClosed.Add(1)
@@ -160,7 +160,7 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 				err = firstRequestErr(reqs)
 			}
 			for i := 0; i < len(reqs); i++ {
-				requestPool.Put(reqs[i])
+				b.releaseRequest(reqs[i])
 			}
 
 			b.sched.mu.Lock()
@@ -185,7 +185,7 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 		if err := b.unavailable(); err != nil {
 			b.sched.mu.Unlock()
 			for i := 0; i < len(reqs); i++ {
-				requestPool.Put(reqs[i])
+				b.releaseRequest(reqs[i])
 			}
 			jobPool.Put(job)
 			if stats {
@@ -217,7 +217,7 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 
 	err := <-job.done
 	for i := 0; i < len(reqs); i++ {
-		requestPool.Put(reqs[i])
+		b.releaseRequest(reqs[i])
 	}
 	jobPool.Put(job)
 	return err

@@ -169,7 +169,7 @@ func (batch *Batch) Cancel() {
 	batch.reqs = nil
 	batch.n = 0
 	for i := 0; i < len(reqs); i++ {
-		requestPool.Put(reqs[i])
+		batch.ex.releaseRequest(reqs[i])
 	}
 	requestScratchPool.Put(reqs)
 }
@@ -256,6 +256,14 @@ func (req *request) payloadBytes() []byte {
 		return nil
 	}
 	return req.setPayload.Bytes()[req.payloadOff:]
+}
+
+func (b *Batcher) releaseRequest(req *request) {
+	if req.setBaseline != nil {
+		b.ops.Release(req.setBaseline)
+		req.setBaseline = nil
+	}
+	requestPool.Put(req)
 }
 
 func (req *request) hasPolicy(policy reqPolicy) bool {

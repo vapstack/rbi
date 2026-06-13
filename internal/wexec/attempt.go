@@ -73,7 +73,7 @@ type attemptState struct {
 	state              recordState
 
 	ownedPayloads []*bytes.Buffer
-	decodedValues []unsafe.Pointer
+	releaseValues []unsafe.Pointer
 
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
@@ -151,13 +151,14 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 				req.Err = err
 				return
 			}
+			att.releaseValues = append(att.releaseValues, newVal)
 		} else {
 			newVal, err = b.ops.Decode(req.payloadBytes())
 			if err != nil {
 				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, err)
 				return
 			}
-			att.decodedValues = append(att.decodedValues, newVal)
+			att.releaseValues = append(att.releaseValues, newVal)
 		}
 		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
 			req.Err = err
@@ -252,7 +253,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 		req.Err = formatPrepareErr(prepareErrRedecodeValue, err)
 		return
 	}
-	att.decodedValues = append(att.decodedValues, newVal)
+	att.releaseValues = append(att.releaseValues, newVal)
 	if err = b.schema.Patch.Apply(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.Err = formatPrepareErr(prepareErrApplyPatch, err)
 		return
@@ -436,7 +437,7 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 						return nil, err
 					}
 					state.value = oldVal
-					st.decodedValues = append(st.decodedValues, oldVal)
+					st.releaseValues = append(st.releaseValues, oldVal)
 				}
 				state.setBorrowedPayload(payload)
 			}
@@ -477,7 +478,7 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 					return nil, err
 				}
 				state.value = oldVal
-				st.decodedValues = append(st.decodedValues, oldVal)
+				st.releaseValues = append(st.releaseValues, oldVal)
 			}
 			state.setBorrowedPayload(payload)
 		}
@@ -747,9 +748,9 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 	if cap(st.ownedPayloads) < capHint {
 		st.ownedPayloads = slices.Grow(st.ownedPayloads, capHint)
 	}
-	decodedCapHint := capHint * 2
-	if cap(st.decodedValues) < decodedCapHint {
-		st.decodedValues = slices.Grow(st.decodedValues, decodedCapHint)
+	releaseCapHint := capHint * 2
+	if cap(st.releaseValues) < releaseCapHint {
+		st.releaseValues = slices.Grow(st.releaseValues, releaseCapHint)
 	}
 	if uniqueFields != 0 {
 		if cap(st.uniqueIdxs) < capHint {
@@ -774,11 +775,11 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 }
 
 func (st *attemptState) cleanup() {
-	for _, ptr := range st.decodedValues {
+	for _, ptr := range st.releaseValues {
 		st.release(ptr)
 	}
-	clear(st.decodedValues)
-	st.decodedValues = st.decodedValues[:0]
+	clear(st.releaseValues)
+	st.releaseValues = st.releaseValues[:0]
 
 	for _, buf := range st.ownedPayloads {
 		encodePool.Put(buf)

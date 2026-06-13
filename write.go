@@ -137,7 +137,7 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 //
 // CloneFunc:
 //   - Receives the write key and source value.
-//   - Must return an independent copy that does not alias the input.
+//   - Must return a fully independent copy that does not alias the input.
 //   - Must not mutate the input.
 //   - Must return non-nil for non-nil input.
 //   - Must be deterministic and free of external side effects.

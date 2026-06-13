@@ -62,16 +62,16 @@ func TestRequestPoolCleanupReleasesPayloadAndDrainsDone(t *testing.T) {
 	}
 }
 
-func TestAttemptStatePoolCleanupReleasesDecodedValuesAndClearsScratch(t *testing.T) {
+func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 	st := attemptStatePool.Get()
-	decodedA := &attemptRec{V: 1}
-	decodedB := &attemptRec{V: 2}
+	valueA := &attemptRec{V: 1}
+	valueB := &attemptRec{V: 2}
 	released := 0
 	st.release = func(ptr unsafe.Pointer) {
 		released++
 		(*attemptRec)(ptr).V = 0
 	}
-	st.decodedValues = append(st.decodedValues, unsafe.Pointer(decodedA), unsafe.Pointer(decodedB))
+	st.releaseValues = append(st.releaseValues, unsafe.Pointer(valueA), unsafe.Pointer(valueB))
 
 	payload := encodePool.Get()
 	_, _ = payload.Write([]byte{1, 2, 3})
@@ -85,21 +85,21 @@ func TestAttemptStatePoolCleanupReleasesDecodedValuesAndClearsScratch(t *testing
 		Patch: []schema.PatchItem{{Name: "v", Value: []byte{1}}},
 	})
 	st.acceptedSnapshots = append(st.acceptedSnapshots, snapshot.BatchEntry{ID: 8})
-	st.states = append(st.states, recordState{idx: 7, value: unsafe.Pointer(decodedA), borrowedPayload: []byte{9}})
-	st.state = recordState{idx: 9, value: unsafe.Pointer(decodedB), borrowedPayload: []byte{10}}
+	st.states = append(st.states, recordState{idx: 7, value: unsafe.Pointer(valueA), borrowedPayload: []byte{9}})
+	st.state = recordState{idx: 9, value: unsafe.Pointer(valueB), borrowedPayload: []byte{10}}
 	st.stateByUintID = map[uint64]int{7: 1}
 	st.stateByStringID = map[string]int{"k": 1}
 
 	attemptStatePool.Put(st)
 
-	if released != 2 || decodedA.V != 0 || decodedB.V != 0 {
-		t.Fatalf("decoded release count=%d decoded=(%d,%d), want released zeroed values", released, decodedA.V, decodedB.V)
+	if released != 2 || valueA.V != 0 || valueB.V != 0 {
+		t.Fatalf("release count=%d values=(%d,%d), want released zeroed values", released, valueA.V, valueB.V)
 	}
 	if payload.Len() != 0 {
 		t.Fatalf("owned payload buffer was not reset: len=%d", payload.Len())
 	}
-	if len(st.decodedValues) != 0 || len(st.ownedPayloads) != 0 {
-		t.Fatalf("attempt cleanup kept decoded/payload slices: decoded=%d payloads=%d", len(st.decodedValues), len(st.ownedPayloads))
+	if len(st.releaseValues) != 0 || len(st.ownedPayloads) != 0 {
+		t.Fatalf("attempt cleanup kept value/payload slices: values=%d payloads=%d", len(st.releaseValues), len(st.ownedPayloads))
 	}
 	if len(st.prepared) != 0 || len(st.accepted) != 0 || len(st.states) != 0 {
 		t.Fatalf("attempt cleanup kept prepared/accepted/states: %d/%d/%d", len(st.prepared), len(st.accepted), len(st.states))

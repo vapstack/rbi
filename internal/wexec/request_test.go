@@ -189,6 +189,45 @@ func TestBuildSetRequestCloneFailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestBuildSetRequestCloneBaselineReleasedOnRequestCleanup(t *testing.T) {
+	ex := NewBatcher(Config{
+		MaxOps:      8,
+		Unavailable: func() error { return nil },
+	})
+	released := 0
+	var releasedPtr unsafe.Pointer
+	ex.ops = &RecordOps{
+		Release: func(ptr unsafe.Pointer) {
+			released++
+			releasedPtr = ptr
+			(*attemptRec)(ptr).V = 0
+		},
+	}
+
+	v := attemptRec{V: 7}
+	var baseline *attemptRec
+	beforeStore := []BeforeStoreHook{func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error { return nil }}
+	cloneValue := func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+		cp := *(*attemptRec)(value)
+		baseline = &cp
+		return unsafe.Pointer(baseline), nil
+	}
+
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), beforeStore, nil, cloneValue)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	if req.setBaseline != unsafe.Pointer(baseline) {
+		t.Fatalf("baseline pointer = %p, want %p", req.setBaseline, baseline)
+	}
+
+	ex.releaseRequest(req)
+
+	if released != 1 || releasedPtr != unsafe.Pointer(baseline) || baseline.V != 0 {
+		t.Fatalf("baseline release count=%d ptr=%p value=%d", released, releasedPtr, baseline.V)
+	}
+}
+
 func TestOpNamesMatchExecutionMode(t *testing.T) {
 	if got := opName(opSet, 1, false, 16); got != "batch" {
 		t.Fatalf("shared single request op = %q, want batch", got)
