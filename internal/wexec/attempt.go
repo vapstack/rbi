@@ -459,11 +459,13 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 			payload := prev
 			if b.strKey {
 				if len(prev) < stringValuePrefixLen {
+					*state = recordState{}
 					st.states = st.states[:pos]
 					return nil, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
 				}
 				idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
 				if idx == 0 {
+					*state = recordState{}
 					st.states = st.states[:pos]
 					return nil, fmt.Errorf("string storage format: zero string id")
 				}
@@ -474,6 +476,7 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 			if decodeOld {
 				oldVal, err := b.ops.Decode(payload)
 				if err != nil {
+					*state = recordState{}
 					st.states = st.states[:pos]
 					return nil, err
 				}

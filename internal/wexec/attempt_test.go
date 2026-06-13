@@ -807,6 +807,46 @@ func TestSharedPatchExistingDecodeFailureCommitsRest(t *testing.T) {
 	}
 }
 
+func TestLoadStateDecodeErrorClearsDiscardedStateSlot(t *testing.T) {
+	decodeErr := errors.New("decode failed")
+	var events []string
+	ex, raw, bucket, mapBucket := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
+		if len(data) == 1 && data[0] == 0xc1 {
+			return nil, decodeErr
+		}
+		return unsafe.Pointer(&attemptRec{V: data[0]}), nil
+	}
+	putStringAttemptPayload(t, raw, bucket, mapBucket, "bad", []byte{0xc1})
+
+	err := raw.View(func(tx *bbolt.Tx) error {
+		st := attemptState{
+			dataBucket: tx.Bucket(bucket),
+			states:     make([]recordState, 0, 1),
+		}
+		req := request{id: keycodec.DataKeyFromUserKey("bad", true)}
+		if _, err := ex.loadState(&st, &req, true, true); !errors.Is(err, decodeErr) {
+			return fmt.Errorf("loadState error = %v, want decode error", err)
+		}
+		if len(st.states) != 0 {
+			return fmt.Errorf("states len = %d, want 0", len(st.states))
+		}
+		state := st.states[:cap(st.states)][0]
+		if state.key != nil || state.value != nil || state.ownedPayload != nil || state.borrowedPayload != nil {
+			return fmt.Errorf("discarded state kept references: %+v", state)
+		}
+		if state.idx != 0 || state.idxKnown || state.idxNew || state.exists || state.payloadOff != 0 {
+			return fmt.Errorf("discarded state kept scalar state: %+v", state)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSharedPatchBeforeStoreFailureCommitsRest(t *testing.T) {
 	hookErr := errors.New("before store failed")
 	var events []string

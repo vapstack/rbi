@@ -596,6 +596,66 @@ func TestExecuteJobsRepeatedPatchFirstBeforeCommitErrorRetriesFollowerFromOrigin
 	}
 }
 
+func TestExecuteJobsRepeatedPatchRetryClearsFollowerPrepareError(t *testing.T) {
+	callbackErr := errors.New("before commit failed")
+	staleErr := errors.New("stale before store error")
+	var events []string
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	putAttemptPayload(t, raw, bucket, 1, []byte{10})
+
+	req1 := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(20)}}, true)
+	req2 := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(30)}}, true)
+	req1.policy = reqRepeatIDSafeShared
+	req2.policy = reqRepeatIDSafeShared
+	req1.beforeCommit = []BeforeCommitHook{
+		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
+			return callbackErr
+		},
+	}
+	var seen []byte
+	req2.beforeStore = []BeforeStoreHook{
+		func(_ keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+			oldRec := (*attemptRec)(oldValue)
+			newRec := (*attemptRec)(newValue)
+			seen = append(seen, oldRec.V, newRec.V)
+			if oldRec.V == 20 {
+				return staleErr
+			}
+			return nil
+		},
+	}
+
+	ex.sched.mu.Lock()
+	ex.sched.window = 0
+	ex.sched.maxOps = 16
+	ex.sched.running = true
+	ex.sched.enqueue(&writeJob{reqs: []*request{req1}, done: req1.Done})
+	ex.sched.enqueue(&writeJob{reqs: []*request{req2}, done: req2.Done})
+	ex.sched.mu.Unlock()
+
+	batch := ex.sched.popBatch(false)
+	if len(batch) != 2 {
+		t.Fatalf("batch len = %d, want 2", len(batch))
+	}
+
+	ex.executeJobs(batch)
+
+	if err := <-req1.Done; !errors.Is(err, callbackErr) {
+		t.Fatalf("req1 error = %v, want callback error", err)
+	}
+	if err := <-req2.Done; err != nil {
+		t.Fatalf("req2 error = %v", err)
+	}
+	if !reflect.DeepEqual(seen, []byte{20, 30, 10, 30}) {
+		t.Fatalf("BeforeStore seen = %v, want [20 30 10 30]", seen)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{30}) {
+		t.Fatalf("id=1 payload = %v, want [30]", got)
+	}
+}
+
 func TestExecuteJobsRepeatedPatchMiddleBeforeCommitErrorRetriesNeighborsSequentially(t *testing.T) {
 	callbackErr := errors.New("before commit failed")
 	var events []string

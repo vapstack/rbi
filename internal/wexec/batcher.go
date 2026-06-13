@@ -1,14 +1,12 @@
 package wexec
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbistats"
 	"go.etcd.io/bbolt"
 )
@@ -367,10 +365,7 @@ func (b *Batcher) runShared(batch []*request) {
 			break
 		}
 		for i := 0; i < len(activeScratch); i++ {
-			req := activeScratch[i]
-			if errors.Is(req.Err, rbierrors.ErrUniqueViolation) {
-				req.Err = nil
-			}
+			activeScratch[i].Err = nil
 		}
 	}
 	if ownedScratch != nil {
