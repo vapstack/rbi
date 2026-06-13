@@ -1139,6 +1139,9 @@ func (qv *View) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		return nil
 
 	case qir.OpSUFFIX, qir.OpCONTAINS:
+		if qv.isNumericKeyOrdinal(e.FieldOrdinal) {
+			return fmt.Errorf("%w: %v is not supported for %v", rbierrors.ErrInvalidQuery, e.Op, fieldName)
+		}
 		_, isSlice, _, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
 			return err

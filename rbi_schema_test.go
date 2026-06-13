@@ -530,6 +530,10 @@ func TestNumericIndexedDBEnablesKeyQueries(t *testing.T) {
 		if _, err = db.Count(invalidStringCounts[i].expr, qx.EQ("sku", "j")); !errors.Is(err, rbierrors.ErrInvalidQuery) || !strings.Contains(err.Error(), "$key") {
 			t.Fatalf("numeric $key %s count err=%v want invalid-query rejection", invalidStringCounts[i].name, err)
 		}
+		q := qx.Query(qx.GT("price", 1000), invalidStringCounts[i].expr).Sort("price", qx.ASC).Limit(1)
+		if _, err = db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) || !strings.Contains(err.Error(), "$key") {
+			t.Fatalf("numeric $key %s ordered-limit err=%v want invalid-query rejection", invalidStringCounts[i].name, err)
+		}
 	}
 	if got, err := db.QueryKeys(qx.Query(qx.EQ("$key", math.Ldexp(1, 64)))); err != nil || len(got) != 0 {
 		t.Fatalf("numeric $key 2^64 query=%v err=%v want empty nil", got, err)
