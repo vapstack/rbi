@@ -7120,6 +7120,10 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 	order := orderInline[:branches.Len()]
 	for i := 0; i < branches.Len(); i++ {
 		branch := &branches.owner[i]
+		if branch.alwaysTrue {
+			releasePlannerORNoOrderStateIters(states[:i])
+			return qv.execPlanORUniverseNoOrder(q, trace), true
+		}
 		branch.leadIdx = branch.noOrderLeadIndex(need)
 		state := &states[i]
 		state.index = i
@@ -7245,11 +7249,15 @@ func (qv *View) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBr
 	var itersInline [plannerORBranchLimit]plannerORIter
 	iters := itersInline[:0]
 	for i := 0; i < branches.Len(); i++ {
-		branch := branches.owner[i]
+		branch := &branches.owner[i]
+		if branch.alwaysTrue {
+			releasePlannerORIters(iters)
+			return qv.execPlanORUniverseNoOrder(q, trace), true
+		}
 		lead := branch.leadPtr()
 		iters = append(iters, plannerORIter{
 			it:     lead.newIter(),
-			branch: &branches.owner[i],
+			branch: branch,
 		})
 	}
 	defer releasePlannerORIters(iters)

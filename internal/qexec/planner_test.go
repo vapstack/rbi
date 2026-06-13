@@ -825,6 +825,67 @@ func TestPlannerORNoOrderAdaptive_ReturnsNoOrderPage(t *testing.T) {
 	assertNoOrderPage(t, q, gotAdaptive, full, "adaptive")
 }
 
+func TestPlannerORNoOrder_LateAlwaysTrueBranchUsesUniversePage(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []rbitrace.Event
+	)
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev rbitrace.Event) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		},
+		TraceSampleEvery: 1,
+	})
+	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i % 64,
+			Active: i%2 == 0,
+		}
+	})
+
+	q := qx.Query(
+		qx.OR(
+			qx.LT("age", 90),
+			qx.EQ("active", true),
+		),
+	).Limit(7)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(got) != 7 {
+		t.Fatalf("expected limited universe page len=7, got=%d ids=%v", len(got), got)
+	}
+
+	mu.Lock()
+	if len(events) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	mu.Unlock()
+	if ev.Plan != rbitrace.PlanORMergeNoOrder {
+		t.Fatalf("expected no-order OR plan, got %q", ev.Plan)
+	}
+
+	fullQ := cloneQuery(q)
+	fullQ.Window.Limit = 0
+	full, err := db.QueryKeys(fullQ)
+	if err != nil {
+		t.Fatalf("full QueryKeys: %v", err)
+	}
+	if len(full) != 128 {
+		t.Fatalf("expected tautological OR to match universe, got full len=%d", len(full))
+	}
+	assertNoOrderPage(t, q, got, full, "late_always_true_or")
+}
+
 func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
