@@ -51,8 +51,9 @@ const ReservedKeyFieldName = "$key"
 // A type that implements ValueIndexer is responsible for ensuring that
 // IndexingValue returns a valid and stable string for every value that may
 // appear in indexed data. This includes handling nil receivers if the type
-// is a pointer or otherwise nillable. The caller does not perform nil
-// checks before invoking IndexingValue.
+// is a pointer or otherwise nillable. Nil scalar interface values are
+// indexed as null, and nil interface elements in slices do not emit index
+// keys. Other nil receivers are passed to IndexingValue.
 //
 // IndexingValue must return a deterministic string: the same value must
 // always produce the same indexing key.

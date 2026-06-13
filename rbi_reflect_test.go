@@ -542,6 +542,33 @@ func TestReflectExt_ValueIndexerInterfaceField_InitAndWritePath(t *testing.T) {
 	assertUint64Slice(t, got, []uint64{1})
 }
 
+func TestReflectExt_ValueIndexerInterfaceField_NilIsIndexedNull(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectInterfaceVIRec](t, "reflect_interface_vi_nil.db")
+
+	if err := db.Set(1, &reflectInterfaceVIRec{}); err != nil {
+		t.Fatalf("Set nil(1): %v", err)
+	}
+	if err := db.Set(2, &reflectInterfaceVIRec{}); err != nil {
+		t.Fatalf("Set nil(2): %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.ISNULL("key")))
+	if err != nil {
+		t.Fatalf("QueryKeys(ISNULL key): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1, 2})
+
+	if err := db.Set(1, &reflectInterfaceVIRec{Key: reflectMapVI{"id": "MiXeD"}}); err != nil {
+		t.Fatalf("Set value(1): %v", err)
+	}
+
+	got, err = db.QueryKeys(qx.Query(qx.ISNULL("key")))
+	if err != nil {
+		t.Fatalf("QueryKeys(ISNULL key after update): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2})
+}
+
 func TestReflectExt_ValueIndexerInterfaceSlice_InitAndWritePath(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectInterfaceVISliceRec](t, "reflect_interface_vi_slice.db")
 
@@ -564,6 +591,29 @@ func TestReflectExt_ValueIndexerInterfaceSlice_InitAndWritePath(t *testing.T) {
 	got, err = db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"second"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(second): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1})
+}
+
+func TestReflectExt_ValueIndexerInterfaceSlice_NilElementsIgnored(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectInterfaceVISliceRec](t, "reflect_interface_vi_slice_nil.db")
+
+	if err := db.Set(1, &reflectInterfaceVISliceRec{
+		Tags: []ValueIndexer{
+			nil,
+			reflectMapVI{"id": "MiXeD"},
+			nil,
+		},
+	}); err != nil {
+		t.Fatalf("Set mixed tags: %v", err)
+	}
+	if err := db.Set(2, &reflectInterfaceVISliceRec{Tags: []ValueIndexer{nil, nil}}); err != nil {
+		t.Fatalf("Set nil-only tags: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"mixed"})))
+	if err != nil {
+		t.Fatalf("QueryKeys(mixed): %v", err)
 	}
 	assertUint64Slice(t, got, []uint64{1})
 }
