@@ -620,6 +620,117 @@ func TestTransparentMode_StringOverwriteSkipsOldPayloadDecode(t *testing.T) {
 	}
 }
 
+func TestTransparentMode_NumericDeleteSkipsOldPayloadDecode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_numeric_delete.db")
+
+	db, raw := openBoltAndNew[uint64, noIndexRec](t, path)
+	defer func() {
+		_ = db.Close()
+		_ = raw.Close()
+	}()
+
+	for id := uint64(1); id <= 3; id++ {
+		if err := db.Set(id, &noIndexRec{Name: fmt.Sprintf("old-%d", id), Age: int(id)}); err != nil {
+			t.Fatalf("seed Set(%d): %v", id, err)
+		}
+	}
+
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		var keyBuf [8]byte
+		for id := uint64(1); id <= 3; id++ {
+			if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, false, &keyBuf), []byte{0xc1}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("corrupt old payloads: %v", err)
+	}
+
+	if err := db.Delete(1); err != nil {
+		t.Fatalf("delete corrupt old payload: %v", err)
+	}
+	if err := db.BatchDelete([]uint64{2, 3}); err != nil {
+		t.Fatalf("batch delete corrupt old payloads: %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		var keyBuf [8]byte
+		for id := uint64(1); id <= 3; id++ {
+			if v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, false, &keyBuf)); v != nil {
+				return fmt.Errorf("id=%d remained: %x", id, v)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify delete state: %v", err)
+	}
+}
+
+func TestTransparentMode_StringDeleteSkipsOldPayloadDecode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_string_delete.db")
+
+	db, raw := openBoltAndNew[string, noIndexRec](t, path)
+	defer func() {
+		_ = db.Close()
+		_ = raw.Close()
+	}()
+
+	if err := db.Set("k", &noIndexRec{Name: "old", Age: 1}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+
+	var oldIdx uint64
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		stored := bucket.Get([]byte("k"))
+		oldIdx = keycodec.U64FromBytes(stored[:8])
+		bad := keycodec.AppendU64Bytes(nil, oldIdx)
+		bad = append(bad, 0xc1)
+		return bucket.Put([]byte("k"), bad)
+	}); err != nil {
+		t.Fatalf("corrupt old payload: %v", err)
+	}
+
+	if err := db.Delete("k"); err != nil {
+		t.Fatalf("delete corrupt old payload: %v", err)
+	}
+
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.dataBucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		if v := bucket.Get([]byte("k")); v != nil {
+			return fmt.Errorf("data remained: %x", v)
+		}
+		m := tx.Bucket(db.strmapBucket)
+		if m == nil {
+			return fmt.Errorf("string map bucket does not exist")
+		}
+		var mapKey [8]byte
+		if v := m.Get(keycodec.U64BytesWithBuf(oldIdx, &mapKey)); v != nil {
+			return fmt.Errorf("map[%d]=%q want empty", oldIdx, v)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify delete state: %v", err)
+	}
+}
+
 func TestIndexTags_OptInSupportRBI(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "opt_in_tags.db")

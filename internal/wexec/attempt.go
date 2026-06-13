@@ -324,10 +324,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 }
 
 func (b *Batcher) prepareDelete(att *attemptState, req *request) {
-	needOldValue := true
-	if b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() && len(req.beforeCommit) == 0 {
-		needOldValue = false
-	}
+	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.beforeCommit) > 0
 	state, err := b.loadState(att, req, true, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
