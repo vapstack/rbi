@@ -101,6 +101,16 @@ type schemaTestReservedIndexedDBTagRec struct {
 	Key string `db:"$key" rbi:"index"`
 }
 
+type schemaTestPatchDBAliasGoNameCollisionRec struct {
+	Unique string `db:"Name" rbi:"unique"`
+	Name   string
+}
+
+type schemaTestPatchJSONAliasGoNameCollisionRec struct {
+	Unique string `json:"Name" rbi:"unique"`
+	Name   string
+}
+
 func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestShadowedPatchRec](), Config{})
 	if err != nil {
@@ -127,6 +137,24 @@ func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	}
 	if rt.PatchNameTouchesUnique("outerCode") {
 		t.Fatal("outer non-indexed json alias was marked unique")
+	}
+}
+
+func TestCompileRejectsPatchAliasGoNameCollisions(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{name: "db", typ: reflect.TypeFor[schemaTestPatchDBAliasGoNameCollisionRec]()},
+		{name: "json", typ: reflect.TypeFor[schemaTestPatchJSONAliasGoNameCollisionRec]()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Compile(tc.typ, Config{}); err == nil || !strings.Contains(err.Error(), "ambiguous patch field name") {
+				t.Fatalf("Compile err=%v want ambiguous patch field name rejection", err)
+			}
+		})
 	}
 }
 

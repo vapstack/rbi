@@ -686,6 +686,9 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, sing
 			f.UseVI = elem.Implements(viType)
 		}
 
+		if existing, ok := patchMap[rf.Name]; ok && existing.Name != f.Name {
+			return fmt.Errorf("ambiguous patch field name '%v' used by fields %v and %v", rf.Name, existing.Name, f.Name)
+		}
 		patchMap[rf.Name] = f
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
