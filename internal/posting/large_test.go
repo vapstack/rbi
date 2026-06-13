@@ -869,6 +869,11 @@ func TestReadLargeRejectsInvalidPayloads(t *testing.T) {
 			encodeBitmap32Payload(),
 		},
 	)
+	const corruptLargeContainerCount = uint64(1 << 20)
+
+	oversizedCountBody := make([]byte, largePostingWireHeaderSize)
+	binary.LittleEndian.PutUint64(oversizedCountBody, corruptLargeContainerCount)
+	oversizedCount := append(encodeUvarint(uint64(len(oversizedCountBody))), oversizedCountBody...)
 
 	tests := []struct {
 		name    string
@@ -877,8 +882,9 @@ func TestReadLargeRejectsInvalidPayloads(t *testing.T) {
 	}{
 		{name: "SizeMismatch", payload: sizeMismatch, wantSub: "size mismatch"},
 		{name: "Oversized", payload: encodeUvarint(^uint64(0)), wantSub: "overflows int64"},
+		{name: "OversizedEmbeddedCount", payload: oversizedCount, wantSub: "exceeds payload size"},
 		{name: "UnsortedKeys", payload: unsortedKeys, wantSub: "strictly increasing"},
-		{name: "EmptyChild", payload: emptyChild, wantSub: "is empty"},
+		{name: "EmptyChild", payload: emptyChild, wantSub: "exceeds payload size"},
 		{name: "Truncated", payload: valid[:len(valid)-1], wantSub: "EOF"},
 	}
 
@@ -888,6 +894,28 @@ func TestReadLargeRejectsInvalidPayloads(t *testing.T) {
 				t.Fatalf("unexpected error: %v want substring %q", err, tc.wantSub)
 			}
 		})
+	}
+}
+
+func TestLargePostingDirectReadFromDoesNotPreallocateContainerCount(t *testing.T) {
+	const corruptLargeContainerCount = uint64(1 << 20)
+
+	payload := make([]byte, largePostingWireHeaderSize)
+	binary.LittleEndian.PutUint64(payload, corruptLargeContainerCount)
+
+	var lp largePosting
+	if _, err := lp.ReadFrom(bytes.NewReader(payload)); err == nil || !bytes.Contains([]byte(err.Error()), []byte("could not read key #0")) {
+		t.Fatalf("unexpected non-bufio error: %v", err)
+	}
+	if lp.highlowcontainer.size() != 0 || cap(lp.highlowcontainer.keys) > len(lp.highlowcontainer.inlineKeys) {
+		t.Fatalf("non-bufio read allocated large array: size=%d cap=%d", lp.highlowcontainer.size(), cap(lp.highlowcontainer.keys))
+	}
+
+	if _, err := lp.ReadFrom(bufio.NewReader(bytes.NewReader(payload))); err == nil || !bytes.Contains([]byte(err.Error()), []byte("could not read key #0")) {
+		t.Fatalf("unexpected bufio error: %v", err)
+	}
+	if lp.highlowcontainer.size() != 0 || cap(lp.highlowcontainer.keys) > len(lp.highlowcontainer.inlineKeys) {
+		t.Fatalf("bufio read allocated large array: size=%d cap=%d", lp.highlowcontainer.size(), cap(lp.highlowcontainer.keys))
 	}
 }
 

@@ -13,6 +13,14 @@ type largePosting struct {
 	highlowcontainer largeArray
 }
 
+const (
+	largePostingWireHeaderSize = 8
+	largePostingWireKeySize    = 4
+
+	// A non-empty child bitmap32 needs its count, one container header, and one uint16 value.
+	minLargePostingContainerWireSize = largePostingWireKeySize + bitmap32WireHeaderSize + bitmap32WireContainerHeaderSize + 2
+)
+
 func newLargePosting() *largePosting {
 	return &largePosting{}
 }
@@ -101,32 +109,34 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 	}
 	p += int64(n)
 
-	size := binary.LittleEndian.Uint64(sizeBuf[:])
+	containerCount := binary.LittleEndian.Uint64(sizeBuf[:])
 	lp.highlowcontainer.clear()
-	lp.highlowcontainer.setSize(int(size))
+	defer clearLargePostingOnReadError(lp, &err)
 
 	keyBuf := sizeBuf[:4]
-	for i := uint64(0); i < size; i++ {
+	for i := uint64(0); i < containerCount; i++ {
 		n, err = io.ReadFull(stream, keyBuf)
-		if err != nil {
-			return int64(n), fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, err)
-		}
 		p += int64(n)
+		if err != nil {
+			return p, fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, err)
+		}
 		key := binary.LittleEndian.Uint32(keyBuf)
 		if i != 0 && key <= prevKey {
 			return p, fmt.Errorf("large posting keys are not strictly increasing")
 		}
 		prevKey = key
-		lp.highlowcontainer.keys[i] = key
-		lp.highlowcontainer.containers[i] = getBitmap32()
-		n64, readErr := lp.highlowcontainer.containers[i].ReadFrom(stream)
+		c := getBitmap32()
+		n64, readErr := c.ReadFrom(stream)
 		p += n64
 		if n64 == 0 || readErr != nil {
+			c.release()
 			return p, fmt.Errorf("could not deserialize container for key #%d: %w", i, readErr)
 		}
-		if lp.highlowcontainer.containers[i].isEmpty() {
+		if c.isEmpty() {
+			c.release()
 			return p, fmt.Errorf("large posting container #%d is empty", i)
 		}
+		lp.highlowcontainer.appendContainer(key, c)
 	}
 
 	return p, nil
@@ -136,9 +146,9 @@ func (lp *largePosting) readFromBufio(reader *bufio.Reader) (p int64, err error)
 	var prevKey uint32
 
 	sizeBytes, err := reader.Peek(8)
-	var size uint64
+	var containerCount uint64
 	if err == nil {
-		size = binary.LittleEndian.Uint64(sizeBytes)
+		containerCount = binary.LittleEndian.Uint64(sizeBytes)
 		if _, err = reader.Discard(8); err != nil {
 			return 0, err
 		}
@@ -150,13 +160,13 @@ func (lp *largePosting) readFromBufio(reader *bufio.Reader) (p int64, err error)
 			return int64(n), readErr
 		}
 		p += int64(n)
-		size = binary.LittleEndian.Uint64(sizeBuf[:])
+		containerCount = binary.LittleEndian.Uint64(sizeBuf[:])
 	}
 
 	lp.highlowcontainer.clear()
-	lp.highlowcontainer.setSize(int(size))
+	defer clearLargePostingOnReadError(lp, &err)
 
-	for i := uint64(0); i < size; i++ {
+	for i := uint64(0); i < containerCount; i++ {
 		keyBytes, peekErr := reader.Peek(4)
 		var key uint32
 		if peekErr == nil {
@@ -168,10 +178,81 @@ func (lp *largePosting) readFromBufio(reader *bufio.Reader) (p int64, err error)
 		} else {
 			var keyBuf [4]byte
 			n, readErr := readFullBufio(reader, keyBuf[:])
-			if readErr != nil {
-				return int64(n), fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, readErr)
-			}
 			p += int64(n)
+			if readErr != nil {
+				return p, fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, readErr)
+			}
+			key = binary.LittleEndian.Uint32(keyBuf[:])
+		}
+		if i != 0 && key <= prevKey {
+			return p, fmt.Errorf("large posting keys are not strictly increasing")
+		}
+		prevKey = key
+		c := getBitmap32()
+		n64, readErr := c.readFromBufio(reader)
+		p += n64
+		if n64 == 0 || readErr != nil {
+			c.release()
+			return p, fmt.Errorf("could not deserialize container for key #%d: %w", i, readErr)
+		}
+		if c.isEmpty() {
+			c.release()
+			return p, fmt.Errorf("large posting container #%d is empty", i)
+		}
+
+		lp.highlowcontainer.appendContainer(key, c)
+	}
+
+	return p, nil
+}
+
+func (lp *largePosting) readFromBufioPayload(reader *bufio.Reader, payloadSize uint64) (p int64, err error) {
+	var prevKey uint32
+
+	sizeBytes, err := reader.Peek(8)
+	var containerCount uint64
+
+	if err == nil {
+		containerCount = binary.LittleEndian.Uint64(sizeBytes)
+		if _, err = reader.Discard(8); err != nil {
+			return 0, err
+		}
+		p = 8
+
+	} else {
+		var sizeBuf [8]byte
+		n, readErr := readFullBufio(reader, sizeBuf[:])
+		if readErr != nil {
+			return int64(n), readErr
+		}
+		p += int64(n)
+		containerCount = binary.LittleEndian.Uint64(sizeBuf[:])
+	}
+
+	lp.highlowcontainer.clear()
+	if containerCount > (payloadSize-largePostingWireHeaderSize)/minLargePostingContainerWireSize {
+		return p, fmt.Errorf("large posting container count %d exceeds payload size %d", containerCount, payloadSize)
+	}
+	defer clearLargePostingOnReadError(lp, &err)
+
+	lp.highlowcontainer.setSize(int(containerCount))
+
+	for i := uint64(0); i < containerCount; i++ {
+		keyBytes, peekErr := reader.Peek(4)
+		var key uint32
+		if peekErr == nil {
+			key = binary.LittleEndian.Uint32(keyBytes)
+			if _, err = reader.Discard(4); err != nil {
+				return p, err
+			}
+			p += 4
+		} else {
+			var keyBuf [4]byte
+			n, readErr := readFullBufio(reader, keyBuf[:])
+			p += int64(n)
+			if readErr != nil {
+				return p, fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, readErr)
+			}
 			key = binary.LittleEndian.Uint32(keyBuf[:])
 		}
 		if i != 0 && key <= prevKey {
@@ -191,6 +272,12 @@ func (lp *largePosting) readFromBufio(reader *bufio.Reader) (p int64, err error)
 	}
 
 	return p, nil
+}
+
+func clearLargePostingOnReadError(lp *largePosting, err *error) {
+	if *err != nil {
+		lp.highlowcontainer.clear()
+	}
 }
 
 func (lp *largePosting) runOptimize() {
@@ -1071,11 +1158,14 @@ func readLarge(reader *bufio.Reader) (lp *largePosting, err error) {
 	if size > (^uint64(0) >> 1) {
 		return nil, fmt.Errorf("large posting size overflows int64: %v", size)
 	}
+	if size < largePostingWireHeaderSize {
+		return nil, fmt.Errorf("large posting payload too small: %v", size)
+	}
 	lp = getLargePosting()
 	lp.clear()
 	defer recoverLargeRead(&lp, &err)
 	var n int64
-	n, err = lp.readFromBufio(reader)
+	n, err = lp.readFromBufioPayload(reader, size)
 	if err != nil {
 		lp.release()
 		return nil, err
