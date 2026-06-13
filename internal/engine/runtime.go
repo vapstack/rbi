@@ -423,7 +423,10 @@ func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, current
 		}
 	}()
 
-	index.releaseCurrentStorage()
+	if index.snapshot.Current() == nil {
+		// After the first publish, current storage is owned and retired by snapshot.Registry.
+		index.releaseCurrentStorage()
+	}
 	index.lenIndexLoaded = result.LenLoaded
 	index.keyIndexLoaded = result.KeyIndexLoaded
 
@@ -600,11 +603,14 @@ func (index *Index) RefreshPlannerStatsLocked() {
 }
 
 func (index *Index) StartAnalyzeLoop(refresh func() error, terminal func(error) bool, resetFailure func(error) bool) {
+	index.exec.Analyzer.Lock()
 	interval := index.exec.Analyzer.Interval
 	if interval <= 0 {
+		index.exec.Analyzer.Unlock()
 		return
 	}
-	if index.exec.Analyzer.Stop != nil {
+	if index.exec.Analyzer.Stop != nil || index.exec.Analyzer.Done != nil {
+		index.exec.Analyzer.Unlock()
 		return
 	}
 
@@ -612,37 +618,40 @@ func (index *Index) StartAnalyzeLoop(refresh func() error, terminal func(error) 
 	done := make(chan struct{})
 	index.exec.Analyzer.Stop = stop
 	index.exec.Analyzer.Done = done
+	index.exec.Analyzer.Unlock()
 
 	go index.runPlannerAnalyzeLoop(stop, done, interval, refresh, terminal, resetFailure)
 }
 
 func (index *Index) StopAnalyzeLoop() {
+	index.exec.Analyzer.Lock()
 	stop := index.exec.Analyzer.Stop
 	done := index.exec.Analyzer.Done
 
 	if stop != nil {
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
+		close(stop)
+		index.exec.Analyzer.Stop = nil
 	}
+	index.exec.Analyzer.Unlock()
+
 	if done != nil {
 		<-done
 	}
 
-	index.exec.Analyzer.Stop = nil
-	index.exec.Analyzer.Done = nil
+	index.exec.Analyzer.Lock()
+	if index.exec.Analyzer.Done == done {
+		index.exec.Analyzer.Done = nil
+	}
+	index.exec.Analyzer.Unlock()
 }
 
 func (index *Index) stopAnalyzerSignal() {
+	index.exec.Analyzer.Lock()
 	if stop := index.exec.Analyzer.Stop; stop != nil {
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
+		close(stop)
+		index.exec.Analyzer.Stop = nil
 	}
+	index.exec.Analyzer.Unlock()
 }
 
 func (index *Index) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- struct{}, base time.Duration, refresh func() error, terminal func(error) bool, resetFailure func(error) bool) {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"unsafe"
@@ -627,6 +628,49 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	}
 }
 
+func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
+	bucket := []byte("runtime_pinned_current_load")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob"})
+	setRuntimeTestSequence(t, db, bucket, 2)
+
+	r := newRuntimeTestRuntime(t, false, true)
+	buildRuntimeTestIndex(t, r, db, bucket)
+
+	file := filepath.Join(t.TempDir(), "runtime.rbi")
+	if err := r.StoreIndex(file, db, bucket); err != nil {
+		t.Fatalf("StoreIndex: %v", err)
+	}
+
+	prepared, shape, err := r.prepareQuery(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	old, seq, ref := r.snapshot.PinCurrent()
+	if old == nil || seq != 2 || ref == nil {
+		t.Fatalf("PinCurrent old snap=%v seq=%d ref=%v", old, seq, ref)
+	}
+	defer r.snapshot.Unpin(seq, ref)
+
+	if _, err = r.LoadIndex(file, db.Path(), bucket, seq); err != nil {
+		t.Fatalf("LoadIndex: %v", err)
+	}
+	if got := r.snapshot.Current(); got == nil || got == old || got.Seq != 2 {
+		t.Fatalf("current snapshot after LoadIndex=%v old=%v", got, old)
+	}
+
+	keys, err := r.queryKeysOnSnapshot(old, &shape, false)
+	if err != nil {
+		t.Fatalf("query old snapshot: %v", err)
+	}
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("old snapshot query IDs=%v want [1]", keys)
+	}
+}
+
 func TestRuntimeDBStatsMissingSnapshotReturnsUnavailable(t *testing.T) {
 	bucket := []byte("runtime_stats_missing_snapshot")
 	db := openRuntimeTestBolt(t, bucket)
@@ -777,6 +821,46 @@ func TestRuntimeCommittedPublishPanicBreaksAndDropsStaged(t *testing.T) {
 	}
 	if got := r.snapshot.Current(); got != nil {
 		t.Fatalf("current snapshot=%v want nil", got)
+	}
+}
+
+func TestRuntimeAnalyzeStopSignalConcurrentWithStop(t *testing.T) {
+	r := newRuntimeTestRuntime(t, false, false)
+
+	for i := 0; i < 1000; i++ {
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		r.exec.Analyzer.Lock()
+		r.exec.Analyzer.Stop = stop
+		r.exec.Analyzer.Done = done
+		r.exec.Analyzer.Unlock()
+
+		var doneWG sync.WaitGroup
+		doneWG.Add(1)
+		go func() {
+			defer doneWG.Done()
+			<-stop
+			close(done)
+		}()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			r.stopAnalyzerSignal()
+		}()
+		go func() {
+			defer wg.Done()
+			r.StopAnalyzeLoop()
+		}()
+		wg.Wait()
+		doneWG.Wait()
+
+		r.exec.Analyzer.Lock()
+		if r.exec.Analyzer.Stop != nil || r.exec.Analyzer.Done != nil {
+			t.Fatalf("iteration %d analyzer state stop=%v done=%v", i, r.exec.Analyzer.Stop, r.exec.Analyzer.Done)
+		}
+		r.exec.Analyzer.Unlock()
 	}
 }
 
