@@ -171,6 +171,51 @@ func TestRecentKeyCache_LimitAndEntryCount(t *testing.T) {
 	cache.Clear()
 }
 
+func TestRecentKeyCache_LimitShrinkDropsHiddenSlots(t *testing.T) {
+	limit := materializedPredCacheLinearMaxEntries + 4
+	keys := qcacheBenchKeys(limit)
+	tailKey := keys[len(keys)-1]
+	var seen RecentKeyCache
+	for i := range keys {
+		if seen.TouchOrRemember(keys[i], limit) {
+			t.Fatalf("TouchOrRemember unexpectedly reported warm hit for cold key %v", keys[i])
+		}
+	}
+	if !seen.TouchOrRemember(keys[0], 2) {
+		t.Fatal("expected key surviving smaller limit to stay hot")
+	}
+	if seen.TouchOrRemember(MaterializedPredKeyForScalar("fresh", qir.OpPREFIX, "seen"), limit) {
+		t.Fatal("expected fresh key after limit growth to be cold")
+	}
+	if seen.Contains(tailKey) {
+		t.Fatal("expected key outside smaller limit to stay evicted after limit growth")
+	}
+	if seen.TouchOrRemember(tailKey, limit) {
+		t.Fatal("expected key outside smaller limit to lose warm-hit state")
+	}
+	seen.Clear()
+
+	var observed RecentKeyCache
+	for i := range keys {
+		if promote, _ := observed.AddWorkAndShouldPromote(keys[i], limit, uint64(i+1), ^uint64(0)); promote {
+			t.Fatalf("AddWorkAndShouldPromote unexpectedly promoted key %v", keys[i])
+		}
+	}
+	if _, hadWork := observed.AddWorkAndShouldPromote(keys[0], 2, 1, ^uint64(0)); !hadWork {
+		t.Fatal("expected key surviving smaller limit to keep observed work")
+	}
+	if promote, _ := observed.AddWorkAndShouldPromote(MaterializedPredKeyForScalar("fresh", qir.OpPREFIX, "work"), limit, 1, ^uint64(0)); promote {
+		t.Fatal("expected fresh observed-work key after limit growth to stay below threshold")
+	}
+	if got := observed.Work(tailKey); got != 0 {
+		t.Fatalf("expected key outside smaller limit to lose observed work, got=%d", got)
+	}
+	if _, hadWork := observed.AddWorkAndShouldPromote(tailKey, limit, 1, ^uint64(0)); hadWork {
+		t.Fatal("expected key outside smaller limit to lose prior observed-work state")
+	}
+	observed.Clear()
+}
+
 func TestRecentKeyCacheClearReleasesAndClearsOwnedState(t *testing.T) {
 	keys := qcacheBenchKeys(materializedPredCacheLinearMaxEntries + 2)
 	var cache RecentKeyCache
@@ -258,6 +303,24 @@ func TestMaterializedPredCache_StoreBorrowedDetachesFromSourceOwner(t *testing.T
 	reloaded.Release()
 	cached.Release()
 	base.Release()
+}
+
+func TestMaterializedPredCache_StoreDuplicateOwnedPayloadReleasesCallerPayload(t *testing.T) {
+	cache := GetMaterializedPredCache(1, 0)
+	defer cache.ReleaseRef()
+
+	key := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user")
+	cache.Store(key, posting.List{})
+
+	var raw [posting.MidCap + 16]uint64
+	for i := range raw {
+		raw[i] = uint64(i)*3 + 1
+	}
+	run := func() {
+		cache.Store(key, posting.BuildFromSorted(raw[:]))
+	}
+
+	requireZeroAllocsAfterWarmupQCache(t, run)
 }
 
 func TestMaterializedPredCache_LoadOrStoreHitReturnsCachedPayloadNotCaller(t *testing.T) {

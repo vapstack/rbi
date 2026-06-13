@@ -166,6 +166,7 @@ func (v *View) HasMaterializedPredKey(key qcache.MaterializedPredKey) bool {
 
 func (v *View) StoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) {
 	if key.IsZero() || v.matPredCache == nil {
+		ids.Release()
 		return
 	}
 	v.matPredCache.Store(key, ids)

@@ -214,23 +214,28 @@ func (c *MaterializedPredCache) Has(key MaterializedPredKey) bool {
 
 func (c *MaterializedPredCache) Store(key MaterializedPredKey, ids posting.List) {
 	if key.IsZero() {
+		ids.Release()
 		return
 	}
 	limit := c.maxEntries
 	if limit <= 0 {
+		ids.Release()
 		return
 	}
 	if !ids.IsEmpty() && c.maxCard > 0 && ids.Cardinality() > c.maxCard {
+		ids.Release()
 		return
 	}
 
 	c.mu.Lock()
 	if _, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
+		ids.Release()
 		return
 	}
 	if int(c.count.Load()) >= limit && !c.evictLocked(matPredCacheEvictPreferRegular) {
 		c.mu.Unlock()
+		ids.Release()
 		return
 	}
 	stored := materializedPredCacheStoredIDs(ids)
@@ -951,6 +956,8 @@ func (c *RecentKeyCache) initSlots(limit int) {
 		copy(slots, c.slots)
 		recentKeyCacheSlotPool.Put(c.slots)
 		c.slots = slots
+	} else if len(c.slots) > limit {
+		clear(c.slots[limit:])
 	}
 	c.slots = c.slots[:limit]
 	if limit > materializedPredCacheLinearMaxEntries {
