@@ -62,6 +62,34 @@ func snapshotBatchKeyStorage(key string, id uint64) indexdata.FieldStorage {
 	return indexdata.NewRegularFieldStorageFromPostingMapOwned(m)
 }
 
+func assertSnapshotEmptyForSchema(t testing.TB, snap *View, s *schema.Schema) {
+	t.Helper()
+	if !snap.Universe.IsEmpty() {
+		t.Fatalf("universe cardinality=%d want 0", snap.Universe.Cardinality())
+	}
+	if snap.universeOwner == nil {
+		t.Fatal("expected empty snapshot to own universe")
+	}
+	if snap.KeyIndex.KeyCount() != 0 {
+		t.Fatalf("key index key count=%d want 0", snap.KeyIndex.KeyCount())
+	}
+	if got, want := len(snap.Index), len(s.Indexed); got != want {
+		t.Fatalf("index slots=%d want %d", got, want)
+	}
+	if got, want := len(snap.NilIndex), len(s.Indexed); got != want {
+		t.Fatalf("nil index slots=%d want %d", got, want)
+	}
+	if got, want := len(snap.LenIndex), len(s.Indexed); got != want {
+		t.Fatalf("len index slots=%d want %d", got, want)
+	}
+	if got, want := len(snap.LenZeroComplement), len(s.Indexed); got != want {
+		t.Fatalf("len zero-complement slots=%d want %d", got, want)
+	}
+	if got, want := len(snap.Measure), len(s.Measures); got != want {
+		t.Fatalf("measure slots=%d want %d", got, want)
+	}
+}
+
 func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	var rec struct{}
 	snap := Build(1, nil, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
@@ -76,6 +104,38 @@ func TestBuildPreparedFromEmptyBaseOwnsUniverse(t *testing.T) {
 	if !snap.Universe.Contains(7) {
 		t.Fatal("expected prepared snapshot universe to contain inserted id")
 	}
+}
+
+func TestBuildPreparedEmptyNilBaseBuildsEmptySnapshot(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	snap := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, nil)
+	defer snap.releaseRuntimeCaches()
+	defer snap.releaseStorage()
+
+	assertSnapshotEmptyForSchema(t, snap, rt)
+}
+
+func TestBuildPreparedNilBaseNoopBuildsEmptySnapshot(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	rec := snapshotBatchStorageRec{Name: "alice", Tags: []string{"red"}}
+
+	snap := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+		{ID: 7, Old: unsafe.Pointer(&rec)},
+	})
+	defer snap.releaseRuntimeCaches()
+	defer snap.releaseStorage()
+
+	assertSnapshotEmptyForSchema(t, snap, rt)
+
+	snapInPlace := BuildInPlace(2, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+		{ID: 7, Old: unsafe.Pointer(&rec)},
+	})
+	defer snapInPlace.releaseRuntimeCaches()
+	defer snapInPlace.releaseStorage()
+
+	assertSnapshotEmptyForSchema(t, snapInPlace, rt)
 }
 
 func TestBuildPreparedAppliesKeyDeltas(t *testing.T) {

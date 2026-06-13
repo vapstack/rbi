@@ -43,6 +43,12 @@ func BuildWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg CacheConfi
 		copy(scratch, entries)
 		normalized = normalizePreparedBatchForSnapshotInPlace(scratch)
 	}
+	if prev == nil && len(normalized) == 0 {
+		if scratch != nil {
+			batchEntrySlicePool.Put(scratch)
+		}
+		return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
+	}
 	snap := buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalized)
 	if scratch != nil {
 		batchEntrySlicePool.Put(scratch)
@@ -62,8 +68,12 @@ func BuildInPlaceWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg Cac
 	if snap, ok := buildPreparedSnapshotInsertOnly(seq, prev, s, cfg, entries); ok {
 		return applySnapshotKeyDeltas(snap, keyDeltas)
 	}
+	normalized := normalizePreparedBatchForSnapshotInPlace(entries)
+	if prev == nil && len(normalized) == 0 {
+		return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
+	}
 	return applySnapshotKeyDeltas(
-		buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalizePreparedBatchForSnapshotInPlace(entries)),
+		buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalized),
 		keyDeltas,
 	)
 }
