@@ -43,11 +43,19 @@ func BuildWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg CacheConfi
 		copy(scratch, entries)
 		normalized = normalizePreparedBatchForSnapshotInPlace(scratch)
 	}
-	if prev == nil && len(normalized) == 0 {
-		if scratch != nil {
-			batchEntrySlicePool.Put(scratch)
+	if prev == nil {
+		if len(normalized) == 0 {
+			if scratch != nil {
+				batchEntrySlicePool.Put(scratch)
+			}
+			return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
 		}
-		return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
+		if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, normalized); ok {
+			if scratch != nil {
+				batchEntrySlicePool.Put(scratch)
+			}
+			return applySnapshotKeyDeltas(snap, keyDeltas)
+		}
 	}
 	snap := buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalized)
 	if scratch != nil {
@@ -69,8 +77,13 @@ func BuildInPlaceWithKeyDeltas(seq uint64, prev *View, s *schema.Schema, cfg Cac
 		return applySnapshotKeyDeltas(snap, keyDeltas)
 	}
 	normalized := normalizePreparedBatchForSnapshotInPlace(entries)
-	if prev == nil && len(normalized) == 0 {
-		return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
+	if prev == nil {
+		if len(normalized) == 0 {
+			return applySnapshotKeyDeltas(buildPreparedSnapshotDeletedAll(seq, s, cfg), keyDeltas)
+		}
+		if snap, ok := buildPreparedSnapshotFromEmptyBase(seq, prev, s, cfg, normalized); ok {
+			return applySnapshotKeyDeltas(snap, keyDeltas)
+		}
 	}
 	return applySnapshotKeyDeltas(
 		buildPreparedSnapshotAggregatedNormalized(seq, prev, s, cfg, patchFields, normalized),
@@ -183,6 +196,9 @@ func normalizePreparedBatchForSnapshotInPlace(entries []BatchEntry) []BatchEntry
 	n := 0
 	for i := range entries {
 		op := entries[i]
+		if op.Old == nil && op.New == nil {
+			continue
+		}
 		if p := pos[op.ID]; p != 0 {
 			// Repeated-id entries collapse to first oldVal -> last newVal.
 			// Patch metadata from any individual request is no longer sufficient

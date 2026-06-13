@@ -138,6 +138,45 @@ func TestBuildPreparedNilBaseNoopBuildsEmptySnapshot(t *testing.T) {
 	assertSnapshotEmptyForSchema(t, snapInPlace, rt)
 }
 
+func TestBuildPreparedNilBaseInsertWithSeparateNoop(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	rec := snapshotBatchStorageRec{Name: "alice", Tags: []string{"red"}}
+
+	snap := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+		{ID: 8},
+	})
+	defer snap.releaseRuntimeCaches()
+	defer snap.releaseStorage()
+
+	if got := snap.Universe.Cardinality(); got != 1 || !snap.Universe.Contains(7) {
+		t.Fatalf("universe cardinality=%d contains inserted=%v", got, snap.Universe.Contains(7))
+	}
+	if snapshotBatchFieldContains(snap, "Name", "alice", 8) {
+		t.Fatal("separate no-op id was inserted")
+	}
+	if !snapshotBatchFieldContains(snap, "Name", "alice", 7) {
+		t.Fatal("inserted id is missing")
+	}
+
+	snapInPlace := BuildInPlace(2, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 7, New: unsafe.Pointer(&rec)},
+		{ID: 8},
+	})
+	defer snapInPlace.releaseRuntimeCaches()
+	defer snapInPlace.releaseStorage()
+
+	if got := snapInPlace.Universe.Cardinality(); got != 1 || !snapInPlace.Universe.Contains(7) {
+		t.Fatalf("in-place universe cardinality=%d contains inserted=%v", got, snapInPlace.Universe.Contains(7))
+	}
+	if snapshotBatchFieldContains(snapInPlace, "Name", "alice", 8) {
+		t.Fatal("in-place separate no-op id was inserted")
+	}
+	if !snapshotBatchFieldContains(snapInPlace, "Name", "alice", 7) {
+		t.Fatal("in-place inserted id is missing")
+	}
+}
+
 func TestBuildPreparedAppliesKeyDeltas(t *testing.T) {
 	var rec struct{}
 	snap := BuildWithKeyDeltas(1, nil, &schema.Schema{}, CacheConfig{}, nil, []BatchEntry{
@@ -342,6 +381,58 @@ func TestBuildPreparedDoesNotMutateCallerEntries(t *testing.T) {
 	}
 	if !snapshotBatchFieldContains(next, "Name", "bobby", 1) {
 		t.Fatal("repeated-id snapshot is missing updated scalar posting")
+	}
+}
+
+func TestBuildPreparedRepeatedIDNoopDoesNotOverrideUpdate(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	oldRec := snapshotBatchStorageRec{Name: "bob", Tags: []string{"yellow"}}
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRec)},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	newRec := snapshotBatchStorageRec{Name: "bobby", Tags: []string{"green"}}
+	next := Build(2, prev, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&oldRec), New: unsafe.Pointer(&newRec)},
+		{ID: 1},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if got := next.Universe.Cardinality(); got != 1 || !next.Universe.Contains(1) {
+		t.Fatalf("universe cardinality=%d contains updated=%v", got, next.Universe.Contains(1))
+	}
+	if snapshotBatchFieldContains(next, "Name", "bob", 1) {
+		t.Fatal("repeated-id no-op left stale posting")
+	}
+	if !snapshotBatchFieldContains(next, "Name", "bobby", 1) {
+		t.Fatal("repeated-id no-op dropped update")
+	}
+}
+
+func TestBuildPreparedRepeatedIDNoopDoesNotHideDelete(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	oldRec := snapshotBatchStorageRec{Name: "bob", Tags: []string{"yellow"}}
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRec)},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	next := BuildInPlace(2, prev, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1},
+		{ID: 1, Old: unsafe.Pointer(&oldRec)},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if !next.Universe.IsEmpty() {
+		t.Fatalf("universe cardinality=%d want 0", next.Universe.Cardinality())
+	}
+	if snapshotBatchFieldContains(next, "Name", "bob", 1) {
+		t.Fatal("repeated-id no-op hid delete")
 	}
 }
 
