@@ -33,6 +33,8 @@ const (
 	materializedPredKeySetHasNil
 )
 
+const materializedPredKeyRangeHasPrefix = materializedPredKeyScalarNumeric
+
 // Keep small exact-set cache keys inline so hot-path key construction stays
 // allocation-free; wider sets simply skip this cache class.
 const materializedPredKeyDistinctSetInlineMax = 4
@@ -183,6 +185,7 @@ func (key MaterializedPredKey) String() string {
 	case materializedPredKeyExactScalarRange, materializedPredKeyExactScalarRangeComplement:
 		loValLen := 0
 		hiValLen := 0
+		prefixValLen := 0
 		if key.flags&materializedPredKeyHasLo != 0 {
 			if key.flags&materializedPredKeyLoNumeric != 0 {
 				loValLen = 8
@@ -197,13 +200,16 @@ func (key MaterializedPredKey) String() string {
 				hiValLen = len(key.hiKey)
 			}
 		}
+		if key.flags&materializedPredKeyRangeHasPrefix != 0 {
+			prefixValLen = len(key.key)
+		}
 		head := "range_exact"
 		if key.kind == materializedPredKeyExactScalarRangeComplement {
 			head = "count_range_exact_complement"
 		}
 		var raw [8]byte
 		var buf strings.Builder
-		buf.Grow(len(key.field) + len(head) + loValLen + hiValLen + materializedPredKeyEncodedSlack)
+		buf.Grow(len(key.field) + len(head) + loValLen + hiValLen + prefixValLen + materializedPredKeyEncodedSlack)
 		buf.WriteString(key.field)
 		buf.WriteByte('\x1f')
 		buf.WriteString(head)
@@ -245,6 +251,10 @@ func (key MaterializedPredKey) String() string {
 		} else {
 			buf.WriteString(key.hiKey)
 		}
+		if key.flags&materializedPredKeyRangeHasPrefix != 0 {
+			buf.WriteString("\x1fp\x1f")
+			buf.WriteString(key.key)
+		}
 		return buf.String()
 
 	case materializedPredKeyNumericBucketSpan:
@@ -283,6 +293,9 @@ func (key *MaterializedPredKey) hash() uint64 {
 	case materializedPredKeyExactScalarRange, materializedPredKeyExactScalarRangeComplement:
 		h = materializedPredKeyHashString(h, key.field)
 		h = materializedPredKeyHashUint(h, uint64(key.flags))
+		if key.flags&materializedPredKeyRangeHasPrefix != 0 {
+			h = materializedPredKeyHashString(h, key.key)
+		}
 		if key.flags&materializedPredKeyHasLo != 0 {
 			if key.flags&materializedPredKeyLoNumeric != 0 {
 				h = materializedPredKeyHashUint(h, key.loIndex.U64())
@@ -430,10 +443,16 @@ func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, fi
 			flags |= materializedPredKeyHiNumeric
 		}
 	}
+	if bounds.HasPrefix {
+		flags |= materializedPredKeyRangeHasPrefix
+	}
 	key := MaterializedPredKey{
 		kind:  kind,
 		field: field,
 		flags: flags,
+	}
+	if bounds.HasPrefix {
+		key.key = bounds.Prefix
 	}
 	if bounds.HasLo {
 		if bounds.LoNumeric {

@@ -52,6 +52,45 @@ func TestMaterializedPredKeyExactScalarRangeComplement_Numeric(t *testing.T) {
 	}
 }
 
+func TestMaterializedPredKeyExactScalarRange_PrefixBoundsDoNotCollide(t *testing.T) {
+	boundsB := indexdata.Bounds{
+		Has:       true,
+		HasLo:     true,
+		LoKey:     "a",
+		LoInc:     true,
+		HasHi:     true,
+		HiKey:     "z",
+		HasPrefix: true,
+		Prefix:    "b",
+	}
+	boundsC := boundsB
+	boundsC.Prefix = "c"
+
+	keyB := MaterializedPredKeyForExactScalarRange("name", boundsB)
+	keyC := MaterializedPredKeyForExactScalarRange("name", boundsC)
+	if keyB.IsZero() || keyC.IsZero() {
+		t.Fatal("expected non-zero prefixed exact range cache keys")
+	}
+	if keyB == keyC {
+		t.Fatal("expected different prefixes to produce distinct exact range cache keys")
+	}
+	if keyB.hash() == keyC.hash() {
+		t.Fatal("expected different prefixes to produce distinct exact range cache hashes")
+	}
+	if keyB.String() == keyC.String() {
+		t.Fatal("expected different prefixes to produce distinct printable exact range cache keys")
+	}
+
+	compB := MaterializedPredComplementKeyForExactScalarRange("name", boundsB)
+	compC := MaterializedPredComplementKeyForExactScalarRange("name", boundsC)
+	if compB == compC {
+		t.Fatal("expected different prefixes to produce distinct exact range complement cache keys")
+	}
+	if compB.hash() == compC.hash() {
+		t.Fatal("expected different prefixes to produce distinct exact range complement cache hashes")
+	}
+}
+
 func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 	k30 := MaterializedPredKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(30)))
 	k40 := MaterializedPredKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(40)))
