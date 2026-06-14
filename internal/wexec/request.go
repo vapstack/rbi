@@ -195,10 +195,15 @@ func (b *Batcher) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, b
 			requestPool.Put(req)
 			return nil, formatPrepareErr(prepareErrEncode, err)
 		}
+		if b.rejectEmptyPayload && buf.Len() == int(req.payloadOff) {
+			encodePool.Put(buf)
+			requestPool.Put(req)
+			return nil, formatPrepareErr(prepareErrEncode, errEmptyPayload)
+		}
 		req.setValue = newVal
 		req.setPayload = buf
 	}
-	if len(beforeStore) == 0 && len(beforeCommit) == 0 {
+	if len(beforeStore) == 0 && len(beforeCommit) == 0 && !b.indexed {
 		req.policy = reqSetDeleteCoalescible
 	}
 	return req, nil
@@ -245,7 +250,7 @@ func (b *Batcher) buildDeleteRequest(key keycodec.DataKey, beforeCommit []Before
 	req.id = key
 	req.beforeCommit = beforeCommit
 	req.policy = reqRepeatIDSafeShared
-	if len(beforeCommit) == 0 && !b.strKey {
+	if len(beforeCommit) == 0 && !b.strKey && !b.indexed {
 		req.policy |= reqSetDeleteCoalescible
 	}
 	return req

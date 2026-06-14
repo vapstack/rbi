@@ -95,7 +95,9 @@ func TestBuildSetRequestHookSuppressesCoalescingPolicy(t *testing.T) {
 		Unavailable: func() error { return nil },
 	})
 	ex.ops = &RecordOps{
-		Encode: func(unsafe.Pointer, *bytes.Buffer) error { return nil },
+		Encode: func(unsafe.Pointer, *bytes.Buffer) error {
+			return nil
+		},
 	}
 
 	v := attemptRec{V: 1}
@@ -122,6 +124,55 @@ func TestBuildSetRequestHookSuppressesCoalescingPolicy(t *testing.T) {
 	requestPool.Put(req)
 }
 
+func TestBuildSetRequestRejectEmptyPayloadValidatesBeforePolicy(t *testing.T) {
+	ex := NewBatcher(Config{
+		MaxOps:             8,
+		Unavailable:        func() error { return nil },
+		RejectEmptyPayload: true,
+	})
+	ex.ops = &RecordOps{
+		Encode: func(unsafe.Pointer, *bytes.Buffer) error {
+			return nil
+		},
+	}
+
+	v := attemptRec{V: 1}
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), nil, nil, nil)
+	if req != nil {
+		t.Fatalf("buildSetRequest returned request for empty payload: %#v", req)
+	}
+	if !errors.Is(err, errEmptyPayload) {
+		t.Fatalf("buildSetRequest error = %v, want empty payload", err)
+	}
+
+	ex.ops.Encode = func(unsafe.Pointer, *bytes.Buffer) error {
+		return nil
+	}
+	ex.rejectEmptyPayload = false
+	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSetRequest without reject-empty: %v", err)
+	}
+	if !req.canCoalesceSetDelete() {
+		t.Fatalf("non-indexed set request was not marked coalescible")
+	}
+	requestPool.Put(req)
+
+	ex.ops.Encode = func(_ unsafe.Pointer, buf *bytes.Buffer) error {
+		_ = buf.WriteByte(1)
+		return nil
+	}
+	ex.rejectEmptyPayload = true
+	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(3), false), unsafe.Pointer(&v), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSetRequest with non-empty payload: %v", err)
+	}
+	if !req.canCoalesceSetDelete() {
+		t.Fatalf("non-empty reject-empty set request was not marked coalescible")
+	}
+	requestPool.Put(req)
+}
+
 func TestBuildDeleteRequestStringKeySuppressesCoalescingPolicy(t *testing.T) {
 	ex := NewBatcher(Config{
 		MaxOps:      8,
@@ -131,6 +182,13 @@ func TestBuildDeleteRequestStringKeySuppressesCoalescingPolicy(t *testing.T) {
 	req := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey(uint64(1), false), nil)
 	if !req.canShareRepeatedID() || !req.canCoalesceSetDelete() {
 		t.Fatalf("numeric delete policy = %08b, want repeat-safe and coalescible", req.policy)
+	}
+	requestPool.Put(req)
+
+	ex.rejectEmptyPayload = true
+	req = ex.buildDeleteRequest(keycodec.DataKeyFromUserKey(uint64(2), false), nil)
+	if !req.canShareRepeatedID() || !req.canCoalesceSetDelete() {
+		t.Fatalf("reject-empty numeric delete policy = %08b, want repeat-safe and coalescible", req.policy)
 	}
 	requestPool.Put(req)
 

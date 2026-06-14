@@ -3,7 +3,6 @@ package wexec
 import (
 	"bytes"
 	"errors"
-	"github.com/vapstack/rbi/rbierrors"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 )
 
@@ -255,6 +255,102 @@ func TestExecuteJobsCoalescedSetDeleteUsesTerminalWrite(t *testing.T) {
 	}
 	if got := ex.sched.stats.CoalescedSetDelete.Load(); got != 2 {
 		t.Fatalf("coalesced counter = %d, want 2", got)
+	}
+}
+
+func TestExecuteJobsIndexedDeleteSetDoesNotCoalesceBeforeUniqueValidation(t *testing.T) {
+	seed := []attemptRec{{V: 1}, {V: 2}}
+	var events []string
+	ex, raw, bucket := newUniqueAttemptTestExecutor(t, &events, []snapshot.BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&seed[0])},
+		{ID: 2, New: unsafe.Pointer(&seed[1])},
+	}, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	putAttemptPayload(t, raw, bucket, 1, []byte{1})
+	putAttemptPayload(t, raw, bucket, 2, []byte{2})
+
+	key := keycodec.DataKeyFromUserKey(uint64(1), false)
+	deleteReq := ex.buildDeleteRequest(key, nil)
+	rec := attemptRec{V: 2}
+	setReq, err := ex.buildSetRequest(key, unsafe.Pointer(&rec), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	defer ex.releaseRequest(deleteReq)
+	defer ex.releaseRequest(setReq)
+
+	ex.sched.mu.Lock()
+	ex.sched.window = 0
+	ex.sched.maxOps = 16
+	ex.sched.running = true
+	ex.sched.enqueue(&writeJob{reqs: []*request{deleteReq}, done: deleteReq.Done})
+	ex.sched.enqueue(&writeJob{reqs: []*request{setReq}, done: setReq.Done})
+	ex.sched.mu.Unlock()
+
+	batch := ex.sched.popBatch(false)
+	if len(batch) != 1 || batch[0].reqs[0] != deleteReq {
+		t.Fatalf("first batch = %#v, want only delete", batch)
+	}
+	ex.executeJobs(batch)
+	if err := <-deleteReq.Done; err != nil {
+		t.Fatalf("delete error = %v", err)
+	}
+
+	batch = ex.sched.popBatch(false)
+	if len(batch) != 1 || batch[0].reqs[0] != setReq {
+		t.Fatalf("second batch = %#v, want only set", batch)
+	}
+	ex.executeJobs(batch)
+	if err := <-setReq.Done; !errors.Is(err, rbierrors.ErrUniqueViolation) {
+		t.Fatalf("set error = %v, want unique violation", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
+		t.Fatalf("id=1 payload = %v, want nil", got)
+	}
+}
+
+func TestExecuteJobsRejectEmptySetFailsBeforeCoalescing(t *testing.T) {
+	var events []string
+	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	ex.indexed = false
+	ex.snapshotOps = SnapshotOps{}
+	ex.ops.Encode = func(unsafe.Pointer, *bytes.Buffer) error {
+		return nil
+	}
+	putAttemptPayload(t, raw, bucket, 1, []byte{1})
+
+	key := keycodec.DataKeyFromUserKey(uint64(1), false)
+	deleteReq := ex.buildDeleteRequest(key, nil)
+	rec := attemptRec{V: 2}
+	setReq, err := ex.buildSetRequest(key, unsafe.Pointer(&rec), nil, nil, nil)
+	if setReq != nil {
+		t.Fatalf("buildSetRequest returned request for empty payload: %#v", setReq)
+	}
+	if !errors.Is(err, errEmptyPayload) {
+		t.Fatalf("buildSetRequest error = %v, want empty payload", err)
+	}
+	defer ex.releaseRequest(deleteReq)
+
+	ex.sched.mu.Lock()
+	ex.sched.window = 0
+	ex.sched.maxOps = 16
+	ex.sched.running = true
+	ex.sched.enqueue(&writeJob{reqs: []*request{deleteReq}, done: deleteReq.Done})
+	ex.sched.mu.Unlock()
+
+	batch := ex.sched.popBatch(false)
+	if len(batch) != 1 || batch[0].reqs[0] != deleteReq {
+		t.Fatalf("batch = %#v, want only delete", batch)
+	}
+	ex.executeJobs(batch)
+	if err := <-deleteReq.Done; err != nil {
+		t.Fatalf("delete error = %v", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
+		t.Fatalf("id=1 payload = %v, want nil", got)
 	}
 }
 
