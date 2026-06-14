@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unsafe"
 
+	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -464,6 +466,60 @@ func TestMeasureStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
 	measureStorageAssertValue(t, chunkedRound, measureProbe, uint64(MeasureChunkThreshold/2*10))
 	chunked.Release()
 	chunkedRound.Release()
+}
+
+func TestReadFieldStorageFlatStringKeysSurviveBufferGrowth(t *testing.T) {
+	keys := []string{
+		strings.Repeat("a", 15),
+		strings.Repeat("b", 15),
+		strings.Repeat("c", 15),
+	}
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, uint64(len(keys))); err != nil {
+		t.Fatalf("write count: %v", err)
+	}
+	for i := range keys {
+		if err := writeKey(writer, keycodec.FromString(keys[i])); err != nil {
+			t.Fatalf("write key %d: %v", i, err)
+		}
+		if err := posting.WriteSingleton(writer, uint64(i+1)); err != nil {
+			t.Fatalf("write posting %d: %v", i, err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if err != nil {
+		t.Fatalf("read flat storage: %v", err)
+	}
+	defer storage.Release()
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(storage.flat.stringData)))
+	limit := base + uintptr(len(storage.flat.stringData))
+	for i := range storage.flat.entries {
+		key := storage.flat.entries[i].Key
+		p := uintptr(unsafe.Pointer(unsafe.StringData(key.UnsafeString())))
+		if p < base || p+uintptr(key.ByteLen()) > limit {
+			t.Fatalf("key %d is outside flat stringData", i)
+		}
+	}
+
+	poison := pooled.GetByteSlice(len(keys) * 8)
+	poison = poison[:cap(poison)]
+	for i := range poison {
+		poison[i] = 'z'
+	}
+	defer pooled.ReleaseByteSlice(poison)
+
+	for i := range keys {
+		fieldStorageAssertPostingContains(t, storage, keys[i], uint64(i+1))
+	}
 }
 
 func TestReadFieldStorageRejectsUnsortedFlatKeys(t *testing.T) {

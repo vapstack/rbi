@@ -104,6 +104,45 @@ func TestMeasureStorageApplyDeltasFlatAndChunked(t *testing.T) {
 	chunkedOut.Release()
 }
 
+func TestMeasureStorageFromEntriesOwnedCoalescesDuplicateIDs(t *testing.T) {
+	entries := GetMeasureEntrySlice(0)
+	entries = append(entries, MeasureEntry{ID: 5, Value: 50})
+	entries = append(entries, MeasureEntry{ID: 1, Value: 10})
+	entries = append(entries, MeasureEntry{ID: 5, Value: 55})
+	entries = append(entries, MeasureEntry{ID: 3, Value: 30})
+
+	storage := NewMeasureStorageFromEntriesOwned(entries)
+	defer storage.Release()
+
+	if storage.Rows() != 3 {
+		t.Fatalf("rows: got %d want 3", storage.Rows())
+	}
+	measureStorageAssertValue(t, storage, 1, 10)
+	measureStorageAssertValue(t, storage, 3, 30)
+	measureStorageAssertValue(t, storage, 5, 55)
+}
+
+func TestMeasureStorageApplyDeltasOwnedCoalescesDuplicateIDs(t *testing.T) {
+	deltas := GetMeasureDeltaSlice(0)
+	deltas = append(deltas, MeasureDelta{ID: 5, NewOK: true, New: 50})
+	deltas = append(deltas, MeasureDelta{ID: 5, NewOK: true, New: 55})
+
+	storage := MeasureStorage{}.ApplyDeltasOwned(deltas)
+	defer storage.Release()
+
+	if storage.Rows() != 1 {
+		t.Fatalf("rows: got %d want 1", storage.Rows())
+	}
+	measureStorageAssertValue(t, storage, 5, 55)
+
+	round, err := measureStorageRoundTripForTest(storage)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer round.Release()
+	measureStorageAssertValue(t, round, 5, 55)
+}
+
 func TestMeasureStorageApplyDeltasOwnedSurvivesBaseReleaseAndPoison(t *testing.T) {
 	flat := measureStorageForTest(8)
 	if flat.IsChunked() {

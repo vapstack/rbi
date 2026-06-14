@@ -71,22 +71,92 @@ func (chunk *measureChunk) init(size int) {
 	}
 }
 
-func sortMeasureEntryBuf(buf []MeasureEntry) {
+func sortUniqueMeasureEntryBuf(buf []MeasureEntry) []MeasureEntry {
 	if len(buf) <= 1 {
-		return
+		return buf
 	}
-	slices.SortFunc(buf, func(a, b MeasureEntry) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
+	ordered := true
+	unique := true
+	prevID := buf[0].ID
+	for i := 1; i < len(buf); i++ {
+		id := buf[i].ID
+		if id < prevID {
+			ordered = false
+			break
+		}
+		if id == prevID {
+			unique = false
+		}
+		prevID = id
+	}
+	if ordered && unique {
+		return buf
+	}
+	if !ordered {
+		unique = false
+		slices.SortStableFunc(buf, func(a, b MeasureEntry) int {
+			return cmp.Compare(a.ID, b.ID)
+		})
+	}
+	if unique {
+		return buf
+	}
+	write := 1
+	for i := 1; i < len(buf); i++ {
+		if buf[i].ID == buf[write-1].ID {
+			buf[write-1] = buf[i]
+			continue
+		}
+		if write != i {
+			buf[write] = buf[i]
+		}
+		write++
+	}
+	return buf[:write]
 }
 
-func sortMeasureBatchDeltaBuf(buf []MeasureDelta) {
+func sortUniqueMeasureDeltaBuf(buf []MeasureDelta) []MeasureDelta {
 	if len(buf) <= 1 {
-		return
+		return buf
 	}
-	slices.SortFunc(buf, func(a, b MeasureDelta) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
+	ordered := true
+	unique := true
+	prevID := buf[0].ID
+	for i := 1; i < len(buf); i++ {
+		id := buf[i].ID
+		if id < prevID {
+			ordered = false
+			break
+		}
+		if id == prevID {
+			unique = false
+		}
+		prevID = id
+	}
+	if ordered && unique {
+		return buf
+	}
+	if !ordered {
+		unique = false
+		slices.SortStableFunc(buf, func(a, b MeasureDelta) int {
+			return cmp.Compare(a.ID, b.ID)
+		})
+	}
+	if unique {
+		return buf
+	}
+	write := 1
+	for i := 1; i < len(buf); i++ {
+		if buf[i].ID == buf[write-1].ID {
+			buf[write-1] = buf[i]
+			continue
+		}
+		if write != i {
+			buf[write] = buf[i]
+		}
+		write++
+	}
+	return buf[:write]
 }
 
 func NewMeasureDeltaBatch(fieldCount int) MeasureDeltaBatch {
@@ -155,7 +225,7 @@ func NewMeasureStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorage {
 		ReleaseMeasureEntrySlice(entries)
 		return MeasureStorage{}
 	}
-	sortMeasureEntryBuf(entries)
+	entries = sortUniqueMeasureEntryBuf(entries)
 
 	if len(entries) <= MeasureChunkThreshold {
 		return newMeasureFlatStorageFromEntriesOwned(entries)
@@ -311,7 +381,7 @@ func (s MeasureStorage) ApplyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
 		ReleaseMeasureDeltaSlice(deltas)
 		return s
 	}
-	sortMeasureBatchDeltaBuf(deltas)
+	deltas = sortUniqueMeasureDeltaBuf(deltas)
 
 	if s.flat != nil {
 		return s.flat.applyDeltasOwned(deltas)

@@ -2181,6 +2181,19 @@ func (r *fieldIndexChunkedRoot) flatten() ([]Entry, []byte) {
 	}
 	out := GetFieldEntrySlice(r.keyCount)[:r.keyCount]
 	var data []byte
+	stringBytes := 0
+	for i := 0; i < len(r.pages); i++ {
+		page := r.pages[i]
+		for j := 0; j < len(page.refs); j++ {
+			chunk := page.refs[j].chunk
+			if chunk.stringRefs != nil {
+				stringBytes += len(chunk.stringData)
+			}
+		}
+	}
+	if stringBytes > 0 {
+		data = pooled.GetByteSlice(stringBytes)
+	}
 	pos := 0
 	for i := 0; i < len(r.pages); i++ {
 		page := r.pages[i]
@@ -2191,16 +2204,7 @@ func (r *fieldIndexChunkedRoot) flatten() ([]Entry, []byte) {
 				if !key.IsNumeric() {
 					s := key.UnsafeString()
 					if len(s) > 0 {
-						if data == nil {
-							data = pooled.GetByteSlice(r.keyCount * 8)
-						}
 						start := len(data)
-						if cap(data)-len(data) < len(s) {
-							next := pooled.GetByteSlice(len(data) + len(s))
-							next = append(next, data...)
-							pooled.ReleaseByteSlice(data)
-							data = next
-						}
 						data = append(data, s...)
 						key = keycodec.FromBytes(data[start:])
 					}

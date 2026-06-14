@@ -546,6 +546,57 @@ func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestFlattenChunkedFieldIndexRootStringKeysSurviveBufferGrowth(t *testing.T) {
+	const total = 5
+	entries := make([]Entry, total)
+	wantKeys := make([]string, total)
+	for i := range entries {
+		key := fmt.Sprintf("%04d/%s", i, strings.Repeat("x", 18))
+		wantKeys[i] = key
+		entries[i] = Entry{
+			Key: keycodec.FromString(key),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	root := buildChunkedFieldIndexRoot(entries)
+	if root == nil {
+		t.Fatalf("expected chunked root")
+	}
+	defer root.release()
+
+	flat, data := root.flatten()
+	if len(flat) != total {
+		t.Fatalf("unexpected flattened len: got %d want %d", len(flat), total)
+	}
+	defer ReleaseFieldEntrySlice(flat)
+	defer pooled.ReleaseByteSlice(data)
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(data)))
+	limit := base + uintptr(len(data))
+	for i := range flat {
+		p := uintptr(unsafe.Pointer(unsafe.StringData(flat[i].Key.UnsafeString())))
+		if p < base || p+uintptr(flat[i].Key.ByteLen()) > limit {
+			t.Fatalf("key %d is outside flattened data", i)
+		}
+	}
+
+	poison := pooled.GetByteSlice(total * 8)
+	poison = poison[:cap(poison)]
+	for i := range poison {
+		poison[i] = 'z'
+	}
+	defer pooled.ReleaseByteSlice(poison)
+
+	for i := range flat {
+		if got := flat[i].Key.UnsafeString(); got != wantKeys[i] {
+			t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
+		}
+		if flat[i].IDs.Cardinality() != 1 || !flat[i].IDs.Contains(uint64(i+1)) {
+			t.Fatalf("posting[%d]: %v", i, flat[i].IDs)
+		}
+	}
+}
+
 func TestFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testing.T) {
 	tests := []struct {
 		name    string

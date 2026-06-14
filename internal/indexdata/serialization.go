@@ -375,9 +375,23 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 						data = pooled.GetByteSlice(int(count) * 8)
 					}
 					if cap(data)-len(data) < keyLen {
+						old := data
 						next := pooled.GetByteSlice(len(data) + keyLen)
 						next = append(next, data...)
-						pooled.ReleaseByteSlice(data)
+						if len(old) > 0 {
+							base := uintptr(unsafe.Pointer(unsafe.SliceData(old)))
+							for j := 0; j < n; j++ {
+								if !entries[j].Key.IsNumeric() {
+									l := entries[j].Key.ByteLen()
+									if l > 0 {
+										p := uintptr(unsafe.Pointer(unsafe.StringData(entries[j].Key.UnsafeString())))
+										off := int(p - base)
+										entries[j].Key = keycodec.FromBytes(next[off : off+l])
+									}
+								}
+							}
+						}
+						pooled.ReleaseByteSlice(old)
 						data = next
 					}
 					data = data[:keyOff+keyLen]
