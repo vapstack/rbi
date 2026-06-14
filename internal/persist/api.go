@@ -117,7 +117,7 @@ func Store(cfg StoreConfig) (err error) {
 		}
 	}()
 
-	f, err := os.Create(tmpFile)
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
