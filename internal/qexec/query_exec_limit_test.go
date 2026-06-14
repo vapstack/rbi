@@ -1340,6 +1340,27 @@ func TestQuery_ORLimit_InvalidSuffixContainsBranchReturnsError(t *testing.T) {
 	}
 }
 
+func TestQuery_ORLimit_InvalidExactComplementReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 40, func(i int) *Rec {
+		return &Rec{
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+
+	invalid := qx.EQ("age", []int{1})
+	q := qx.Query(qx.OR(invalid, qx.NOT(invalid))).Limit(3)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("no-order QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
+	}
+
+	q = qx.Query(qx.OR(invalid, qx.NOT(invalid))).Sort("score", qx.ASC).Limit(3)
+	if _, err := db.QueryKeys(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("ordered QueryKeys err=%v, want rbierrors.ErrInvalidQuery", err)
+	}
+}
+
 func TestQuery_NoOrderLimit_EmptyRangeValidatesResidual(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedGeneratedUint64Data(t, db, 20, func(i int) *Rec {

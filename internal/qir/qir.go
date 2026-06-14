@@ -273,7 +273,7 @@ func (q *Query) setNormalizedExpr(raw Expr) {
 		q.Expr = raw
 		return
 	}
-	expr, changed := normalizeExprWithAlloc(raw, q.newOwnedExprBuf)
+	expr, changed := normalizeExprWithAlloc(raw, q.newOwnedExprBuf, false)
 	if changed {
 		q.Expr = expr
 		return
@@ -397,12 +397,15 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 	if args[1].Kind != qx.KindLIT {
 		return Expr{}, fmt.Errorf("rbi does not support computed predicate values for field %q", field)
 	}
+	if (op == OpHASALL || op == OpHASANY) && info.Caps&FieldCapArrayPredicate == 0 {
+		return Expr{}, fmt.Errorf("rbi does not support array predicates for %s", field)
+	}
 	if info.Caps&FieldCapNilPredicate == 0 {
 		value := args[1].Value
 		if value == nil {
 			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
 		}
-		if op == OpIN {
+		if op == OpIN || op == OpHASALL || op == OpHASANY {
 			v := reflect.ValueOf(value)
 			for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
 				if v.IsNil() {
@@ -438,9 +441,6 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 				}
 			}
 		}
-	}
-	if (op == OpHASALL || op == OpHASANY) && info.Caps&FieldCapArrayPredicate == 0 {
-		return Expr{}, fmt.Errorf("rbi does not support array predicates for %s", field)
 	}
 	return Expr{
 		Op:           op,
@@ -572,11 +572,11 @@ func normalizeExpr(e Expr) (Expr, bool) {
 			return nil
 		}
 		return make([]Expr, 0, capacity)
-	})
+	}, true)
 }
 
-func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc) (Expr, bool) {
-	first, c1, postNeeded := normalizeExprInverted(e, false, alloc)
+func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool) {
+	first, c1, postNeeded := normalizeExprInverted(e, false, alloc, foldExactComplements)
 	if !c1 && !postNeeded {
 		return e, false
 	}
@@ -584,7 +584,7 @@ func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc) (Expr, bool) {
 	second := first
 	c2 := false
 	if c1 || postNeeded {
-		second, c2 = normalizeExprPost(first, alloc)
+		second, c2 = normalizeExprPost(first, alloc, foldExactComplements)
 	}
 	if c1 || c2 {
 		return second, true
@@ -592,13 +592,13 @@ func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc) (Expr, bool) {
 	return e, false
 }
 
-func normalizeExprInverted(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, bool) {
+func normalizeExprInverted(e Expr, invert bool, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool, bool) {
 	switch e.Op {
 	case OpConst:
 		out, changed := normalizeConst(e, invert)
 		return out, changed, false
 	case OpAND, OpOR:
-		return normalizeBoolNode(e, invert, alloc)
+		return normalizeBoolNode(e, invert, alloc, foldExactComplements)
 	default:
 		if !invert {
 			return e, false, false
@@ -630,7 +630,7 @@ func normalizeConst(e Expr, invert bool) (Expr, bool) {
 	return Expr{Op: OpConst, FieldOrdinal: NoFieldOrdinal}, !IsTrueConst(e)
 }
 
-func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, bool) {
+func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool, bool) {
 	if len(e.Operands) == 0 {
 		neg := e.Op == OpOR
 		if e.Not {
@@ -669,7 +669,7 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 	}
 
 	for i, ch := range e.Operands {
-		nc, c, childPost := normalizeExprInverted(ch, childInvert, alloc)
+		nc, c, childPost := normalizeExprInverted(ch, childInvert, alloc, foldExactComplements)
 		if c {
 			if !changed {
 				changed = true
@@ -736,14 +736,14 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 	}
 
 	if !changed {
-		if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(op, e.Operands, alloc); constOK {
+		if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(op, e.Operands, alloc, foldExactComplements); constOK {
 			return constExpr, true, false
 		} else if exactChanged {
 			out = simplified
 		} else {
 			return e, false, postNeeded
 		}
-	} else if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(op, out, alloc); constOK {
+	} else if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(op, out, alloc, foldExactComplements); constOK {
 		return constExpr, true, false
 	} else if exactChanged {
 		out = simplified
@@ -820,23 +820,23 @@ func exprWeight(e Expr) int {
 	}
 }
 
-func normalizeExprPost(e Expr, alloc exprBufAlloc) (Expr, bool) {
+func normalizeExprPost(e Expr, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool) {
 	switch e.Op {
 	case OpAND:
-		return normalizeANDPost(e, alloc)
+		return normalizeANDPost(e, alloc, foldExactComplements)
 	case OpOR:
-		return normalizeORPost(e, alloc)
+		return normalizeORPost(e, alloc, foldExactComplements)
 	default:
 		return e, false
 	}
 }
 
-func normalizeANDPost(expr Expr, alloc exprBufAlloc) (Expr, bool) {
+func normalizeANDPost(expr Expr, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool) {
 	changed := false
 	var out []Expr
 
 	for i, ch := range expr.Operands {
-		n, c := normalizeExprPost(ch, alloc)
+		n, c := normalizeExprPost(ch, alloc, foldExactComplements)
 		drop := n.Op == OpConst && !n.Not
 		flatten := n.Op == OpAND && !n.Not
 		if !changed && !c && !drop && !flatten {
@@ -860,7 +860,7 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc) (Expr, bool) {
 	if !changed {
 		return expr, false
 	}
-	if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(OpAND, out, alloc); constOK {
+	if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(OpAND, out, alloc, foldExactComplements); constOK {
 		return constExpr, true
 	} else if exactChanged {
 		out = simplified
@@ -880,12 +880,12 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc) (Expr, bool) {
 	return Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: out}, true
 }
 
-func normalizeORPost(e Expr, alloc exprBufAlloc) (Expr, bool) {
+func normalizeORPost(e Expr, alloc exprBufAlloc, foldExactComplements bool) (Expr, bool) {
 	changed := false
 	var out []Expr
 
 	for i, ch := range e.Operands {
-		n, c := normalizeExprPost(ch, alloc)
+		n, c := normalizeExprPost(ch, alloc, foldExactComplements)
 		drop := n.Op == OpConst && !n.Not
 		if !changed && !c && !drop {
 			continue
@@ -904,7 +904,7 @@ func normalizeORPost(e Expr, alloc exprBufAlloc) (Expr, bool) {
 	if !changed {
 		return e, false
 	}
-	if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(OpOR, out, alloc); constOK {
+	if simplified, exactChanged, constExpr, constOK := simplifyExactBoolTerms(OpOR, out, alloc, foldExactComplements); constOK {
 		return constExpr, true
 	} else if exactChanged {
 		out = simplified
@@ -925,7 +925,7 @@ func needLeafSortExprs(exprs []Expr) bool {
 	return false
 }
 
-func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bool, Expr, bool) {
+func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc, foldExactComplements bool) ([]Expr, bool, Expr, bool) {
 	if len(terms) < 2 {
 		return terms, false, Expr{}, false
 	}
@@ -939,7 +939,8 @@ func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bo
 			if len(prev.Operands) == 0 &&
 				prev.Op != OpConst &&
 				prev.Op == cur.Op &&
-				prev.FieldOrdinal == cur.FieldOrdinal {
+				prev.FieldOrdinal == cur.FieldOrdinal &&
+				(foldExactComplements || prev.Not == cur.Not) {
 				mayMatch = true
 				break
 			}
@@ -969,6 +970,9 @@ func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bo
 			if prev.Not == cur.Not {
 				dup = true
 				break
+			}
+			if !foldExactComplements {
+				continue
 			}
 			if op == OpAND {
 				return nil, true, Expr{Op: OpConst, Not: true, FieldOrdinal: NoFieldOrdinal}, true

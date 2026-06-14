@@ -17,6 +17,8 @@ func (testPrepareResolver) ResolveField(name string) (FieldInfo, bool) {
 		return FieldInfo{Ordinal: 1, Caps: FieldCapAll}, true
 	case "tags":
 		return FieldInfo{Ordinal: 2, Caps: FieldCapAll}, true
+	case "tags_array_no_nil":
+		return FieldInfo{Ordinal: 5, Caps: FieldCapArrayPredicate}, true
 	case "country":
 		return FieldInfo{Ordinal: 3, Caps: FieldCapAll}, true
 	default:
@@ -146,6 +148,40 @@ func TestPrepareCountExpr_TypedNilAllowedForNilPredicateField(t *testing.T) {
 		t.Fatalf("PrepareCountExprResolved: %v", err)
 	}
 	q.Release()
+}
+
+func TestPrepareCountExpr_ArrayPredicateNilElementsRejectedWithoutNilCap(t *testing.T) {
+	var value *string
+	tests := []struct {
+		name string
+		expr qx.Expr
+	}{
+		{name: "has_any_nil", expr: qx.HASANY("tags_array_no_nil", []any{nil, "go"})},
+		{name: "has_all_nil", expr: qx.HASALL("tags_array_no_nil", []any{nil, "go"})},
+		{name: "has_any_typed_nil", expr: qx.HASANY("tags_array_no_nil", []any{value, "go"})},
+		{name: "has_all_typed_nil", expr: qx.HASALL("tags_array_no_nil", []any{value, "go"})},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if q, err := PrepareCountExprResolved(testPrepareFieldResolver, tc.expr); err == nil {
+				q.Release()
+				t.Fatal("expected PrepareCountExprResolved to reject nil array predicate element")
+			}
+		})
+	}
+}
+
+func TestPrepareCountExpr_UnsupportedArrayPredicateRejectedBeforeNilElements(t *testing.T) {
+	q, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.HASANY("$key", []any{nil, "go"}))
+	if err == nil {
+		q.Release()
+		t.Fatal("expected PrepareCountExprResolved to reject unsupported array predicate")
+	}
+	want := "rbi does not support array predicates for $key"
+	if err.Error() != want {
+		t.Fatalf("unexpected error: got %q want %q", err.Error(), want)
+	}
 }
 
 func TestPrepareCountExpr_EmptyBoolOpsRejected(t *testing.T) {
@@ -324,7 +360,7 @@ func TestPrepareCountExprs_ResolverPreservesDistinctFieldIdentity(t *testing.T) 
 	}
 }
 
-func TestPrepareCountExprs_ResolverKeepsSameFieldComplementFold(t *testing.T) {
+func TestPrepareCountExprs_ResolverKeepsUnvalidatedSameFieldComplement(t *testing.T) {
 	prepared, err := PrepareCountExprsResolved(testPrepareFieldResolver,
 		qx.EQ("status", "active"),
 		qx.NOT(qx.EQ("status", "active")),
@@ -334,8 +370,21 @@ func TestPrepareCountExprs_ResolverKeepsSameFieldComplementFold(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	if !IsFalseConst(prepared.Expr) {
-		t.Fatalf("expected same-field complement to normalize to false, got %+v", prepared.Expr)
+	if prepared.Expr.Op != OpAND || len(prepared.Expr.Operands) != 2 {
+		t.Fatalf("expected same-field complement to stay visible, got %+v", prepared.Expr)
+	}
+}
+
+func TestPrepareCountExpr_ResolverKeepsInvalidExactComplementVisible(t *testing.T) {
+	leaf := qx.EQ("status", []int{1})
+	prepared, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.OR(leaf, qx.NOT(leaf)))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved: %v", err)
+	}
+	defer prepared.Release()
+
+	if prepared.Expr.Op != OpOR || len(prepared.Expr.Operands) != 2 {
+		t.Fatalf("expected invalid exact complement to stay visible, got %+v", prepared.Expr)
 	}
 }
 
