@@ -124,6 +124,10 @@ func (sm *Registry) DropStaged(seq uint64) {
 		sm.mu.Unlock()
 		return
 	}
+	if ref.snap == nil {
+		sm.mu.Unlock()
+		return
+	}
 	if current := sm.current.Load(); current != nil && current.Seq == seq {
 		sm.mu.Unlock()
 		return

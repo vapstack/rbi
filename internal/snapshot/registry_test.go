@@ -83,6 +83,26 @@ func TestManagerDropStagedPinnedEntryBecomesUnpinnableUntilUnpin(t *testing.T) {
 	}
 }
 
+func TestManagerDropStagedPinnedEntryRetrySurvivesUnpin(t *testing.T) {
+	m := NewRegistry(true)
+
+	staged := &View{Seq: 13}
+	m.Stage(staged)
+
+	got, ref, ok := m.PinBySeq(staged.Seq)
+	if !ok || got != staged {
+		t.Fatalf("expected staged snapshot to be pinnable before drop")
+	}
+
+	m.DropStaged(staged.Seq)
+	m.DropStaged(staged.Seq)
+	m.Unpin(staged.Seq, ref)
+
+	if managerTestRef(m, staged.Seq) != nil {
+		t.Fatalf("expected staged snapshot registry entry to be pruned after retried drop")
+	}
+}
+
 func TestManagerDropStagedUnpinnedDeletesEntry(t *testing.T) {
 	m := NewRegistry(true)
 
