@@ -1100,6 +1100,9 @@ func (qv *View) orderDataValues(v any, fm *schema.Field) ([]keycodec.IndexLookup
 	}
 
 	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return nil, nil
+	}
 	rv, isNil := schema.UnwrapQueryValue(rv)
 	if isNil {
 		return nil, nil

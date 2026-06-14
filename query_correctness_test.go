@@ -126,6 +126,28 @@ func TestAPI_Count_IgnoresInvalidOrderField(t *testing.T) {
 	}
 }
 
+func TestAPI_QueryKeys_POSNilPriorityDoesNotPanic(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	mustSetAPIRecs(t, db, map[uint64]*Rec{
+		1: {Name: "a", Tags: []string{"go"}},
+		2: {Name: "b", Tags: []string{"db"}},
+		3: {Name: "c", Tags: []string{"go", "db"}},
+		4: {Name: "d", Tags: []string{"ops"}},
+	})
+
+	got, err := db.QueryKeys(qx.Query(
+		qx.HASANY("tags", []string{"go", "db"}),
+	).SortBy(qx.POS("tags", nil), qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	slices.Sort(got)
+	if want := []uint64{1, 2, 3}; !slices.Equal(got, want) {
+		t.Fatalf("QueryKeys=%v want %v", got, want)
+	}
+}
+
 func TestQuery_MissingBucket_EmptyIndexResultStillRequiresSequenceTx(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {

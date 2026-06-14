@@ -1725,6 +1725,42 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 	}
 }
 
+func TestCount_SignedIntFloatUpperEdgeBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	mustSetAPIRecs(t, db, map[uint64]*Rec{
+		1: {Name: "a", Age: -10},
+		2: {Name: "b", Age: 0},
+		3: {Name: "c", Age: 42},
+	})
+
+	upper := math.Ldexp(1, 63)
+	cases := []struct {
+		name string
+		expr qx.Expr
+		want uint64
+	}{
+		{name: "gte_ldexp_empty", expr: qx.GTE("age", upper), want: 0},
+		{name: "gte_maxint_float_empty", expr: qx.GTE("age", float64(math.MaxInt64)), want: 0},
+		{name: "gt_ldexp_empty", expr: qx.GT("age", upper), want: 0},
+		{name: "lt_ldexp_full", expr: qx.LT("age", upper), want: 3},
+		{name: "lte_ldexp_full", expr: qx.LTE("age", upper), want: 3},
+		{name: "eq_ldexp_empty", expr: qx.EQ("age", upper), want: 0},
+		{name: "ne_ldexp_full", expr: qx.NE("age", upper), want: 3},
+	}
+	for i := range cases {
+		tc := cases[i]
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := db.Count(tc.expr)
+			if err != nil {
+				t.Fatalf("Count: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("count mismatch: got=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
 	var events []rbitrace.Event
 	opts := Options{

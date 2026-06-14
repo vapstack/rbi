@@ -234,6 +234,38 @@ func TestQueryCorrectness_NegativeNilComplementAndCount(t *testing.T) {
 	}
 }
 
+func TestCountScalarInSplit_TautologicalResidualCountsINPostings(t *testing.T) {
+	db := newCorrectnessDB(t)
+
+	expr := qx.AND(
+		qx.IN("country", []string{"US", "DE"}),
+		qx.NOT(qx.EQ("name", "missing")),
+	)
+	prepared, compiled, err := prepareTestExpr(db.engine, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr: %v", err)
+	}
+	defer prepared.Release()
+
+	trace := &Trace{}
+	got, ok, err := db.engine.currentQueryViewForTests().TryFilterCardinalityByScalarInSplit(compiled, trace)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByScalarInSplit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("TryFilterCardinalityByScalarInSplit was not used")
+	}
+	want := countExpected(db, func(_ uint64, r *Rec) bool {
+		return (r.Country == "US" || r.Country == "DE") && r.Name != "missing"
+	})
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if trace.Event().Plan != rbitrace.PlanCountScalarInSplit {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanCountScalarInSplit, trace.Event().Plan)
+	}
+}
+
 func TestCardinalityORByPredicates_DisjointScalarEQBranches(t *testing.T) {
 	db := newCorrectnessDB(t)
 

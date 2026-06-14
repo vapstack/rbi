@@ -564,6 +564,8 @@ func queryValueIsCollectionForField(v reflect.Value, fm *schema.Field) bool {
 
 const (
 	impossibleLookupKey     = "\x00"
+	minInt64Float           = -9223372036854775808.0
+	maxInt64FloatExclusive  = 9223372036854775808.0
 	maxUint64FloatExclusive = 18446744073709551616.0
 )
 
@@ -697,7 +699,7 @@ func numericQueryValueToInt64Exact(v reflect.Value) (int64, bool) {
 
 	case reflect.Float32, reflect.Float64:
 		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
-		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < math.MinInt64 || f > math.MaxInt64 {
+		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < minInt64Float || f >= maxInt64FloatExclusive {
 			return 0, false
 		}
 		i := int64(f)
@@ -845,18 +847,20 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 			}
 
 		case f == math.Trunc(f):
-			if f < math.MinInt64 || f > math.MaxInt64 {
+			if f < minInt64Float {
 				switch op {
 				case qir.OpGT, qir.OpGTE:
-					if f < math.MinInt64 {
-						return normalizedScalarBound{full: true}
-					}
-					return normalizedScalarBound{empty: true}
-				default:
-					if f < math.MinInt64 {
-						return normalizedScalarBound{empty: true}
-					}
 					return normalizedScalarBound{full: true}
+				default:
+					return normalizedScalarBound{empty: true}
+				}
+			}
+			if f >= maxInt64FloatExclusive {
+				switch op {
+				case qir.OpLT, qir.OpLTE:
+					return normalizedScalarBound{full: true}
+				default:
+					return normalizedScalarBound{empty: true}
 				}
 			}
 			return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(int64(f))))
@@ -866,20 +870,20 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 
 		case op == qir.OpGT || op == qir.OpGTE:
 			floor := math.Floor(f)
-			if floor < math.MinInt64 {
+			if floor < minInt64Float {
 				return normalizedScalarBound{full: true}
 			}
-			if floor > math.MaxInt64 {
+			if floor >= maxInt64FloatExclusive {
 				return normalizedScalarBound{empty: true}
 			}
 			return normalizedScalarBoundFromIndexKey(qir.OpGT, keycodec.FromU64(keycodec.OrderedInt64Key(int64(floor))))
 
 		default:
 			ceil := math.Ceil(f)
-			if ceil < math.MinInt64 {
+			if ceil < minInt64Float {
 				return normalizedScalarBound{empty: true}
 			}
-			if ceil > math.MaxInt64 {
+			if ceil >= maxInt64FloatExclusive {
 				return normalizedScalarBound{full: true}
 			}
 			return normalizedScalarBoundFromIndexKey(qir.OpLT, keycodec.FromU64(keycodec.OrderedInt64Key(int64(ceil))))

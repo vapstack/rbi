@@ -995,16 +995,16 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		defer filter.ids.Release()
 
 		if filter.ids.IsEmpty() {
-			if filter.neg {
+			if !filter.neg {
 				if trace != nil {
 					trace.SetPlan(rbitrace.PlanCountScalarInSplit)
 					trace.AddExamined(0)
 				}
 				return 0, true, nil
 			}
-			return 0, true, nil
+		} else {
+			useFilter = true
 		}
-		useFilter = true
 	}
 
 	var cnt uint64
