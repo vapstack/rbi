@@ -825,27 +825,41 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	}
 }
 
-func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
+func TestIndexTags_EmbeddedChildTagsCollectedFromUntaggedParent(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "embedded_parent_index.db")
-	db, raw := openBoltAndNew[uint64, embeddedEnabledByParentRec](t, path)
+	path := filepath.Join(dir, "embedded_child_tags.db")
+	db, raw := openBoltAndNew[uint64, embeddedChildTaggedRec](t, path)
 	t.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()
 	})
 
-	if err := db.Set(1, &embeddedEnabledByParentRec{
+	if err := db.Set(1, &embeddedChildTaggedRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "alice", Email: "alice@example.com"},
 	}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &embeddedEnabledByParentRec{
+	if err := db.Set(2, &embeddedChildTaggedRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "bob", Email: "alice@example.com"},
 	}); !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("duplicate embedded unique err=%v want %v", err, rbierrors.ErrUniqueViolation)
 	}
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice"))); err == nil {
-		t.Fatal("embedded parent index tag must not enable untagged child field")
+		t.Fatal("embedded parent must not enable untagged child field")
+	}
+}
+
+func TestIndexTags_EmbeddedParentIndexRejectsNonIndexableContainer(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := bbolt.Open(filepath.Join(dir, "embedded_parent_index.db"), 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	_, err = New[uint64, embeddedEnabledByParentRec](raw, testOptions(Options{}))
+	if err == nil || !strings.Contains(err.Error(), "cannot index field EmbeddedSharedFields") {
+		t.Fatalf("embedded parent index err=%v", err)
 	}
 }
 
@@ -1401,6 +1415,10 @@ type EmbeddedSharedFields struct {
 
 type embeddedEnabledByParentRec struct {
 	EmbeddedSharedFields `rbi:"index"`
+}
+
+type embeddedChildTaggedRec struct {
+	EmbeddedSharedFields
 }
 
 type embeddedDisabledByParentRec struct {

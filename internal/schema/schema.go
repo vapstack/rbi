@@ -24,6 +24,7 @@ type Field struct {
 	KeyKind    FieldKeyKind
 	DBName     string
 	QueryName  string
+	QueryNames []string
 	DBTagged   bool
 	JSONName   string
 	JSONTagged bool
@@ -81,6 +82,14 @@ func isNativeTimeScalarType(t reflect.Type) bool {
 
 func isNativeTimePointerType(t reflect.Type) bool {
 	return t == nativeTimePtr
+}
+
+func isEmbeddedContainerType(t reflect.Type) bool {
+	return t.Kind() == reflect.Struct && !isNativeTimeScalarType(t)
+}
+
+func isEmbeddedPointerContainerType(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct && !isNativeTimeScalarType(t.Elem())
 }
 
 func IsNativeTimeField(f *Field) bool {
@@ -238,7 +247,19 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
 	}
 
-	patch, err := makePatchRuntime(vtype)
+	patchFieldCount := len(collector.indexFields) + len(collector.measureFields)
+	var patchIndexed map[string]struct{}
+	if patchFieldCount != 0 {
+		patchIndexed = make(map[string]struct{}, patchFieldCount)
+		for _, f := range collector.indexFields {
+			patchIndexed[fieldIndexID(f.Index)] = struct{}{}
+		}
+		for _, f := range collector.measureFields {
+			patchIndexed[fieldIndexID(f.Index)] = struct{}{}
+		}
+	}
+
+	patch, err := makePatchRuntime(vtype, patchIndexed)
 	if err != nil {
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
@@ -249,13 +270,21 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 	}
 	for i := range access {
 		access[i].PatchOrdinal = -1
+		queryIndex := access[i].Field.Index
+		queryName := access[i].Field.DBName
 		for ordinal := range patch.Access {
-			if slices.Equal(patch.Access[ordinal].Field.Index, access[i].Field.Index) {
+			f := patch.Access[ordinal].Field
+			if slices.Equal(f.Index, queryIndex) {
 				access[i].PatchOrdinal = ordinal
-				f := patch.Access[ordinal].Field
-				f.QueryName = access[i].Field.DBName
-				f.Unique = access[i].Field.Unique
-				break
+				f.setQueryName(queryName)
+				if access[i].Field.Unique {
+					f.Unique = true
+				}
+			} else if fieldIndexesOverlap(f.Index, queryIndex) {
+				f.addQueryName(queryName)
+				if access[i].Field.Unique {
+					f.Unique = true
+				}
 			}
 		}
 	}
@@ -278,10 +307,14 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
 	}
 	for i := range measureAccess {
+		queryIndex := measureAccess[i].Field.Index
+		queryName := measureAccess[i].Field.DBName
 		for ordinal := range patch.Access {
-			if slices.Equal(patch.Access[ordinal].Field.Index, measureAccess[i].Field.Index) {
-				patch.Access[ordinal].Field.QueryName = measureAccess[i].Field.DBName
-				break
+			f := patch.Access[ordinal].Field
+			if slices.Equal(f.Index, queryIndex) {
+				f.setQueryName(queryName)
+			} else if fieldIndexesOverlap(f.Index, queryIndex) {
+				f.addQueryName(queryName)
 			}
 		}
 	}
@@ -321,19 +354,27 @@ func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []in
 			return err
 		}
 		if f.Anonymous {
-			if indexKind == IndexUnique {
-				return fmt.Errorf("unique is not supported for anonymous embedded struct field %v", f.Name)
+			if skip {
+				continue
 			}
-			if indexKind == IndexMeasure {
-				return fmt.Errorf("measure is not supported for anonymous embedded struct field %v", f.Name)
-			}
-			if f.Type.Kind() == reflect.Struct {
-				if skip {
-					continue
-				}
-				newIdx := append(idx, i)
-				if err := collector.populateFieldsFromTags(f.Type, newIdx); err != nil {
+			newIdx := append(idx, i)
+			if use {
+				if err = collector.addIndexedField(f, newIdx, indexKind); err != nil {
 					return err
+				}
+				continue
+			}
+			if isEmbeddedContainerType(f.Type) {
+				if err = collector.populateFieldsFromTags(f.Type, newIdx); err != nil {
+					return err
+				}
+			} else if isEmbeddedPointerContainerType(f.Type) {
+				hasIndexTags, err := hasEmbeddedIndexTags(f.Type.Elem(), nil)
+				if err != nil {
+					return err
+				}
+				if hasIndexTags {
+					return fmt.Errorf("anonymous embedded pointer field %v cannot promote rbi tags, embed %v by value", f.Name, f.Type.Elem())
 				}
 			}
 			continue
@@ -436,11 +477,13 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 			continue
 		}
 		nextIdx := append(idx, i)
-		if sf.Anonymous && sf.Type.Kind() == reflect.Struct {
+		if sf.Anonymous && isEmbeddedContainerType(sf.Type) {
 			if err := collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
 				return err
 			}
-			continue
+			if !sf.Type.Implements(viType) {
+				continue
+			}
 		}
 
 		dbName := sf.Name
@@ -486,6 +529,91 @@ func fieldIndexID(index []int) string {
 		buf = strconv.AppendInt(buf, int64(index[i]), 10)
 	}
 	return string(buf)
+}
+
+type embeddedIndexTagScan struct {
+	typ  reflect.Type
+	prev *embeddedIndexTagScan
+}
+
+func hasEmbeddedIndexTags(t reflect.Type, prev *embeddedIndexTagScan) (bool, error) {
+	for cur := prev; cur != nil; cur = cur.prev {
+		if cur.typ == t {
+			return false, nil
+		}
+	}
+	frame := embeddedIndexTagScan{typ: t, prev: prev}
+
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		_, use, skip, err := parseTag(f.Tag.Get("rbi"), f.Name)
+		if err != nil {
+			return false, err
+		}
+		if use {
+			return true, nil
+		}
+		if skip {
+			continue
+		}
+		if f.Anonymous {
+			if isEmbeddedContainerType(f.Type) {
+				hasIndexTags, err := hasEmbeddedIndexTags(f.Type, &frame)
+				if err != nil {
+					return false, err
+				}
+				if hasIndexTags {
+					return true, nil
+				}
+			} else if isEmbeddedPointerContainerType(f.Type) {
+				hasIndexTags, err := hasEmbeddedIndexTags(f.Type.Elem(), &frame)
+				if err != nil {
+					return false, err
+				}
+				if hasIndexTags {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+func fieldIndexesOverlap(a, b []int) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return slices.Equal(b[:len(a)], a)
+}
+
+func (f *Field) setQueryName(queryName string) {
+	if f.QueryName == queryName {
+		return
+	}
+	previous := f.QueryName
+	f.QueryName = queryName
+	if previous != "" {
+		f.addQueryName(previous)
+	}
+}
+
+func (f *Field) addQueryName(queryName string) {
+	if f.QueryName == "" {
+		f.QueryName = queryName
+		return
+	}
+	if f.QueryName == queryName {
+		return
+	}
+	for i := range f.QueryNames {
+		if f.QueryNames[i] == queryName {
+			return
+		}
+	}
+	f.QueryNames = append(f.QueryNames, queryName)
 }
 
 func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index []int, indexKind IndexKind) error {
@@ -668,7 +796,7 @@ type (
 	StringValidationAccessorFn       func(ptr unsafe.Pointer) error
 )
 
-func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguous map[string]int, t reflect.Type, idx []int, single []int) error {
+func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguous map[string]int, t reflect.Type, idx []int, single []int, patchIndexed map[string]struct{}, jsonHidden bool) error {
 	for i := 0; i < t.NumField(); i++ {
 
 		rf := t.Field(i)
@@ -677,14 +805,21 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 			continue
 		}
 
-		if rf.Anonymous {
-			if rf.Type.Kind() == reflect.Struct {
+		if rf.Anonymous && rf.Type.Kind() == reflect.Struct {
+			recurse := isEmbeddedContainerType(rf.Type)
+			if recurse {
 				nidx := append(idx, i)
-				if err := populatePatcher(patchMap, patchFields, ambiguous, rf.Type, nidx, single); err != nil {
+				selfIndexed := false
+				if patchIndexed != nil {
+					_, selfIndexed = patchIndexed[fieldIndexID(nidx)]
+				}
+				if err := populatePatcher(patchMap, patchFields, ambiguous, rf.Type, nidx, single, patchIndexed, jsonHidden || rf.Tag.Get("json") == "-"); err != nil {
 					return err
 				}
+				if !selfIndexed {
+					continue
+				}
 			}
-			continue
 		}
 
 		var fieldIndex []int
@@ -700,6 +835,9 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 			JSONName: rf.Name,
 			Kind:     rf.Type.Kind(),
 			Index:    fieldIndex,
+		}
+		if jsonHidden {
+			f.JSONName = ""
 		}
 		*patchFields = append(*patchFields, f)
 
@@ -788,24 +926,26 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 			patchMap[dbTag] = f
 		}
 
-		jsonTag := rf.Tag.Get("json")
-		if jsonTag == "-" {
-			f.JSONName = ""
-		} else if jsonTag != "" {
-			jsonName, _, _ := strings.Cut(jsonTag, ",")
-			if jsonName != "" {
-				if jsonName == ReservedKeyFieldName {
-					return fmt.Errorf("field %v uses reserved json tag %q", rf.Name, jsonName)
+		if !jsonHidden {
+			jsonTag := rf.Tag.Get("json")
+			if jsonTag == "-" {
+				f.JSONName = ""
+			} else if jsonTag != "" {
+				jsonName, _, _ := strings.Cut(jsonTag, ",")
+				if jsonName != "" {
+					if jsonName == ReservedKeyFieldName {
+						return fmt.Errorf("field %v uses reserved json tag %q", rf.Name, jsonName)
+					}
+					if _, ok := ambiguous[jsonName]; ok {
+						return fmt.Errorf("ambiguous json tag '%v' used by field %v and promoted field name", jsonName, f.Name)
+					}
+					f.JSONName = jsonName
+					f.JSONTagged = true
+					if existing, ok := patchMap[jsonName]; ok && existing != f {
+						return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
+					}
+					patchMap[jsonName] = f
 				}
-				if _, ok := ambiguous[jsonName]; ok {
-					return fmt.Errorf("ambiguous json tag '%v' used by field %v and promoted field name", jsonName, f.Name)
-				}
-				f.JSONName = jsonName
-				f.JSONTagged = true
-				if existing, ok := patchMap[jsonName]; ok && existing != f {
-					return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
-				}
-				patchMap[jsonName] = f
 			}
 		}
 		if dbNameUnsafe && !f.DBTagged && f.DBName == f.Name {
@@ -818,10 +958,10 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 	return nil
 }
 
-func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
+func makePatchRuntime(vtype reflect.Type, patchIndexed map[string]struct{}) (PatchRuntime, error) {
 	patchMap := make(map[string]*Field, vtype.NumField()*2)
 	patchFields := make([]*Field, 0, vtype.NumField())
-	if err := populatePatcher(patchMap, &patchFields, make(map[string]int), vtype, nil, make([]int, vtype.NumField())); err != nil {
+	if err := populatePatcher(patchMap, &patchFields, make(map[string]int), vtype, nil, make([]int, vtype.NumField()), patchIndexed, false); err != nil {
 		return PatchRuntime{}, err
 	}
 	for _, f := range patchFields {

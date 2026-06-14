@@ -68,6 +68,301 @@ func mustMakePatchInto[V any](t testing.TB, db *DB[uint64, V], oldVal, newVal *V
 	return patch
 }
 
+type PatchAnonymousID string
+
+type patchAnonymousTaggedIndexRec struct {
+	PatchAnonymousID `rbi:"index"`
+}
+
+type patchAnonymousOptionIndexRec struct {
+	PatchAnonymousID
+}
+
+type PatchAnonymousToken struct {
+	Value string `db:"value"`
+}
+
+func (v PatchAnonymousToken) IndexingValue() string {
+	return strings.ToLower(v.Value)
+}
+
+type patchAnonymousTaggedTokenRec struct {
+	PatchAnonymousToken `rbi:"index"`
+}
+
+type patchAnonymousOptionTokenRec struct {
+	PatchAnonymousToken
+}
+
+type PatchAnonymousShadowToken struct {
+	ID string
+}
+
+func (v PatchAnonymousShadowToken) IndexingValue() string {
+	return strings.ToLower(v.ID)
+}
+
+type patchAnonymousShadowTokenRec struct {
+	PatchAnonymousShadowToken `rbi:"index"`
+	ID                        string
+}
+
+type PatchAnonymousJSONHiddenToken struct {
+	Value string `db:"value" json:"-"`
+}
+
+func (v PatchAnonymousJSONHiddenToken) IndexingValue() string {
+	return strings.ToLower(v.Value)
+}
+
+type patchAnonymousJSONHiddenTokenRec struct {
+	PatchAnonymousJSONHiddenToken `rbi:"index"`
+}
+
+type PatchAnonymousEarlyChildToken struct {
+	Value string `db:"AAA" json:"-"`
+}
+
+func (v PatchAnonymousEarlyChildToken) IndexingValue() string {
+	return strings.ToLower(v.Value)
+}
+
+type patchAnonymousEarlyChildTokenRec struct {
+	PatchAnonymousEarlyChildToken
+}
+
+func TestMakePatch_AnonymousIndexedFieldRoundTrips(t *testing.T) {
+	db := openTempDBUint64Reflect[patchAnonymousTaggedIndexRec](t, "patch_anonymous_tagged_index.db")
+
+	oldVal := &patchAnonymousTaggedIndexRec{PatchAnonymousID: "old"}
+	newVal := &patchAnonymousTaggedIndexRec{PatchAnonymousID: "new"}
+	if err := db.Set(1, oldVal); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousID", PatchAnonymousID("old"))))
+	if err != nil {
+		t.Fatalf("QueryKeys old anonymous ID: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("old anonymous ID ids=%v want [1]", ids)
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousID" || patch[0].Value != PatchAnonymousID("new") {
+		t.Fatalf("anonymous ID patch=%#v", patch)
+	}
+	if err = db.Patch(1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch anonymous ID: %v", err)
+	}
+	ids, err = db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousID", PatchAnonymousID("new"))))
+	if err != nil {
+		t.Fatalf("QueryKeys new anonymous ID: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("new anonymous ID ids=%v want [1]", ids)
+	}
+	ids, err = db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousID", PatchAnonymousID("old"))))
+	if err != nil {
+		t.Fatalf("QueryKeys stale anonymous ID: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("stale anonymous ID ids=%v want []", ids)
+	}
+}
+
+func TestMakePatch_AnonymousOptionIndexedFieldRoundTrips(t *testing.T) {
+	db := openTempDBUint64Reflect[patchAnonymousOptionIndexRec](t, "patch_anonymous_option_index.db", Options{
+		Index: map[string]IndexKind{"PatchAnonymousID": IndexDefault},
+	})
+
+	oldVal := &patchAnonymousOptionIndexRec{PatchAnonymousID: "old"}
+	newVal := &patchAnonymousOptionIndexRec{PatchAnonymousID: "new"}
+	if err := db.Set(1, oldVal); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousID" || patch[0].Value != PatchAnonymousID("new") {
+		t.Fatalf("anonymous option ID patch=%#v", patch)
+	}
+	if err := db.Patch(1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch anonymous option ID: %v", err)
+	}
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousID", PatchAnonymousID("new"))))
+	if err != nil {
+		t.Fatalf("QueryKeys anonymous option ID: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("anonymous option ID ids=%v want [1]", ids)
+	}
+}
+
+func TestMakePatch_IndexedAnonymousParentSuppressesUnsafeDescendant(t *testing.T) {
+	db := openTempDBUint64Reflect[patchAnonymousShadowTokenRec](t, "patch_anonymous_shadow_token.db")
+
+	oldVal := &patchAnonymousShadowTokenRec{
+		PatchAnonymousShadowToken: PatchAnonymousShadowToken{ID: "Old"},
+		ID:                        "outer",
+	}
+	newVal := &patchAnonymousShadowTokenRec{
+		PatchAnonymousShadowToken: PatchAnonymousShadowToken{ID: "New"},
+		ID:                        "outer",
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousShadowToken" {
+		t.Fatalf("shadowed child patch=%#v", patch)
+	}
+	if v, ok := patch[0].Value.(PatchAnonymousShadowToken); !ok || v.ID != "New" {
+		t.Fatalf("shadowed child parent patch value=%#v", patch[0].Value)
+	}
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Apply parent patch: %v", err)
+	}
+	if applied.PatchAnonymousShadowToken.ID != "New" || applied.ID != "outer" {
+		t.Fatalf("parent patch applied wrong value: %+v", applied)
+	}
+
+	patch = mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousShadowToken" {
+		t.Fatalf("shadowed child JSON patch=%#v", patch)
+	}
+}
+
+func TestMakePatch_PatchJSONIndexedAnonymousParentSuppressesJSONHiddenDescendant(t *testing.T) {
+	db := openTempDBUint64Reflect[patchAnonymousJSONHiddenTokenRec](t, "patch_anonymous_json_hidden_token.db")
+
+	oldVal := &patchAnonymousJSONHiddenTokenRec{PatchAnonymousJSONHiddenToken: PatchAnonymousJSONHiddenToken{Value: "Old"}}
+	newVal := &patchAnonymousJSONHiddenTokenRec{PatchAnonymousJSONHiddenToken: PatchAnonymousJSONHiddenToken{Value: "old"}}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousJSONHiddenToken" {
+		t.Fatalf("JSON hidden child patch=%#v", patch)
+	}
+	if v, ok := patch[0].Value.(PatchAnonymousJSONHiddenToken); !ok || v.Value != "old" {
+		t.Fatalf("JSON hidden child parent patch value=%#v", patch[0].Value)
+	}
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Apply JSON parent patch: %v", err)
+	}
+	if applied.Value != "old" {
+		t.Fatalf("JSON parent patch applied value=%q", applied.Value)
+	}
+}
+
+func TestMakePatch_PatchJSONIndexedAnonymousParentSuppressesEarlierIndexedChild(t *testing.T) {
+	db := openTempDBUint64Reflect[patchAnonymousEarlyChildTokenRec](t, "patch_anonymous_early_child_token.db", Options{
+		Index: map[string]IndexKind{
+			"AAA":                           IndexDefault,
+			"PatchAnonymousEarlyChildToken": IndexDefault,
+		},
+	})
+
+	oldVal := &patchAnonymousEarlyChildTokenRec{PatchAnonymousEarlyChildToken: PatchAnonymousEarlyChildToken{Value: "Old"}}
+	newVal := &patchAnonymousEarlyChildTokenRec{PatchAnonymousEarlyChildToken: PatchAnonymousEarlyChildToken{Value: "New"}}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 1 || patch[0].Name != "PatchAnonymousEarlyChildToken" {
+		t.Fatalf("early indexed child patch=%#v", patch)
+	}
+	if v, ok := patch[0].Value.(PatchAnonymousEarlyChildToken); !ok || v.Value != "New" {
+		t.Fatalf("early indexed child parent patch value=%#v", patch[0].Value)
+	}
+}
+
+func TestPatch_AnonymousValueIndexerChildFieldUpdatesParentIndex(t *testing.T) {
+	t.Run("tagged_parent", func(t *testing.T) {
+		db := openTempDBUint64Reflect[patchAnonymousTaggedTokenRec](t, "patch_anonymous_tagged_token.db")
+		if err := db.Set(1, &patchAnonymousTaggedTokenRec{PatchAnonymousToken: PatchAnonymousToken{Value: "Old"}}); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousToken", "old")))
+		if err != nil {
+			t.Fatalf("QueryKeys old PatchAnonymousToken: %v", err)
+		}
+		if !slices.Equal(ids, []uint64{1}) {
+			t.Fatalf("old PatchAnonymousToken ids=%v want [1]", ids)
+		}
+
+		if err := db.Patch(1, []Field{{Name: "value", Value: "New"}}, PatchStrict); err != nil {
+			t.Fatalf("Patch child field: %v", err)
+		}
+		ids, err = db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousToken", "new")))
+		if err != nil {
+			t.Fatalf("QueryKeys new PatchAnonymousToken: %v", err)
+		}
+		if !slices.Equal(ids, []uint64{1}) {
+			t.Fatalf("new PatchAnonymousToken ids=%v want [1]", ids)
+		}
+		ids, err = db.QueryKeys(qx.Query(qx.EQ("PatchAnonymousToken", "old")))
+		if err != nil {
+			t.Fatalf("QueryKeys stale PatchAnonymousToken: %v", err)
+		}
+		if len(ids) != 0 {
+			t.Fatalf("stale PatchAnonymousToken ids=%v want []", ids)
+		}
+	})
+
+	t.Run("options_parent_and_child", func(t *testing.T) {
+		db := openTempDBUint64Reflect[patchAnonymousOptionTokenRec](t, "patch_anonymous_option_token.db", Options{
+			Index: map[string]IndexKind{
+				"PatchAnonymousToken": IndexDefault,
+				"value":               IndexDefault,
+			},
+		})
+		if err := db.Set(1, &patchAnonymousOptionTokenRec{PatchAnonymousToken: PatchAnonymousToken{Value: "Old"}}); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		for _, indexed := range []struct {
+			field string
+			old   string
+			new   string
+		}{
+			{field: "PatchAnonymousToken", old: "old", new: "new"},
+			{field: "value", old: "Old", new: "New"},
+		} {
+			ids, err := db.QueryKeys(qx.Query(qx.EQ(indexed.field, indexed.old)))
+			if err != nil {
+				t.Fatalf("QueryKeys old %s: %v", indexed.field, err)
+			}
+			if !slices.Equal(ids, []uint64{1}) {
+				t.Fatalf("old %s ids=%v want [1]", indexed.field, ids)
+			}
+		}
+
+		if err := db.Patch(1, []Field{{Name: "value", Value: "New"}}, PatchStrict); err != nil {
+			t.Fatalf("Patch child field: %v", err)
+		}
+		for _, indexed := range []struct {
+			field string
+			old   string
+			new   string
+		}{
+			{field: "PatchAnonymousToken", old: "old", new: "new"},
+			{field: "value", old: "Old", new: "New"},
+		} {
+			ids, err := db.QueryKeys(qx.Query(qx.EQ(indexed.field, indexed.new)))
+			if err != nil {
+				t.Fatalf("QueryKeys new %s: %v", indexed.field, err)
+			}
+			if !slices.Equal(ids, []uint64{1}) {
+				t.Fatalf("new %s ids=%v want [1]", indexed.field, ids)
+			}
+			ids, err = db.QueryKeys(qx.Query(qx.EQ(indexed.field, indexed.old)))
+			if err != nil {
+				t.Fatalf("QueryKeys stale %s: %v", indexed.field, err)
+			}
+			if len(ids) != 0 {
+				t.Fatalf("stale %s ids=%v want []", indexed.field, ids)
+			}
+		}
+	})
+}
+
 func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -550,6 +845,14 @@ type patchJSONOmittedRec struct {
 	Hidden  string `json:"-"`
 }
 
+type PatchJSONHiddenAnonymousEmbeddedRec struct {
+	Value string `json:"value"`
+}
+
+type patchJSONHiddenAnonymousRec struct {
+	PatchJSONHiddenAnonymousEmbeddedRec `json:"-"`
+}
+
 func TestMakePatch_PatchJSON_RejectsChangedJSONOmittedField(t *testing.T) {
 	db := openTempDBUint64Reflect[patchJSONOmittedRec](t, "patch_json_omitted_field.db")
 
@@ -559,6 +862,25 @@ func TestMakePatch_PatchJSON_RejectsChangedJSONOmittedField(t *testing.T) {
 	patch, err := db.MakePatch(oldVal, newVal, PatchJSON)
 	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
 		t.Fatalf("MakePatch PatchJSON err=%v want omitted field error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+func TestMakePatch_PatchJSON_RejectsChangedJSONHiddenAnonymousSubtree(t *testing.T) {
+	db := openTempDBUint64Reflect[patchJSONHiddenAnonymousRec](t, "patch_json_hidden_anonymous.db")
+
+	oldVal := &patchJSONHiddenAnonymousRec{
+		PatchJSONHiddenAnonymousEmbeddedRec: PatchJSONHiddenAnonymousEmbeddedRec{Value: "old"},
+	}
+	newVal := &patchJSONHiddenAnonymousRec{
+		PatchJSONHiddenAnonymousEmbeddedRec: PatchJSONHiddenAnonymousEmbeddedRec{Value: "new"},
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal, PatchJSON)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
+		t.Fatalf("MakePatch PatchJSON err=%v want hidden anonymous subtree error", err)
 	}
 	if len(patch) != 0 {
 		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)

@@ -121,6 +121,101 @@ type schemaTestOptionShadowedRec struct {
 	ID string
 }
 
+type SchemaTestAnonymousID string
+
+type schemaTestAnonymousTaggedIDRec struct {
+	SchemaTestAnonymousID `rbi:"index"`
+}
+
+type schemaTestAnonymousOptionIDRec struct {
+	SchemaTestAnonymousID
+}
+
+type schemaTestAnonymousTaggedTimeRec struct {
+	time.Time `rbi:"index"`
+}
+
+type SchemaTestAnonymousToken struct {
+	Value string
+}
+
+func (v SchemaTestAnonymousToken) IndexingValue() string {
+	return strings.ToLower(v.Value)
+}
+
+type schemaTestAnonymousTaggedVIRec struct {
+	SchemaTestAnonymousToken `rbi:"index"`
+}
+
+type SchemaTestAnonymousVIEmbedded struct {
+	Email string `db:"email" json:"email" rbi:"unique"`
+}
+
+func (v SchemaTestAnonymousVIEmbedded) IndexingValue() string {
+	return strings.ToLower(v.Email)
+}
+
+type schemaTestAnonymousVIEmbeddedRec struct {
+	SchemaTestAnonymousVIEmbedded
+}
+
+type SchemaTestSkippedAnonymousTagParent struct {
+	SchemaTestAnonymousToken `rbi:"index"`
+}
+
+type schemaTestSkippedAnonymousTagRec struct {
+	SchemaTestSkippedAnonymousTagParent `rbi:"-"`
+}
+
+type SchemaTestSkippedInvalidAnonymousTagParent struct {
+	SchemaTestAnonymousContainer `rbi:"index,unique"`
+}
+
+type schemaTestSkippedInvalidAnonymousTagRec struct {
+	SchemaTestSkippedInvalidAnonymousTagParent `rbi:"-"`
+}
+
+type SchemaTestAnonymousContainer struct {
+	Value string
+}
+
+type schemaTestAnonymousTaggedContainerRec struct {
+	SchemaTestAnonymousContainer `rbi:"index"`
+}
+
+type SchemaTestPointerEmbeddedTagged struct {
+	Email string `rbi:"unique"`
+}
+
+type schemaTestPointerEmbeddedTaggedRec struct {
+	*SchemaTestPointerEmbeddedTagged
+}
+
+type SchemaTestRecursivePointerEmbedded struct {
+	*SchemaTestRecursivePointerEmbedded
+}
+
+type schemaTestRecursivePointerEmbeddedRec struct {
+	*SchemaTestRecursivePointerEmbedded
+}
+
+type SchemaTestRecursivePointerEmbeddedTagged struct {
+	*SchemaTestRecursivePointerEmbeddedTagged
+	Email string `rbi:"index"`
+}
+
+type schemaTestRecursivePointerEmbeddedTaggedRec struct {
+	*SchemaTestRecursivePointerEmbeddedTagged
+}
+
+type SchemaTestJSONHiddenAnonymous struct {
+	Value string `json:"value"`
+}
+
+type schemaTestJSONHiddenAnonymousRec struct {
+	SchemaTestJSONHiddenAnonymous `json:"-"`
+}
+
 type schemaTestMeasureOnlyRec struct {
 	Amount int64 `db:"amount" rbi:"measure"`
 }
@@ -438,6 +533,204 @@ func TestCompileOptionsNilEmptyAndNameResolution(t *testing.T) {
 	}
 	if _, err = Compile(vtype, Config{Index: map[string]IndexKind{"Score": IndexDefault, "score_db": IndexDefault}}); err == nil || !strings.Contains(err.Error(), `indexed more than once`) {
 		t.Fatalf("duplicate option err=%v", err)
+	}
+}
+
+func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAnonymousTaggedIDRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile anonymous ID: %v", err)
+	}
+	if f := rt.Fields["SchemaTestAnonymousID"]; f == nil || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous ID index field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["SchemaTestAnonymousID"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("anonymous ID index accessor=(%+v,%v)", acc, ok)
+	}
+	if f := rt.Patch.Fields["SchemaTestAnonymousID"]; f == nil || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous ID patch field=%+v", f)
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedTimeRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile anonymous time: %v", err)
+	}
+	if f := rt.Fields["Time"]; f == nil || !IsNativeTimeField(f) || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous time index field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["Time"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("anonymous time index accessor=(%+v,%v)", acc, ok)
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedVIRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile anonymous ValueIndexer: %v", err)
+	}
+	if f := rt.Fields["SchemaTestAnonymousToken"]; f == nil || !f.UseVI || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous ValueIndexer index field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["SchemaTestAnonymousToken"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("anonymous ValueIndexer index accessor=(%+v,%v)", acc, ok)
+	}
+	if f := rt.Patch.Fields["Value"]; f == nil || !slices.Equal(f.Index, []int{0, 0}) || f.QueryName != "SchemaTestAnonymousToken" {
+		t.Fatalf("anonymous ValueIndexer child patch field=%+v", f)
+	}
+
+	if _, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedContainerRec](), Config{}); err == nil || !strings.Contains(err.Error(), "cannot index field SchemaTestAnonymousContainer") {
+		t.Fatalf("anonymous non-indexable container err=%v", err)
+	}
+}
+
+func TestCompileUntaggedAnonymousValueIndexerStructPromotesChildren(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile tags: %v", err)
+	}
+	if f := rt.Fields["email"]; f == nil || !f.Unique || !slices.Equal(f.Index, []int{0, 0}) {
+		t.Fatalf("embedded ValueIndexer child index field=%+v", f)
+	}
+	if f := rt.Patch.Fields["email"]; f == nil || !slices.Equal(f.Index, []int{0, 0}) {
+		t.Fatalf("embedded ValueIndexer child patch field=%+v", f)
+	}
+	if _, ok := rt.Patch.Fields["SchemaTestAnonymousVIEmbedded"]; ok {
+		t.Fatal("untagged embedded ValueIndexer parent was registered as patch field")
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec](), Config{Index: map[string]IndexKind{
+		"email": IndexDefault,
+	}})
+	if err != nil {
+		t.Fatalf("Compile options: %v", err)
+	}
+	if f := rt.Fields["email"]; f == nil || !slices.Equal(f.Index, []int{0, 0}) {
+		t.Fatalf("embedded ValueIndexer child option field=%+v", f)
+	}
+	if _, ok := rt.Patch.Fields["SchemaTestAnonymousVIEmbedded"]; ok {
+		t.Fatal("options mode registered untagged embedded ValueIndexer parent as patch field")
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec](), Config{Index: map[string]IndexKind{
+		"SchemaTestAnonymousVIEmbedded": IndexDefault,
+	}})
+	if err != nil {
+		t.Fatalf("Compile anonymous ValueIndexer option: %v", err)
+	}
+	if f := rt.Fields["SchemaTestAnonymousVIEmbedded"]; f == nil || !f.UseVI || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous ValueIndexer option field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["SchemaTestAnonymousVIEmbedded"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("anonymous ValueIndexer option accessor=(%+v,%v)", acc, ok)
+	}
+	if f := rt.Patch.Fields["SchemaTestAnonymousVIEmbedded"]; f == nil || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous ValueIndexer option patch field=%+v", f)
+	}
+	if f := rt.Patch.Fields["email"]; f == nil || !slices.Equal(f.Index, []int{0, 0}) || f.QueryName != "SchemaTestAnonymousVIEmbedded" {
+		t.Fatalf("anonymous ValueIndexer option child patch field=%+v", f)
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec](), Config{Index: map[string]IndexKind{
+		"SchemaTestAnonymousVIEmbedded": IndexUnique,
+	}})
+	if err != nil {
+		t.Fatalf("Compile anonymous ValueIndexer unique option: %v", err)
+	}
+	if !rt.PatchNameTouchesUnique("email") {
+		t.Fatal("anonymous ValueIndexer child patch field was not marked as touching parent unique index")
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec](), Config{Index: map[string]IndexKind{
+		"SchemaTestAnonymousVIEmbedded": IndexDefault,
+		"email":                         IndexUnique,
+	}})
+	if err != nil {
+		t.Fatalf("Compile overlapping anonymous ValueIndexer options: %v", err)
+	}
+	parentField := rt.Patch.Fields["SchemaTestAnonymousVIEmbedded"]
+	if parentField == nil || parentField.QueryName != "SchemaTestAnonymousVIEmbedded" || !slices.Contains(parentField.QueryNames, "email") || !parentField.Unique {
+		t.Fatalf("overlapping anonymous ValueIndexer parent patch field=%+v", parentField)
+	}
+	childField := rt.Patch.Fields["email"]
+	if childField == nil || childField.QueryName != "email" || !slices.Contains(childField.QueryNames, "SchemaTestAnonymousVIEmbedded") || !childField.Unique {
+		t.Fatalf("overlapping anonymous ValueIndexer child patch field=%+v", childField)
+	}
+}
+
+func TestCompileSkippedAnonymousSubtreeIgnoresNestedIndexTags(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestSkippedAnonymousTagRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile skipped subtree: %v", err)
+	}
+	if rt.HasQueryFields() {
+		t.Fatal("skipped embedded subtree produced query fields")
+	}
+	if _, ok := rt.Patch.Fields["SchemaTestAnonymousToken"]; ok {
+		t.Fatal("skipped subtree interpreted nested anonymous index tag as parent patch field")
+	}
+	if f := rt.Patch.Fields["Value"]; f == nil || !slices.Equal(f.Index, []int{0, 0, 0}) {
+		t.Fatalf("skipped subtree promoted child patch field=%+v", f)
+	}
+
+	if _, err = Compile(reflect.TypeFor[schemaTestSkippedInvalidAnonymousTagRec](), Config{}); err != nil {
+		t.Fatalf("Compile skipped subtree with invalid nested anonymous tag: %v", err)
+	}
+}
+
+func TestCompileRejectsPointerEmbeddedSubtreeIndexTags(t *testing.T) {
+	_, err := Compile(reflect.TypeFor[schemaTestPointerEmbeddedTaggedRec](), Config{})
+	if err == nil || !strings.Contains(err.Error(), "anonymous embedded pointer field SchemaTestPointerEmbeddedTagged cannot promote rbi tags") {
+		t.Fatalf("Compile pointer embedded tags err=%v", err)
+	}
+
+	rt, err := Compile(reflect.TypeFor[schemaTestRecursivePointerEmbeddedRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile recursive pointer embedded without tags: %v", err)
+	}
+	if rt.HasQueryFields() {
+		t.Fatal("recursive pointer embedded without tags produced query fields")
+	}
+
+	_, err = Compile(reflect.TypeFor[schemaTestRecursivePointerEmbeddedTaggedRec](), Config{})
+	if err == nil || !strings.Contains(err.Error(), "anonymous embedded pointer field SchemaTestRecursivePointerEmbeddedTagged cannot promote rbi tags") {
+		t.Fatalf("Compile recursive pointer embedded tags err=%v", err)
+	}
+}
+
+func TestCompileJSONHiddenAnonymousSubtreeOmitsPromotedJSONNames(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestJSONHiddenAnonymousRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile json hidden anonymous subtree: %v", err)
+	}
+	if f := rt.Patch.Fields["Value"]; f == nil || f.JSONName != "" {
+		t.Fatalf("hidden anonymous child patch field=%+v", f)
+	}
+	if f := rt.Patch.Fields["value"]; f != nil {
+		t.Fatalf("hidden anonymous child json alias was registered: %+v", f)
+	}
+}
+
+func TestCompileOptionsAnonymousFieldsHavePatchAccess(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAnonymousOptionIDRec](), Config{Index: map[string]IndexKind{
+		"SchemaTestAnonymousID": IndexDefault,
+	}})
+	if err != nil {
+		t.Fatalf("Compile anonymous option ID: %v", err)
+	}
+	if f := rt.Fields["SchemaTestAnonymousID"]; f == nil || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous option ID index field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["SchemaTestAnonymousID"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("anonymous option ID index accessor=(%+v,%v)", acc, ok)
+	}
+	if f := rt.Patch.Fields["SchemaTestAnonymousID"]; f == nil || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("anonymous option ID patch field=%+v", f)
+	}
+
+	var rec schemaTestAnonymousOptionIDRec
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "SchemaTestAnonymousID", Value: "patched"}}, false); err != nil {
+		t.Fatalf("Apply anonymous option ID: %v", err)
+	}
+	if rec.SchemaTestAnonymousID != "patched" {
+		t.Fatalf("anonymous option ID patch value=%q", rec.SchemaTestAnonymousID)
 	}
 }
 

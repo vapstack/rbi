@@ -245,33 +245,51 @@ func collectSnapshotBatchEntryDiffs(
 			if !ok {
 				continue
 			}
-			queryName := fieldDef.QueryName
-			if queryName == "" {
-				continue
-			}
-			indexAcc, hasIndex := s.IndexedByName[queryName]
-			measureAcc, hasMeasure := s.MeasuresByName[queryName]
-			if !hasIndex && !hasMeasure {
-				continue
-			}
-			duplicate := false
-			for j := 0; j < i; j++ {
-				prev, ok := patchFields[op.Patch[j].Name]
-				if ok && prev.QueryName == queryName {
-					duplicate = true
-					break
+			queryNameCount := 1 + len(fieldDef.QueryNames)
+			for queryNameOrdinal := 0; queryNameOrdinal < queryNameCount; queryNameOrdinal++ {
+				queryName := fieldDef.QueryName
+				if queryNameOrdinal != 0 {
+					queryName = fieldDef.QueryNames[queryNameOrdinal-1]
 				}
-			}
-			if duplicate {
-				continue
-			}
-			if hasIndex {
-				deltas.markTouched(indexAcc.Ordinal)
-				useZeroComplement := indexAcc.Ordinal < len(lenZeroComplement) && lenZeroComplement[indexAcc.Ordinal]
-				indexAcc.CollectBatchDiff(op.ID, op.Old, op.New, useZeroComplement, &deltas.fields[indexAcc.Ordinal])
-			}
-			if hasMeasure {
-				collectSnapshotMeasureDelta(measureAcc, op.ID, op.Old, op.New, measureDeltas)
+				if queryName == "" {
+					continue
+				}
+				indexAcc, hasIndex := s.IndexedByName[queryName]
+				measureAcc, hasMeasure := s.MeasuresByName[queryName]
+				if !hasIndex && !hasMeasure {
+					continue
+				}
+				duplicate := false
+				for j := 0; j < i; j++ {
+					prev, ok := patchFields[op.Patch[j].Name]
+					if !ok {
+						continue
+					}
+					if prev.QueryName == queryName {
+						duplicate = true
+						break
+					}
+					for n := range prev.QueryNames {
+						if prev.QueryNames[n] == queryName {
+							duplicate = true
+							break
+						}
+					}
+					if duplicate {
+						break
+					}
+				}
+				if duplicate {
+					continue
+				}
+				if hasIndex {
+					deltas.markTouched(indexAcc.Ordinal)
+					useZeroComplement := indexAcc.Ordinal < len(lenZeroComplement) && lenZeroComplement[indexAcc.Ordinal]
+					indexAcc.CollectBatchDiff(op.ID, op.Old, op.New, useZeroComplement, &deltas.fields[indexAcc.Ordinal])
+				}
+				if hasMeasure {
+					collectSnapshotMeasureDelta(measureAcc, op.ID, op.Old, op.New, measureDeltas)
+				}
 			}
 		}
 		return

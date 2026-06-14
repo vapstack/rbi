@@ -111,10 +111,13 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 		if acc.PatchOrdinal < 0 {
 			return true
 		}
-		patchAcc := patchAccess[acc.PatchOrdinal]
-		name := patchAcc.Field.DBName
+		ordinal := patchCoverOrdinal(patchAccess, acc.PatchOrdinal, useJSON)
+		if scratch.seen[ordinal] {
+			return true
+		}
+		patchAcc := patchAccess[ordinal]
+		name := patchFieldName(patchAcc.Field, useJSON)
 		if useJSON {
-			name = patchAcc.Field.JSONName
 			if name == "" {
 				patchErr = fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
 				return false
@@ -129,7 +132,7 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 		} else {
 			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
 		}
-		scratch.seen[acc.PatchOrdinal] = true
+		markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 		target = append(target, Field{
 			Name:  name,
 			Value: value,
@@ -160,9 +163,8 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 			}
 		}
 
-		name := patchAcc.Field.DBName
+		name := patchFieldName(patchAcc.Field, useJSON)
 		if useJSON {
-			name = patchAcc.Field.JSONName
 			if name == "" {
 				return target[:0], fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
 			}
@@ -182,9 +184,52 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 			Name:  name,
 			Value: newValue,
 		})
+		markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 	}
 
 	return target, nil
+}
+
+func patchFieldName(f *schema.Field, useJSON bool) string {
+	if useJSON {
+		return f.JSONName
+	}
+	return f.DBName
+}
+
+func patchCoverOrdinal(access []schema.PatchFieldAccessor, ordinal int, useJSON bool) int {
+	index := access[ordinal].Field.Index
+	if len(index) == 1 {
+		return ordinal
+	}
+
+	cover := ordinal
+	first := index[0]
+	for i := ordinal - 1; i >= 0; i-- {
+		parent := access[i].Field.Index
+		if parent[0] != first {
+			break
+		}
+		if len(parent) >= len(index) || !slices.Equal(index[:len(parent)], parent) {
+			continue
+		}
+		if patchFieldName(access[i].Field, useJSON) != "" {
+			cover = i
+		}
+	}
+	return cover
+}
+
+func markPatchSubtreeSeen(seen []bool, access []schema.PatchFieldAccessor, ordinal int) {
+	seen[ordinal] = true
+	parentIndex := access[ordinal].Field.Index
+	for ordinal++; ordinal < len(access); ordinal++ {
+		childIndex := access[ordinal].Field.Index
+		if len(childIndex) <= len(parentIndex) || !slices.Equal(childIndex[:len(parentIndex)], parentIndex) {
+			break
+		}
+		seen[ordinal] = true
+	}
 }
 
 func patchItemsForWrite(fields []Field) []schema.PatchItem {
