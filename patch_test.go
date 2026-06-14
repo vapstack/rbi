@@ -433,6 +433,13 @@ type patchInterfacePointerRec struct {
 	Values []any
 }
 
+type patchPointerShapeRec struct {
+	Name  string `db:"name" rbi:"index"`
+	Tags  *[]int
+	Next  **int
+	Value *any
+}
+
 func TestMakePatch_RoundTripPreservesInterfacePointerValues(t *testing.T) {
 	db := openTempDBUint64Reflect[patchInterfacePointerRec](t, "patch_interface_pointer.db")
 
@@ -462,6 +469,41 @@ func TestMakePatch_RoundTripPreservesInterfacePointerValues(t *testing.T) {
 	}
 	if got, ok := applied.Values[1].(*int); !ok || got != nil {
 		t.Fatalf("interface slice typed nil pointer round-trip failed: %#v", applied.Values)
+	}
+}
+
+func TestMakePatch_RoundTripPreservesPointerValueShape(t *testing.T) {
+	db := openTempDBUint64Reflect[patchPointerShapeRec](t, "patch_pointer_shape.db")
+
+	tags := []int{1, 2}
+	nextValue := 33
+	next := &nextValue
+	anyValue := any(44)
+	oldVal := &patchPointerShapeRec{Name: "alice"}
+	newVal := &patchPointerShapeRec{
+		Name:  "alice",
+		Tags:  &tags,
+		Next:  &next,
+		Value: &anyValue,
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+
+	if applied.Tags == nil || !slices.Equal(*applied.Tags, []int{1, 2}) {
+		t.Fatalf("pointer-to-slice round-trip failed: %#v", applied.Tags)
+	}
+	if applied.Next == nil || *applied.Next == nil || **applied.Next != 33 {
+		t.Fatalf("nested pointer round-trip failed: %#v", applied.Next)
+	}
+	if applied.Value == nil {
+		t.Fatal("pointer-to-interface round-trip produced nil pointer")
+	}
+	if got, ok := (*applied.Value).(int); !ok || got != 44 {
+		t.Fatalf("pointer-to-interface round-trip failed: %#v", *applied.Value)
 	}
 }
 

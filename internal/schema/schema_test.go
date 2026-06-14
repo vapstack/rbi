@@ -1137,6 +1137,9 @@ type schemaTestPatchApplyRec struct {
 	DBName   string `db:"db_name"`
 	JSONName string `json:"jsonName"`
 	Ptr      *int
+	PtrTags  *[]int16
+	PtrPtr   **int
+	PtrAny   *any
 	Tags     []int16
 	Named    schemaTestNamedStrings
 	Nested   schemaTestPatchNested
@@ -1251,6 +1254,10 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	vi := schemaTestVI("BB")
 	anyPtr := 77
 	var nilAnyPtr *int
+	ptrTags := []int16{3, 4}
+	ptrPtrValue := 88
+	ptrPtr := &ptrPtrValue
+	ptrAnyValue := any(99)
 	rec := schemaTestPatchApplyRec{}
 	err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{
 		{Name: "GoName", Value: "go"},
@@ -1258,6 +1265,9 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 		{Name: "jsonName", Value: "json"},
 		{Name: "embedded_db", Value: "embedded"},
 		{Name: "Ptr", Value: int64(42)},
+		{Name: "PtrTags", Value: &ptrTags},
+		{Name: "PtrPtr", Value: &ptrPtr},
+		{Name: "PtrAny", Value: &ptrAnyValue},
 		{Name: "Tags", Value: []int{1, 2}},
 		{Name: "Named", Value: []string{"n1", "n2"}},
 		{Name: "Nested", Value: schemaTestPatchNested{Values: []int{7, 8}}},
@@ -1279,6 +1289,18 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	}
 	if rec.Ptr == nil || *rec.Ptr != 42 {
 		t.Fatalf("pointer conversion failed: %+v", rec.Ptr)
+	}
+	if rec.PtrTags == nil || !slices.Equal(*rec.PtrTags, []int16{3, 4}) {
+		t.Fatalf("same-type pointer-to-slice assignment failed: %#v", rec.PtrTags)
+	}
+	if rec.PtrPtr == nil || *rec.PtrPtr == nil || **rec.PtrPtr != 88 {
+		t.Fatalf("same-type nested pointer assignment failed: %#v", rec.PtrPtr)
+	}
+	if rec.PtrAny == nil {
+		t.Fatal("same-type pointer-to-interface assignment produced nil pointer")
+	}
+	if got, ok := (*rec.PtrAny).(int); !ok || got != 99 {
+		t.Fatalf("same-type pointer-to-interface assignment failed: %#v", *rec.PtrAny)
 	}
 	if !slices.Equal(rec.Tags, []int16{1, 2}) {
 		t.Fatalf("slice numeric conversion failed: %#v", rec.Tags)

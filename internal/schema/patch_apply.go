@@ -95,9 +95,19 @@ func setReflectValue(fv reflect.Value, val any) error {
 	}
 
 	if fv.Kind() == reflect.Pointer {
-		if sv.Kind() == reflect.Pointer && sv.IsNil() {
-			fv.Set(reflect.Zero(fv.Type()))
-			return nil
+		if sv.Kind() == reflect.Pointer {
+			if sv.IsNil() {
+				fv.Set(reflect.Zero(fv.Type()))
+				return nil
+			}
+			if sv.Type().AssignableTo(fv.Type()) {
+				ptr := reflect.New(fv.Type().Elem())
+				if err := setReflectValue(ptr.Elem(), sv.Elem().Interface()); err != nil {
+					return err
+				}
+				fv.Set(ptr)
+				return nil
+			}
 		}
 		ptr := reflect.New(fv.Type().Elem())
 		if err := setReflectValue(ptr.Elem(), val); err != nil {
