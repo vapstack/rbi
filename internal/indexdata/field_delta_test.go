@@ -506,6 +506,216 @@ func TestFieldStorageApplyPostingDiffBufOwnedCopiesBorrowedDeltaKeyBytes(t *test
 	fieldStorageAssertPostingContains(t, next, "diff-buf/c", 3)
 }
 
+func TestFieldStorageApplyPostingDiffChunkedAllowChunkFalseKeepsBaseEntries(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 17
+	entries := make([]Entry, total)
+	for i := range entries {
+		entries[i] = Entry{
+			Key: keycodec.FromString(fmt.Sprintf("flat-diff/%04d", i)),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+	base := newRegularFieldStorage(entries)
+	if !base.IsChunked() {
+		base.Release()
+		t.Fatalf("expected chunked base")
+	}
+
+	next := base.applyPostingDiff([]PostingDelta{{
+		Key: keycodec.FromString("flat-diff/new"),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_001),
+		},
+	}}, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	defer next.Release()
+
+	if next.KeyCount() != total+1 {
+		t.Fatalf("key count got %d want %d", next.KeyCount(), total+1)
+	}
+	fieldStorageAssertPostingContains(t, next, "flat-diff/0000", 1)
+	fieldStorageAssertPostingContains(t, next, fmt.Sprintf("flat-diff/%04d", fieldIndexChunkTargetEntries), uint64(fieldIndexChunkTargetEntries+1))
+	fieldStorageAssertPostingContains(t, next, fmt.Sprintf("flat-diff/%04d", total-1), uint64(total))
+	fieldStorageAssertPostingContains(t, next, "flat-diff/new", 900_001)
+}
+
+func TestFieldStorageApplyPostingDiffBufOwnedChunkedAllowChunkFalseKeepsBaseEntries(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 17
+	entries := make([]Entry, total)
+	for i := range entries {
+		entries[i] = Entry{
+			Key: keycodec.FromU64(uint64(i * 2)),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+	base := newRegularFieldStorage(entries)
+	if !base.IsChunked() {
+		base.Release()
+		t.Fatalf("expected chunked base")
+	}
+
+	buf := GetPostingDeltaSlice(1)
+	buf = append(buf, PostingDelta{
+		Key: keycodec.FromU64(uint64(total*2 + 1)),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_001),
+		},
+	})
+	next := base.applyPostingDiffBufOwned(buf, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	defer next.Release()
+
+	if next.KeyCount() != total+1 {
+		t.Fatalf("key count got %d want %d", next.KeyCount(), total+1)
+	}
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(0), 1)
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(uint64(fieldIndexChunkTargetEntries*2)), uint64(fieldIndexChunkTargetEntries+1))
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(uint64((total-1)*2)), uint64(total))
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(uint64(total*2+1)), 900_001)
+}
+
+func fieldStorageMixedChunkedForDiffTest(t *testing.T) (FieldStorage, []byte) {
+	t.Helper()
+	numeric := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, true)
+	strings := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, false)
+	if keycodec.Compare(numeric.last, strings.chunk.keyAt(0)) >= 0 {
+		t.Fatalf("mixed test chunks are not sorted")
+	}
+	data := strings.chunk.stringData
+	root := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
+		newFieldIndexChunkDirPage([]fieldIndexChunkRef{numeric, strings}),
+	})
+	return newChunkedFieldStorage(root), data
+}
+
+func TestFieldStorageApplyPostingDiffChunkedAllowChunkFalseMixedCopiesStringKeys(t *testing.T) {
+	base, oldData := fieldStorageMixedChunkedForDiffTest(t)
+
+	next := base.applyPostingDiff([]PostingDelta{{
+		Key: keycodec.FromU64(1),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_001),
+		},
+	}}, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	poisonBytes(oldData)
+	defer next.Release()
+
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(1), 900_001)
+	fieldStorageAssertPostingContains(t, next, "k/0000", 1, 1_000_001)
+}
+
+func TestFieldStorageApplyPostingDiffBufOwnedChunkedAllowChunkFalseMixedCopiesStringKeys(t *testing.T) {
+	base, oldData := fieldStorageMixedChunkedForDiffTest(t)
+
+	buf := GetPostingDeltaSlice(1)
+	buf = append(buf, PostingDelta{
+		Key: keycodec.FromU64(1),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_001),
+		},
+	})
+	next := base.applyPostingDiffBufOwned(buf, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	poisonBytes(oldData)
+	defer next.Release()
+
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(1), 900_001)
+	fieldStorageAssertPostingContains(t, next, "k/0000", 1, 1_000_001)
+}
+
+func fieldStorageMixedFlatForDiffTest(t *testing.T) FieldStorage {
+	t.Helper()
+	base, oldData := fieldStorageMixedChunkedForDiffTest(t)
+	flat := base.applyPostingDiff([]PostingDelta{{
+		Key: keycodec.FromU64(1),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_001),
+		},
+	}}, false)
+	if flat.IsChunked() {
+		flat.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	if flat.flat == nil || flat.flat.stringData == nil {
+		flat.Release()
+		base.Release()
+		t.Fatalf("expected mixed flat storage with owned string data")
+	}
+	base.Release()
+	poisonBytes(oldData)
+	return flat
+}
+
+func TestFieldStorageApplyPostingDiffFlatMixedAllowChunkFalseCopiesStringKeys(t *testing.T) {
+	base := fieldStorageMixedFlatForDiffTest(t)
+
+	oldData := base.flat.stringData
+	next := base.applyPostingDiff([]PostingDelta{{
+		Key: keycodec.FromU64(3),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_003),
+		},
+	}}, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	poisonBytes(oldData)
+	defer next.Release()
+
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(3), 900_003)
+	fieldStorageAssertPostingContains(t, next, "k/0000", 1, 1_000_001)
+}
+
+func TestFieldStorageApplyPostingDiffBufOwnedFlatMixedAllowChunkFalseCopiesStringKeys(t *testing.T) {
+	base := fieldStorageMixedFlatForDiffTest(t)
+
+	buf := GetPostingDeltaSlice(1)
+	buf = append(buf, PostingDelta{
+		Key: keycodec.FromU64(3),
+		Delta: BatchPostingDelta{
+			Add: fieldStorageSingleton(900_003),
+		},
+	})
+	oldData := base.flat.stringData
+	next := base.applyPostingDiffBufOwned(buf, false)
+	if next.IsChunked() {
+		next.Release()
+		base.Release()
+		t.Fatalf("expected flat result")
+	}
+	base.Release()
+	poisonBytes(oldData)
+	defer next.Release()
+
+	fieldStorageAssertPostingContainsKey(t, next, keycodec.FromU64(3), 900_003)
+	fieldStorageAssertPostingContains(t, next, "k/0000", 1, 1_000_001)
+}
+
 func TestFieldStorageApplyPostingDiffChunkedToFlatCopiesStringKeys(t *testing.T) {
 	const total = fieldIndexChunkThreshold
 	entries := make([]Entry, total)

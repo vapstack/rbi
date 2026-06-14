@@ -576,6 +576,11 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				pooled.ReleaseUint64Slice(keyOwners)
 				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, n, err)
 			}
+			if ids.IsEmpty() {
+				releaseReadFieldChunkBuffers(posts, keys, nil, nil)
+				pooled.ReleaseUint64Slice(keyOwners)
+				return nil, fmt.Errorf("numeric chunk posting %d/%d is empty", i+1, n)
+			}
 
 			if posts != nil {
 				keys[i] = key
@@ -696,6 +701,11 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
 				pooled.ReleaseUint64Slice(owners)
 				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
+			}
+			if ids.IsEmpty() {
+				releaseReadFieldChunkBuffers(posts, nil, refs, data)
+				pooled.ReleaseUint64Slice(owners)
+				return nil, fmt.Errorf("string chunk posting %d/%d is empty", i+1, len(refs))
 			}
 
 			if posts != nil {

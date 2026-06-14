@@ -1200,13 +1200,27 @@ func (s FieldStorage) applyPostingDiff(deltaKeys []PostingDelta, allowChunk bool
 	}
 
 	if !allowChunk {
-		var flat []Entry
 		if s.flat != nil {
-			flat = s.flat.entries
+			hasStringDelta := false
+			if s.flat.stringData == nil {
+				hasStringDelta = postingDeltasHaveStringKey(deltaKeys)
+			}
+			updated, same := applyFieldPostingDiffSorted(s.flat.entries, deltaKeys)
+			if same {
+				return s
+			}
+			if s.flat.stringData != nil || hasStringDelta {
+				return newFlatFieldStorageFromDiffEntries(updated)
+			}
+			return newFlatFieldStorage(updated, nil)
 		}
-		updated, same := applyFieldPostingDiffSorted(flat, deltaKeys)
-		if same {
-			return s
+		if s.chunked != nil {
+			return s.chunked.applyPostingDiffFlat(deltaKeys)
+		}
+		hasStringDelta := postingDeltasHaveStringKey(deltaKeys)
+		updated, _ := applyFieldPostingDiffSorted(nil, deltaKeys)
+		if hasStringDelta {
+			return newFlatFieldStorageFromDiffEntries(updated)
 		}
 		return newFlatFieldStorage(updated, nil)
 	}
@@ -1243,13 +1257,27 @@ func (s FieldStorage) applyPostingDiffBufOwned(buf []PostingDelta, allowChunk bo
 	}
 
 	if !allowChunk {
-		var flat []Entry
 		if s.flat != nil {
-			flat = s.flat.entries
+			hasStringDelta := false
+			if s.flat.stringData == nil {
+				hasStringDelta = postingDeltasHaveStringKey(buf)
+			}
+			updated, same := applyFieldPostingDiffSortedBuf(s.flat.entries, buf)
+			if same {
+				return s
+			}
+			if s.flat.stringData != nil || hasStringDelta {
+				return newFlatFieldStorageFromDiffEntries(updated)
+			}
+			return newFlatFieldStorage(updated, nil)
 		}
-		updated, same := applyFieldPostingDiffSortedBuf(flat, buf)
-		if same {
-			return s
+		if s.chunked != nil {
+			return s.chunked.applyPostingDiffFlatBuf(buf)
+		}
+		hasStringDelta := postingDeltasHaveStringKey(buf)
+		updated, _ := applyFieldPostingDiffSortedBuf(nil, buf)
+		if hasStringDelta {
+			return newFlatFieldStorageFromDiffEntries(updated)
 		}
 		return newFlatFieldStorage(updated, nil)
 	}
@@ -1424,6 +1452,192 @@ func (b *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 					out.append(b, baseEnt.Key, ids)
 				}
 				base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
+				j++
+			}
+		}
+	}
+}
+
+func postingDeltasHaveStringKey(deltaKeys []PostingDelta) bool {
+	for i := range deltaKeys {
+		if !deltaKeys[i].Key.IsNumeric() {
+			return true
+		}
+	}
+	return false
+}
+
+func newFlatFieldStorageFromDiffEntries(entries []Entry) FieldStorage {
+	hasString := false
+	stringBytes := 0
+	for i := range entries {
+		if entries[i].Key.IsNumeric() {
+			continue
+		}
+		n := entries[i].Key.ByteLen()
+		if n > fieldIndexStringRefMax {
+			panic("field Entry string key len exceeds uint16")
+		}
+		hasString = true
+		stringBytes += n
+	}
+	if !hasString {
+		return newFlatFieldStorage(entries, nil)
+	}
+	var data []byte
+	if stringBytes > 0 {
+		data = fieldByteSlice(stringBytes)
+		off := 0
+		for i := range entries {
+			if entries[i].Key.IsNumeric() {
+				continue
+			}
+			s := entries[i].Key.UnsafeString()
+			n := copy(data[off:], s)
+			entries[i].Key = keycodec.FromBytes(data[off : off+n])
+			off += n
+		}
+	} else {
+		data = fieldByteSlice(1)[:0]
+	}
+	return newFlatFieldStorage(entries, data)
+}
+
+func (r *fieldIndexChunkedRoot) applyPostingDiffFlat(deltaKeys []PostingDelta) FieldStorage {
+	out := GetFieldEntrySlice(r.keyCount + len(deltaKeys))
+	singleDelta := len(deltaKeys) == 1
+	changed := !singleDelta
+	chunkIdx := 0
+	entryIdx := 0
+	j := 0
+
+	for {
+		baseEnt, hasBase := r.nextPostingDiffEntry(r.chunkCount, chunkIdx, entryIdx)
+
+		switch {
+		case !hasBase && j >= len(deltaKeys):
+			if !changed {
+				ReleaseFieldEntrySlice(out)
+				return newChunkedFieldStorage(r)
+			}
+			if len(out) == 0 {
+				ReleaseFieldEntrySlice(out)
+				return FieldStorage{}
+			}
+			return newFlatFieldStorageFromDiffEntries(out)
+
+		case !hasBase:
+			ids := deltaKeys[j].Delta.applyOwned(posting.List{})
+			if !ids.IsEmpty() {
+				out = append(out, Entry{Key: deltaKeys[j].Key, IDs: ids})
+				changed = true
+			}
+			j++
+
+		case j >= len(deltaKeys):
+			out = append(out, baseEnt)
+			r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
+
+		default:
+			delta := deltaKeys[j]
+			cmp := keycodec.Compare(baseEnt.Key, delta.Key)
+
+			switch {
+			case cmp < 0:
+				out = append(out, baseEnt)
+				r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
+
+			case cmp > 0:
+				ids := deltaKeys[j].Delta.applyOwned(posting.List{})
+				if !ids.IsEmpty() {
+					out = append(out, Entry{Key: deltaKeys[j].Key, IDs: ids})
+					changed = true
+				}
+				j++
+
+			default:
+				ids := deltaKeys[j].Delta.applyOwned(baseEnt.IDs)
+				if ids.IsEmpty() {
+					changed = true
+				} else if ids.SharesPayload(baseEnt.IDs) {
+					out = append(out, baseEnt)
+				} else {
+					out = append(out, Entry{Key: baseEnt.Key, IDs: ids})
+					changed = true
+				}
+				r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
+				j++
+			}
+		}
+	}
+}
+
+func (r *fieldIndexChunkedRoot) applyPostingDiffFlatBuf(deltaKeys []PostingDelta) FieldStorage {
+	out := GetFieldEntrySlice(r.keyCount + len(deltaKeys))
+	singleDelta := len(deltaKeys) == 1
+	changed := !singleDelta
+	chunkIdx := 0
+	entryIdx := 0
+	j := 0
+
+	for {
+		baseEnt, hasBase := r.nextPostingDiffEntry(r.chunkCount, chunkIdx, entryIdx)
+
+		switch {
+		case !hasBase && j >= len(deltaKeys):
+			if !changed {
+				ReleaseFieldEntrySlice(out)
+				return newChunkedFieldStorage(r)
+			}
+			if len(out) == 0 {
+				ReleaseFieldEntrySlice(out)
+				return FieldStorage{}
+			}
+			return newFlatFieldStorageFromDiffEntries(out)
+
+		case !hasBase:
+			delta := takePostingDeltaBuf(deltaKeys, j)
+			ids := delta.Delta.applyOwned(posting.List{})
+			if !ids.IsEmpty() {
+				out = append(out, Entry{Key: delta.Key, IDs: ids})
+				changed = true
+			}
+			j++
+
+		case j >= len(deltaKeys):
+			out = append(out, baseEnt)
+			r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
+
+		default:
+			delta := deltaKeys[j]
+			cmp := keycodec.Compare(baseEnt.Key, delta.Key)
+
+			switch {
+			case cmp < 0:
+				out = append(out, baseEnt)
+				r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
+
+			case cmp > 0:
+				delta = takePostingDeltaBuf(deltaKeys, j)
+				ids := delta.Delta.applyOwned(posting.List{})
+				if !ids.IsEmpty() {
+					out = append(out, Entry{Key: delta.Key, IDs: ids})
+					changed = true
+				}
+				j++
+
+			default:
+				delta = takePostingDeltaBuf(deltaKeys, j)
+				ids := delta.Delta.applyOwned(baseEnt.IDs)
+				if ids.IsEmpty() {
+					changed = true
+				} else if ids.SharesPayload(baseEnt.IDs) {
+					out = append(out, baseEnt)
+				} else {
+					out = append(out, Entry{Key: baseEnt.Key, IDs: ids})
+					changed = true
+				}
+				r.advancePostingDiffEntry(r.chunkCount, &chunkIdx, &entryIdx)
 				j++
 			}
 		}

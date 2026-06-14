@@ -582,6 +582,80 @@ func TestReadFieldStorageRejectsUnsortedChunkKeys(t *testing.T) {
 	}
 }
 
+func TestReadFieldStorageRejectsEmptyNumericChunkPosting(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write page count: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write ref count: %v", err)
+	}
+	if err := writer.WriteByte(fieldIndexChunkEncodingRaw8); err != nil {
+		t.Fatalf("write chunk tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write chunk count: %v", err)
+	}
+	if err := writeBEUint64(writer, 10); err != nil {
+		t.Fatalf("write numeric key: %v", err)
+	}
+	if err := (posting.List{}).WriteTo(writer); err != nil {
+		t.Fatalf("write empty posting: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if storage.KeyCount() != 0 {
+		storage.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "numeric chunk posting 1/1 is empty") {
+		t.Fatalf("ReadFieldStorage err=%v, want empty numeric chunk posting error", err)
+	}
+}
+
+func TestReadFieldStorageRejectsEmptyStringChunkPosting(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write page count: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write ref count: %v", err)
+	}
+	if err := writer.WriteByte(fieldIndexChunkEncodingString); err != nil {
+		t.Fatalf("write chunk tag: %v", err)
+	}
+	if err := writeUvarint(writer, 1); err != nil {
+		t.Fatalf("write chunk count: %v", err)
+	}
+	if err := writeString(writer, "empty-posting"); err != nil {
+		t.Fatalf("write string key: %v", err)
+	}
+	if err := (posting.List{}).WriteTo(writer); err != nil {
+		t.Fatalf("write empty posting: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if storage.KeyCount() != 0 {
+		storage.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "string chunk posting 1/1 is empty") {
+		t.Fatalf("ReadFieldStorage err=%v, want empty string chunk posting error", err)
+	}
+}
+
 func TestReadFieldStorageRejectsUnsortedChunkRefs(t *testing.T) {
 	var raw bytes.Buffer
 	writer := bufio.NewWriter(&raw)
