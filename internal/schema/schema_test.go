@@ -112,6 +112,15 @@ type schemaTestOptionRec struct {
 	Amount int64  `db:"amount"`
 }
 
+type SchemaTestOptionShadowedEmbedded struct {
+	ID string `db:"embedded_id"`
+}
+
+type schemaTestOptionShadowedRec struct {
+	SchemaTestOptionShadowedEmbedded
+	ID string
+}
+
 type schemaTestMeasureOnlyRec struct {
 	Amount int64 `db:"amount" rbi:"measure"`
 }
@@ -123,6 +132,24 @@ type SchemaTestShadowedUniqueEmbedded struct {
 type schemaTestShadowedPatchRec struct {
 	SchemaTestShadowedUniqueEmbedded
 	Code string `db:"outer_code" json:"outerCode"`
+}
+
+type SchemaTestShadowedJSONOnlyIndexedEmbedded struct {
+	ID string `json:"inner" rbi:"index"`
+}
+
+type schemaTestShadowedJSONOnlyIndexedRec struct {
+	SchemaTestShadowedJSONOnlyIndexedEmbedded
+	ID string
+}
+
+type SchemaTestShadowedJSONOnlyMeasureEmbedded struct {
+	Score int64 `json:"innerScore" rbi:"measure"`
+}
+
+type schemaTestShadowedJSONOnlyMeasureRec struct {
+	SchemaTestShadowedJSONOnlyMeasureEmbedded
+	Score int64
 }
 
 type schemaTestReservedDBTagRec struct {
@@ -204,6 +231,42 @@ func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
 	}
 	if rt.PatchNameTouchesUnique("outerCode") {
 		t.Fatal("outer non-indexed json alias was marked unique")
+	}
+}
+
+func TestPatchRuntimeKeepsQueryNameForShadowedJSONOnlyAliases(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestShadowedJSONOnlyIndexedRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile index: %v", err)
+	}
+	if got := rt.Patch.Fields["inner"].DBName; got != "" {
+		t.Fatalf("shadowed indexed JSON alias DBName=%q want hidden default name", got)
+	}
+	if got := rt.Patch.Fields["inner"].QueryName; got != "ID" {
+		t.Fatalf("shadowed indexed JSON alias QueryName=%q want %q", got, "ID")
+	}
+	if got := rt.Patch.Fields["ID"].DBName; got != "ID" {
+		t.Fatalf("shadowing non-indexed field DBName=%q want safe patch name", got)
+	}
+	if got := rt.Patch.Fields["ID"].QueryName; got != "" {
+		t.Fatalf("shadowing non-indexed field QueryName=%q want no query name", got)
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestShadowedJSONOnlyMeasureRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile measure: %v", err)
+	}
+	if got := rt.Patch.Fields["innerScore"].DBName; got != "" {
+		t.Fatalf("shadowed measure JSON alias DBName=%q want hidden default name", got)
+	}
+	if got := rt.Patch.Fields["innerScore"].QueryName; got != "Score" {
+		t.Fatalf("shadowed measure JSON alias QueryName=%q want %q", got, "Score")
+	}
+	if got := rt.Patch.Fields["Score"].DBName; got != "Score" {
+		t.Fatalf("shadowing non-measure field DBName=%q want safe patch name", got)
+	}
+	if got := rt.Patch.Fields["Score"].QueryName; got != "" {
+		t.Fatalf("shadowing non-measure field QueryName=%q want no query name", got)
 	}
 }
 
@@ -351,6 +414,17 @@ func TestCompileOptionsNilEmptyAndNameResolution(t *testing.T) {
 	}
 	if _, ok := rt.Fields["right_id"]; !ok {
 		t.Fatal("right db tag option did not resolve")
+	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestOptionShadowedRec](), Config{Index: map[string]IndexKind{"ID": IndexDefault}})
+	if err != nil {
+		t.Fatalf("Compile shadowed Go option: %v", err)
+	}
+	if f := rt.Fields["ID"]; f == nil || !slices.Equal(f.Index, []int{1}) {
+		t.Fatalf("shadowed Go option field=%+v want top-level ID", f)
+	}
+	if _, ok := rt.Fields["embedded_id"]; ok {
+		t.Fatal("shadowed promoted field was indexed by Go name option")
 	}
 
 	if _, err = Compile(vtype, Config{Index: map[string]IndexKind{"ID": IndexDefault}}); err == nil || !strings.Contains(err.Error(), `ambiguous Go field name "ID"`) {
@@ -677,7 +751,9 @@ type schemaTestMeasureRec struct {
 	Signed   int64    `db:"signed" rbi:"measure"`
 	Unsigned uint64   `db:"unsigned" rbi:"measure"`
 	Float    float64  `db:"float" rbi:"measure"`
+	Float32  float32  `db:"float32" rbi:"measure"`
 	Ptr      *uint64  `db:"ptr" rbi:"measure"`
+	FloatPtr *float64 `db:"float_ptr" rbi:"measure"`
 	Invalid  string   `db:"invalid"`
 	Indexed  []string `db:"indexed" rbi:"index"`
 }
@@ -687,7 +763,9 @@ func TestMeasureAccessorsReadAndDetectChanges(t *testing.T) {
 		"Signed":   IndexMeasure,
 		"Unsigned": IndexMeasure,
 		"Float":    IndexMeasure,
+		"Float32":  IndexMeasure,
 		"Ptr":      IndexMeasure,
+		"FloatPtr": IndexMeasure,
 	}})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -708,6 +786,9 @@ func TestMeasureAccessorsReadAndDetectChanges(t *testing.T) {
 	if got, ok := rt.MeasuresByName["float"].Read(oldPtr); !ok || got != math.Float64bits(1.25) {
 		t.Fatalf("float read=(%d,%v)", got, ok)
 	}
+	if got, ok := rt.MeasuresByName["float32"].Read(oldPtr); !ok || got != math.Float64bits(0) {
+		t.Fatalf("float32 read=(%d,%v)", got, ok)
+	}
 	if got, ok := rt.MeasuresByName["ptr"].Read(oldPtr); !ok || got != 9 {
 		t.Fatalf("ptr read=(%d,%v)", got, ok)
 	}
@@ -716,6 +797,21 @@ func TestMeasureAccessorsReadAndDetectChanges(t *testing.T) {
 	}
 	if !rt.MeasuresByName["ptr"].Modified(oldPtr, newPtrUnsafe) {
 		t.Fatal("ptr change was not detected")
+	}
+	negZero := math.Copysign(0, -1)
+	posZero := 0.0
+	oldZero := schemaTestMeasureRec{Float: negZero, Float32: float32(negZero), FloatPtr: &negZero}
+	newZero := schemaTestMeasureRec{Float: posZero, Float32: float32(posZero), FloatPtr: &posZero}
+	oldZeroPtr := unsafe.Pointer(&oldZero)
+	newZeroPtr := unsafe.Pointer(&newZero)
+	if !rt.MeasuresByName["float"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float -0/+0 encoded change was not detected")
+	}
+	if !rt.MeasuresByName["float32"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float32 -0/+0 encoded change was not detected")
+	}
+	if !rt.MeasuresByName["float_ptr"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float pointer -0/+0 encoded change was not detected")
 	}
 
 	if _, err = Compile(reflect.TypeFor[schemaTestMeasureRec](), Config{Index: map[string]IndexKind{"Invalid": IndexMeasure}}); err == nil || !strings.Contains(err.Error(), "measure field Invalid has unsupported type") {
@@ -751,8 +847,11 @@ type schemaTestPatchApplyRec struct {
 	Tags     []int16
 	Named    schemaTestNamedStrings
 	Nested   schemaTestPatchNested
+	Any      any
+	Anys     []any
 	I8       int8
 	U8       uint8
+	UPtr     uintptr
 	F32      float32
 	VI       schemaTestVI
 	VIPtr    *schemaTestVI
@@ -857,6 +956,8 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	}
 
 	vi := schemaTestVI("BB")
+	anyPtr := 77
+	var nilAnyPtr *int
 	rec := schemaTestPatchApplyRec{}
 	err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{
 		{Name: "GoName", Value: "go"},
@@ -867,8 +968,11 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 		{Name: "Tags", Value: []int{1, 2}},
 		{Name: "Named", Value: []string{"n1", "n2"}},
 		{Name: "Nested", Value: schemaTestPatchNested{Values: []int{7, 8}}},
+		{Name: "Any", Value: &anyPtr},
+		{Name: "Anys", Value: []any{&anyPtr, nilAnyPtr}},
 		{Name: "I8", Value: int64(12)},
 		{Name: "U8", Value: float64(13)},
+		{Name: "UPtr", Value: uint64(15)},
 		{Name: "F32", Value: uint64(14)},
 		{Name: "VI", Value: "aa"},
 		{Name: "VIPtr", Value: vi},
@@ -892,7 +996,19 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	if !slices.Equal(rec.Nested.Values, []int{7, 8}) {
 		t.Fatalf("nested field assignment failed: %#v", rec.Nested)
 	}
-	if rec.I8 != 12 || rec.U8 != 13 || rec.F32 != 14 {
+	if got, ok := rec.Any.(*int); !ok || got == nil || *got != 77 {
+		t.Fatalf("interface pointer assignment failed: %#v", rec.Any)
+	}
+	if len(rec.Anys) != 2 {
+		t.Fatalf("interface slice length=%d want 2", len(rec.Anys))
+	}
+	if got, ok := rec.Anys[0].(*int); !ok || got == nil || *got != 77 {
+		t.Fatalf("interface slice pointer assignment failed: %#v", rec.Anys)
+	}
+	if got, ok := rec.Anys[1].(*int); !ok || got != nil {
+		t.Fatalf("interface slice typed nil pointer assignment failed: %#v", rec.Anys)
+	}
+	if rec.I8 != 12 || rec.U8 != 13 || rec.UPtr != 15 || rec.F32 != 14 {
 		t.Fatalf("numeric conversion failed: %+v", rec)
 	}
 	if rec.VI != "aa" || rec.VIPtr == nil || *rec.VIPtr != "BB" {
@@ -936,6 +1052,19 @@ func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
 	}
 	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "I8", Value: int64(200)}}, false); err == nil || !strings.Contains(err.Error(), "overflows int field") {
 		t.Fatalf("int overflow error=%v", err)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "U8", Value: uintptr(300)}}, false); err == nil || !strings.Contains(err.Error(), "overflows uint field") {
+		t.Fatalf("uintptr source overflow error=%v", err)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "UPtr", Value: -1}}, false); err == nil || !strings.Contains(err.Error(), "negative int") {
+		t.Fatalf("negative uintptr error=%v", err)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "UPtr", Value: 1.5}}, false); err == nil || !strings.Contains(err.Error(), "cannot assign float") {
+		t.Fatalf("fractional uintptr error=%v", err)
+	}
+	uintptrOverflow := math.Ldexp(1, int(reflect.TypeFor[uintptr]().Bits()))
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "UPtr", Value: uintptrOverflow}}, false); err == nil || !strings.Contains(err.Error(), "overflows uint field") {
+		t.Fatalf("uintptr overflow error=%v", err)
 	}
 	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Tags", Value: []any{nil}}}, false); err == nil || !strings.Contains(err.Error(), "cannot set nil to non-pointer slice element") {
 		t.Fatalf("slice nil element error=%v", err)
@@ -985,6 +1114,20 @@ func TestRuntimeLookupHelpers(t *testing.T) {
 	}
 	if !reflect.TypeFor[schemaTestVI]().Implements(ValueIndexerType) {
 		t.Fatal("schemaTestVI must implement ValueIndexer")
+	}
+}
+
+func TestUnwrapQueryValuePreservesTypedNilValueIndexer(t *testing.T) {
+	var folded *schemaTestPtrFoldedString
+	v, isNil := UnwrapQueryValue(reflect.ValueOf(folded))
+	if isNil {
+		t.Fatal("typed nil ValueIndexer pointer was reported as nil")
+	}
+	if v.Kind() != reflect.Pointer || !v.IsNil() {
+		t.Fatalf("unwrapped value=%v kind=%v want nil pointer", v, v.Kind())
+	}
+	if got := v.Interface().(ValueIndexer).IndexingValue(); got != "<nil>" {
+		t.Fatalf("typed nil ValueIndexer key=%q want %q", got, "<nil>")
 	}
 }
 
@@ -1139,6 +1282,42 @@ func TestIndexStateMaterializedStorageSurvivesStateRelease(t *testing.T) {
 	}
 	if !schemaTestIndexViewContainsKey(lenStorage, 2, 1) {
 		t.Fatal("materialized len storage did not survive index state release")
+	}
+}
+
+func TestIndexStateReleaseDiscardsUnmaterializedPostingLists(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	rec := schemaTestAccessorRec{
+		Name:   "alice",
+		Scores: []int64{5, 7},
+	}
+	ptr := unsafe.Pointer(&rec)
+	states := GetIndexStates(len(rt.Indexed))
+
+	nameOrdinal := rt.IndexedByName["name"].Ordinal
+	scoresOrdinal := rt.IndexedByName["scores"].Ordinal
+	maybeOrdinal := rt.IndexedByName["maybe"].Ordinal
+	for id := uint64(1); id <= 8; id++ {
+		rt.IndexedByName["name"].CollectIndexValue(ptr, id, &states[nameOrdinal])
+		rt.IndexedByName["scores"].CollectIndexValue(ptr, id, &states[scoresOrdinal])
+		rt.IndexedByName["maybe"].CollectIndexValue(ptr, id, &states[maybeOrdinal])
+	}
+
+	ReleaseIndexStates(states)
+	states = GetIndexStates(len(rt.Indexed))
+	defer ReleaseIndexStates(states)
+
+	if states[nameOrdinal].Changed() || states[nameOrdinal].index != nil {
+		t.Fatalf("released string index state was not reset: %+v", states[nameOrdinal])
+	}
+	if states[scoresOrdinal].Changed() || states[scoresOrdinal].fixed != nil || states[scoresOrdinal].lengths != nil {
+		t.Fatalf("released fixed index state was not reset: %+v", states[scoresOrdinal])
+	}
+	if states[maybeOrdinal].Changed() || states[maybeOrdinal].nils != nil {
+		t.Fatalf("released nil index state was not reset: %+v", states[maybeOrdinal])
 	}
 }
 

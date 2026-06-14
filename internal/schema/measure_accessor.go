@@ -88,9 +88,9 @@ func buildMeasureAccessorFns(f *Field, fieldType reflect.Type, offset uintptr) (
 	case reflect.Uint64:
 		return MeasureValueUnsigned, measurePtrOrScalarUintFns[uint64](offset, f.Ptr), measureScalarModified[uint64](offset, f.Ptr), nil
 	case reflect.Float32:
-		return MeasureValueFloat, measurePtrOrScalarFloatFns[float32](offset, f.Ptr), measureScalarModified[float32](offset, f.Ptr), nil
+		return MeasureValueFloat, measurePtrOrScalarFloatFns[float32](offset, f.Ptr), measureFloatModified[float32](offset, f.Ptr), nil
 	case reflect.Float64:
-		return MeasureValueFloat, measurePtrOrScalarFloatFns[float64](offset, f.Ptr), measureScalarModified[float64](offset, f.Ptr), nil
+		return MeasureValueFloat, measurePtrOrScalarFloatFns[float64](offset, f.Ptr), measureFloatModified[float64](offset, f.Ptr), nil
 	default:
 		return 0, nil, nil, fmt.Errorf("unsupported measure field kind %v for %v", f.Kind, fieldType)
 	}
@@ -109,6 +109,24 @@ func measureScalarModified[T comparable](offset uintptr, ptr bool) FieldModified
 	}
 	return func(v1, v2 unsafe.Pointer) bool {
 		return scalarFieldValue[T](v1, offset) != scalarFieldValue[T](v2, offset)
+	}
+}
+
+func measureFloatModified[T floatFieldValue](offset uintptr, ptr bool) FieldModifiedFn {
+	if ptr {
+		return func(v1, v2 unsafe.Pointer) bool {
+			p1 := ptrFieldValue[T](v1, offset)
+			p2 := ptrFieldValue[T](v2, offset)
+			if p1 == nil || p2 == nil {
+				return p1 != p2
+			}
+			return math.Float64bits(float64(*p1)) != math.Float64bits(float64(*p2))
+		}
+	}
+	return func(v1, v2 unsafe.Pointer) bool {
+		f1 := scalarFieldValue[T](v1, offset)
+		f2 := scalarFieldValue[T](v2, offset)
+		return math.Float64bits(float64(f1)) != math.Float64bits(float64(f2))
 	}
 }
 

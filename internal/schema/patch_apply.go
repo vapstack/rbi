@@ -49,6 +49,18 @@ func setReflectValue(fv reflect.Value, val any) error {
 		return nil
 	}
 
+	if fv.Kind() == reflect.Interface {
+		if sv.Type().AssignableTo(fv.Type()) {
+			fv.Set(sv)
+			return nil
+		}
+		if sv.Type().ConvertibleTo(fv.Type()) {
+			fv.Set(sv.Convert(fv.Type()))
+			return nil
+		}
+		return fmt.Errorf("type mismatch: cannot convert %v to %v", sv.Type(), fv.Type())
+	}
+
 	if fv.Kind() == reflect.Slice {
 		if sv.Kind() != reflect.Slice {
 			return fmt.Errorf("source is not a slice, but destination is")
@@ -233,7 +245,7 @@ func isReflectIntKind(kind reflect.Kind) bool {
 }
 
 func isReflectUintKind(kind reflect.Kind) bool {
-	return kind >= reflect.Uint && kind <= reflect.Uint64
+	return kind >= reflect.Uint && kind <= reflect.Uint64 || kind == reflect.Uintptr
 }
 
 func isReflectFloatKind(kind reflect.Kind) bool {

@@ -1108,10 +1108,7 @@ func (qv *View) orderDataValues(v any, fm *schema.Field) ([]keycodec.IndexLookup
 		return nil, nil
 	}
 
-	collection := queryValueIsCollectionForField(rv, fm)
-	if !collection && rv.Kind() == reflect.Slice {
-		collection = !rv.Type().Implements(schema.ValueIndexerType)
-	}
+	collection := queryValueIsCollectionForField(v, rv, fm)
 
 	if collection {
 		valsBuf, _, err := sliceValueToLookupKeyBuf(rv, fm)

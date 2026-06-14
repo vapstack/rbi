@@ -24,6 +24,15 @@ type snapshotBatchStorageRec struct {
 	Opt  *string  `rbi:"index"`
 }
 
+type SnapshotBatchShadowedIndexedEmbedded struct {
+	ID string `json:"inner" rbi:"index"`
+}
+
+type snapshotBatchShadowedIndexedRec struct {
+	SnapshotBatchShadowedIndexedEmbedded
+	ID string
+}
+
 func snapshotBatchStorageRuntime(t *testing.T) *schema.Schema {
 	t.Helper()
 	rt, err := schema.Compile(reflect.TypeOf(snapshotBatchStorageRec{}), schema.Config{})
@@ -381,6 +390,50 @@ func TestBuildPreparedDoesNotMutateCallerEntries(t *testing.T) {
 	}
 	if !snapshotBatchFieldContains(next, "Name", "bobby", 1) {
 		t.Fatal("repeated-id snapshot is missing updated scalar posting")
+	}
+}
+
+func TestBuildPreparedPatchOnlyShadowedJSONAliasUpdatesIndex(t *testing.T) {
+	rt, err := schema.Compile(reflect.TypeOf(snapshotBatchShadowedIndexedRec{}), schema.Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	oldRec := snapshotBatchShadowedIndexedRec{
+		SnapshotBatchShadowedIndexedEmbedded: SnapshotBatchShadowedIndexedEmbedded{ID: "old"},
+		ID:                                   "outer",
+	}
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRec)},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	if !snapshotBatchFieldContains(prev, "ID", "old", 1) {
+		t.Fatal("previous snapshot is missing initial embedded ID posting")
+	}
+
+	newRec := snapshotBatchShadowedIndexedRec{
+		SnapshotBatchShadowedIndexedEmbedded: SnapshotBatchShadowedIndexedEmbedded{ID: "new"},
+		ID:                                   "outer",
+	}
+	next := Build(2, prev, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{
+			ID:        1,
+			Old:       unsafe.Pointer(&oldRec),
+			New:       unsafe.Pointer(&newRec),
+			Patch:     []schema.PatchItem{{Name: "inner", Value: "new"}},
+			PatchOnly: true,
+		},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if snapshotBatchFieldContains(next, "ID", "old", 1) {
+		t.Fatal("patch-only JSON alias update kept stale embedded ID posting")
+	}
+	if !snapshotBatchFieldContains(next, "ID", "new", 1) {
+		t.Fatal("patch-only JSON alias update is missing new embedded ID posting")
 	}
 }
 

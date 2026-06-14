@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vmihailenco/msgpack/v5"
@@ -128,6 +129,44 @@ func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	gotTags2, _ := got["tags"].([]string)
 	if len(gotTags2) != 2 || gotTags2[0] != "x" || gotTags2[1] != "y" {
 		t.Fatalf("expected deep-copied tags [x y], got %#v", gotTags2)
+	}
+}
+
+type patchInterfacePointerRec struct {
+	Name   string `db:"name" rbi:"index"`
+	Value  any
+	Values []any
+}
+
+func TestMakePatch_RoundTripPreservesInterfacePointerValues(t *testing.T) {
+	db := openTempDBUint64Reflect[patchInterfacePointerRec](t, "patch_interface_pointer.db")
+
+	ptr := 11
+	var nilPtr *int
+	oldVal := &patchInterfacePointerRec{Name: "alice"}
+	newVal := &patchInterfacePointerRec{
+		Name:   "alice",
+		Value:  &ptr,
+		Values: []any{&ptr, nilPtr},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+
+	if got, ok := applied.Value.(*int); !ok || got == nil || *got != 11 {
+		t.Fatalf("interface pointer round-trip failed: %#v", applied.Value)
+	}
+	if len(applied.Values) != 2 {
+		t.Fatalf("interface slice length=%d want 2", len(applied.Values))
+	}
+	if got, ok := applied.Values[0].(*int); !ok || got == nil || *got != 11 {
+		t.Fatalf("interface slice pointer round-trip failed: %#v", applied.Values)
+	}
+	if got, ok := applied.Values[1].(*int); !ok || got != nil {
+		t.Fatalf("interface slice typed nil pointer round-trip failed: %#v", applied.Values)
 	}
 }
 
@@ -340,6 +379,24 @@ type patchUnaliasedPromotedRec struct {
 	PatchUnaliasedPromotedRightRec
 }
 
+type PatchShadowedIndexedJSONOnlyEmbeddedRec struct {
+	ID string `json:"inner" rbi:"index"`
+}
+
+type patchShadowedIndexedJSONOnlyRec struct {
+	PatchShadowedIndexedJSONOnlyEmbeddedRec
+	ID string
+}
+
+type PatchShadowedMeasureJSONOnlyEmbeddedRec struct {
+	Score int64 `json:"innerScore" rbi:"measure"`
+}
+
+type patchShadowedMeasureJSONOnlyRec struct {
+	PatchShadowedMeasureJSONOnlyEmbeddedRec
+	Score int64
+}
+
 func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
 	db := openTempDBUint64Reflect[patchUnaliasedPromotedRec](t, "patch_unaliased_promoted_names.db")
 
@@ -366,6 +423,58 @@ func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
 	}
 	if len(patch) != 0 {
 		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+func TestMakePatch_RejectsShadowedIndexedDefaultNameAndUsesJSONAlias(t *testing.T) {
+	db := openTempDBUint64Reflect[patchShadowedIndexedJSONOnlyRec](t, "patch_shadowed_indexed_json_only.db")
+
+	oldVal := &patchShadowedIndexedJSONOnlyRec{
+		PatchShadowedIndexedJSONOnlyEmbeddedRec: PatchShadowedIndexedJSONOnlyEmbeddedRec{ID: "old"},
+		ID:                                      "outer",
+	}
+	newVal := &patchShadowedIndexedJSONOnlyRec{
+		PatchShadowedIndexedJSONOnlyEmbeddedRec: PatchShadowedIndexedJSONOnlyEmbeddedRec{ID: "new"},
+		ID:                                      "outer",
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
+		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
+	}
+
+	patch = mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 1 || patch[0].Name != "inner" || patch[0].Value != "new" {
+		t.Fatalf("PatchJSON patch=%#v want inner=new", patch)
+	}
+}
+
+func TestMakePatch_RejectsShadowedMeasureDefaultNameAndUsesJSONAlias(t *testing.T) {
+	db := openTempDBUint64Reflect[patchShadowedMeasureJSONOnlyRec](t, "patch_shadowed_measure_json_only.db")
+
+	oldVal := &patchShadowedMeasureJSONOnlyRec{
+		PatchShadowedMeasureJSONOnlyEmbeddedRec: PatchShadowedMeasureJSONOnlyEmbeddedRec{Score: 10},
+		Score:                                   100,
+	}
+	newVal := &patchShadowedMeasureJSONOnlyRec{
+		PatchShadowedMeasureJSONOnlyEmbeddedRec: PatchShadowedMeasureJSONOnlyEmbeddedRec{Score: 20},
+		Score:                                   100,
+	}
+
+	patch, err := db.MakePatch(oldVal, newVal)
+	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
+		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
+	}
+	if len(patch) != 0 {
+		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
+	}
+
+	patch = mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 1 || patch[0].Name != "innerScore" || patch[0].Value != int64(20) {
+		t.Fatalf("PatchJSON patch=%#v want innerScore=20", patch)
 	}
 }
 

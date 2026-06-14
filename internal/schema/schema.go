@@ -23,6 +23,7 @@ type Field struct {
 	UseVI      bool
 	KeyKind    FieldKeyKind
 	DBName     string
+	QueryName  string
 	DBTagged   bool
 	JSONName   string
 	JSONTagged bool
@@ -107,8 +108,18 @@ func QueryValueToUnixSeconds(v reflect.Value) (int64, bool) {
 func UnwrapQueryValue(v reflect.Value) (reflect.Value, bool) {
 	for {
 		switch v.Kind() {
-		case reflect.Interface, reflect.Pointer:
+		case reflect.Interface:
 			if v.IsNil() {
+				return v, true
+			}
+			v = v.Elem()
+			continue
+
+		case reflect.Pointer:
+			if v.IsNil() {
+				if v.Type().Implements(viType) {
+					return v, false
+				}
 				return v, true
 			}
 			v = v.Elem()
@@ -241,7 +252,9 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		for ordinal := range patch.Access {
 			if slices.Equal(patch.Access[ordinal].Field.Index, access[i].Field.Index) {
 				access[i].PatchOrdinal = ordinal
-				patch.Access[ordinal].Field.Unique = access[i].Field.Unique
+				f := patch.Access[ordinal].Field
+				f.QueryName = access[i].Field.DBName
+				f.Unique = access[i].Field.Unique
 				break
 			}
 		}
@@ -263,6 +276,14 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 	measureAccess, measureMap, err := makeMeasureFieldAccessors(vtype, collector.measureFields)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
+	}
+	for i := range measureAccess {
+		for ordinal := range patch.Access {
+			if slices.Equal(patch.Access[ordinal].Field.Index, measureAccess[i].Field.Index) {
+				patch.Access[ordinal].Field.QueryName = measureAccess[i].Field.DBName
+				break
+			}
+		}
 	}
 
 	return &Schema{
@@ -361,6 +382,7 @@ type optionIndexField struct {
 	structField reflect.StructField
 	index       []int
 	dbName      string
+	depth       int
 }
 
 func (collector *fieldCollector) populateFieldsFromOptions(t reflect.Type) error {
@@ -434,11 +456,12 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 			structField: sf,
 			index:       slices.Clone(nextIdx),
 			dbName:      dbName,
+			depth:       len(nextIdx),
 		}
-		if existing, ok := byGo[sf.Name]; ok && !slices.Equal(existing.index, nextIdx) {
-			byGo[sf.Name] = optionIndexField{}
-		} else {
+		if existing, ok := byGo[sf.Name]; !ok || slices.Equal(existing.index, nextIdx) || existing.depth > info.depth {
 			byGo[sf.Name] = info
+		} else if existing.depth == info.depth {
+			byGo[sf.Name] = optionIndexField{depth: info.depth}
 		}
 		if hasDBName {
 			if existing, ok := byDB[dbName]; ok && !slices.Equal(existing.index, nextIdx) {

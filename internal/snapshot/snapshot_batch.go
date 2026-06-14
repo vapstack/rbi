@@ -245,15 +245,19 @@ func collectSnapshotBatchEntryDiffs(
 			if !ok {
 				continue
 			}
-			indexAcc, hasIndex := s.IndexedByName[fieldDef.DBName]
-			measureAcc, hasMeasure := s.MeasuresByName[fieldDef.DBName]
+			queryName := fieldDef.QueryName
+			if queryName == "" {
+				continue
+			}
+			indexAcc, hasIndex := s.IndexedByName[queryName]
+			measureAcc, hasMeasure := s.MeasuresByName[queryName]
 			if !hasIndex && !hasMeasure {
 				continue
 			}
 			duplicate := false
 			for j := 0; j < i; j++ {
 				prev, ok := patchFields[op.Patch[j].Name]
-				if ok && prev.DBName == fieldDef.DBName {
+				if ok && prev.QueryName == queryName {
 					duplicate = true
 					break
 				}

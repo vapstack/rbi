@@ -154,10 +154,12 @@ func (state *IndexState) MaterializeLenStorage(universe posting.List) (indexdata
 
 func (state *IndexState) Reset() {
 	if state.index != nil {
+		posting.ReleaseMapString(state.index)
 		indexdata.ReleasePostingMap(state.index)
 		state.index = nil
 	}
 	if state.fixed != nil {
+		posting.ReleaseMapU64(state.fixed)
 		indexdata.ReleaseFixedPostingMap(state.fixed)
 		state.fixed = nil
 	}
@@ -167,6 +169,7 @@ func (state *IndexState) Reset() {
 		state.lengths = nil
 	}
 	if state.nils != nil {
+		posting.ReleaseMapString(state.nils)
 		indexdata.ReleasePostingMap(state.nils)
 		state.nils = nil
 	}

@@ -552,12 +552,19 @@ func (qv *View) evalSliceEQ(field string, fieldOrdinal int, vals []keycodec.Inde
 	return postingResult{ids: acc}, nil
 }
 
-func queryValueIsCollectionForField(v reflect.Value, fm *schema.Field) bool {
+func queryValueIsCollectionForField(raw any, v reflect.Value, fm *schema.Field) bool {
 	if v.Kind() != reflect.Slice {
 		return false
 	}
 	if fm != nil && fm.UseVI && !fm.Slice {
-		return false
+		if _, ok := raw.(schema.ValueIndexer); ok {
+			return false
+		}
+		if v.CanInterface() {
+			if _, ok := v.Interface().(schema.ValueIndexer); ok {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -1082,7 +1089,7 @@ func (qv *View) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScala
 	if isNil {
 		return normalizedScalarBound{empty: true}, false, nil
 	}
-	if queryValueIsCollectionForField(v, fm) {
+	if queryValueIsCollectionForField(expr.Value, v, fm) {
 		return normalizedScalarBound{}, true, nil
 	}
 	if bound, ok := qv.loadNormalizedScalarBound(expr, v); ok {
@@ -1340,7 +1347,7 @@ func (qv *View) exprValueToLookupKey(expr qir.Expr) (keycodec.IndexLookupKey, bo
 	if isNil {
 		return keycodec.IndexLookupKey{}, false, true, nil
 	}
-	if queryValueIsCollectionForField(v, fm) {
+	if queryValueIsCollectionForField(expr.Value, v, fm) {
 		return keycodec.IndexLookupKey{}, true, false, nil
 	}
 
@@ -1405,7 +1412,7 @@ func (qv *View) exprValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keycodec.Index
 		return nil, false, true, nil
 	}
 
-	if queryValueIsCollectionForField(v, fm) {
+	if queryValueIsCollectionForField(expr.Value, v, fm) {
 		valsBuf, hasNil, err := sliceValueToLookupKeyBuf(v, fm)
 		if err != nil {
 			return nil, true, false, err
