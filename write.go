@@ -316,6 +316,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	key := keycodec.DataKeyFromUserKey(id, db.strKey)
 	if len(cfg.beforeProcess) != 0 {
 		for _, fn := range cfg.beforeProcess {
@@ -373,6 +376,9 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	var keyScratch []keycodec.DataKey
 	if len(cfg.beforeProcess) != 0 {
 		keyScratch = keycodec.GetDataKeySlice(len(ids))

@@ -1418,6 +1418,58 @@ func TestReflectExt_MakePatch_PreservesNamedSliceType(t *testing.T) {
 	}
 }
 
+func TestReflectExt_MakePatch_DeepCopyAliasedSliceFieldsByHeader(t *testing.T) {
+	type shortTags []string
+	type longTags []string
+	type payload struct {
+		Short shortTags
+		Long  longTags
+	}
+	type rec struct {
+		Name    string `db:"name" rbi:"index"`
+		Payload payload
+	}
+
+	db := openTempDBUint64Reflect[rec](t, "reflect_patch_aliased_slice_headers.db")
+
+	tags := []string{"go", "db", "rbi"}
+	oldVal := &rec{Name: "alice"}
+	newVal := &rec{
+		Name: "alice",
+		Payload: payload{
+			Short: shortTags(tags[:2]),
+			Long:  longTags(tags[:3]),
+		},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+
+	gotPayload, ok := fields["Payload"].(payload)
+	if !ok {
+		t.Fatalf("patch must contain payload value for Payload, got %#v", fields["Payload"])
+	}
+	if !reflect.DeepEqual(gotPayload.Short, shortTags{"go", "db"}) {
+		t.Fatalf("patch lost short slice contents: %#v", gotPayload.Short)
+	}
+	if !reflect.DeepEqual(gotPayload.Long, longTags{"go", "db", "rbi"}) {
+		t.Fatalf("patch lost long slice contents: %#v", gotPayload.Long)
+	}
+
+	tags[0] = "mutated"
+	if !reflect.DeepEqual(gotPayload.Short, shortTags{"go", "db"}) || !reflect.DeepEqual(gotPayload.Long, longTags{"go", "db", "rbi"}) {
+		t.Fatalf("patch aliased source slices: %#v", gotPayload)
+	}
+
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	if !reflect.DeepEqual(applied.Payload.Short, shortTags{"go", "db"}) {
+		t.Fatalf("patched record lost short slice contents: %#v", applied.Payload.Short)
+	}
+	if !reflect.DeepEqual(applied.Payload.Long, longTags{"go", "db", "rbi"}) {
+		t.Fatalf("patched record lost long slice contents: %#v", applied.Payload.Long)
+	}
+}
+
 func TestReflectExt_MakePatch_UsesFullFieldEqualityForValueIndexer(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectMapVIRec](t, "reflect_patch_value_indexer_full_equality.db")
 

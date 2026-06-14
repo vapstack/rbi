@@ -90,6 +90,47 @@ func TestBeforeProcess_Set_MutatesCallerOwnedValue(t *testing.T) {
 	}
 }
 
+func TestBeforeProcess_ClosedDBDoesNotRunSetOrBatchSetHooks(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	setInput := &Rec{Name: "alice", Age: 10}
+	setCalls := 0
+	err := db.Set(1, setInput, BeforeProcess(func(_ uint64, value *Rec) error {
+		setCalls++
+		value.Name = "mutated"
+		return errors.New("set before process")
+	}))
+	if !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("Set after Close error = %v, want rbierrors.ErrClosed", err)
+	}
+	if setCalls != 0 {
+		t.Fatalf("Set BeforeProcess calls = %d, want 0", setCalls)
+	}
+	if setInput.Name != "alice" || setInput.Age != 10 {
+		t.Fatalf("Set mutated caller-owned input after Close: %#v", setInput)
+	}
+
+	batchInputs := []*Rec{{Name: "bob", Age: 20}, {Name: "carol", Age: 30}}
+	batchCalls := 0
+	err = db.BatchSet([]uint64{2, 3}, batchInputs, BeforeProcess(func(_ uint64, value *Rec) error {
+		batchCalls++
+		value.Name = "mutated"
+		return errors.New("batch before process")
+	}))
+	if !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("BatchSet after Close error = %v, want rbierrors.ErrClosed", err)
+	}
+	if batchCalls != 0 {
+		t.Fatalf("BatchSet BeforeProcess calls = %d, want 0", batchCalls)
+	}
+	if batchInputs[0].Name != "bob" || batchInputs[0].Age != 20 || batchInputs[1].Name != "carol" || batchInputs[1].Age != 30 {
+		t.Fatalf("BatchSet mutated caller-owned inputs after Close: %#v", batchInputs)
+	}
+}
+
 func TestBeforeProcess_Patch_MutatesFinalStoredValue(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -912,8 +953,36 @@ func TestPublishAfterCommitFailureBreaksDB(t *testing.T) {
 		t.Fatalf("unexpected committed value after publish failure: %#v", got)
 	}
 
-	if err = db.Set(2, &Rec{Name: "bob", Age: 20}); !errors.Is(err, rbierrors.ErrBroken) {
+	rejected := &Rec{Name: "bob", Age: 20}
+	setCalls := 0
+	if err = db.Set(2, rejected, BeforeProcess(func(_ uint64, value *Rec) error {
+		setCalls++
+		value.Name = "mutated"
+		return errors.New("set before process")
+	})); !errors.Is(err, rbierrors.ErrBroken) {
 		t.Fatalf("expected DB to reject subsequent writes with rbierrors.ErrBroken, got: %v", err)
+	}
+	if setCalls != 0 {
+		t.Fatalf("Set BeforeProcess calls after broken DB = %d, want 0", setCalls)
+	}
+	if rejected.Name != "bob" || rejected.Age != 20 {
+		t.Fatalf("Set mutated caller-owned input after broken DB: %#v", rejected)
+	}
+
+	batchRejected := []*Rec{{Name: "carol", Age: 30}, {Name: "dave", Age: 40}}
+	batchCalls := 0
+	if err = db.BatchSet([]uint64{3, 4}, batchRejected, BeforeProcess(func(_ uint64, value *Rec) error {
+		batchCalls++
+		value.Name = "mutated"
+		return errors.New("batch before process")
+	})); !errors.Is(err, rbierrors.ErrBroken) {
+		t.Fatalf("expected DB to reject subsequent batch writes with rbierrors.ErrBroken, got: %v", err)
+	}
+	if batchCalls != 0 {
+		t.Fatalf("BatchSet BeforeProcess calls after broken DB = %d, want 0", batchCalls)
+	}
+	if batchRejected[0].Name != "carol" || batchRejected[0].Age != 30 || batchRejected[1].Name != "dave" || batchRejected[1].Age != 40 {
+		t.Fatalf("BatchSet mutated caller-owned inputs after broken DB: %#v", batchRejected)
 	}
 	if _, err := db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, rbierrors.ErrBroken) {
 		t.Fatalf("expected Query to fail with rbierrors.ErrBroken after publish failure, got: %v", err)
