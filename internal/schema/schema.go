@@ -73,7 +73,6 @@ var (
 	viType           = reflect.TypeFor[ValueIndexer]()
 	ValueIndexerType = viType
 	nativeTimeType   = reflect.TypeFor[time.Time]()
-	nativeTimePtr    = reflect.TypeFor[*time.Time]()
 )
 
 func isNativeTimeScalarType(t reflect.Type) bool {
@@ -81,7 +80,7 @@ func isNativeTimeScalarType(t reflect.Type) bool {
 }
 
 func isNativeTimePointerType(t reflect.Type) bool {
-	return t == nativeTimePtr
+	return t.Kind() == reflect.Pointer && isNativeTimeScalarType(t.Elem())
 }
 
 func isEmbeddedContainerType(t reflect.Type) bool {
@@ -712,7 +711,6 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 				reflect.Uint16,
 				reflect.Uint32,
 				reflect.Uint64,
-				reflect.Uintptr,
 				reflect.Float32,
 				reflect.Float64,
 				reflect.String:

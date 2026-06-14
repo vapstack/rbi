@@ -135,6 +135,16 @@ type schemaTestAnonymousTaggedTimeRec struct {
 	time.Time `rbi:"index"`
 }
 
+type schemaTestNamedTime time.Time
+
+type schemaTestNamedTimePtrRec struct {
+	When *schemaTestNamedTime `db:"when" rbi:"index"`
+}
+
+type schemaTestUintptrSliceIndexRec struct {
+	Values []uintptr `db:"values" rbi:"index"`
+}
+
 type SchemaTestAnonymousToken struct {
 	Value string
 }
@@ -562,6 +572,17 @@ func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
 		t.Fatalf("anonymous time index accessor=(%+v,%v)", acc, ok)
 	}
 
+	rt, err = Compile(reflect.TypeFor[schemaTestNamedTimePtrRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile named time pointer: %v", err)
+	}
+	if f := rt.Fields["when"]; f == nil || !IsNativeTimeField(f) || !f.Ptr || !slices.Equal(f.Index, []int{0}) {
+		t.Fatalf("named time pointer index field=%+v", f)
+	}
+	if acc, ok := rt.IndexedByName["when"]; !ok || acc.PatchOrdinal < 0 {
+		t.Fatalf("named time pointer index accessor=(%+v,%v)", acc, ok)
+	}
+
 	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedVIRec](), Config{})
 	if err != nil {
 		t.Fatalf("Compile anonymous ValueIndexer: %v", err)
@@ -578,6 +599,9 @@ func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
 
 	if _, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedContainerRec](), Config{}); err == nil || !strings.Contains(err.Error(), "cannot index field SchemaTestAnonymousContainer") {
 		t.Fatalf("anonymous non-indexable container err=%v", err)
+	}
+	if _, err = Compile(reflect.TypeFor[schemaTestUintptrSliceIndexRec](), Config{}); err == nil || !strings.Contains(err.Error(), "slice elements must either be of a simple type") {
+		t.Fatalf("uintptr slice index err=%v", err)
 	}
 }
 

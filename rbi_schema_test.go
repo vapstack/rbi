@@ -1213,17 +1213,15 @@ func TestIndexTags_MeasureRejectsUnsupportedType(t *testing.T) {
 	}
 }
 
-func TestReflectExt_NewRejectsNamedNativeTimePointerType(t *testing.T) {
+func TestReflectExt_NewAcceptsNamedNativeTimePointerType(t *testing.T) {
 	raw, _ := openRawBolt(t)
 	defer func() { _ = raw.Close() }()
 
-	_, err := New[uint64, reflectNamedTimePtrRec](raw, testOptions(Options{}))
-	if err == nil {
-		t.Fatalf("expected New to reject named *time.Time indexed field")
+	db, err := New[uint64, reflectNamedTimePtrRec](raw, testOptions(Options{}))
+	if err != nil {
+		t.Fatalf("New named *time.Time indexed field: %v", err)
 	}
-	if !strings.Contains(err.Error(), "cannot index field When") {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	defer func() { _ = db.Close() }()
 }
 
 func TestStringKeyIndexKeyOnlyOverwriteSkipsOldPayloadDecode(t *testing.T) {

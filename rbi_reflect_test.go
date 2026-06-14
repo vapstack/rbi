@@ -128,6 +128,10 @@ type reflectTimePtrRec struct {
 	When *time.Time `db:"when" rbi:"index"`
 }
 
+type reflectNamedTimePointerRec struct {
+	When *reflectNamedTime `db:"when" rbi:"index"`
+}
+
 type reflectNamedTimePtrRec struct {
 	When reflectNamedTimePtr `db:"when" rbi:"index"`
 }
@@ -720,6 +724,48 @@ func TestReflectExt_QueryNativeTimeScalar_POSSort_NormalizesPriorities(t *testin
 		t.Fatalf("QueryKeys(SortBy POS when): %v", err)
 	}
 	assertUint64Slice(t, got, []uint64{3, 1, 2})
+}
+
+func TestReflectExt_QueryNativeTimePointerNamedType_UsesUnixSeconds(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectNamedTimePointerRec](t, "reflect_named_time_pointer.db")
+
+	base := time.Unix(1_700_000_000, 100_000_000).UTC()
+	sameSec := time.Unix(base.Unix(), 900_000_000).UTC()
+	later := base.Add(2 * time.Second)
+	baseNamed := reflectNamedTime(base)
+	sameSecNamed := reflectNamedTime(sameSec)
+	laterNamed := reflectNamedTime(later)
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3, 4},
+		[]*reflectNamedTimePointerRec{
+			{When: &baseNamed},
+			{When: &sameSecNamed},
+			{When: &laterNamed},
+			{},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.EQ("when", base)))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ time.Time): %v", err)
+	}
+	assertUint64Set(t, got, []uint64{1, 2})
+
+	got, err = db.QueryKeys(qx.Query(qx.GTE("when", base.Add(time.Second))))
+	if err != nil {
+		t.Fatalf("QueryKeys(GTE time): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{3})
+
+	var nilWhen *reflectNamedTime
+	got, err = db.QueryKeys(qx.Query(qx.EQ("when", nilWhen)))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ nil named time pointer): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{4})
 }
 
 func TestReflectExt_TimeWrapperValueIndexer_PreservesCustomSemantics(t *testing.T) {
