@@ -251,11 +251,18 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 		root := measureFlatRootPool.Get()
 		root.ids = pooled.GetUint64Slice(total)[:total]
 		root.values = pooled.GetUint64Slice(total)[:total]
-		for i := 0; i < total; i++ {
-			entry := popMeasureEntryRun(runs, pos)
-			root.ids[i] = entry.ID
-			root.values[i] = entry.Value
+		rows := 0
+		for {
+			entry, ok := popUniqueMeasureEntryRun(runs, pos)
+			if !ok {
+				break
+			}
+			root.ids[rows] = entry.ID
+			root.values[rows] = entry.Value
+			rows++
 		}
+		root.ids = root.ids[:rows]
+		root.values = root.values[:rows]
 		root.refs.Store(1)
 		releaseMeasureEntryRunsOwned(runs)
 		pooled.ReleaseIntSlice(pos)
@@ -264,28 +271,62 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 
 	root := measureChunkedRootPool.Get()
 	root.refsByID = measureChunkRefSlicePool.Get((total + MeasureChunkTargetRows - 1) / MeasureChunkTargetRows)
-	for remaining := total; remaining > 0; {
-		size := min(MeasureChunkTargetRows, remaining)
-		chunk := measureChunkPool.Get()
-		chunk.init(size)
-		for i := 0; i < size; i++ {
-			entry := popMeasureEntryRun(runs, pos)
-			chunk.ids[i] = entry.ID
-			chunk.values[i] = entry.Value
+	var chunk *measureChunk
+	rows := 0
+	for {
+		entry, ok := popUniqueMeasureEntryRun(runs, pos)
+		if !ok {
+			break
 		}
+		if chunk == nil {
+			chunk = measureChunkPool.Get()
+			chunk.init(MeasureChunkTargetRows)
+		}
+		chunk.ids[rows] = entry.ID
+		chunk.values[rows] = entry.Value
+		rows++
+		if rows == MeasureChunkTargetRows {
+			chunk.refs.Store(1)
+			root.appendChunkRef(chunk)
+			chunk = nil
+			rows = 0
+		}
+	}
+	if chunk != nil {
+		chunk.ids = chunk.ids[:rows]
+		chunk.values = chunk.values[:rows]
 		chunk.refs.Store(1)
 		root.appendChunkRef(chunk)
-		remaining -= size
 	}
 	root.refs.Store(1)
+
+	if root.rows <= MeasureChunkThreshold {
+		flat := measureFlatRootPool.Get()
+		flat.ids = pooled.GetUint64Slice(root.rows)[:root.rows]
+		flat.values = pooled.GetUint64Slice(root.rows)[:root.rows]
+		off := 0
+		for i := range root.refsByID {
+			c := root.refsByID[i].chunk
+			n := copy(flat.ids[off:], c.ids)
+			copy(flat.values[off:], c.values)
+			off += n
+		}
+		flat.refs.Store(1)
+		root.release()
+		releaseMeasureEntryRunsOwned(runs)
+		pooled.ReleaseIntSlice(pos)
+		return MeasureStorage{flat: flat}
+	}
+
 	releaseMeasureEntryRunsOwned(runs)
 	pooled.ReleaseIntSlice(pos)
 	return MeasureStorage{chunked: root}
 }
 
-func popMeasureEntryRun(runs [][]MeasureEntry, pos []int) MeasureEntry {
+func popUniqueMeasureEntryRun(runs [][]MeasureEntry, pos []int) (MeasureEntry, bool) {
 	best := -1
 	bestID := uint64(0)
+	duplicateHead := false
 	for i := range runs {
 		p := pos[i]
 		if p == len(runs[i]) {
@@ -295,11 +336,31 @@ func popMeasureEntryRun(runs [][]MeasureEntry, pos []int) MeasureEntry {
 		if best < 0 || id < bestID {
 			best = i
 			bestID = id
+			duplicateHead = false
+			continue
+		}
+		if id == bestID {
+			duplicateHead = true
 		}
 	}
+	if best < 0 {
+		return MeasureEntry{}, false
+	}
 	entry := runs[best][pos[best]]
-	pos[best]++
-	return entry
+	next := pos[best] + 1
+	if !duplicateHead && (next == len(runs[best]) || runs[best][next].ID != bestID) {
+		pos[best] = next
+		return entry, true
+	}
+	for i := range runs {
+		p := pos[i]
+		for p < len(runs[i]) && runs[i][p].ID == bestID {
+			entry = runs[i][p]
+			p++
+		}
+		pos[i] = p
+	}
+	return entry, true
 }
 
 func releaseMeasureEntryRunsOwned(runs [][]MeasureEntry) {

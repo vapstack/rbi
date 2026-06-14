@@ -311,6 +311,26 @@ func TestBuildFieldWriteSinkAddStringRejectsTooLongValue(t *testing.T) {
 	}
 }
 
+func TestFlatFieldStorageRejectsOverlongStringKey(t *testing.T) {
+	entries := GetFieldEntrySlice(1)[:1]
+	entries[0] = Entry{
+		Key: keycodec.FromString(strings.Repeat("x", fieldIndexStringRefMax+1)),
+		IDs: fieldStorageSingleton(1),
+	}
+
+	var storage FieldStorage
+	defer func() {
+		if recover() == nil {
+			storage.Release()
+			t.Fatalf("expected overlong string key panic")
+		}
+		entries[0].IDs.Release()
+		ReleaseFieldEntrySlice(entries)
+	}()
+
+	storage = newRegularFieldStorage(entries)
+}
+
 func TestRegularFieldStorageFlatCopiesBorrowedStringKeyBytes(t *testing.T) {
 	keys := [][]byte{
 		[]byte("flat/alpha"),

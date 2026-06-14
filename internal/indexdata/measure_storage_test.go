@@ -1,6 +1,10 @@
 package indexdata
 
-import "testing"
+import (
+	"bufio"
+	"bytes"
+	"testing"
+)
 
 // Measure storage ownership matrix:
 // - NewMeasureStorageFromEntriesOwned consumes entry buffers and copies ID/value data into storage-owned slices.
@@ -19,6 +23,24 @@ func poisonUint64s(bufs ...[]uint64) {
 			buf[j] = ^uint64(0)
 		}
 	}
+}
+
+func roundTripMeasureStorage(t *testing.T, storage MeasureStorage) MeasureStorage {
+	t.Helper()
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := storage.WriteInto(writer); err != nil {
+		t.Fatalf("WriteInto: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	round, err := ReadMeasureStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true)
+	if err != nil {
+		t.Fatalf("ReadMeasureStorage: %v", err)
+	}
+	return round
 }
 
 func TestMeasureStorageFromEntriesOwnedCopiesEntryBuffer(t *testing.T) {
@@ -223,6 +245,106 @@ func TestMeasureStorageFromSortedRunsOwned(t *testing.T) {
 			measureStorageAssertValue(t, storage, uint64(tc.rows), uint64(tc.rows*10))
 		})
 	}
+}
+
+func TestMeasureStorageFromSortedRunsOwnedCoalescesDuplicateIDsFlat(t *testing.T) {
+	runs := GetMeasureEntrySlots(3)
+	runs[0] = append(GetMeasureEntrySlice(0),
+		MeasureEntry{ID: 1, Value: 10},
+		MeasureEntry{ID: 3, Value: 30},
+		MeasureEntry{ID: 5, Value: 50},
+		MeasureEntry{ID: 5, Value: 55},
+	)
+	runs[1] = append(GetMeasureEntrySlice(0),
+		MeasureEntry{ID: 2, Value: 20},
+		MeasureEntry{ID: 3, Value: 300},
+		MeasureEntry{ID: 6, Value: 60},
+	)
+	runs[2] = append(GetMeasureEntrySlice(0),
+		MeasureEntry{ID: 3, Value: 3_000},
+		MeasureEntry{ID: 7, Value: 70},
+	)
+
+	storage := NewMeasureStorageFromSortedRunsOwned(runs)
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+	if got := storage.Rows(); got != 6 {
+		t.Fatalf("rows: got %d want 6", got)
+	}
+	measureStorageAssertValue(t, storage, 3, 3_000)
+	measureStorageAssertValue(t, storage, 5, 55)
+
+	round := roundTripMeasureStorage(t, storage)
+	defer round.Release()
+	if got := round.Rows(); got != 6 {
+		t.Fatalf("round rows: got %d want 6", got)
+	}
+	measureStorageAssertValue(t, round, 3, 3_000)
+	measureStorageAssertValue(t, round, 5, 55)
+}
+
+func TestMeasureStorageFromSortedRunsOwnedCoalescesDuplicateIDsToFlat(t *testing.T) {
+	const rows = MeasureChunkThreshold
+
+	runs := GetMeasureEntrySlots(2)
+	first := GetMeasureEntrySlice(rows)
+	second := GetMeasureEntrySlice(rows)
+	for id := 1; id <= rows; id++ {
+		first = append(first, MeasureEntry{ID: uint64(id), Value: uint64(id * 10)})
+		second = append(second, MeasureEntry{ID: uint64(id), Value: uint64(id * 100)})
+	}
+	runs[0] = first
+	runs[1] = second
+
+	storage := NewMeasureStorageFromSortedRunsOwned(runs)
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+	if got := storage.Rows(); got != rows {
+		t.Fatalf("rows: got %d want %d", got, rows)
+	}
+	measureStorageAssertValue(t, storage, 1, 100)
+	measureStorageAssertValue(t, storage, rows, rows*100)
+}
+
+func TestMeasureStorageFromSortedRunsOwnedCoalescesDuplicateIDsChunked(t *testing.T) {
+	const rows = MeasureChunkThreshold + 17
+
+	runs := GetMeasureEntrySlots(2)
+	run := GetMeasureEntrySlice(rows)
+	for id := 1; id <= rows; id++ {
+		run = append(run, MeasureEntry{ID: uint64(id), Value: uint64(id * 10)})
+	}
+	runs[0] = run
+	runs[1] = append(GetMeasureEntrySlice(0),
+		MeasureEntry{ID: 7, Value: 7_000},
+		MeasureEntry{ID: MeasureChunkTargetRows + 1, Value: 88_000},
+		MeasureEntry{ID: rows, Value: 99_000},
+	)
+
+	storage := NewMeasureStorageFromSortedRunsOwned(runs)
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+	if got := storage.Rows(); got != rows {
+		t.Fatalf("rows: got %d want %d", got, rows)
+	}
+	measureStorageAssertValue(t, storage, 7, 7_000)
+	measureStorageAssertValue(t, storage, MeasureChunkTargetRows+1, 88_000)
+	measureStorageAssertValue(t, storage, rows, 99_000)
+
+	round := roundTripMeasureStorage(t, storage)
+	defer round.Release()
+	if got := round.Rows(); got != rows {
+		t.Fatalf("round rows: got %d want %d", got, rows)
+	}
+	measureStorageAssertValue(t, round, 7, 7_000)
+	measureStorageAssertValue(t, round, MeasureChunkTargetRows+1, 88_000)
+	measureStorageAssertValue(t, round, rows, 99_000)
 }
 
 func TestMeasureStorageFromSortedRunsOwnedCopiesRunBuffers(t *testing.T) {
