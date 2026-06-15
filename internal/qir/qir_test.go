@@ -172,6 +172,31 @@ func TestPrepareCountExpr_ArrayPredicateNilElementsRejectedWithoutNilCap(t *test
 	}
 }
 
+func TestPrepareCountExpr_SliceEqualityNilElementsRejectedWithoutNilCap(t *testing.T) {
+	var value *string
+	var values []string
+	tests := []struct {
+		name string
+		expr qx.Expr
+	}{
+		{name: "eq_nil", expr: qx.EQ("tags_array_no_nil", []any{nil, "go"})},
+		{name: "ne_nil", expr: qx.NE("tags_array_no_nil", []any{nil, "go"})},
+		{name: "eq_typed_nil", expr: qx.EQ("tags_array_no_nil", []any{value, "go"})},
+		{name: "ne_typed_nil", expr: qx.NE("tags_array_no_nil", []any{value, "go"})},
+		{name: "eq_nil_slice", expr: qx.EQ("tags_array_no_nil", values)},
+		{name: "ne_nil_slice", expr: qx.NE("tags_array_no_nil", values)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if q, err := PrepareCountExprResolved(testPrepareFieldResolver, tc.expr); err == nil {
+				q.Release()
+				t.Fatal("expected PrepareCountExprResolved to reject nil slice equality element")
+			}
+		})
+	}
+}
+
 func TestPrepareCountExpr_UnsupportedArrayPredicateRejectedBeforeNilElements(t *testing.T) {
 	q, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.HASANY("$key", []any{nil, "go"}))
 	if err == nil {

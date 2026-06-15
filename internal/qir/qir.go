@@ -414,13 +414,16 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 				v = v.Elem()
 			}
 			if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
-				for i := 0; i < v.Len(); i++ {
-					elem := v.Index(i)
-					for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-						if elem.IsNil() {
-							return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+				k := v.Type().Elem().Kind()
+				if k == reflect.Interface || k == reflect.Pointer {
+					for i := 0; i < v.Len(); i++ {
+						elem := v.Index(i)
+						for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
+							if elem.IsNil() {
+								return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+							}
+							elem = elem.Elem()
 						}
-						elem = elem.Elem()
 					}
 				}
 			}
@@ -438,6 +441,28 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 						return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
 					}
 					v = v.Elem()
+				}
+				if op == OpEQ {
+					k := v.Kind()
+					if k == reflect.Slice {
+						if v.IsNil() {
+							return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+						}
+					}
+					if k == reflect.Slice || k == reflect.Array {
+						k := v.Type().Elem().Kind()
+						if k == reflect.Interface || k == reflect.Pointer {
+							for i := 0; i < v.Len(); i++ {
+								elem := v.Index(i)
+								for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
+									if elem.IsNil() {
+										return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+									}
+									elem = elem.Elem()
+								}
+							}
+						}
+					}
 				}
 			}
 		}
