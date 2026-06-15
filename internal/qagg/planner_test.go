@@ -96,7 +96,7 @@ func TestAggregateSelectorsChooseRouteContracts(t *testing.T) {
 		var decision aggregateRouteDecision
 		family := selectAggregateFamily(prepared)
 		if family == aggregateSelectorCount {
-			decision = selectCountAggregate(aggregateCountFacts{filterCardinality: db.snap.Universe.Cardinality()})
+			decision = selectCountAggregate()
 		} else {
 			ids, err := view.Filter(prepared.filter)
 			if err != nil {

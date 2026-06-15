@@ -80,10 +80,6 @@ type aggregateRouteDecision struct {
 	groupMapLen         uint64
 }
 
-type aggregateCountFacts struct {
-	filterCardinality uint64
-}
-
 type aggregateDistinctFacts struct {
 	filterCardinality uint64
 	ordinaryKeyCount  uint64
@@ -131,12 +127,10 @@ type aggregateGroupedFacts struct {
 	byIDMapLen    uint64
 }
 
-func selectCountAggregate(facts aggregateCountFacts) aggregateRouteDecision {
+func selectCountAggregate() aggregateRouteDecision {
 	return aggregateRouteDecision{
-		route:              aggregateRouteRowCount,
-		filterInput:        aggregateFilterInputCardinality,
-		selectedCost:       float64(facts.filterCardinality),
-		expectedFilterRows: facts.filterCardinality,
+		route:       aggregateRouteRowCount,
+		filterInput: aggregateFilterInputCardinality,
 	}
 }
 

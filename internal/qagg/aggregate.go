@@ -254,10 +254,6 @@ func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, e
 	defer aggregateOutputPositionMapPool.Put(outputPositions)
 
 	for i := range src.Reduction.Group {
-		if err = rejectReservedKeyExpr(src.Reduction.Group[i], "GROUP BY"); err != nil {
-			out.Release()
-			return nil, err
-		}
 		group, err := prepareAggregateGroup(s, src.Reduction.Group[i])
 		if err != nil {
 			out.Release()
@@ -271,10 +267,6 @@ func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, e
 	}
 
 	for i := range src.Reduction.Metrics {
-		if err = rejectReservedKeyExpr(src.Reduction.Metrics[i], "aggregate metric"); err != nil {
-			out.Release()
-			return nil, err
-		}
 		metric, err := prepareAggregateMetric(s, src.Reduction.Metrics[i])
 		if err != nil {
 			out.Release()
@@ -303,10 +295,6 @@ func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, e
 	}
 
 	if !src.Reduction.Having.IsZero() {
-		if err = rejectReservedKeyExpr(src.Reduction.Having, "HAVING"); err != nil {
-			out.Release()
-			return nil, err
-		}
 		havingArgs, havingValues, err := aggregateHavingStorageSize(src.Reduction.Having, outputPositions)
 		if err != nil {
 			out.Release()
@@ -332,10 +320,6 @@ func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, e
 			out.order = make([]aggregateOrder, 0, len(src.Order))
 		}
 		for i := range src.Order {
-			if err = rejectReservedKeyExpr(src.Order[i].By, "ORDER"); err != nil {
-				out.Release()
-				return nil, err
-			}
 			by := src.Order[i].By
 			if by.Kind != qx.KindOUT || by.Name == "" {
 				out.Release()
@@ -377,18 +361,6 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 		return fmt.Errorf("%w: duplicate aggregate output %q", rbierrors.ErrInvalidQuery, name)
 	}
 	seen[name] = pos
-	return nil
-}
-
-func rejectReservedKeyExpr(expr qx.Expr, context string) error {
-	if expr.Kind == qx.KindREF && expr.Name == schema.ReservedKeyFieldName {
-		return fmt.Errorf("%w: %v is not supported in %s", rbierrors.ErrInvalidQuery, schema.ReservedKeyFieldName, context)
-	}
-	for i := range expr.Args {
-		if err := rejectReservedKeyExpr(expr.Args[i], context); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -871,7 +843,14 @@ func (ae *aggregateExecutor) executeAggregateFamily(q *Query, ids posting.List, 
 	var decision aggregateRouteDecision
 	switch family {
 	case aggregateSelectorCount:
-		decision = selectCountAggregate(aggregateCountFacts{filterCardinality: ids.Cardinality()})
+		decision = selectCountAggregate()
+		count := ids.Cardinality()
+		decision.expectedFilterRows = count
+		decision.selectedCost = float64(count)
+		if trace != nil {
+			trace.SetAggregateRoute(decision.traceRoute())
+		}
+		return aggregateCountResult(q.metrics[0].out, count), nil
 	case aggregateSelectorDistinct:
 		decision = selectDistinctAggregate(ae.collectDistinctFacts(q, ids))
 	case aggregateSelectorUngrouped:
@@ -892,11 +871,13 @@ func (ae *aggregateExecutor) executeCountAggregateFamily(view *qexec.View, q *Qu
 	if err != nil {
 		return Result{}, err
 	}
-	decision := selectCountAggregate(aggregateCountFacts{filterCardinality: count})
+	decision := selectCountAggregate()
+	decision.expectedFilterRows = count
+	decision.selectedCost = float64(count)
 	if trace != nil {
 		trace.SetAggregateRoute(decision.traceRoute())
 	}
-	return ae.dispatchAggregateRoute(q, posting.List{}, decision)
+	return aggregateCountResult(q.metrics[0].out, count), nil
 }
 
 func aggregateCountResult(out string, count uint64) Result {
@@ -910,8 +891,6 @@ func aggregateCountResult(out string, count uint64) Result {
 
 func (ae *aggregateExecutor) dispatchAggregateRoute(q *Query, ids posting.List, decision aggregateRouteDecision) (Result, error) {
 	switch decision.route {
-	case aggregateRouteRowCount:
-		return aggregateCountResult(q.metrics[0].out, decision.expectedFilterRows), nil
 	case aggregateRouteDistinctUngrouped:
 		return ae.executeDistinctAggregate(q.metrics[0], ids)
 	case aggregateRouteCountDistinctUngrouped:

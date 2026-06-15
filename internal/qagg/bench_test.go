@@ -565,6 +565,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 						b.Fatalf("Filter: %v", err)
 					}
 					defer ids.Release()
+					idsCardinality := ids.Cardinality()
 
 					exec := aggregateExecutor{snap: db.snap}
 					var decision aggregateRouteDecision
@@ -573,7 +574,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						switch selectAggregateFamily(prepared) {
 						case aggregateSelectorCount:
-							decision = selectCountAggregate(aggregateCountFacts{filterCardinality: ids.Cardinality()})
+							decision = selectCountAggregate()
 						case aggregateSelectorDistinct:
 							decision = selectDistinctAggregate(exec.collectDistinctFacts(prepared, ids))
 						case aggregateSelectorUngrouped:
@@ -583,7 +584,7 @@ func BenchmarkAggregateSelectorOnly(b *testing.B) {
 						}
 					}
 					qaggBenchDecision = decision
-					b.ReportMetric(float64(ids.Cardinality()), "ids/op")
+					b.ReportMetric(float64(idsCardinality), "ids/op")
 				})
 			}
 		}

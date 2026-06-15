@@ -665,7 +665,7 @@ func TestPrepareRejectsUnsupportedAggregateShapes(t *testing.T) {
 		{
 			name: "having_reserved_key_ref",
 			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.EQ(qx.REF(schema.ReservedKeyFieldName), "alpha")),
-			want: schema.ReservedKeyFieldName,
+			want: "OUT references",
 		},
 	}
 
