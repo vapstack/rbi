@@ -531,6 +531,30 @@ type User struct {
 }
 ```
 
+## Creating a patch
+
+`MakePatch` builds a complete patch from fields changed between two values.
+
+By default, field names use `db` tags when present and otherwise fall back to
+the Go field name only when that name is an unambiguous patch identifier. If any
+changed field has no safe default name, `MakePatch` returns an error.
+
+With `PatchJSON`, names use explicit, non-empty `json` tags and otherwise fall
+back to unambiguous Go field names. Changed fields without a safe JSON patch
+name, including `json:"-"` fields, return an error instead of being dropped.
+
+### Ownership and safety
+
+`MakePatch` and `MakePatchInto` copy changed values into the patch,
+including unexported nested fields (if any), so later mutations of `newVal`
+do not affect ordinary patch data. This is intended for record data graphs:
+scalars, structs, slices, maps, pointers, and interfaces containing data values.
+
+They are not general object cloners. Runtime state such as `sync`/`atomic`
+values, locks, channels, functions, and other unsafe resources are not supported
+and are not diagnosed. These methods do not return errors for such values and 
+copy safety is provided on a best-effort basis.
+
 ## Index persistence and recovery
 
 Indexes are persisted only on `Close`.

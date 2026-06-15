@@ -1219,6 +1219,20 @@ func TestPatchStrictOption_NilRules(t *testing.T) {
 	}
 }
 
+func TestPatchStrictOption_UnknownFieldOnMissingTarget(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	err := db.Patch(999, []Field{{Name: "does_not_exist", Value: 123}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field does_not_exist") {
+		t.Fatalf("Patch missing target error=%v, want strict unknown field error", err)
+	}
+
+	err = db.BatchPatch([]uint64{998, 999}, []Field{{Name: "does_not_exist", Value: 123}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field does_not_exist") {
+		t.Fatalf("BatchPatch missing targets error=%v, want strict unknown field error", err)
+	}
+}
+
 func TestBatchPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	type tc struct {
 		name  string
@@ -1467,6 +1481,58 @@ func TestReflectExt_MakePatch_DeepCopyAliasedSliceFieldsByHeader(t *testing.T) {
 	}
 	if !reflect.DeepEqual(applied.Payload.Long, longTags{"go", "db", "rbi"}) {
 		t.Fatalf("patched record lost long slice contents: %#v", applied.Payload.Long)
+	}
+}
+
+func TestReflectExt_MakePatch_DeepCopyUnexportedStructFields(t *testing.T) {
+	type child struct {
+		values []int
+	}
+	type payload struct {
+		tags  []string
+		attrs map[string]int
+		child *child
+	}
+	type rec struct {
+		Name    string  `db:"name" rbi:"index"`
+		Payload payload `db:"payload"`
+	}
+
+	db := openTempDBUint64Reflect[rec](t, "reflect_patch_unexported_struct_fields.db")
+
+	oldVal := &rec{Name: "alice"}
+	newVal := &rec{
+		Name: "alice",
+		Payload: payload{
+			tags:  []string{"go", "db"},
+			attrs: map[string]int{"x": 1},
+			child: &child{values: []int{1, 2}},
+		},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+
+	gotPayload, ok := fields["payload"].(payload)
+	if !ok {
+		t.Fatalf("patch must contain payload value for payload, got %#v", fields["payload"])
+	}
+
+	newVal.Payload.tags[0] = "mutated"
+	newVal.Payload.attrs["x"] = 9
+	newVal.Payload.child.values[0] = 7
+
+	if !reflect.DeepEqual(gotPayload.tags, []string{"go", "db"}) {
+		t.Fatalf("patch aliased unexported slice field: %#v", gotPayload.tags)
+	}
+	if !reflect.DeepEqual(gotPayload.attrs, map[string]int{"x": 1}) {
+		t.Fatalf("patch aliased unexported map field: %#v", gotPayload.attrs)
+	}
+	if gotPayload.child == nil || gotPayload.child == newVal.Payload.child {
+		t.Fatalf("patch did not detach unexported pointer field: %#v", gotPayload.child)
+	}
+	if !reflect.DeepEqual(gotPayload.child.values, []int{1, 2}) {
+		t.Fatalf("patch aliased unexported pointer data: %#v", gotPayload.child)
 	}
 }
 

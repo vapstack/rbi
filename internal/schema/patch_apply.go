@@ -43,6 +43,15 @@ func (patch *PatchRuntime) Apply(ptr unsafe.Pointer, items []PatchItem, ignoreUn
 	return nil
 }
 
+func (patch *PatchRuntime) ValidateNames(items []PatchItem) error {
+	for _, p := range items {
+		if _, ok := patch.Fields[p.Name]; !ok {
+			return fmt.Errorf("cannot patch field %v: field information is missing", p.Name)
+		}
+	}
+	return nil
+}
+
 func setReflectValue(fv reflect.Value, val any) error {
 	sv := reflect.ValueOf(val)
 	if !sv.IsValid() {

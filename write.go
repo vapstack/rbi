@@ -442,6 +442,11 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 	}
 
 	patchItems := patchItemsForWrite(patch)
+	if !ignoreUnknown {
+		if err := db.schema.Patch.ValidateNames(patchItems); err != nil {
+			return err
+		}
+	}
 	batch := db.batcher.NewBatch(1)
 	batch.AddPatch(keycodec.DataKeyFromUserKey(id, db.strKey), patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 	return batch.Submit(cfg.noBatch)
@@ -469,6 +474,11 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	}
 
 	patchItems := patchItemsForWrite(patch)
+	if !ignoreUnknown {
+		if err := db.schema.Patch.ValidateNames(patchItems); err != nil {
+			return err
+		}
+	}
 	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {

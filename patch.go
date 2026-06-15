@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"time"
 	"unsafe"
 
 	"github.com/vapstack/pooled"
@@ -39,7 +40,13 @@ const (
 // PatchJSON still builds a full patch,
 // it does not silently drop changes outside the JSON representation.
 //
-// Value is always a deep copy taken from newVal.
+// Value is a deep copy taken from newVal, including nested unexported fields.
+// MakePatch supports normal record data graphs: scalars, structs, slices,
+// maps, pointers, and interfaces containing data values.
+// It is not a general object cloner. Runtime state such as sync/atomic values,
+// locks, channels, functions, and other unsafe resources are not supported
+// and are not diagnosed. MakePatch does not return errors for such values
+// and copy safety is provided on a best-effort basis.
 //
 // If newVal is nil, it returns an empty slice.
 func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, error) {
@@ -308,6 +315,8 @@ type sliceCopyKey struct {
 	cap int
 }
 
+var timeTimeType = reflect.TypeFor[time.Time]()
+
 func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 	if !origin.IsValid() {
 		return origin
@@ -347,14 +356,19 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 		return origin
 
 	case reflect.Struct:
+		typ := origin.Type()
+		if typ == timeTimeType ||
+			typ.NumField() == timeTimeType.NumField() && typ.ConvertibleTo(timeTimeType) && timeTimeType.ConvertibleTo(typ) {
+			return origin
+		}
 		s := reflect.New(origin.Type()).Elem()
 		s.Set(origin)
 		for i := 0; i < origin.NumField(); i++ {
 			sf := s.Field(i)
 			if !sf.CanSet() {
-				continue
+				sf = reflect.NewAt(sf.Type(), unsafe.Pointer(sf.UnsafeAddr())).Elem()
 			}
-			clone := deepCopy(origin.Field(i), state)
+			clone := deepCopy(sf, state)
 			sf.Set(clone)
 		}
 		return s
