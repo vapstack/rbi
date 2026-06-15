@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"slices"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/keycodec"
 )
 
 type MeasureValueKind uint8
@@ -120,13 +122,13 @@ func measureFloatModified[T floatFieldValue](offset uintptr, ptr bool) FieldModi
 			if p1 == nil || p2 == nil {
 				return p1 != p2
 			}
-			return math.Float64bits(float64(*p1)) != math.Float64bits(float64(*p2))
+			return !floatsEqualForIndex(*p1, *p2)
 		}
 	}
 	return func(v1, v2 unsafe.Pointer) bool {
 		f1 := scalarFieldValue[T](v1, offset)
 		f2 := scalarFieldValue[T](v2, offset)
-		return math.Float64bits(float64(f1)) != math.Float64bits(float64(f2))
+		return !floatsEqualForIndex(f1, f2)
 	}
 }
 
@@ -167,10 +169,10 @@ func measurePtrOrScalarFloatFns[T floatFieldValue](offset uintptr, ptr bool) Mea
 			if v == nil {
 				return 0, false
 			}
-			return math.Float64bits(float64(*v)), true
+			return math.Float64bits(keycodec.CanonicalizeFloat64ForIndex(float64(*v))), true
 		}
 	}
 	return func(root unsafe.Pointer) (uint64, bool) {
-		return math.Float64bits(float64(scalarFieldValue[T](root, offset))), true
+		return math.Float64bits(keycodec.CanonicalizeFloat64ForIndex(float64(scalarFieldValue[T](root, offset)))), true
 	}
 }

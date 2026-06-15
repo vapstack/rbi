@@ -1121,14 +1121,36 @@ func TestMeasureAccessorsReadAndDetectChanges(t *testing.T) {
 	newZero := schemaTestMeasureRec{Float: posZero, Float32: float32(posZero), FloatPtr: &posZero}
 	oldZeroPtr := unsafe.Pointer(&oldZero)
 	newZeroPtr := unsafe.Pointer(&newZero)
-	if !rt.MeasuresByName["float"].Modified(oldZeroPtr, newZeroPtr) {
-		t.Fatal("float -0/+0 encoded change was not detected")
+	if rt.MeasuresByName["float"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float -0/+0 canonical match was reported as modified")
 	}
-	if !rt.MeasuresByName["float32"].Modified(oldZeroPtr, newZeroPtr) {
-		t.Fatal("float32 -0/+0 encoded change was not detected")
+	if rt.MeasuresByName["float32"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float32 -0/+0 canonical match was reported as modified")
 	}
-	if !rt.MeasuresByName["float_ptr"].Modified(oldZeroPtr, newZeroPtr) {
-		t.Fatal("float pointer -0/+0 encoded change was not detected")
+	if rt.MeasuresByName["float_ptr"].Modified(oldZeroPtr, newZeroPtr) {
+		t.Fatal("float pointer -0/+0 canonical match was reported as modified")
+	}
+	if got, ok := rt.MeasuresByName["float"].Read(oldZeroPtr); !ok || got != math.Float64bits(0) {
+		t.Fatalf("float -0 read=(%x,%v), want +0 bits", got, ok)
+	}
+
+	oldNaN := math.Float64frombits(0x7ff0000000000001)
+	newNaN := math.Float64frombits(0x7ff8000000000001)
+	oldNaNRec := schemaTestMeasureRec{Float: oldNaN, Float32: math.Float32frombits(0x7f800001), FloatPtr: &oldNaN}
+	newNaNRec := schemaTestMeasureRec{Float: newNaN, Float32: math.Float32frombits(0x7fc00001), FloatPtr: &newNaN}
+	oldNaNPtr := unsafe.Pointer(&oldNaNRec)
+	newNaNPtr := unsafe.Pointer(&newNaNRec)
+	if rt.MeasuresByName["float"].Modified(oldNaNPtr, newNaNPtr) {
+		t.Fatal("float NaN canonical match was reported as modified")
+	}
+	if rt.MeasuresByName["float32"].Modified(oldNaNPtr, newNaNPtr) {
+		t.Fatal("float32 NaN canonical match was reported as modified")
+	}
+	if rt.MeasuresByName["float_ptr"].Modified(oldNaNPtr, newNaNPtr) {
+		t.Fatal("float pointer NaN canonical match was reported as modified")
+	}
+	if got, ok := rt.MeasuresByName["float"].Read(oldNaNPtr); !ok || got != keycodec.CanonicalFloat64NaNBits {
+		t.Fatalf("float NaN read=(%x,%v), want canonical NaN bits", got, ok)
 	}
 
 	if _, err = Compile(reflect.TypeFor[schemaTestMeasureRec](), Config{Index: map[string]IndexKind{"Invalid": IndexMeasure}}); err == nil || !strings.Contains(err.Error(), "measure field Invalid has unsupported type") {

@@ -2,7 +2,6 @@ package schema
 
 import (
 	"fmt"
-	"math"
 	"reflect"
 	"slices"
 	"time"
@@ -176,6 +175,10 @@ func slicesEqualExact[T comparable](lhs, rhs []T) bool {
 	return true
 }
 
+func floatsEqualForIndex[T floatFieldValue](lhs, rhs T) bool {
+	return lhs == rhs || lhs != lhs && rhs != rhs
+}
+
 func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) PatchValueEqualFn {
 	if ptr {
 		return func(v1, v2 unsafe.Pointer) bool {
@@ -192,41 +195,53 @@ func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) PatchValueEqu
 	}
 }
 
-func float32PatchValueEqual(offset uintptr, ptr bool) PatchValueEqualFn {
+func floatPatchValueEqual[T floatFieldValue](offset uintptr, ptr bool) PatchValueEqualFn {
 	if ptr {
 		return func(v1, v2 unsafe.Pointer) bool {
-			p1 := ptrFieldValue[float32](v1, offset)
-			p2 := ptrFieldValue[float32](v2, offset)
+			p1 := ptrFieldValue[T](v1, offset)
+			p2 := ptrFieldValue[T](v2, offset)
 			if p1 == nil || p2 == nil {
 				return p1 == p2
 			}
-			return math.Float32bits(*p1) == math.Float32bits(*p2)
+			return floatsEqualForIndex(*p1, *p2)
 		}
 	}
 	return func(v1, v2 unsafe.Pointer) bool {
-		return math.Float32bits(scalarFieldValue[float32](v1, offset)) == math.Float32bits(scalarFieldValue[float32](v2, offset))
-	}
-}
-
-func float64PatchValueEqual(offset uintptr, ptr bool) PatchValueEqualFn {
-	if ptr {
-		return func(v1, v2 unsafe.Pointer) bool {
-			p1 := ptrFieldValue[float64](v1, offset)
-			p2 := ptrFieldValue[float64](v2, offset)
-			if p1 == nil || p2 == nil {
-				return p1 == p2
-			}
-			return math.Float64bits(*p1) == math.Float64bits(*p2)
-		}
-	}
-	return func(v1, v2 unsafe.Pointer) bool {
-		return math.Float64bits(scalarFieldValue[float64](v1, offset)) == math.Float64bits(scalarFieldValue[float64](v2, offset))
+		return floatsEqualForIndex(scalarFieldValue[T](v1, offset), scalarFieldValue[T](v2, offset))
 	}
 }
 
 func slicePatchValueEqual[T comparable](offset uintptr) PatchValueEqualFn {
 	return func(v1, v2 unsafe.Pointer) bool {
 		return slicesEqualExact(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
+	}
+}
+
+func floatSlicePatchValueEqual[T floatFieldValue](offset uintptr) PatchValueEqualFn {
+	return func(v1, v2 unsafe.Pointer) bool {
+		lhs := sliceFieldValue[T](v1, offset)
+		rhs := sliceFieldValue[T](v2, offset)
+		if (lhs == nil) != (rhs == nil) {
+			return false
+		}
+		if len(lhs) != len(rhs) {
+			return false
+		}
+		for i := range lhs {
+			if !floatsEqualForIndex(lhs[i], rhs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func reflectFloatSlicePatchValueEqual(fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
+	return func(v1, v2 unsafe.Pointer) bool {
+		return reflectPatchFloatSlicesEqual(
+			reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem(),
+			reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem(),
+		)
 	}
 }
 
@@ -262,6 +277,108 @@ func typeHasMutableReferencePayload(t reflect.Type) bool {
 		}
 	}
 	return false
+}
+
+func typeSupportsPatchFloatEqual(t reflect.Type) bool {
+	ok, needs := patchFloatEqualType(t)
+	return ok && needs
+}
+
+func patchFloatEqualType(t reflect.Type) (bool, bool) {
+	switch t.Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.String,
+		reflect.Complex64, reflect.Complex128:
+		return true, false
+	case reflect.Float32, reflect.Float64:
+		return true, true
+	case reflect.Array:
+		return patchFloatEqualType(t.Elem())
+	case reflect.Slice:
+		switch t.Elem().Kind() {
+		case reflect.Float32, reflect.Float64:
+			return true, true
+		default:
+			return false, false
+		}
+	case reflect.Struct:
+		needs := false
+		for i := 0; i < t.NumField(); i++ {
+			ok, fieldNeeds := patchFloatEqualType(t.Field(i).Type)
+			if !ok {
+				return false, false
+			}
+			needs = needs || fieldNeeds
+		}
+		return true, needs
+	}
+	return false, false
+}
+
+func reflectPatchValueEqual(fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
+	return func(v1, v2 unsafe.Pointer) bool {
+		return reflectPatchValuesEqual(
+			reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem(),
+			reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem(),
+		)
+	}
+}
+
+func reflectPatchValuesEqual(v1, v2 reflect.Value) bool {
+	switch v1.Kind() {
+	case reflect.Bool:
+		return v1.Bool() == v2.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v1.Int() == v2.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v1.Uint() == v2.Uint()
+	case reflect.String:
+		return v1.String() == v2.String()
+	case reflect.Float32, reflect.Float64:
+		return floatsEqualForIndex(v1.Float(), v2.Float())
+	case reflect.Complex64, reflect.Complex128:
+		return v1.Complex() == v2.Complex()
+	case reflect.Array:
+		for i := 0; i < v1.Len(); i++ {
+			if !reflectPatchValuesEqual(v1.Index(i), v2.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Slice:
+		return reflectPatchFloatSlicesEqual(v1, v2)
+	case reflect.Struct:
+		for i := 0; i < v1.NumField(); i++ {
+			if !reflectPatchValuesEqual(v1.Field(i), v2.Field(i)) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func reflectPatchFloatSlicesEqual(v1, v2 reflect.Value) bool {
+	if v1.IsNil() || v2.IsNil() {
+		return v1.IsNil() == v2.IsNil()
+	}
+	if v1.Len() != v2.Len() {
+		return false
+	}
+	switch v1.Type().Elem().Kind() {
+	case reflect.Float32, reflect.Float64:
+		for i := 0; i < v1.Len(); i++ {
+			if !floatsEqualForIndex(v1.Index(i).Float(), v2.Index(i).Float()) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
@@ -720,6 +837,18 @@ func slicesModified[T comparable](lhs, rhs []T) bool {
 	}
 	for i := range lhs {
 		if lhs[i] != rhs[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func floatSlicesModified[T floatFieldValue](lhs, rhs []T) bool {
+	if len(lhs) != len(rhs) {
+		return true
+	}
+	for i := range lhs {
+		if !floatsEqualForIndex(lhs[i], rhs[i]) {
 			return true
 		}
 	}
@@ -1365,7 +1494,7 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 				if p1 == nil || p2 == nil {
 					return p1 != p2
 				}
-				return *p1 != *p2
+				return !floatsEqualForIndex(*p1, *p2)
 			},
 		}
 	}
@@ -1388,7 +1517,7 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 		},
 
 		modified: func(v1, v2 unsafe.Pointer) bool {
-			return scalarFieldValue[T](v1, offset) != scalarFieldValue[T](v2, offset)
+			return !floatsEqualForIndex(scalarFieldValue[T](v1, offset), scalarFieldValue[T](v2, offset))
 		},
 	}
 }
@@ -1491,7 +1620,7 @@ func floatSliceAccessorBundle[T floatFieldValue](offset uintptr) fieldAccessorBu
 		},
 
 		modified: func(v1, v2 unsafe.Pointer) bool {
-			return slicesModified(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
+			return floatSlicesModified(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
 		},
 	}
 }
@@ -1527,9 +1656,9 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 		case reflect.Uint64:
 			return scalarPatchValueEqual[uint64](offset, f.Ptr)
 		case reflect.Float32:
-			return float32PatchValueEqual(offset, f.Ptr)
+			return floatPatchValueEqual[float32](offset, f.Ptr)
 		case reflect.Float64:
-			return float64PatchValueEqual(offset, f.Ptr)
+			return floatPatchValueEqual[float64](offset, f.Ptr)
 		}
 		return nil
 	}
@@ -1561,12 +1690,17 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 		case reflect.Uint64:
 			return slicePatchValueEqual[uint64](offset)
 		case reflect.Float32:
-			return slicePatchValueEqual[float32](offset)
+			if fieldType == reflect.TypeFor[[]float32]() {
+				return floatSlicePatchValueEqual[float32](offset)
+			}
+			return reflectFloatSlicePatchValueEqual(fieldType, offset)
 		case reflect.Float64:
-			return slicePatchValueEqual[float64](offset)
-		default:
-			return nil
+			if fieldType == reflect.TypeFor[[]float64]() {
+				return floatSlicePatchValueEqual[float64](offset)
+			}
+			return reflectFloatSlicePatchValueEqual(fieldType, offset)
 		}
+		return nil
 	}
 
 	switch f.Kind {
@@ -1595,10 +1729,13 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 	case reflect.Uint64:
 		return scalarPatchValueEqual[uint64](offset, f.Ptr)
 	case reflect.Float32:
-		return float32PatchValueEqual(offset, f.Ptr)
+		return floatPatchValueEqual[float32](offset, f.Ptr)
 	case reflect.Float64:
-		return float64PatchValueEqual(offset, f.Ptr)
+		return floatPatchValueEqual[float64](offset, f.Ptr)
 	default:
+		if typeSupportsPatchFloatEqual(fieldType) {
+			return reflectPatchValueEqual(fieldType, offset)
+		}
 		return nil
 	}
 }

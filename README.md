@@ -543,6 +543,13 @@ With `PatchJSON`, names use explicit, non-empty `json` tags and otherwise fall
 back to unambiguous Go field names. Changed fields without a safe JSON patch
 name, including `json:"-"` fields, return an error instead of being dropped.
 
+Float semantics are canonical: `-0` equals `+0`, and all NaN values compare
+equal. `MakePatch` applies the same semantics to schema-known values it can
+compare without walking arbitrary object graphs: direct float fields,
+direct float pointer fields, float slices, and acyclic value composites
+made of structs/arrays. For maps, interfaces, and arbitrary reference graphs,
+MakePatch uses Go reflect equality.
+
 ### Ownership and safety
 
 `MakePatch` and `MakePatchInto` copy changed values into the patch,

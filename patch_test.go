@@ -741,6 +741,43 @@ type patchMeasureFloatZeroRec struct {
 	Ptr       *float64 `db:"ptr" rbi:"measure"`
 }
 
+type patchFloat64s []float64
+
+type patchFloatSliceZeroRec struct {
+	Name     string    `db:"name"`
+	Values64 []float64 `db:"values64"`
+	Values32 []float32 `db:"values32"`
+	Named64  patchFloat64s
+}
+
+type patchFloatNestedZeroPayload struct {
+	Value64 float64
+	Value32 float32
+	Values  [2]float64
+}
+
+type patchFloatNestedZeroRec struct {
+	Name    string                      `db:"name"`
+	Payload patchFloatNestedZeroPayload `db:"payload"`
+}
+
+type patchFloatPointerFallbackRec struct {
+	Name   string
+	Hidden *float64 `json:"-"`
+}
+
+type patchIndexedFloatHiddenRec struct {
+	Name    string   `db:"name"`
+	Score64 float64  `db:"score64" json:"-" rbi:"index"`
+	Score32 float32  `db:"score32" json:"-" rbi:"index"`
+	Ptr     *float64 `db:"ptr" json:"-" rbi:"index"`
+}
+
+type patchIndexedFloatSliceHiddenRec struct {
+	Name   string    `db:"name"`
+	Hidden []float64 `db:"hidden" json:"-" rbi:"index"`
+}
+
 func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
 	db := openTempDBUint64Reflect[patchUnaliasedPromotedRec](t, "patch_unaliased_promoted_names.db")
 
@@ -822,7 +859,7 @@ func TestMakePatch_RejectsShadowedMeasureDefaultNameAndUsesJSONAlias(t *testing.
 	}
 }
 
-func TestMakePatch_EmitsMeasureFloatSignedZeroTransitions(t *testing.T) {
+func TestMakePatch_SkipsCanonicalMeasureFloatZeroTransitions(t *testing.T) {
 	db := openTempDBUint64Reflect[patchMeasureFloatZeroRec](t, "patch_measure_float_zero.db")
 
 	negZero := math.Copysign(0, -1)
@@ -831,31 +868,161 @@ func TestMakePatch_EmitsMeasureFloatSignedZeroTransitions(t *testing.T) {
 	newVal := &patchMeasureFloatZeroRec{Name: "same", Measure: posZero, Measure32: float32(posZero), Ptr: &posZero}
 
 	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_EmitsCanonicalMeasureFloatValueChanges(t *testing.T) {
+	db := openTempDBUint64Reflect[patchMeasureFloatZeroRec](t, "patch_measure_float_change.db")
+
+	oldPtr := 2.5
+	newPtr := 3.5
+	oldVal := &patchMeasureFloatZeroRec{Name: "same", Measure: 1.25, Measure32: 1.5, Ptr: &oldPtr}
+	newVal := &patchMeasureFloatZeroRec{Name: "same", Measure: 2.25, Measure32: 2.5, Ptr: &newPtr}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
 	fields := patchFieldsByName(patch)
-	if len(patch) != 3 {
-		t.Fatalf("patch fields=%#v want only measure float fields", patch)
-	}
-	if got, ok := fields["measure"].(float64); !ok || math.Float64bits(got) != math.Float64bits(posZero) {
-		t.Fatalf("measure patch value=%#v", fields["measure"])
-	}
-	if got, ok := fields["measure32"].(float32); !ok || math.Float32bits(got) != math.Float32bits(float32(posZero)) {
-		t.Fatalf("measure32 patch value=%#v", fields["measure32"])
+	if len(patch) != 3 || fields["measure"] != 2.25 || fields["measure32"] != float32(2.5) {
+		t.Fatalf("patch fields=%#v want changed float measure fields", patch)
 	}
 	gotPtr, ok := fields["ptr"].(*float64)
-	if !ok || gotPtr == nil || math.Float64bits(*gotPtr) != math.Float64bits(posZero) {
+	if !ok || gotPtr == nil || *gotPtr != 3.5 {
 		t.Fatalf("ptr patch value=%#v", fields["ptr"])
 	}
+}
 
-	applied := applyPatchForTest(t, db, oldVal, patch)
-	defer db.ReleaseRecords(applied)
-	if math.Float64bits(applied.Measure) != math.Float64bits(posZero) {
-		t.Fatalf("applied measure bits=%x want %x", math.Float64bits(applied.Measure), math.Float64bits(posZero))
+func TestMakePatch_SkipsCanonicalFloatSliceZeroTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchFloatSliceZeroRec](t, "patch_float_slice_zero.db")
+
+	negZero := math.Copysign(0, -1)
+	posZero := 0.0
+	oldVal := &patchFloatSliceZeroRec{
+		Name:     "same",
+		Values64: []float64{negZero, 1.5},
+		Values32: []float32{float32(negZero), 2.5},
+		Named64:  patchFloat64s{negZero, 3.5},
 	}
-	if math.Float32bits(applied.Measure32) != math.Float32bits(float32(posZero)) {
-		t.Fatalf("applied measure32 bits=%x want %x", math.Float32bits(applied.Measure32), math.Float32bits(float32(posZero)))
+	newVal := &patchFloatSliceZeroRec{
+		Name:     "same",
+		Values64: []float64{posZero, 1.5},
+		Values32: []float32{float32(posZero), 2.5},
+		Named64:  patchFloat64s{posZero, 3.5},
 	}
-	if applied.Ptr == nil || math.Float64bits(*applied.Ptr) != math.Float64bits(posZero) {
-		t.Fatalf("applied ptr=%#v", applied.Ptr)
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalNestedFloatZeroTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchFloatNestedZeroRec](t, "patch_float_nested_zero.db")
+
+	negZero := math.Copysign(0, -1)
+	posZero := 0.0
+	oldVal := &patchFloatNestedZeroRec{
+		Name:    "same",
+		Payload: patchFloatNestedZeroPayload{Value64: negZero, Value32: float32(negZero), Values: [2]float64{1.5, negZero}},
+	}
+	newVal := &patchFloatNestedZeroRec{
+		Name:    "same",
+		Payload: patchFloatNestedZeroPayload{Value64: posZero, Value32: float32(posZero), Values: [2]float64{1.5, posZero}},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalNestedFloatNaNTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchFloatNestedZeroRec](t, "patch_float32_nan_nested.db")
+
+	oldBits := uint32(0x7f800001)
+	newBits := uint32(0x7fc00001)
+	oldVal := &patchFloatNestedZeroRec{
+		Name:    "same",
+		Payload: patchFloatNestedZeroPayload{Value64: 1, Value32: math.Float32frombits(oldBits)},
+	}
+	newVal := &patchFloatNestedZeroRec{
+		Name:    "same",
+		Payload: patchFloatNestedZeroPayload{Value64: 1, Value32: math.Float32frombits(newBits)},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalFloatPointerNaNTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchFloatPointerFallbackRec](t, "patch_float_nan_pointer_fallback.db")
+
+	oldNaN := math.Float64frombits(0x7ff0000000000001)
+	newNaN := math.Float64frombits(0x7ff8000000000001)
+	oldVal := &patchFloatPointerFallbackRec{Name: "same", Hidden: &oldNaN}
+	newVal := &patchFloatPointerFallbackRec{Name: "same", Hidden: &newNaN}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalIndexedFloatNaNTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchIndexedFloatHiddenRec](t, "patch_indexed_float_nan.db")
+
+	oldNaN := math.Float64frombits(0x7ff0000000000001)
+	newNaN := math.Float64frombits(0x7ff8000000000001)
+	oldVal := &patchIndexedFloatHiddenRec{
+		Name:    "same",
+		Score64: oldNaN,
+		Score32: math.Float32frombits(0x7f800001),
+		Ptr:     &oldNaN,
+	}
+	newVal := &patchIndexedFloatHiddenRec{
+		Name:    "same",
+		Score64: newNaN,
+		Score32: math.Float32frombits(0x7fc00001),
+		Ptr:     &newNaN,
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalIndexedFloatZeroTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchIndexedFloatHiddenRec](t, "patch_indexed_float_zero.db")
+
+	negZero := math.Copysign(0, -1)
+	posZero := 0.0
+	oldVal := &patchIndexedFloatHiddenRec{Name: "same", Score64: negZero, Score32: float32(negZero), Ptr: &negZero}
+	newVal := &patchIndexedFloatHiddenRec{Name: "same", Score64: posZero, Score32: float32(posZero), Ptr: &posZero}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalIndexedFloatSliceNaNTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchIndexedFloatSliceHiddenRec](t, "patch_indexed_float_slice_nan.db")
+
+	oldVal := &patchIndexedFloatSliceHiddenRec{
+		Name:   "same",
+		Hidden: []float64{math.Float64frombits(0x7ff0000000000001)},
+	}
+	newVal := &patchIndexedFloatSliceHiddenRec{
+		Name:   "same",
+		Hidden: []float64{math.Float64frombits(0x7ff8000000000001)},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
 	}
 }
 
