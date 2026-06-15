@@ -905,6 +905,230 @@ func TestIndexPersistence(t *testing.T) {
 	}
 }
 
+func TestIndexPersistence_RelativeBoltPathKeepsSidecarWithOriginalCWD(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "db")
+	otherDir := filepath.Join(dir, "other")
+	if err := os.Mkdir(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir db dir: %v", err)
+	}
+	if err := os.Mkdir(otherDir, 0o755); err != nil {
+		t.Fatalf("mkdir other dir: %v", err)
+	}
+
+	name := "relative_sidecar.db"
+	opts := testOptions(Options{BucketName: "relative_sidecar"})
+	if err := os.Chdir(dbDir); err != nil {
+		t.Fatalf("chdir db dir: %v", err)
+	}
+
+	raw, err := bbolt.Open(name, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("New: %v", err)
+	}
+
+	wantBoltPath := filepath.Join(dbDir, name)
+	if db.boltPath != wantBoltPath {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("boltPath=%q want %q", db.boltPath, wantBoltPath)
+	}
+	if err := db.Set(1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := os.Chdir(otherDir); err != nil {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("chdir other dir: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		_ = raw.Close()
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	wantSidecar := filepath.Join(dbDir, name+"."+opts.BucketName+".rbi")
+	if _, err := os.Stat(wantSidecar); err != nil {
+		t.Fatalf("stat original cwd sidecar: %v", err)
+	}
+	wrongSidecar := filepath.Join(otherDir, name+"."+opts.BucketName+".rbi")
+	if _, err := os.Stat(wrongSidecar); !os.IsNotExist(err) {
+		t.Fatalf("sidecar resolved from changed cwd: statErr=%v", err)
+	}
+
+	if err := os.Chdir(dbDir); err != nil {
+		t.Fatalf("chdir db dir before reopen: %v", err)
+	}
+	raw2, err := bbolt.Open(name, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	db2, err := New[uint64, schemaSubsetRec](raw2, opts)
+	if err != nil {
+		_ = raw2.Close()
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	}()
+
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys=%v want [1]", ids)
+	}
+}
+
+func TestIndexPersistence_PersistedIndexPathOverridesRelativeBoltPathCWD(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "db")
+	runDir := filepath.Join(dir, "run")
+	sidecarDir := filepath.Join(dir, "sidecar")
+	if err := os.Mkdir(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir db dir: %v", err)
+	}
+	if err := os.Mkdir(runDir, 0o755); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
+	if err := os.Mkdir(sidecarDir, 0o755); err != nil {
+		t.Fatalf("mkdir sidecar dir: %v", err)
+	}
+
+	name := "relative_override.db"
+	sidecar := filepath.Join(sidecarDir, "relative_override.rbi")
+	opts := testOptions(Options{
+		BucketName:         "relative_override",
+		PersistedIndexPath: sidecar,
+	})
+
+	if err := os.Chdir(dbDir); err != nil {
+		t.Fatalf("chdir db dir: %v", err)
+	}
+	raw, err := bbolt.Open(name, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	if err := os.Chdir(runDir); err != nil {
+		_ = raw.Close()
+		t.Fatalf("chdir run dir: %v", err)
+	}
+	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("New: %v", err)
+	}
+	if db.rbiFile != sidecar {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("rbiFile=%q want %q", db.rbiFile, sidecar)
+	}
+	if err := db.Set(1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		_ = raw.Close()
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("stat explicit sidecar: %v", err)
+	}
+	defaultSidecar := filepath.Join(runDir, name+"."+opts.BucketName+".rbi")
+	if _, err := os.Stat(defaultSidecar); !os.IsNotExist(err) {
+		t.Fatalf("default sidecar was written despite override: statErr=%v", err)
+	}
+
+	if err := os.Chdir(dbDir); err != nil {
+		t.Fatalf("chdir db dir before reopen: %v", err)
+	}
+	raw2, err := bbolt.Open(name, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	if err := os.Chdir(runDir); err != nil {
+		_ = raw2.Close()
+		t.Fatalf("chdir run dir before reopen New: %v", err)
+	}
+	db2, err := New[uint64, schemaSubsetRec](raw2, opts)
+	if err != nil {
+		_ = raw2.Close()
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	}()
+
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys=%v want [1]", ids)
+	}
+}
+
+func TestIndexPersistence_PersistedIndexPathRejectsBoltPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reject_same_path.db")
+	raw, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() {
+		_ = raw.Close()
+	}()
+
+	db, err := New[uint64, schemaSubsetRec](raw, testOptions(Options{
+		BucketName:         "reject_same_path",
+		PersistedIndexPath: path,
+	}))
+	if err == nil {
+		_ = db.Close()
+		t.Fatalf("New accepted PersistedIndexPath matching Bolt database path")
+	}
+	if !strings.Contains(err.Error(), "PersistedIndexPath cannot match Bolt database path") {
+		t.Fatalf("New err=%v want PersistedIndexPath rejection", err)
+	}
+}
+
 func TestIndexPersistence_LargeFieldRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist_large.db")

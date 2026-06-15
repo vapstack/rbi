@@ -101,6 +101,11 @@ type Options struct {
 	// to the .rbi file on Close.
 	DisableIndexStore bool
 
+	// PersistedIndexPath overrides the .rbi file path used for persisted index
+	// load/store. If empty, the path is derived from the absolute bbolt path
+	// and bucket name. Relative paths are resolved during New.
+	PersistedIndexPath string
+
 	// Logger receives informational indexer messages.
 	//
 	// Default: standard logger from package log.
@@ -348,7 +353,8 @@ type DB[K ~string | ~uint64, V any] struct {
 	closed atomic.Bool
 	broken atomic.Bool
 
-	rbiFile string
+	boltPath string
+	rbiFile  string
 
 	encodeFn func(*V, io.Writer) error
 	decodeFn func(*V, io.Reader) error
@@ -411,7 +417,20 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		return nil, err
 	}
 
-	boltPath := bolt.Path()
+	boltPath, err := filepath.Abs(bolt.Path())
+	if err != nil {
+		return nil, fmt.Errorf("error getting absolute file path: %w", err)
+	}
+	rbiFile := boltPath + "." + vname + ".rbi"
+	if options.PersistedIndexPath != "" {
+		rbiFile, err = filepath.Abs(options.PersistedIndexPath)
+		if err != nil {
+			return nil, fmt.Errorf("error getting absolute persisted index path: %w", err)
+		}
+		if rbiFile == boltPath {
+			return nil, fmt.Errorf("PersistedIndexPath cannot match Bolt database path: %q", rbiFile)
+		}
+	}
 
 	if err = regInstance(boltPath, vname); err != nil {
 		return nil, err
@@ -425,7 +444,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		options:    &options,
 		logger:     options.Logger,
 
-		rbiFile: bolt.Path() + "." + vname + ".rbi",
+		boltPath: boltPath,
+		rbiFile:  rbiFile,
 
 		execOptions: defaultExecOptions,
 		encodeFn:    encodeFn,
@@ -700,7 +720,7 @@ func (db *DB[K, V]) loadIndex() (
 		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
 	}
 	start := time.Now()
-	result, err := db.index.LoadIndex(db.rbiFile, db.bolt.Path(), db.dataBucket, currentSeq)
+	result, err := db.index.LoadIndex(db.rbiFile, db.boltPath, db.dataBucket, currentSeq)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -892,7 +912,7 @@ func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer unregInstance(db.bolt.Path(), string(db.dataBucket))
+	defer unregInstance(db.boltPath, string(db.dataBucket))
 
 	db.stopAnalyzeLoop()
 
@@ -1143,12 +1163,7 @@ func regInstance(dbPath, bucket string) error {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 
-	abs, err := filepath.Abs(dbPath)
-	if err != nil {
-		return fmt.Errorf("error getting absolute file path: %w", err)
-	}
-
-	key := abs + "::" + bucket
+	key := dbPath + "::" + bucket
 	if _, exists := registry[key]; exists {
 		return fmt.Errorf("rbi is already open for \"%v\" at %v", bucket, dbPath)
 	}
@@ -1161,7 +1176,6 @@ func unregInstance(dbPath, bucket string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 
-	absPath, _ := filepath.Abs(dbPath)
-	key := absPath + "::" + bucket
+	key := dbPath + "::" + bucket
 	delete(registry, key)
 }
