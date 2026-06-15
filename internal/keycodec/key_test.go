@@ -225,6 +225,17 @@ func TestPrefixUpperBoundBoundaryComparisons(t *testing.T) {
 	if ComparePrefixUpperBound(FromU64(0x0103000000000000), numericUpper) <= 0 {
 		t.Fatalf("numeric key equal to upper prefix and longer than it must sort after upper bound")
 	}
+
+	raw8Upper, ok := NewPrefixUpperBound("\x01\x02\x03\x04\x05\x06\x07\x07")
+	if !ok {
+		t.Fatalf("expected raw-8 upper bound")
+	}
+	if ComparePrefixUpperBound(FromString("\x01\x02\x03\x04\x05\x06\x07\x08"), raw8Upper) != 0 {
+		t.Fatalf("raw-8 string equal to upper bytes must compare equal")
+	}
+	if ComparePrefixUpperBound(FromU64(0x0102030405060708), raw8Upper) <= 0 {
+		t.Fatalf("numeric key equal to raw-8 upper bytes must sort after the upper bound")
+	}
 }
 
 func TestDataKeyBytesAndRoundTrip(t *testing.T) {

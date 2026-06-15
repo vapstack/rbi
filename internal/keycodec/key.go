@@ -209,10 +209,7 @@ func ComparePrefixUpperBound(a IndexKey, upper PrefixUpperBound) int {
 	if 8 < upper.cutLen {
 		return -1
 	}
-	if 8 > upper.cutLen {
-		return 1
-	}
-	return 0
+	return 1
 }
 
 func HasSuffixString(a IndexKey, suffix string) bool {
