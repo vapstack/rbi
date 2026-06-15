@@ -107,7 +107,11 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 }
 
 func Store(cfg StoreConfig) (err error) {
-	tmpFile := cfg.File + ".temp"
+	f, err := os.CreateTemp(filepath.Dir(cfg.File), filepath.Base(cfg.File)+".*.temp")
+	if err != nil {
+		return err
+	}
+	tmpFile := f.Name()
 	removeTemp := true
 	defer func() {
 		if removeTemp {
@@ -117,10 +121,6 @@ func Store(cfg StoreConfig) (err error) {
 		}
 	}()
 
-	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
 	closed := false
 	defer func() {
 		if !closed {
@@ -162,7 +162,7 @@ func Store(cfg StoreConfig) (err error) {
 func loadV29(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return LoadResult{}, fmt.Errorf("decode: reading bucket sequence: %w", err)
+		return LoadResult{}, fmt.Errorf("%w: decode: reading bucket sequence: %w", rbierrors.ErrPersistedIndexInvalid, err)
 	}
 	if storedSeq != cfg.CurrentSeq {
 		return LoadResult{}, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", rbierrors.ErrPersistedIndexStale, storedSeq, cfg.CurrentSeq)

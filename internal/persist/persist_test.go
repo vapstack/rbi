@@ -505,6 +505,27 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsTruncatedSequenceAsInvalid(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "truncated-seq.rbi")
+	if err := os.WriteFile(file, []byte{currentPersistedIndexVersion}, 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	_, err := Load(LoadConfig{
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 1,
+		Schema:     &schema.Schema{},
+	})
+	if !errors.Is(err, rbierrors.ErrPersistedIndexInvalid) {
+		t.Fatalf("Load err=%v, want invalid sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "reading bucket sequence") {
+		t.Fatalf("Load err=%v, want bucket sequence diagnostic", err)
+	}
+}
+
 func TestLoadRejectsUnsupportedVersion(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "unsupported.rbi")
 	if err := os.WriteFile(file, []byte{99}, 0o600); err != nil {
@@ -526,6 +547,61 @@ func TestLoadRejectsUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestStoreIgnoresExistingTempFileWithoutModifyingIt(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "sidecar.rbi")
+	temp := final + ".temp"
+	want := []byte("preexisting temp")
+	if err := os.WriteFile(temp, want, 0o644); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+
+	err := Store(StoreConfig{
+		File:      final,
+		BucketSeq: 1,
+		Schema:    &schema.Schema{},
+		Snapshot:  &snapshot.View{},
+	})
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	got, readErr := os.ReadFile(temp)
+	if readErr != nil {
+		t.Fatalf("read temp: %v", readErr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("temp content=%q, want %q", got, want)
+	}
+	if info, statErr := os.Stat(final); statErr != nil || info.IsDir() {
+		t.Fatalf("final stat info=%v err=%v", info, statErr)
+	}
+}
+
+func TestStoreIgnoresExistingTempDirectory(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "sidecar.rbi")
+	temp := final + ".temp"
+	if err := os.Mkdir(temp, 0o700); err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+
+	err := Store(StoreConfig{
+		File:      final,
+		BucketSeq: 1,
+		Schema:    &schema.Schema{},
+		Snapshot:  &snapshot.View{},
+	})
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if info, statErr := os.Stat(temp); statErr != nil || !info.IsDir() {
+		t.Fatalf("temp dir stat info=%v err=%v", info, statErr)
+	}
+	if info, statErr := os.Stat(final); statErr != nil || info.IsDir() {
+		t.Fatalf("final stat info=%v err=%v", info, statErr)
+	}
+}
+
 func TestStoreRemovesTempFileOnRenameFailure(t *testing.T) {
 	dir := t.TempDir()
 	final := filepath.Join(dir, "sidecar.rbi")
@@ -544,6 +620,13 @@ func TestStoreRemovesTempFileOnRenameFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(final + ".temp"); !os.IsNotExist(statErr) {
 		t.Fatalf("temp file stat err=%v, want not exist", statErr)
+	}
+	matches, globErr := filepath.Glob(final + ".*.temp")
+	if globErr != nil {
+		t.Fatalf("glob temp files: %v", globErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp files after Store failure: %v", matches)
 	}
 	if info, statErr := os.Stat(final); statErr != nil || !info.IsDir() {
 		t.Fatalf("final dir stat info=%v err=%v", info, statErr)
