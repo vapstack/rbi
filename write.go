@@ -311,14 +311,15 @@ func (db *DB[K, V]) resolveExecOptions(opts []ExecOption[K, V]) execOptions[K, V
 // If any hook returns an error, the transaction is rolled back and the error is
 // returned.
 func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	if newVal == nil {
 		return rbierrors.ErrNilValue
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
+
 	key := keycodec.DataKeyFromUserKey(id, db.strKey)
 	if len(cfg.beforeProcess) != 0 {
 		for _, fn := range cfg.beforeProcess {
@@ -326,9 +327,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 				return err
 			}
 		}
-	}
-	if err := db.unavailableErr(); err != nil {
-		return err
+		if err := db.unavailableErr(); err != nil {
+			return err
+		}
 	}
 
 	batch := db.batcher.NewBatch(1)
@@ -362,6 +363,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 // BatchSet allocates a buffer for each encoded value.
 // Storing a large number of values will consume a proportional amount of memory.
 func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	if len(ids) != len(newVals) {
 		return fmt.Errorf("different slice lengths")
 	}
@@ -376,9 +380,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
+
 	var keyScratch []keycodec.DataKey
 	if len(cfg.beforeProcess) != 0 {
 		keyScratch = keycodec.GetDataKeySlice(len(ids))
@@ -394,9 +396,10 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 			keyScratch = append(keyScratch, key)
 		}
 		defer keycodec.ReleaseDataKeySlice(keyScratch)
-	}
-	if err := db.unavailableErr(); err != nil {
-		return err
+
+		if err := db.unavailableErr(); err != nil {
+			return err
+		}
 	}
 
 	batch := db.batcher.NewBatch(len(ids))
@@ -432,14 +435,14 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 // original (old) and final (new) values before commit. After a successful
 // commit, the in-memory index is updated.
 func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	if len(patch) == 0 {
 		return nil
 	}
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
 
 	patchItems := patchItemsForWrite(patch)
 	if !ignoreUnknown {
@@ -463,15 +466,14 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 // BatchPatch allocates a buffer for each encoded value.
 // Patching a large number of values will consume a proportional amount of memory.
 func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K, V]) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
-
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
 
 	patchItems := patchItemsForWrite(patch)
 	if !ignoreUnknown {
@@ -494,11 +496,10 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 // operation is aborted. If the record does not exist, Delete is a no-op and no
 // callbacks are invoked.
 func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
-	cfg := db.resolveExecOptions(execOpts)
-
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
+	cfg := db.resolveExecOptions(execOpts)
 
 	batch := db.batcher.NewBatch(1)
 	batch.AddDelete(keycodec.DataKeyFromUserKey(id, db.strKey), cfg.beforeCommit)
@@ -513,15 +514,13 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 // processing, the entire operation is rolled back.
 // Missing IDs are skipped and do not trigger callbacks.
 func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	cfg := db.resolveExecOptions(execOpts)
-
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
+	if len(ids) == 0 {
+		return nil
+	}
+	cfg := db.resolveExecOptions(execOpts)
 
 	batch := db.batcher.NewBatch(len(ids))
 

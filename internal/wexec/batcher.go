@@ -119,15 +119,6 @@ func (b *Batcher) submit(reqs []*request, isolated bool) error {
 	if stats {
 		b.sched.stats.Submitted.Add(1)
 	}
-	if err := b.unavailable(); err != nil {
-		for i := 0; i < len(reqs); i++ {
-			b.releaseRequest(reqs[i])
-		}
-		if stats {
-			b.sched.stats.FallbackClosed.Add(1)
-		}
-		return err
-	}
 
 	if b.sched.maxOps == 1 && b.sched.window == 0 && b.sched.maxQ == 0 {
 		b.sched.mu.Lock()
