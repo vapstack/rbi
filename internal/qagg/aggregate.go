@@ -372,6 +372,12 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 	values := 0
 	switch expr.Name {
 	case qx.OpAND, qx.OpOR:
+		if len(expr.Args) == 0 {
+			if expr.Name == qx.OpAND {
+				return 0, 0, fmt.Errorf("%w: aggregate HAVING empty AND expression", rbierrors.ErrInvalidQuery)
+			}
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING empty OR expression", rbierrors.ErrInvalidQuery)
+		}
 		args += len(expr.Args)
 		for i := range expr.Args {
 			childArgs, childValues, err := aggregateHavingStorageSize(expr.Args[i], outputs)

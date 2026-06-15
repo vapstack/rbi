@@ -633,6 +633,16 @@ func TestPrepareRejectsUnsupportedAggregateShapes(t *testing.T) {
 			want: `unknown aggregate output "missing" in HAVING`,
 		},
 		{
+			name: "having_empty_and",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.AND()),
+			want: "aggregate HAVING empty AND expression",
+		},
+		{
+			name: "having_empty_or",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.OR()),
+			want: "aggregate HAVING empty OR expression",
+		},
+		{
 			name: "order_unknown_output",
 			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortOut("missing"),
 			want: `unknown aggregate output "missing" in ORDER`,
