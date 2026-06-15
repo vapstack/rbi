@@ -2,6 +2,7 @@ package schema
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"time"
@@ -188,6 +189,38 @@ func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) PatchValueEqu
 	}
 	return func(v1, v2 unsafe.Pointer) bool {
 		return scalarFieldValue[T](v1, offset) == scalarFieldValue[T](v2, offset)
+	}
+}
+
+func float32PatchValueEqual(offset uintptr, ptr bool) PatchValueEqualFn {
+	if ptr {
+		return func(v1, v2 unsafe.Pointer) bool {
+			p1 := ptrFieldValue[float32](v1, offset)
+			p2 := ptrFieldValue[float32](v2, offset)
+			if p1 == nil || p2 == nil {
+				return p1 == p2
+			}
+			return math.Float32bits(*p1) == math.Float32bits(*p2)
+		}
+	}
+	return func(v1, v2 unsafe.Pointer) bool {
+		return math.Float32bits(scalarFieldValue[float32](v1, offset)) == math.Float32bits(scalarFieldValue[float32](v2, offset))
+	}
+}
+
+func float64PatchValueEqual(offset uintptr, ptr bool) PatchValueEqualFn {
+	if ptr {
+		return func(v1, v2 unsafe.Pointer) bool {
+			p1 := ptrFieldValue[float64](v1, offset)
+			p2 := ptrFieldValue[float64](v2, offset)
+			if p1 == nil || p2 == nil {
+				return p1 == p2
+			}
+			return math.Float64bits(*p1) == math.Float64bits(*p2)
+		}
+	}
+	return func(v1, v2 unsafe.Pointer) bool {
+		return math.Float64bits(scalarFieldValue[float64](v1, offset)) == math.Float64bits(scalarFieldValue[float64](v2, offset))
 	}
 }
 
@@ -1494,9 +1527,9 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 		case reflect.Uint64:
 			return scalarPatchValueEqual[uint64](offset, f.Ptr)
 		case reflect.Float32:
-			return scalarPatchValueEqual[float32](offset, f.Ptr)
+			return float32PatchValueEqual(offset, f.Ptr)
 		case reflect.Float64:
-			return scalarPatchValueEqual[float64](offset, f.Ptr)
+			return float64PatchValueEqual(offset, f.Ptr)
 		}
 		return nil
 	}
@@ -1562,9 +1595,9 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 	case reflect.Uint64:
 		return scalarPatchValueEqual[uint64](offset, f.Ptr)
 	case reflect.Float32:
-		return scalarPatchValueEqual[float32](offset, f.Ptr)
+		return float32PatchValueEqual(offset, f.Ptr)
 	case reflect.Float64:
-		return scalarPatchValueEqual[float64](offset, f.Ptr)
+		return float64PatchValueEqual(offset, f.Ptr)
 	default:
 		return nil
 	}

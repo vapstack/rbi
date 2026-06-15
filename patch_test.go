@@ -734,6 +734,13 @@ type patchShadowedMeasureJSONOnlyRec struct {
 	Score int64
 }
 
+type patchMeasureFloatZeroRec struct {
+	Name      string   `db:"name" rbi:"index"`
+	Measure   float64  `db:"measure" rbi:"measure"`
+	Measure32 float32  `db:"measure32" rbi:"measure"`
+	Ptr       *float64 `db:"ptr" rbi:"measure"`
+}
+
 func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
 	db := openTempDBUint64Reflect[patchUnaliasedPromotedRec](t, "patch_unaliased_promoted_names.db")
 
@@ -812,6 +819,43 @@ func TestMakePatch_RejectsShadowedMeasureDefaultNameAndUsesJSONAlias(t *testing.
 	patch = mustMakePatch(t, db, oldVal, newVal, PatchJSON)
 	if len(patch) != 1 || patch[0].Name != "innerScore" || patch[0].Value != int64(20) {
 		t.Fatalf("PatchJSON patch=%#v want innerScore=20", patch)
+	}
+}
+
+func TestMakePatch_EmitsMeasureFloatSignedZeroTransitions(t *testing.T) {
+	db := openTempDBUint64Reflect[patchMeasureFloatZeroRec](t, "patch_measure_float_zero.db")
+
+	negZero := math.Copysign(0, -1)
+	posZero := 0.0
+	oldVal := &patchMeasureFloatZeroRec{Name: "same", Measure: negZero, Measure32: float32(negZero), Ptr: &negZero}
+	newVal := &patchMeasureFloatZeroRec{Name: "same", Measure: posZero, Measure32: float32(posZero), Ptr: &posZero}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	if len(patch) != 3 {
+		t.Fatalf("patch fields=%#v want only measure float fields", patch)
+	}
+	if got, ok := fields["measure"].(float64); !ok || math.Float64bits(got) != math.Float64bits(posZero) {
+		t.Fatalf("measure patch value=%#v", fields["measure"])
+	}
+	if got, ok := fields["measure32"].(float32); !ok || math.Float32bits(got) != math.Float32bits(float32(posZero)) {
+		t.Fatalf("measure32 patch value=%#v", fields["measure32"])
+	}
+	gotPtr, ok := fields["ptr"].(*float64)
+	if !ok || gotPtr == nil || math.Float64bits(*gotPtr) != math.Float64bits(posZero) {
+		t.Fatalf("ptr patch value=%#v", fields["ptr"])
+	}
+
+	applied := applyPatchForTest(t, db, oldVal, patch)
+	defer db.ReleaseRecords(applied)
+	if math.Float64bits(applied.Measure) != math.Float64bits(posZero) {
+		t.Fatalf("applied measure bits=%x want %x", math.Float64bits(applied.Measure), math.Float64bits(posZero))
+	}
+	if math.Float32bits(applied.Measure32) != math.Float32bits(float32(posZero)) {
+		t.Fatalf("applied measure32 bits=%x want %x", math.Float32bits(applied.Measure32), math.Float32bits(float32(posZero)))
+	}
+	if applied.Ptr == nil || math.Float64bits(*applied.Ptr) != math.Float64bits(posZero) {
+		t.Fatalf("applied ptr=%#v", applied.Ptr)
 	}
 }
 
