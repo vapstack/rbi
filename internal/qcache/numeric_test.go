@@ -107,6 +107,67 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 	}
 }
 
+func TestNumericRangeBucketCacheInitClearsSlotsFieldIndexAndEntries(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	cache := GetNumericRangeBucketCache(2, 99)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
+	ageEntry := GetNumericRangeBucketEntry(storage, idx, 0)
+	scoreEntry := GetNumericRangeBucketEntry(storage, idx, 0)
+	cache.StoreSlot("age", 0, ageEntry)
+	cache.StoreSlot("score", 1, scoreEntry)
+	if _, ok := cache.LoadField("age"); !ok {
+		t.Fatal("expected field index to be built")
+	}
+	fieldIndex := cache.fieldIndex
+
+	cache.Init(2, 7)
+	if ageEntry.refs.Load() != 0 || scoreEntry.refs.Load() != 0 {
+		t.Fatalf("expected init to release old entries: age=%d score=%d", ageEntry.refs.Load(), scoreEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after init=%d want 0", got)
+	}
+	if got := cache.MaxCardinality(); got != 7 {
+		t.Fatalf("MaxCardinality after init=%d want 7", got)
+	}
+	if cache.fieldIndexLen != 0 {
+		t.Fatalf("fieldIndexLen after init=%d want 0", cache.fieldIndexLen)
+	}
+	if fieldIndex != nil && len(fieldIndex) != 0 {
+		t.Fatalf("expected init to clear field index, got %d entries", len(fieldIndex))
+	}
+	if _, ok := cache.LoadSlot("age", 0); ok {
+		t.Fatal("expected old ordinal slot to miss after init")
+	}
+	if _, ok := cache.LoadField("score"); ok {
+		t.Fatal("expected old field index entry to miss after init")
+	}
+
+	heightEntry := GetNumericRangeBucketEntry(storage, idx, 0)
+	cache.StoreSlot("height", 1, heightEntry)
+	if _, ok := cache.LoadField("height"); !ok {
+		t.Fatal("expected fresh field index entry")
+	}
+
+	cache.Init(4, 8)
+	if heightEntry.refs.Load() != 0 {
+		t.Fatalf("expected growing init to release old entry, refs=%d", heightEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after growing init=%d want 0", got)
+	}
+	if got := cache.MaxCardinality(); got != 8 {
+		t.Fatalf("MaxCardinality after growing init=%d want 8", got)
+	}
+	if _, ok := cache.LoadSlot("height", 1); ok {
+		t.Fatal("expected fresh slot to miss after growing init")
+	}
+}
+
 func TestNumericRangeBucketCacheStoreSlotReleasesReplacedEntry(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()

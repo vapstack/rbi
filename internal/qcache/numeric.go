@@ -85,14 +85,32 @@ func GetNumericRangeBucketEntry(storage indexdata.FieldStorage, idx NumericRange
 }
 
 func (c *NumericRangeBucketCache) Init(fieldCount int, maxCard uint64) {
+	c.mu.Lock()
 	c.maxCard = maxCard
 	c.count = 0
 	c.fieldIndexLen = 0
+	for i := range c.slots {
+		slot := c.slots[i]
+		if slot.entry != nil {
+			slot.entry.Release()
+		}
+		c.slots[i] = numericRangeBucketCacheSlot{}
+	}
+	if c.fieldIndex != nil {
+		clear(c.fieldIndex)
+	}
+	if fieldCount == 0 {
+		c.slots = c.slots[:0]
+		c.mu.Unlock()
+		return
+	}
 	if cap(c.slots) < fieldCount {
 		c.slots = make([]numericRangeBucketCacheSlot, fieldCount)
+		c.mu.Unlock()
 		return
 	}
 	c.slots = c.slots[:fieldCount]
+	c.mu.Unlock()
 }
 
 func (c *NumericRangeBucketCache) ClearEntries() {

@@ -130,23 +130,27 @@ func GetMaterializedPredCache(maxEntries int, maxCardinality uint64) *Materializ
 }
 
 func (c *MaterializedPredCache) Init(maxEntries int, maxCardinality uint64) {
-	if maxEntries <= 0 {
-		return
-	}
+	c.mu.Lock()
+	c.clearLocked()
+	c.count.Store(0)
+	c.oversizedCount.Store(0)
+	c.clock.Store(0)
 	c.maxEntries = maxEntries
 	c.maxCard = maxCardinality
-	c.freeHint = 0
-	if cap(c.slots) < maxEntries {
-		c.slots = make([]materializedPredCacheSlot, maxEntries)
-		if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
-			c.index = materializedPredCacheIndexPool.Get()
-		}
+	if maxEntries <= 0 {
+		c.slots = c.slots[:0]
+		c.mu.Unlock()
 		return
 	}
-	c.slots = c.slots[:maxEntries]
+	if cap(c.slots) < maxEntries {
+		c.slots = make([]materializedPredCacheSlot, maxEntries)
+	} else {
+		c.slots = c.slots[:maxEntries]
+	}
 	if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
 		c.index = materializedPredCacheIndexPool.Get()
 	}
+	c.mu.Unlock()
 }
 
 func (c *MaterializedPredCache) Retain() {

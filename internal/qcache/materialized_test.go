@@ -245,6 +245,96 @@ func TestRecentKeyCacheClearReleasesAndClearsOwnedState(t *testing.T) {
 	}
 }
 
+func TestMaterializedPredCacheInitClearsEntriesIndexAndCounters(t *testing.T) {
+	limit := materializedPredCacheLinearMaxEntries + 2
+	cache := GetMaterializedPredCache(limit, 1)
+	defer cache.ReleaseRef()
+
+	small := qcacheTestPosting(1)
+	large := qcacheTestPosting(1, 2)
+	defer small.Release()
+	defer large.Release()
+
+	regularKey := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user")
+	oversizedKey := MaterializedPredKeyForNumericBucketSpan("age", 3, 7)
+	cache.Store(regularKey, small.Borrow())
+	if !cache.TryStoreOversized(oversizedKey, large.Borrow()) {
+		t.Fatal("expected oversized entry to be stored")
+	}
+
+	var regularEntry, oversizedEntry *materializedPredCacheEntry
+	for i := range cache.slots {
+		slot := cache.slots[i]
+		if !slot.used {
+			continue
+		}
+		if slot.key == regularKey {
+			regularEntry = slot.entry
+		}
+		if slot.key == oversizedKey {
+			oversizedEntry = slot.entry
+		}
+	}
+	if regularEntry == nil || oversizedEntry == nil {
+		t.Fatal("expected test entries to be stored")
+	}
+
+	cache.Init(limit, 7)
+	if regularEntry.refs.Load() != 0 || oversizedEntry.refs.Load() != 0 {
+		t.Fatalf("expected init to release old entries: regular=%d oversized=%d", regularEntry.refs.Load(), oversizedEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after init=%d want 0", got)
+	}
+	if got := cache.OversizedCount(); got != 0 {
+		t.Fatalf("OversizedCount after init=%d want 0", got)
+	}
+	if got := cache.Clock(); got != 0 {
+		t.Fatalf("Clock after init=%d want 0", got)
+	}
+	if got := cache.Limit(); got != limit {
+		t.Fatalf("Limit after init=%d want %d", got, limit)
+	}
+	if got := cache.MaxCardinality(); got != 7 {
+		t.Fatalf("MaxCardinality after init=%d want 7", got)
+	}
+	if cache.Has(regularKey) {
+		t.Fatal("expected old regular key to miss after init")
+	}
+	if ids, ok := cache.Load(oversizedKey); ok {
+		ids.Release()
+		t.Fatal("expected old oversized key to miss after init")
+	}
+	if len(cache.index) != 0 {
+		t.Fatalf("expected init to clear index, got %d entries", len(cache.index))
+	}
+
+	reallocatedKey := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "fresh")
+	cache.Store(reallocatedKey, small.Borrow())
+	var reallocatedEntry *materializedPredCacheEntry
+	for i := range cache.slots {
+		slot := cache.slots[i]
+		if slot.used && slot.key == reallocatedKey {
+			reallocatedEntry = slot.entry
+			break
+		}
+	}
+	if reallocatedEntry == nil {
+		t.Fatal("expected fresh entry to be stored")
+	}
+
+	cache.Init(limit+4, 9)
+	if reallocatedEntry.refs.Load() != 0 {
+		t.Fatalf("expected growing init to release old entry, refs=%d", reallocatedEntry.refs.Load())
+	}
+	if got := cache.EntryCount(); got != 0 {
+		t.Fatalf("EntryCount after growing init=%d want 0", got)
+	}
+	if cache.Has(reallocatedKey) {
+		t.Fatal("expected fresh key to miss after growing init")
+	}
+}
+
 func TestMaterializedPredCache_StoreBorrowedDetachesFromSourceOwner(t *testing.T) {
 	cache := GetMaterializedPredCache(4, 0)
 	defer cache.ReleaseRef()
