@@ -919,6 +919,24 @@ func TestLargePostingDirectReadFromDoesNotPreallocateContainerCount(t *testing.T
 	}
 }
 
+func TestLargePostingPayloadReadDoesNotPreallocateFromDeclaredSize(t *testing.T) {
+	const corruptLargeContainerCount = uint64(1 << 16)
+
+	payloadSize := largePostingWireHeaderSize + corruptLargeContainerCount*minLargePostingContainerWireSize
+	payload := make([]byte, largePostingWireHeaderSize)
+	binary.LittleEndian.PutUint64(payload, corruptLargeContainerCount)
+
+	var lp largePosting
+	defer lp.highlowcontainer.releaseBacking()
+
+	if _, err := lp.readFromBufioPayload(bufio.NewReader(bytes.NewReader(payload)), payloadSize); err == nil || !bytes.Contains([]byte(err.Error()), []byte("could not read key #0")) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if lp.highlowcontainer.size() != 0 || cap(lp.highlowcontainer.keys) > len(lp.highlowcontainer.inlineKeys) {
+		t.Fatalf("payload read allocated from declared size: size=%d cap=%d", lp.highlowcontainer.size(), cap(lp.highlowcontainer.keys))
+	}
+}
+
 func TestLargePostingConcurrentIteratorCreateReleaseStable(t *testing.T) {
 	lp := newLargePosting()
 	defer lp.Release()

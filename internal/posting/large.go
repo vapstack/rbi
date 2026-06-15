@@ -230,12 +230,23 @@ func (lp *largePosting) readFromBufioPayload(reader *bufio.Reader, payloadSize u
 	}
 
 	lp.highlowcontainer.clear()
-	if containerCount > (payloadSize-largePostingWireHeaderSize)/minLargePostingContainerWireSize {
+	payloadBodySize := payloadSize - largePostingWireHeaderSize
+	if containerCount > payloadBodySize/minLargePostingContainerWireSize {
 		return p, fmt.Errorf("large posting container count %d exceeds payload size %d", containerCount, payloadSize)
 	}
 	defer clearLargePostingOnReadError(lp, &err)
 
-	lp.highlowcontainer.setSize(int(containerCount))
+	bufferedBodySize := uint64(reader.Buffered())
+	if bufferedBodySize > payloadBodySize {
+		bufferedBodySize = payloadBodySize
+	}
+	preallocCount := bufferedBodySize / minLargePostingContainerWireSize
+	if preallocCount > containerCount {
+		preallocCount = containerCount
+	}
+	if preallocCount != 0 {
+		lp.highlowcontainer.setSize(int(preallocCount))
+	}
 
 	for i := uint64(0); i < containerCount; i++ {
 		keyBytes, peekErr := reader.Peek(4)
@@ -259,14 +270,19 @@ func (lp *largePosting) readFromBufioPayload(reader *bufio.Reader, payloadSize u
 			return p, fmt.Errorf("large posting keys are not strictly increasing")
 		}
 		prevKey = key
-		lp.highlowcontainer.keys[i] = key
-		lp.highlowcontainer.containers[i] = getBitmap32()
-		n64, readErr := lp.highlowcontainer.containers[i].readFromBufio(reader)
+		c := getBitmap32()
+		if i < preallocCount {
+			lp.highlowcontainer.keys[i] = key
+			lp.highlowcontainer.containers[i] = c
+		} else {
+			lp.highlowcontainer.appendContainer(key, c)
+		}
+		n64, readErr := c.readFromBufio(reader)
 		p += n64
 		if n64 == 0 || readErr != nil {
 			return p, fmt.Errorf("could not deserialize container for key #%d: %w", i, readErr)
 		}
-		if lp.highlowcontainer.containers[i].isEmpty() {
+		if c.isEmpty() {
 			return p, fmt.Errorf("large posting container #%d is empty", i)
 		}
 	}
