@@ -656,6 +656,16 @@ func TestArrayPosOrderPrioritiesKeepTypedLookupKeysDistinct(t *testing.T) {
 	if len(desc) != 3 || desc[0] != keycodec.IndexLookupString("tag") || desc[1] != keycodec.IndexLookupString(raw) || desc[2] != keycodec.IndexLookupU64(fixed) {
 		t.Fatalf("descending distinct priorities mismatch: got=%+v", desc)
 	}
+
+	dup := []keycodec.IndexLookupKey{
+		keycodec.IndexLookupString("first"),
+		keycodec.IndexLookupString("second"),
+		keycodec.IndexLookupString("first"),
+	}
+	dup = orderedDistinctLookupKeys(dup, true)
+	if len(dup) != 2 || dup[0] != keycodec.IndexLookupString("second") || dup[1] != keycodec.IndexLookupString("first") {
+		t.Fatalf("descending duplicate priorities mismatch: got=%+v", dup)
+	}
 }
 
 func TestArrayPosOrderNumericCoverageRejectsFixedWidthStringPriorities(t *testing.T) {

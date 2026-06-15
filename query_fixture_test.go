@@ -954,14 +954,6 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 				sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 				break
 			}
-			priority := want
-			if order.desc {
-				priority = append([]string(nil), want...)
-				// reverse priority for desc
-				for i, j := 0, len(priority)-1; i < j; i, j = i+1, j-1 {
-					priority[i], priority[j] = priority[j], priority[i]
-				}
-			}
 			rank := func(r row) int {
 				raw := fieldValue(r.rec, f)
 				set := make(map[string]struct{})
@@ -973,16 +965,24 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 				case string:
 					set[v] = struct{}{}
 				}
-				for i, v := range priority {
+				for i, v := range want {
 					if _, ok := set[v]; ok {
 						return i
 					}
 				}
-				return len(priority)
+				return len(want)
 			}
 			sort.Slice(rows, func(i, j int) bool {
 				ri := rank(rows[i])
 				rj := rank(rows[j])
+				if order.desc {
+					if ri < len(want) {
+						ri = len(want) - 1 - ri
+					}
+					if rj < len(want) {
+						rj = len(want) - 1 - rj
+					}
+				}
 				if ri == rj {
 					return rows[i].id < rows[j].id
 				}
@@ -1082,13 +1082,6 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 				sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
 				break
 			}
-			priority := want
-			if order.desc {
-				priority = append([]string(nil), want...)
-				for i, j := 0, len(priority)-1; i < j; i, j = i+1, j-1 {
-					priority[i], priority[j] = priority[j], priority[i]
-				}
-			}
 			rank := func(r row) int {
 				raw := fieldValue(r.rec, f)
 				set := make(map[string]struct{})
@@ -1100,16 +1093,24 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 				case string:
 					set[v] = struct{}{}
 				}
-				for i, v := range priority {
+				for i, v := range want {
 					if _, ok := set[v]; ok {
 						return i
 					}
 				}
-				return len(priority)
+				return len(want)
 			}
 			sort.Slice(rows, func(i, j int) bool {
 				ri := rank(rows[i])
 				rj := rank(rows[j])
+				if order.desc {
+					if ri < len(want) {
+						ri = len(want) - 1 - ri
+					}
+					if rj < len(want) {
+						rj = len(want) - 1 - rj
+					}
+				}
 				if ri == rj {
 					return rows[i].idx < rows[j].idx
 				}

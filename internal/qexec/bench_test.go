@@ -2462,6 +2462,35 @@ func BenchmarkPlannerDispatch(b *testing.B) {
 	})
 }
 
+func BenchmarkArrayPosOrderSingleHasAnyDesc(b *testing.B) {
+	qexecBenchRunScales(b, func(b *testing.B, db *testDB, scale qexecBenchScale) {
+		_ = scale
+		cases := []struct {
+			name string
+			q    *qx.QX
+		}{
+			{
+				name: "FastPath_NoEarlierOverlap",
+				q: qx.Query(
+					qx.HASANY("tags", []string{"java", "missing_tag"}),
+				).SortBy(qx.POS("tags", []string{"tag_mid", "go", "java"}), qx.DESC).Offset(4096).Limit(128),
+			},
+			{
+				name: "Fallback_EarlierOverlap",
+				q: qx.Query(
+					qx.HASANY("tags", []string{"db", "missing_tag"}),
+				).SortBy(qx.POS("tags", []string{"tag_mid", "go", "db"}), qx.DESC).Offset(4096).Limit(128),
+			},
+		}
+		for i := range cases {
+			tc := cases[i]
+			b.Run(tc.name, func(b *testing.B) {
+				benchmarkArrayPosOrderDispatch(b, db, tc.q)
+			})
+		}
+	})
+}
+
 func benchmarkPlannerRegressionBudget(b *testing.B, db *testDB, q *qx.QX, cold bool) {
 	b.Helper()
 
@@ -2922,6 +2951,49 @@ func BenchmarkQueryPreparedArrayOrder(b *testing.B) {
 					).SortBy(qx.POS("tags", []string{tag, "go", "db"}), qx.ASC).Limit(128)
 					benchmarkPreparedQueryShape(b, db, q)
 				})
+			})
+		}
+	})
+}
+
+func BenchmarkQueryPreparedArrayPosDesc(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		start, end := qexecBenchRange(scale.rows, sel)
+		offset := (end - start) / 2
+		if offset > 1_000_000 {
+			offset = 1_000_000
+		}
+		if offset < 1 {
+			offset = 1
+		}
+		tag := qexecBenchTag(sel)
+		filter := qx.AND(
+			qx.HASANY("tags", []string{tag, "missing_tag"}),
+			qx.GTE("age", 1),
+		)
+		priority := []string{tag, "go", "db"}
+
+		cases := []struct {
+			name string
+			q    *qx.QX
+		}{
+			{
+				name: "TagsPOS_DESC_Limit128",
+				q:    qx.Query(filter).SortBy(qx.POS("tags", priority), qx.DESC).Limit(128),
+			},
+			{
+				name: "TagsPOS_DESC_Offset_Limit128",
+				q:    qx.Query(filter).SortBy(qx.POS("tags", priority), qx.DESC).Offset(offset).Limit(128),
+			},
+			{
+				name: "TagsPOS_DESC_Unbounded",
+				q:    qx.Query(filter).SortBy(qx.POS("tags", priority), qx.DESC),
+			},
+		}
+		for i := range cases {
+			tc := cases[i]
+			b.Run(tc.name, func(b *testing.B) {
+				benchmarkPreparedQueryShape(b, db, tc.q)
 			})
 		}
 	})

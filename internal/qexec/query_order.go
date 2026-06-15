@@ -557,43 +557,6 @@ func orderedDistinctLookupKeys(vals []keycodec.IndexLookupKey, desc bool) []keyc
 	var fixed u64set
 	var set map[string]struct{}
 
-	if desc {
-		write := len(vals)
-		for i := len(vals) - 1; i >= 0; i-- {
-			v := vals[i]
-			if v.IsNumeric() {
-				if len(fixed.keys) == 0 {
-					fixed = getU64Set(len(vals))
-				}
-				if !fixed.Add(v.U64()) {
-					continue
-				}
-			} else {
-				s := v.StringKey()
-				if set == nil {
-					set = stringSetPool.Get()
-				}
-				if _, ok := set[s]; ok {
-					continue
-				}
-				set[s] = struct{}{}
-			}
-			write--
-			vals[write] = v
-		}
-		out := vals[write:]
-		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-			out[i], out[j] = out[j], out[i]
-		}
-		if set != nil {
-			stringSetPool.Put(set)
-		}
-		if len(fixed.keys) != 0 {
-			releaseU64Set(&fixed)
-		}
-		return out
-	}
-
 	write := 0
 	for _, v := range vals {
 		if v.IsNumeric() {
@@ -622,7 +585,13 @@ func orderedDistinctLookupKeys(vals []keycodec.IndexLookupKey, desc bool) []keyc
 	if len(fixed.keys) != 0 {
 		releaseU64Set(&fixed)
 	}
-	return vals[:write]
+	out := vals[:write]
+	if desc {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out
 }
 
 func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, vals []keycodec.IndexLookupKey) bool {
@@ -716,12 +685,12 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	}
 
 	out := makeOutSlice(resultCard, need)
-	var tmp posting.List
-
-	cursor := newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
-	defer cursor.release()
 
 	if !o.Desc {
+		var tmp posting.List
+		cursor := newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
+		defer cursor.release()
+
 		for _, v := range vals {
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, lookupScalarPostingRetained(ov, v), result)
@@ -731,20 +700,94 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 			}
 		}
 
-	} else {
-		for i := len(vals) - 1; i >= 0; i-- {
-			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, lookupScalarPostingRetained(ov, vals[i]), result)
-			if done {
-				tmp.Release()
-				return cursor.out, nil
+		qv.forEachPostingResultAll(result, cursor.emit)
+
+		tmp.Release()
+		return cursor.out, nil
+	}
+
+	cursor := newQueryCursor(out, skip, need, all, 0)
+	buckets := posting.GetSlice(len(vals))
+	var assigned posting.List
+	var assignedCard uint64
+	for i := 0; i < len(vals); i++ {
+		ids := lookupScalarPostingRetained(ov, vals[i])
+		if ids.IsEmpty() {
+			continue
+		}
+
+		bucket := ids.Borrow()
+		if result.neg {
+			bucket = bucket.BuildAndNot(result.ids)
+		} else {
+			bucket = bucket.BuildAnd(result.ids)
+		}
+		if bucket.IsEmpty() {
+			continue
+		}
+		if !assigned.IsEmpty() {
+			bucket = bucket.BuildAndNot(assigned)
+			if bucket.IsEmpty() {
+				continue
 			}
+		}
+		if assigned.IsEmpty() {
+			assigned = bucket.Borrow()
+		} else {
+			assigned = assigned.BuildOr(bucket)
+		}
+		assignedCard += bucket.Cardinality()
+		buckets = append(buckets, bucket)
+		if assignedCard == resultCard {
+			break
 		}
 	}
 
-	qv.forEachPostingResultAll(result, cursor.emit)
+	for i := len(buckets) - 1; i >= 0; i-- {
+		if cursor.emitPosting(buckets[i]) {
+			assigned.Release()
+			posting.ReleaseAll(buckets)
+			posting.ReleaseSlice(buckets)
+			return cursor.out, nil
+		}
+	}
 
-	tmp.Release()
+	if assignedCard != resultCard {
+		skipAssigned := assignedCard != 0
+		if !result.neg {
+			it := result.ids.Iter()
+			for it.HasNext() {
+				idx := it.Next()
+				if skipAssigned && assigned.Contains(idx) {
+					continue
+				}
+				if cursor.emit(idx) {
+					break
+				}
+			}
+			it.Release()
+		} else {
+			exclude := result.ids
+			it := qv.snap.Universe.Borrow().Iter()
+			for it.HasNext() {
+				idx := it.Next()
+				if !exclude.IsEmpty() && exclude.Contains(idx) {
+					continue
+				}
+				if skipAssigned && assigned.Contains(idx) {
+					continue
+				}
+				if cursor.emit(idx) {
+					break
+				}
+			}
+			it.Release()
+		}
+	}
+
+	assigned.Release()
+	posting.ReleaseAll(buckets)
+	posting.ReleaseSlice(buckets)
 
 	return cursor.out, nil
 }
@@ -957,31 +1000,16 @@ func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plann
 		return nil, false, nil
 	}
 
-	if !q.Order.Desc {
-		for i := 0; i < len(orderVals); i++ {
-			v := orderVals[i]
-			if compareLookupKey(v, filterKey) == 0 {
-				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
-			}
-			ids := lookupScalarPostingRetained(ov, v)
-			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
-			ids.Release()
-			if intersects {
-				return nil, false, nil
-			}
+	for i := 0; i < len(orderVals); i++ {
+		v := orderVals[i]
+		if compareLookupKey(v, filterKey) == 0 {
+			return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
 		}
-	} else {
-		for i := len(orderVals) - 1; i >= 0; i-- {
-			v := orderVals[i]
-			if compareLookupKey(v, filterKey) == 0 {
-				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
-			}
-			ids := lookupScalarPostingRetained(ov, v)
-			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
-			ids.Release()
-			if intersects {
-				return nil, false, nil
-			}
+		ids := lookupScalarPostingRetained(ov, v)
+		intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
+		ids.Release()
+		if intersects {
+			return nil, false, nil
 		}
 	}
 

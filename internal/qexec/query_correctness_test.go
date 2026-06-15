@@ -163,6 +163,22 @@ func tagPosAsc(priority []string) correctnessRowLess {
 	}
 }
 
+func tagPosDesc(priority []string) correctnessRowLess {
+	return func(aID uint64, a *Rec, bID uint64, b *Rec) bool {
+		ar, br := tagRank(a.Tags, priority), tagRank(b.Tags, priority)
+		if ar == br {
+			return aID < bID
+		}
+		if ar == len(priority) {
+			return false
+		}
+		if br == len(priority) {
+			return true
+		}
+		return ar > br
+	}
+}
+
 func tagRank(tags []string, priority []string) int {
 	for i := range priority {
 		for j := range tags {
@@ -337,6 +353,8 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	}
 	q = qx.Query(qx.HASANY("tags", priority)).SortBy(qx.POS("tags", priority), qx.ASC).Offset(1).Limit(5)
 	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasPriorityTag, tagPosAsc(priority), 1, 5))
+	q = qx.Query(qx.HASANY("tags", priority)).SortBy(qx.POS("tags", priority), qx.DESC).Offset(1).Limit(5)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasPriorityTag, tagPosDesc(priority), 1, 5))
 
 	hasSingleIndexedPriorityTag := func(_ uint64, r *Rec) bool {
 		return hasAnyString(r.Tags, "tag_mid", "missing_tag")
@@ -345,6 +363,12 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 1, 5))
 	q = qx.Query(qx.HASANY("tags", []string{"tag_mid", "missing_tag"})).SortBy(qx.POS("tags", priority), qx.ASC)
 	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 0, 0))
+
+	hasDBTag := func(_ uint64, r *Rec) bool {
+		return hasAnyString(r.Tags, "db", "missing_tag")
+	}
+	q = qx.Query(qx.HASANY("tags", []string{"db", "missing_tag"})).SortBy(qx.POS("tags", priority), qx.DESC)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasDBTag, tagPosDesc(priority), 0, 0))
 
 	prepared, shape, err := prepareTestQuery(db.engine, q)
 	if err != nil {
@@ -355,7 +379,7 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreparedQuery: %v", err)
 	}
-	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 0, 0))
+	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, hasDBTag, tagPosDesc(priority), 0, 0))
 }
 
 func TestQueryCorrectness_PreparedQueryConcurrentReadOnlyViews(t *testing.T) {
