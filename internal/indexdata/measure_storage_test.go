@@ -144,6 +144,24 @@ func TestMeasureStorageFromEntriesOwnedCoalescesDuplicateIDs(t *testing.T) {
 	measureStorageAssertValue(t, storage, 5, 55)
 }
 
+func TestMeasureStorageFromEntriesOwnedCoalescesDescendingDuplicateIDs(t *testing.T) {
+	entries := GetMeasureEntrySlice(0)
+	entries = append(entries, MeasureEntry{ID: 7, Value: 70})
+	entries = append(entries, MeasureEntry{ID: 5, Value: 50})
+	entries = append(entries, MeasureEntry{ID: 5, Value: 55})
+	entries = append(entries, MeasureEntry{ID: 1, Value: 10})
+
+	storage := NewMeasureStorageFromEntriesOwned(entries)
+	defer storage.Release()
+
+	if storage.Rows() != 3 {
+		t.Fatalf("rows: got %d want 3", storage.Rows())
+	}
+	measureStorageAssertValue(t, storage, 1, 10)
+	measureStorageAssertValue(t, storage, 5, 55)
+	measureStorageAssertValue(t, storage, 7, 70)
+}
+
 func TestMeasureStorageApplyDeltasOwnedCoalescesDuplicateIDs(t *testing.T) {
 	deltas := GetMeasureDeltaSlice(0)
 	deltas = append(deltas, MeasureDelta{ID: 5, NewOK: true, New: 50})
@@ -163,6 +181,24 @@ func TestMeasureStorageApplyDeltasOwnedCoalescesDuplicateIDs(t *testing.T) {
 	}
 	defer round.Release()
 	measureStorageAssertValue(t, round, 5, 55)
+}
+
+func TestMeasureStorageApplyDeltasOwnedCoalescesDescendingDuplicateIDs(t *testing.T) {
+	deltas := GetMeasureDeltaSlice(0)
+	deltas = append(deltas, MeasureDelta{ID: 7, NewOK: true, New: 70})
+	deltas = append(deltas, MeasureDelta{ID: 5, NewOK: true, New: 50})
+	deltas = append(deltas, MeasureDelta{ID: 5, NewOK: false})
+	deltas = append(deltas, MeasureDelta{ID: 1, NewOK: true, New: 10})
+
+	storage := MeasureStorage{}.ApplyDeltasOwned(deltas)
+	defer storage.Release()
+
+	if storage.Rows() != 2 {
+		t.Fatalf("rows: got %d want 2", storage.Rows())
+	}
+	measureStorageAssertValue(t, storage, 1, 10)
+	measureStorageAssertMissing(t, storage, 5)
+	measureStorageAssertValue(t, storage, 7, 70)
 }
 
 func TestMeasureStorageApplyDeltasOwnedSurvivesBaseReleaseAndPoison(t *testing.T) {

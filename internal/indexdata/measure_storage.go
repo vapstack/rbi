@@ -75,32 +75,61 @@ func sortUniqueMeasureEntryBuf(buf []MeasureEntry) []MeasureEntry {
 	if len(buf) <= 1 {
 		return buf
 	}
-	ordered := true
+	asc := true
+	desc := true
 	unique := true
 	prevID := buf[0].ID
 	for i := 1; i < len(buf); i++ {
 		id := buf[i].ID
 		if id < prevID {
-			ordered = false
-			break
-		}
-		if id == prevID {
+			asc = false
+		} else if id > prevID {
+			desc = false
+		} else {
 			unique = false
 		}
 		prevID = id
+		if !asc && !desc {
+			break
+		}
 	}
-	if ordered && unique {
-		return buf
+	if asc {
+		if unique {
+			return buf
+		}
+		write := 1
+		for i := 1; i < len(buf); i++ {
+			if buf[i].ID == buf[write-1].ID {
+				buf[write-1] = buf[i]
+				continue
+			}
+			if write != i {
+				buf[write] = buf[i]
+			}
+			write++
+		}
+		return buf[:write]
 	}
-	if !ordered {
-		unique = false
-		slices.SortStableFunc(buf, func(a, b MeasureEntry) int {
-			return cmp.Compare(a.ID, b.ID)
-		})
+	if desc {
+		slices.Reverse(buf)
+		if unique {
+			return buf
+		}
+		write := 0
+		for i := 0; i < len(buf); {
+			entry := buf[i]
+			i++
+			for i < len(buf) && buf[i].ID == entry.ID {
+				i++
+			}
+			buf[write] = entry
+			write++
+		}
+		return buf[:write]
 	}
-	if unique {
-		return buf
-	}
+	slices.SortStableFunc(buf, func(a, b MeasureEntry) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 	write := 1
 	for i := 1; i < len(buf); i++ {
 		if buf[i].ID == buf[write-1].ID {
@@ -119,32 +148,61 @@ func sortUniqueMeasureDeltaBuf(buf []MeasureDelta) []MeasureDelta {
 	if len(buf) <= 1 {
 		return buf
 	}
-	ordered := true
+	asc := true
+	desc := true
 	unique := true
 	prevID := buf[0].ID
 	for i := 1; i < len(buf); i++ {
 		id := buf[i].ID
 		if id < prevID {
-			ordered = false
-			break
-		}
-		if id == prevID {
+			asc = false
+		} else if id > prevID {
+			desc = false
+		} else {
 			unique = false
 		}
 		prevID = id
+		if !asc && !desc {
+			break
+		}
 	}
-	if ordered && unique {
-		return buf
+	if asc {
+		if unique {
+			return buf
+		}
+		write := 1
+		for i := 1; i < len(buf); i++ {
+			if buf[i].ID == buf[write-1].ID {
+				buf[write-1] = buf[i]
+				continue
+			}
+			if write != i {
+				buf[write] = buf[i]
+			}
+			write++
+		}
+		return buf[:write]
 	}
-	if !ordered {
-		unique = false
-		slices.SortStableFunc(buf, func(a, b MeasureDelta) int {
-			return cmp.Compare(a.ID, b.ID)
-		})
+	if desc {
+		slices.Reverse(buf)
+		if unique {
+			return buf
+		}
+		write := 0
+		for i := 0; i < len(buf); {
+			delta := buf[i]
+			i++
+			for i < len(buf) && buf[i].ID == delta.ID {
+				i++
+			}
+			buf[write] = delta
+			write++
+		}
+		return buf[:write]
 	}
-	if unique {
-		return buf
-	}
+	slices.SortStableFunc(buf, func(a, b MeasureDelta) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 	write := 1
 	for i := 1; i < len(buf); i++ {
 		if buf[i].ID == buf[write-1].ID {
