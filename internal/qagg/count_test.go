@@ -356,6 +356,92 @@ func TestExecuteDistinctAndCountDistinct(t *testing.T) {
 	requireQaggUint(t, result.Rows[0][0], 3)
 }
 
+func TestExecuteDistinctWindow(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	prepared, err := Prepare(
+		qx.Aggregate(qx.DISTINCT("country").AS("country")).
+			Offset(1).
+			Limit(2),
+		db.rt,
+		db.rt.IndexedByName,
+	)
+	if err != nil {
+		t.Fatalf("Prepare distinct window: %v", err)
+	}
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute distinct window: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"country"})
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireQaggString(t, result.Rows[0][0], "NL")
+	requireQaggString(t, result.Rows[1][0], "PL")
+}
+
+func TestExecuteDistinctOrderWindow(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	prepared, err := Prepare(
+		qx.Aggregate(qx.DISTINCT("country").AS("country")).
+			SortOut("country", qx.DESC).
+			Offset(1).
+			Limit(2),
+		db.rt,
+		db.rt.IndexedByName,
+	)
+	if err != nil {
+		t.Fatalf("Prepare distinct order window: %v", err)
+	}
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute distinct order window: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"country"})
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireQaggString(t, result.Rows[0][0], "PL")
+	requireQaggString(t, result.Rows[1][0], "NL")
+}
+
+func TestExecuteDistinctWindowCanReturnNilValue(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	prepared, err := Prepare(
+		qx.Aggregate(qx.DISTINCT("segment").AS("segment")).
+			Offset(2).
+			Limit(1),
+		db.rt,
+		db.rt.IndexedByName,
+	)
+	if err != nil {
+		t.Fatalf("Prepare distinct nil window: %v", err)
+	}
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute distinct nil window: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"segment"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	if result.Rows[0][0].Kind() != ValueKindNone {
+		t.Fatalf("segment kind=%v, want nil; rows=%#v", result.Rows[0][0].Kind(), result.Rows)
+	}
+}
+
 func TestExecuteNumericMetricsOverMeasureAndOrdinaryFields(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 	prepared, err := Prepare(

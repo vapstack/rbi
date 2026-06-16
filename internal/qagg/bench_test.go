@@ -449,6 +449,96 @@ func qaggBenchCases() []qaggBenchCase {
 	}
 }
 
+func qaggBenchSharedMeasureCases() []qaggBenchCase {
+	return []qaggBenchCase{
+		{
+			name:        "CountSumMinFullScan",
+			route:       "SharedMeasure",
+			selectivity: "All",
+			storage:     "MeasureDense",
+			build: func(qaggBenchScale) *qx.QX {
+				return qx.Aggregate(
+					qx.COUNT("dense_measure").AS("cnt"),
+					qx.SUM("dense_measure").AS("sum"),
+					qx.MIN("dense_measure").AS("min"),
+				)
+			},
+		},
+		{
+			name:        "CountSumAvgMinMaxFullScan",
+			route:       "SharedMeasure",
+			selectivity: "All",
+			storage:     "MeasureDense",
+			build: func(qaggBenchScale) *qx.QX {
+				return qx.Aggregate(
+					qx.COUNT("dense_measure").AS("cnt"),
+					qx.SUM("dense_measure").AS("sum"),
+					qx.AVG("dense_measure").AS("avg"),
+					qx.MIN("dense_measure").AS("min"),
+					qx.MAX("dense_measure").AS("max"),
+				)
+			},
+		},
+		{
+			name:        "CountSumMinMergeScan",
+			route:       "SharedMeasure",
+			selectivity: "Broad",
+			storage:     "MeasureDense",
+			build: func(qaggBenchScale) *qx.QX {
+				return qaggBenchQuery(qaggBenchScalarFilter("Broad")).Metrics(
+					qx.COUNT("dense_measure").AS("cnt"),
+					qx.SUM("dense_measure").AS("sum"),
+					qx.MIN("dense_measure").AS("min"),
+				)
+			},
+		},
+		{
+			name:        "CountSumMinLookup",
+			route:       "SharedMeasure",
+			selectivity: "Tiny",
+			storage:     "MeasureSparse",
+			build: func(qaggBenchScale) *qx.QX {
+				return qaggBenchQuery(qaggBenchScalarFilter("Tiny")).Metrics(
+					qx.COUNT("sparse_measure").AS("cnt"),
+					qx.SUM("sparse_measure").AS("sum"),
+					qx.MIN("sparse_measure").AS("min"),
+				)
+			},
+		},
+		{
+			name:        "CountSumMinGroup2Lookup",
+			route:       "SharedMeasure",
+			selectivity: "Tiny",
+			storage:     "MeasureSparse_Group2",
+			build: func(qaggBenchScale) *qx.QX {
+				return qaggBenchQuery(qaggBenchScalarFilter("Tiny")).
+					Group("group_low", "group_mid").
+					Metrics(
+						qx.COUNT("sparse_measure").AS("cnt"),
+						qx.SUM("sparse_measure").AS("sum"),
+						qx.MIN("sparse_measure").AS("min"),
+					)
+			},
+		},
+		{
+			name:        "HybridCountSumMinFullScan",
+			route:       "SharedMeasure",
+			selectivity: "All",
+			storage:     "HybridOrdinaryMeasure",
+			build: func(qaggBenchScale) *qx.QX {
+				return qx.Aggregate(
+					qx.COUNT("dense_measure").AS("measure_cnt"),
+					qx.SUM("dense_measure").AS("measure_sum"),
+					qx.MIN("dense_measure").AS("measure_min"),
+					qx.COUNT("value_low").AS("value_cnt"),
+					qx.SUM("value_low").AS("value_sum"),
+					qx.MIN("value_low").AS("value_min"),
+				)
+			},
+		},
+	}
+}
+
 func qaggBenchName(c qaggBenchCase, scale qaggBenchScale, layout qaggBenchIDLayout) string {
 	return c.route + "/" + scale.name + "/" + c.selectivity + "/" + c.storage + "/" + layout.name + "/" + c.name
 }
@@ -638,6 +728,53 @@ func BenchmarkAggregateOnly(b *testing.B) {
 	}
 }
 
+func BenchmarkAggregateSharedMeasureMetrics(b *testing.B) {
+	cases := qaggBenchSharedMeasureCases()
+	for si := range qaggBenchScales {
+		scale := qaggBenchScales[si]
+		for li := range qaggBenchIDLayouts {
+			layout := qaggBenchIDLayouts[li]
+			for ci := range cases {
+				tc := cases[ci]
+				b.Run(qaggBenchName(tc, scale, layout), func(b *testing.B) {
+					db := qaggBenchCachedDB(b, scale, layout)
+					prepared, err := Prepare(tc.build(scale), db.rt, db.rt.IndexedByName)
+					if err != nil {
+						b.Fatalf("Prepare: %v", err)
+					}
+					defer prepared.Release()
+
+					view := db.exec.AcquireView(db.snap)
+					defer db.exec.ReleaseView(view)
+					ids, err := view.Filter(prepared.filter)
+					if err != nil {
+						b.Fatalf("Filter: %v", err)
+					}
+					defer ids.Release()
+
+					exec := aggregateExecutor{snap: db.snap}
+					result, err := exec.executeAggregate(prepared, ids)
+					if err != nil {
+						b.Fatalf("Aggregate warmup: %v", err)
+					}
+					qaggBenchReportResult(b, prepared, ids.Cardinality(), result)
+
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						result, err = exec.executeAggregate(prepared, ids)
+						if err != nil {
+							b.Fatalf("Aggregate: %v", err)
+						}
+						qaggBenchResult = result
+					}
+					qaggBenchReportResult(b, prepared, ids.Cardinality(), qaggBenchResult)
+				})
+			}
+		}
+	}
+}
+
 func BenchmarkAggregatePreparedEndToEnd(b *testing.B) {
 	cases := qaggBenchCases()
 	for si := range qaggBenchScales {
@@ -728,6 +865,9 @@ func BenchmarkAggregatePostprocessOnly(b *testing.B) {
 					result = applyAggregateHaving(result, prepared.having)
 					result = applyAggregateOrder(result, prepared.order, prepared.orderUnique, prepared.offset, prepared.limit)
 					result = applyAggregateWindow(result, prepared.offset, prepared.limit)
+					if shouldCompactAggregateRows(len(base.Rows), len(result.Rows)) {
+						result = compactAggregateRows(result)
+					}
 					qaggBenchResult = result
 				}
 				b.ReportMetric(float64(len(qaggBenchResult.Rows)), "rows/op")

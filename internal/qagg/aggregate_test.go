@@ -121,6 +121,51 @@ func TestAggregateQueryReleaseDropsOversizedPlannerSlices(t *testing.T) {
 	}
 }
 
+func TestCompactAggregateRowsDetachesKeptRows(t *testing.T) {
+	values := []Value{
+		{num: 1, any: ValueKindUint},
+		{num: 10, any: ValueKindUint},
+		{num: 2, any: ValueKindUint},
+		{num: 20, any: ValueKindUint},
+		{num: 3, any: ValueKindUint},
+		{num: 30, any: ValueKindUint},
+	}
+	result := compactAggregateRows(Result{
+		Layout: []string{"group", "rows"},
+		Rows:   []Row{values[2:4:4]},
+	})
+
+	values[2] = Value{num: 200, any: ValueKindUint}
+	values[3] = Value{num: 2000, any: ValueKindUint}
+
+	group, _ := result.Rows[0][0].Uint()
+	rows, _ := result.Rows[0][1].Uint()
+	if group != 2 || rows != 20 {
+		t.Fatalf("compacted row=(%d,%d), want (2,20)", group, rows)
+	}
+}
+
+func TestShouldCompactAggregateRows(t *testing.T) {
+	tests := []struct {
+		before int
+		after  int
+		want   bool
+	}{
+		{before: 100, after: 0, want: false},
+		{before: 100, after: 100, want: false},
+		{before: 100, after: 90, want: false},
+		{before: 100, after: 50, want: false},
+		{before: 100, after: 49, want: true},
+		{before: 100, after: 1, want: true},
+	}
+	for i := range tests {
+		got := shouldCompactAggregateRows(tests[i].before, tests[i].after)
+		if got != tests[i].want {
+			t.Fatalf("case %d: shouldCompactAggregateRows(%d,%d)=%v want %v", i, tests[i].before, tests[i].after, got, tests[i].want)
+		}
+	}
+}
+
 func TestAggregateHavingStorageSizeValidatesLeftBeforeINValues(t *testing.T) {
 	_, values, err := aggregateHavingStorageSize(
 		qx.IN(qx.REF("country"), []uint64{1, 2, 3, 4}),
