@@ -1,10 +1,12 @@
 package qir
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/rbierrors"
 )
 
 type testPrepareResolver struct{}
@@ -78,6 +80,103 @@ func TestPrepareCountExpr_MalformedKindNoneRejected(t *testing.T) {
 	for i := range tests {
 		if _, err := PrepareCountExprResolved(testPrepareFieldResolver, tests[i]); err == nil {
 			t.Fatal("expected PrepareCountExpr to reject malformed KindNONE expression")
+		}
+	}
+}
+
+func TestPrepareCountExpr_MalformedNodeFieldsRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		expr qx.Expr
+	}{
+		{
+			name: "op_value",
+			expr: qx.Expr{
+				Kind:  qx.KindOP,
+				Name:  qx.OpEQ,
+				Value: true,
+				Args: []qx.Expr{
+					qx.REF("status"),
+					qx.LIT("active"),
+				},
+			},
+		},
+		{
+			name: "ref_value",
+			expr: qx.EQ(qx.Expr{Kind: qx.KindREF, Name: "status", Value: "ignored"}, "active"),
+		},
+		{
+			name: "ref_args",
+			expr: qx.EQ(qx.Expr{Kind: qx.KindREF, Name: "status", Args: []qx.Expr{qx.LIT("ignored")}}, "active"),
+		},
+		{
+			name: "lit_name",
+			expr: qx.EQ("status", qx.Expr{Kind: qx.KindLIT, Name: "status", Value: "active"}),
+		},
+		{
+			name: "lit_args",
+			expr: qx.EQ("status", qx.Expr{Kind: qx.KindLIT, Value: "active", Args: []qx.Expr{qx.LIT("ignored")}}),
+		},
+	}
+
+	for i := range tests {
+		q, err := PrepareCountExprResolved(testPrepareFieldResolver, tests[i].expr)
+		if q != nil {
+			q.Release()
+		}
+		if err == nil {
+			t.Fatalf("%s: expected PrepareCountExprResolved to reject malformed qx node fields", tests[i].name)
+		}
+		if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("%s: err=%v, want ErrInvalidQuery", tests[i].name, err)
+		}
+	}
+}
+
+func TestPrepareQuery_MalformedOrderNodeFieldsRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		by   qx.Expr
+	}{
+		{
+			name: "ref_args",
+			by:   qx.Expr{Kind: qx.KindREF, Name: "status", Args: []qx.Expr{qx.LIT("ignored")}},
+		},
+		{
+			name: "op_value",
+			by: qx.Expr{
+				Kind:  qx.KindOP,
+				Name:  qx.OpLEN,
+				Value: true,
+				Args:  []qx.Expr{qx.REF("tags")},
+			},
+		},
+		{
+			name: "pos_lit_args",
+			by: qx.Expr{
+				Kind: qx.KindOP,
+				Name: qx.OpPOS,
+				Args: []qx.Expr{
+					qx.REF("tags"),
+					{Kind: qx.KindLIT, Value: []string{"go"}, Args: []qx.Expr{qx.LIT("ignored")}},
+				},
+			},
+		},
+	}
+
+	for i := range tests {
+		q, err := PrepareQuery(&qx.QX{
+			Filter: qx.EQ("status", "active"),
+			Order:  []qx.Order{{By: tests[i].by}},
+		}, testPrepareFieldResolver)
+		if q != nil {
+			q.Release()
+		}
+		if err == nil {
+			t.Fatalf("%s: expected PrepareQuery to reject malformed qx order node fields", tests[i].name)
+		}
+		if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("%s: err=%v, want ErrInvalidQuery", tests[i].name, err)
 		}
 	}
 }

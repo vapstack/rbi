@@ -694,6 +694,26 @@ func TestPrepareRejectsUnsupportedAggregateShapes(t *testing.T) {
 			want: "GROUP BY supports only field references",
 		},
 		{
+			name: "group_ref_args",
+			q:    qx.GroupBy(qx.Expr{Kind: qx.KindREF, Name: "country", Args: []qx.Expr{qx.LIT("ignored")}}).Metrics(qx.ROWCOUNT()),
+			want: `GROUP BY field reference "country" must not have arguments`,
+		},
+		{
+			name: "metric_op_value",
+			q: qx.Aggregate(qx.Expr{
+				Kind:  qx.KindOP,
+				Name:  qx.OpSUM,
+				Value: true,
+				Args:  []qx.Expr{qx.REF("amount")},
+			}),
+			want: `aggregate metric operation "sum" must not carry a value`,
+		},
+		{
+			name: "metric_ref_args",
+			q:    qx.Aggregate(qx.SUM(qx.Expr{Kind: qx.KindREF, Name: "amount", Args: []qx.Expr{qx.LIT("ignored")}})),
+			want: `aggregate metric "sum" field reference "amount" must not have arguments`,
+		},
+		{
 			name: "distinct_with_other_metric",
 			q:    qx.Aggregate(qx.DISTINCT("country"), qx.ROWCOUNT()),
 			want: "DISTINCT is supported only as a single ungrouped metric",
@@ -729,9 +749,34 @@ func TestPrepareRejectsUnsupportedAggregateShapes(t *testing.T) {
 			want: "aggregate HAVING empty OR expression",
 		},
 		{
+			name: "having_op_value",
+			q: qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.Expr{
+				Kind:  qx.KindOP,
+				Name:  qx.OpGT,
+				Value: true,
+				Args:  []qx.Expr{qx.OUT("rows"), qx.LIT(1)},
+			}),
+			want: `aggregate HAVING operation "gt" must not carry a value`,
+		},
+		{
+			name: "having_out_args",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.Expr{Kind: qx.KindOUT, Name: "rows", Args: []qx.Expr{qx.LIT("ignored")}}, 1)),
+			want: `aggregate HAVING output reference "rows" must not have arguments`,
+		},
+		{
+			name: "having_lit_args",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), qx.Expr{Kind: qx.KindLIT, Value: 1, Args: []qx.Expr{qx.LIT("ignored")}})),
+			want: "aggregate HAVING literal must not have arguments",
+		},
+		{
 			name: "order_unknown_output",
 			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortOut("missing"),
 			want: `unknown aggregate output "missing" in ORDER`,
+		},
+		{
+			name: "order_out_args",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortBy(qx.Expr{Kind: qx.KindOUT, Name: "rows", Args: []qx.Expr{qx.LIT("ignored")}}),
+			want: `aggregate ORDER output reference "rows" must not have arguments`,
 		},
 		{
 			name: "projection",

@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/rbierrors"
 )
 
 type Op byte
@@ -290,10 +291,13 @@ func compileRootFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr,
 
 func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, error) {
 	if src.Kind == qx.KindNONE {
-		return Expr{}, fmt.Errorf("rbi: invalid empty filter expression")
+		return Expr{}, fmt.Errorf("%w: empty filter expression", rbierrors.ErrInvalidQuery)
 	}
 	if src.Kind != qx.KindOP {
-		return Expr{}, fmt.Errorf("rbi does not support filter expression kind %q", src.Kind)
+		return Expr{}, fmt.Errorf("%w: filter expression must be an operation, got %q", rbierrors.ErrInvalidQuery, src.Kind)
+	}
+	if src.Value != nil {
+		return Expr{}, fmt.Errorf("%w: filter operation %q must not carry a value", rbierrors.ErrInvalidQuery, src.Name)
 	}
 
 	switch src.Name {
@@ -301,7 +305,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 	case qx.OpAND:
 		out := Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal}
 		if len(src.Args) == 0 {
-			return Expr{}, fmt.Errorf("rbi: empty AND expression")
+			return Expr{}, fmt.Errorf("%w: AND expression requires at least one operand", rbierrors.ErrInvalidQuery)
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
@@ -316,7 +320,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 	case qx.OpOR:
 		out := Expr{Op: OpOR, FieldOrdinal: NoFieldOrdinal}
 		if len(src.Args) == 0 {
-			return Expr{}, fmt.Errorf("rbi: empty OR expression")
+			return Expr{}, fmt.Errorf("%w: OR expression requires at least one operand", rbierrors.ErrInvalidQuery)
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
@@ -330,7 +334,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 
 	case qx.OpNOT:
 		if len(src.Args) != 1 {
-			return Expr{}, fmt.Errorf("rbi: invalid NOT expression")
+			return Expr{}, fmt.Errorf("%w: NOT expression expects one operand", rbierrors.ErrInvalidQuery)
 		}
 		child, err := compileFilter(q, &src.Args[0], compiler)
 		if err != nil {
@@ -360,7 +364,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 
 	case qx.OpISNULL:
 		if len(src.Args) != 1 {
-			return Expr{}, fmt.Errorf("rbi: invalid %s expression", qx.OpISNULL)
+			return Expr{}, fmt.Errorf("%w: %s expression expects one field reference", rbierrors.ErrInvalidQuery, qx.OpISNULL)
 		}
 		field, info, err := compileFieldRef(&src.Args[0], compiler)
 		if err != nil {
@@ -382,20 +386,26 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 	case qx.OpCONTAINS:
 		return compileLeaf(OpCONTAINS, false, src.Args, compiler)
 	default:
-		return Expr{}, fmt.Errorf("rbi does not support filter operation %q", src.Name)
+		return Expr{}, fmt.Errorf("%w: unsupported filter operation %q", rbierrors.ErrInvalidQuery, src.Name)
 	}
 }
 
 func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Expr, error) {
 	if len(args) != 2 {
-		return Expr{}, fmt.Errorf("rbi: invalid %v expression", op)
+		return Expr{}, fmt.Errorf("%w: %s expression expects field reference and literal", rbierrors.ErrInvalidQuery, op)
 	}
 	field, info, err := compileFieldRef(&args[0], compiler)
 	if err != nil {
 		return Expr{}, err
 	}
 	if args[1].Kind != qx.KindLIT {
-		return Expr{}, fmt.Errorf("rbi does not support computed predicate values for field %q", field)
+		return Expr{}, fmt.Errorf("%w: predicate value for field %q must be a literal", rbierrors.ErrInvalidQuery, field)
+	}
+	if args[1].Name != "" {
+		return Expr{}, fmt.Errorf("%w: predicate literal for field %q must not define a name", rbierrors.ErrInvalidQuery, field)
+	}
+	if len(args[1].Args) != 0 {
+		return Expr{}, fmt.Errorf("%w: predicate literal for field %q must not have arguments", rbierrors.ErrInvalidQuery, field)
 	}
 	if (op == OpHASALL || op == OpHASANY) && info.Caps&FieldCapArrayPredicate == 0 {
 		return Expr{}, fmt.Errorf("rbi does not support array predicates for %s", field)
@@ -476,8 +486,17 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 }
 
 func compileFieldRef(src *qx.Expr, compiler *prepareCompiler) (string, FieldInfo, error) {
-	if src.Kind != qx.KindREF || src.Name == "" {
-		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("rbi supports only source-field refs in filters/order")
+	if src.Kind != qx.KindREF {
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("%w: source-field reference expected in filters/order", rbierrors.ErrInvalidQuery)
+	}
+	if src.Name == "" {
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("%w: source-field reference name must not be empty", rbierrors.ErrInvalidQuery)
+	}
+	if src.Value != nil {
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("%w: source-field reference %q must not carry a value", rbierrors.ErrInvalidQuery, src.Name)
+	}
+	if len(src.Args) != 0 {
+		return "", FieldInfo{Ordinal: NoFieldOrdinal}, fmt.Errorf("%w: source-field reference %q must not have arguments", rbierrors.ErrInvalidQuery, src.Name)
 	}
 	info, ok := compiler.fieldInfo(src.Name)
 	if !ok {
@@ -501,10 +520,13 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 		}, nil
 
 	case qx.KindOP:
+		if by.Value != nil {
+			return Order{}, fmt.Errorf("%w: order operation %q must not carry a value", rbierrors.ErrInvalidQuery, by.Name)
+		}
 		switch by.Name {
 		case qx.OpLEN:
 			if len(by.Args) != 1 {
-				return Order{}, fmt.Errorf("rbi: invalid LEN order expression")
+				return Order{}, fmt.Errorf("%w: LEN order expression expects one field reference", rbierrors.ErrInvalidQuery)
 			}
 			field, info, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
@@ -521,7 +543,7 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 
 		case qx.OpPOS:
 			if len(by.Args) != 2 {
-				return Order{}, fmt.Errorf("rbi: invalid POS order expression")
+				return Order{}, fmt.Errorf("%w: POS order expression expects field reference and literal priority list", rbierrors.ErrInvalidQuery)
 			}
 			field, info, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
@@ -531,7 +553,13 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 				return Order{}, fmt.Errorf("rbi does not support POS order for %s", field)
 			}
 			if by.Args[1].Kind != qx.KindLIT {
-				return Order{}, fmt.Errorf("rbi does not support computed POS order values for field %q", field)
+				return Order{}, fmt.Errorf("%w: POS order values for field %q must be a literal", rbierrors.ErrInvalidQuery, field)
+			}
+			if by.Args[1].Name != "" {
+				return Order{}, fmt.Errorf("%w: POS order literal for field %q must not define a name", rbierrors.ErrInvalidQuery, field)
+			}
+			if len(by.Args[1].Args) != 0 {
+				return Order{}, fmt.Errorf("%w: POS order literal for field %q must not have arguments", rbierrors.ErrInvalidQuery, field)
 			}
 			if posOrderLiteralIsScalarString(by.Args[1].Value) {
 				return Order{}, fmt.Errorf("rbi does not support scalar-string POS order values for field %q", field)

@@ -339,6 +339,14 @@ func Prepare(src *qx.QX, s *schema.Schema, resolve qir.FieldResolver) (*Query, e
 				out.Release()
 				return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", rbierrors.ErrInvalidQuery)
 			}
+			if by.Value != nil {
+				out.Release()
+				return nil, fmt.Errorf("%w: aggregate ORDER output reference %q must not carry a value", rbierrors.ErrInvalidQuery, by.Name)
+			}
+			if len(by.Args) != 0 {
+				out.Release()
+				return nil, fmt.Errorf("%w: aggregate ORDER output reference %q must not have arguments", rbierrors.ErrInvalidQuery, by.Name)
+			}
 			pos, ok := outputPositions[by.Name]
 			if !ok {
 				out.Release()
@@ -381,6 +389,9 @@ func reserveAggregateOutputName(seen map[string]int, name string, pos int) error
 func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int, error) {
 	if expr.Kind != qx.KindOP {
 		return 0, 0, fmt.Errorf("%w: aggregate HAVING root must be a predicate", rbierrors.ErrInvalidQuery)
+	}
+	if expr.Value != nil {
+		return 0, 0, fmt.Errorf("%w: aggregate HAVING operation %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 	args := 0
 	values := 0
@@ -429,6 +440,12 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 		if expr.Args[1].Kind != qx.KindLIT {
 			return 0, 0, fmt.Errorf("%w: aggregate HAVING right side supports only literals", rbierrors.ErrInvalidQuery)
 		}
+		if expr.Args[1].Name != "" {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING literal must not define a name", rbierrors.ErrInvalidQuery)
+		}
+		if len(expr.Args[1].Args) != 0 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING literal must not have arguments", rbierrors.ErrInvalidQuery)
+		}
 	case qx.OpIN:
 		if len(expr.Args) != 2 {
 			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", rbierrors.ErrInvalidQuery)
@@ -438,6 +455,12 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 		}
 		if expr.Args[1].Kind != qx.KindLIT {
 			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
+		}
+		if expr.Args[1].Name != "" {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN literal slice must not define a name", rbierrors.ErrInvalidQuery)
+		}
+		if len(expr.Args[1].Args) != 0 {
+			return 0, 0, fmt.Errorf("%w: aggregate HAVING IN literal slice must not have arguments", rbierrors.ErrInvalidQuery)
 		}
 		raw := reflect.ValueOf(expr.Args[1].Value)
 		if !raw.IsValid() {
@@ -460,6 +483,9 @@ func aggregateHavingStorageSize(expr qx.Expr, outputs map[string]int) (int, int,
 func (q *Query) prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
 	if expr.Kind != qx.KindOP {
 		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING root must be a predicate", rbierrors.ErrInvalidQuery)
+	}
+	if expr.Value != nil {
+		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING operation %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name)
 	}
 	switch expr.Name {
 
@@ -545,6 +571,12 @@ func prepareAggregateHavingOutput(expr qx.Expr, outputs map[string]int) (int, er
 	if expr.Kind != qx.KindOUT || expr.Name == "" {
 		return 0, fmt.Errorf("%w: aggregate HAVING left side supports only OUT references", rbierrors.ErrInvalidQuery)
 	}
+	if expr.Value != nil {
+		return 0, fmt.Errorf("%w: aggregate HAVING output reference %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name)
+	}
+	if len(expr.Args) != 0 {
+		return 0, fmt.Errorf("%w: aggregate HAVING output reference %q must not have arguments", rbierrors.ErrInvalidQuery, expr.Name)
+	}
 	pos, ok := outputs[expr.Name]
 	if !ok {
 		return 0, fmt.Errorf("%w: unknown aggregate output %q in HAVING", rbierrors.ErrInvalidQuery, expr.Name)
@@ -572,6 +604,12 @@ func aggregateHavingPredicateOp(name string) aggregateHavingOp {
 func aggregateLiteralValue(expr qx.Expr) (Value, error) {
 	if expr.Kind != qx.KindLIT {
 		return Value{}, fmt.Errorf("%w: aggregate HAVING right side supports only literals", rbierrors.ErrInvalidQuery)
+	}
+	if expr.Name != "" {
+		return Value{}, fmt.Errorf("%w: aggregate HAVING literal must not define a name", rbierrors.ErrInvalidQuery)
+	}
+	if len(expr.Args) != 0 {
+		return Value{}, fmt.Errorf("%w: aggregate HAVING literal must not have arguments", rbierrors.ErrInvalidQuery)
 	}
 	return aggregateLiteralRawValue(expr.Value)
 }
@@ -616,6 +654,12 @@ func (q *Query) aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 	if expr.Kind != qx.KindLIT {
 		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
 	}
+	if expr.Name != "" {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN literal slice must not define a name", rbierrors.ErrInvalidQuery)
+	}
+	if len(expr.Args) != 0 {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN literal slice must not have arguments", rbierrors.ErrInvalidQuery)
+	}
 	raw := reflect.ValueOf(expr.Value)
 	if !raw.IsValid() {
 		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", rbierrors.ErrInvalidQuery)
@@ -645,6 +689,12 @@ func prepareAggregateGroup(s *schema.Schema, expr qx.Expr) (aggregateFieldRef, e
 	if expr.Kind != qx.KindREF || expr.Name == "" {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", rbierrors.ErrInvalidQuery)
 	}
+	if expr.Value != nil {
+		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY field reference %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name)
+	}
+	if len(expr.Args) != 0 {
+		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY field reference %q must not have arguments", rbierrors.ErrInvalidQuery, expr.Name)
+	}
 	if expr.Name == schema.ReservedKeyFieldName {
 		return aggregateFieldRef{}, fmt.Errorf("%w: %v is not supported in GROUP BY", rbierrors.ErrInvalidQuery, schema.ReservedKeyFieldName)
 	}
@@ -673,6 +723,9 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 	if expr.Kind != qx.KindOP {
 		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric must be an operation", rbierrors.ErrInvalidQuery)
 	}
+	if expr.Value != nil {
+		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric operation %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name)
+	}
 	metric := aggregateMetric{out: expr.Alias}
 	switch expr.Name {
 
@@ -687,8 +740,17 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 		}
 		if len(expr.Args) == 1 && expr.Args[0].Kind == qx.KindOP && expr.Args[0].Name == qx.OpDISTINCT {
 			metric.op = aggregateMetricCountDistinct
+			if expr.Args[0].Value != nil {
+				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) operation must not carry a value", rbierrors.ErrInvalidQuery)
+			}
 			if len(expr.Args[0].Args) != 1 || expr.Args[0].Args[0].Kind != qx.KindREF || expr.Args[0].Args[0].Name == "" {
 				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) supports only direct field reference", rbierrors.ErrInvalidQuery)
+			}
+			if expr.Args[0].Args[0].Value != nil {
+				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) field reference %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Args[0].Args[0].Name)
+			}
+			if len(expr.Args[0].Args[0].Args) != 0 {
+				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) field reference %q must not have arguments", rbierrors.ErrInvalidQuery, expr.Args[0].Args[0].Name)
 			}
 			field, err := prepareAggregateMetricField(s, expr.Args[0].Args[0].Name, metric.op)
 			if err != nil {
@@ -717,6 +779,12 @@ func prepareAggregateMetric(s *schema.Schema, expr qx.Expr) (aggregateMetric, er
 
 	if len(expr.Args) != 1 || expr.Args[0].Kind != qx.KindREF || expr.Args[0].Name == "" {
 		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q supports only direct field reference", rbierrors.ErrInvalidQuery, expr.Name)
+	}
+	if expr.Args[0].Value != nil {
+		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q field reference %q must not carry a value", rbierrors.ErrInvalidQuery, expr.Name, expr.Args[0].Name)
+	}
+	if len(expr.Args[0].Args) != 0 {
+		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q field reference %q must not have arguments", rbierrors.ErrInvalidQuery, expr.Name, expr.Args[0].Name)
 	}
 
 	f, err := prepareAggregateMetricField(s, expr.Args[0].Name, metric.op)
