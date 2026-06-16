@@ -190,6 +190,67 @@ func tagRank(tags []string, priority []string) int {
 	return len(priority)
 }
 
+func TestQueryCorrectness_ArrayPosNullableScalarNilPriority(t *testing.T) {
+	db := newCorrectnessDB(t)
+
+	priority := []any{nil, "aa"}
+	allRows := func(_ uint64, _ *Rec) bool {
+		return true
+	}
+	rank := func(r *Rec) int {
+		for i := range priority {
+			v, ok := priority[i].(string)
+			if !ok {
+				if r.Opt == nil {
+					return i
+				}
+				continue
+			}
+			if r.Opt != nil && *r.Opt == v {
+				return i
+			}
+		}
+		return len(priority)
+	}
+	asc := func(aID uint64, a *Rec, bID uint64, b *Rec) bool {
+		ar, br := rank(a), rank(b)
+		if ar == br {
+			return aID < bID
+		}
+		return ar < br
+	}
+	desc := func(aID uint64, a *Rec, bID uint64, b *Rec) bool {
+		ar, br := rank(a), rank(b)
+		if ar == br {
+			return aID < bID
+		}
+		if ar == len(priority) {
+			return false
+		}
+		if br == len(priority) {
+			return true
+		}
+		return ar > br
+	}
+
+	q := qx.Query().SortBy(qx.POS("opt", priority), qx.ASC)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, allRows, asc, 0, 0))
+
+	q = qx.Query().SortBy(qx.POS("opt", priority), qx.DESC)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, allRows, desc, 0, 0))
+
+	prepared, shape, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+	got, err := db.engine.currentQueryViewForTests().PreparedQuery(&shape)
+	if err != nil {
+		t.Fatalf("PreparedQuery: %v", err)
+	}
+	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, allRows, desc, 0, 0))
+}
+
 func TestQueryCorrectness_NegativeNilComplementAndCount(t *testing.T) {
 	db := newCorrectnessDB(t)
 
