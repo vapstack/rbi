@@ -235,6 +235,7 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 					maxStringIdx = idx
 				}
 				if buildKeyIndex {
+					// bbolt data keys are capped at 32 KiB, below FieldStringRefMax.
 					keyBuilder.AppendBytes(k, idx)
 				}
 			} else {

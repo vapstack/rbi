@@ -59,6 +59,7 @@ func buildKeyOnly(cfg Config, state State) (Result, error) {
 					formatDiagnosticBytesPrefix(v, 32),
 				)
 			}
+			// bbolt data keys are capped at 32 KiB, below FieldStringRefMax.
 			builder.AppendBytes(k, idx)
 			if buildUniverse {
 				scannedUniverse = scannedUniverse.BuildAdded(idx)
