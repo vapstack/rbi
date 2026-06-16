@@ -168,8 +168,7 @@ func (p *leafPred) containsIdx(idx uint64) bool {
 		return p.posting.Contains(idx)
 
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
-		if p.postsAnyState != nil &&
-			(!p.postsAnyState.ids.IsEmpty() || p.postsAnyState.containsMaterializeAt == 1) {
+		if p.postsAnyState != nil {
 			return p.postsAnyState.matches(idx)
 		}
 		for i := 0; i < p.postCount(); i++ {
@@ -396,7 +395,7 @@ func leafPredsTryBucketPosting(
 		return ids, false, false, false, nextExactWork, nextApplyWork
 	}
 
-	allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActive))
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
 	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByLeafChecks(preds, exactActive, ids, exactWork, allowExact)
 
 	nextExactWork = updatedExactWork

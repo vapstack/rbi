@@ -260,6 +260,10 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 
 	// case 1: no ordering, negative result: iterate over universe excluding the result set
 	if !q.HasOrder && result.neg {
+		resultCard := qv.postingResultCardinality(result)
+		if skip >= resultCard {
+			return nil, nil
+		}
 		if !qv.strKey && needAll && skip == 0 &&
 			shouldMaterializeNegativeAllNumericKeys(qv.snap.Universe.Cardinality(), result.ids.Cardinality()) {
 			ids := qv.materializeNegativeResultKeysExcluding(result.ids)
@@ -268,7 +272,7 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 			}
 			return ids, nil
 		}
-		out := makeOutSlice(qv.postingResultCardinality(result), need)
+		out := makeOutSlice(resultCard, need)
 		cursor := newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids
@@ -333,7 +337,11 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 		return ids, nil
 	}
 
-	out := makeOutSlice(result.ids.Cardinality(), need)
+	resultCard := result.ids.Cardinality()
+	if skip >= resultCard {
+		return nil, nil
+	}
+	out := makeOutSlice(resultCard, need)
 	cursor := newQueryCursor(out, skip, need, needAll, 0)
 
 	iter := result.ids.Iter()

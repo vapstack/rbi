@@ -1427,6 +1427,27 @@ func TestQuery_OrderLimit_EmptyBaseLeafValidatesUnsupportedBaseOp(t *testing.T) 
 	}
 }
 
+func TestQuery_MaterializedOrderedOffsetBeyondResultValidatesOrder(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	for i := uint64(1); i <= 2; i++ {
+		if err := db.Set(i, &Rec{Active: true, Tags: []string{"go"}}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	hideLenIndexForTest(t, db, "tags")
+
+	prepared, shape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("active", true)).SortBy(qx.LEN("tags"), qx.ASC).Offset(2).Limit(1))
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	_, err = db.engine.currentQueryViewForTests().queryMaterialized(&shape)
+	if err == nil || !strings.Contains(err.Error(), "no lenIndex for slice field: tags") {
+		t.Fatalf("queryMaterialized err=%v, want missing lenIndex error", err)
+	}
+}
+
 func TestQuery_OrderLimit_NegatedBoolEQRespectsValueIndexer(t *testing.T) {
 	db, raw := openBoltAndNew[uint64, limitBoolVIRec](t, filepath.Join(t.TempDir(), "bool_vi.db"), Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
@@ -3812,6 +3833,16 @@ func TestPlannerFilterPostingByLeafChecks_PreservesWorkWhenApplyDeclines(t *test
 	}
 }
 
+func TestPlannerAllowExactBucketFilter_GatesSmallSkipSingleCheck(t *testing.T) {
+	card := uint64(plannerPredicateBucketExactMinCard * 64)
+	if plannerAllowExactBucketFilter(1, 1, card, true, 1) {
+		t.Fatalf("small skip must not force exact bucket filtering for a single exact check")
+	}
+	if !plannerAllowExactBucketFilter(card, 1, card, true, 1) {
+		t.Fatalf("full-bucket skip should allow exact bucket filtering")
+	}
+}
+
 func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testing.T) {
 	postA := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13})
 	postB := posting.BuildFromSorted([]uint64{5, 7, 9, 15, 17, 19})
@@ -3855,6 +3886,88 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 	}
 	if cnt != 6 {
 		t.Fatalf("unexpected runtime state bucket count: got=%d want=6", cnt)
+	}
+}
+
+func TestLeafPred_PostsAnyContainsIdxMaterializesAfterThreshold(t *testing.T) {
+	postA := posting.BuildFromSorted([]uint64{1, 3, 5, 7})
+	postB := posting.BuildFromSorted([]uint64{2, 4, 6, 8})
+
+	postsBuf := posting.GetSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+	state.containsMaterializeAt = 3
+
+	pred := leafPred{
+		kind:          leafPredKindPostsUnion,
+		postsBuf:      postsBuf,
+		postsAnyState: state,
+	}
+
+	defer func() {
+		postsAnyFilterStatePool.Put(state)
+		for i := 0; i < len(postsBuf); i++ {
+			postsBuf[i].Release()
+		}
+		posting.ReleaseSlice(postsBuf)
+	}()
+
+	if !pred.containsIdx(1) || !pred.containsIdx(2) {
+		t.Fatalf("expected direct contains checks before materialization to match")
+	}
+	if !state.ids.IsEmpty() {
+		t.Fatalf("unexpected materialization before threshold")
+	}
+	if !pred.containsIdx(3) {
+		t.Fatalf("expected threshold contains check to match")
+	}
+	if state.ids.IsEmpty() {
+		t.Fatalf("expected containsIdx to materialize union at threshold")
+	}
+}
+
+func TestQueryCursorEmitPostingSkipsWholePostingWithoutDedupe(t *testing.T) {
+	src := make([]uint64, 0, iteratorThreshold)
+	for i := 0; i < iteratorThreshold; i++ {
+		src = append(src, uint64(i*2+1))
+	}
+	ids := posting.BuildFromSorted(src)
+	defer ids.Release()
+
+	cursor := newQueryCursor(nil, ids.Cardinality(), 1, false, 0)
+	if cursor.emitPosting(ids) {
+		t.Fatalf("unexpected stop while skipping whole posting")
+	}
+	if cursor.skip != 0 {
+		t.Fatalf("unexpected remaining skip: got=%d want=0", cursor.skip)
+	}
+	if len(cursor.out) != 0 {
+		t.Fatalf("unexpected output while skipping whole posting: %v", cursor.out)
+	}
+}
+
+func TestQueryCursorEmitPostingDedupeRecordsSkippedIDs(t *testing.T) {
+	first := posting.BuildFromSorted([]uint64{10})
+	second := posting.BuildFromSorted([]uint64{10, 20})
+	defer first.Release()
+	defer second.Release()
+
+	cursor := newQueryCursor(nil, 1, 1, false, 2)
+	defer cursor.release()
+
+	if cursor.emitPosting(first) {
+		t.Fatalf("unexpected stop while skipping first posting")
+	}
+	if cursor.skip != 0 {
+		t.Fatalf("unexpected remaining skip: got=%d want=0", cursor.skip)
+	}
+	if !cursor.emitPosting(second) {
+		t.Fatalf("expected stop after second posting")
+	}
+	if !reflect.DeepEqual(cursor.out, []uint64{20}) {
+		t.Fatalf("unexpected deduped output: got=%v want=[20]", cursor.out)
 	}
 }
 

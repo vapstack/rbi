@@ -104,6 +104,13 @@ func (c *queryCursor) emitPosting(ids posting.List) bool {
 	if idx, ok := ids.TrySingle(); ok {
 		return c.emit(idx)
 	}
+	if !c.dedupe && c.skip >= uint64(iteratorThreshold) {
+		card := ids.Cardinality()
+		if c.skip >= card {
+			c.skip -= card
+			return false
+		}
+	}
 	it := ids.Iter()
 	defer it.Release()
 	for it.HasNext() {

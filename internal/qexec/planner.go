@@ -504,7 +504,7 @@ func plannerAllowExactBucketFilter(skip, need, card uint64, exactOnly bool, exac
 	if card <= plannerPredicateBucketExactMinCard {
 		return false
 	}
-	if skip > 0 {
+	if skip >= card {
 		return true
 	}
 	if exactChecks <= 0 {

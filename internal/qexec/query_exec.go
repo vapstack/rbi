@@ -2298,7 +2298,7 @@ func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldInd
 	if br.Empty() {
 		return boundedWindowCap(extraRows, offset, limit)
 	}
-	if limit != 0 && limit <= fieldIndexRangeExactCapMinLimit {
+	if offset == 0 && limit != 0 && limit <= fieldIndexRangeExactCapMinLimit {
 		return limit, false
 	}
 	if uint64(br.Len()) < window {
@@ -2307,6 +2307,9 @@ func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldInd
 			rows = mathutil.SatAddUint64(rows, extraRows)
 		}
 		return boundedWindowCap(rows, offset, limit)
+	}
+	if limit != 0 && limit <= fieldIndexRangeExactCapMinLimit {
+		return limit, false
 	}
 	return limit, limit == 0
 }
