@@ -464,8 +464,8 @@ func BenchmarkLoadRejects(b *testing.B) {
 	b.Run("StaleSequence", func(b *testing.B) {
 		var buf bytes.Buffer
 		writer := bufio.NewWriter(&buf)
-		if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
-			b.Fatalf("write version: %v", err)
+		if err := writePersistedIndexHeader(writer); err != nil {
+			b.Fatalf("write header: %v", err)
 		}
 		if err := writeSidecarUvarint(writer, benchPersistSeq); err != nil {
 			b.Fatalf("write seq: %v", err)
@@ -497,7 +497,7 @@ func BenchmarkLoadRejects(b *testing.B) {
 
 	b.Run("InvalidVersion", func(b *testing.B) {
 		file := benchPersistTempFile(b, "invalid.rbi")
-		if err := os.WriteFile(file, []byte{99}, 0o600); err != nil {
+		if err := os.WriteFile(file, []byte{'R', 'B', 'I', 99}, 0o600); err != nil {
 			b.Fatalf("WriteFile: %v", err)
 		}
 		cfg := LoadConfig{
@@ -507,7 +507,7 @@ func BenchmarkLoadRejects(b *testing.B) {
 			CurrentSeq: benchPersistSeq,
 			Schema:     &schema.Schema{},
 		}
-		b.SetBytes(1)
+		b.SetBytes(4)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {

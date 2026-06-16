@@ -589,6 +589,8 @@ func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
 	}
 	if f := rt.Fields["SchemaTestAnonymousToken"]; f == nil || !f.UseVI || !slices.Equal(f.Index, []int{0}) {
 		t.Fatalf("anonymous ValueIndexer index field=%+v", f)
+	} else if f.VIType != fieldTypeID(reflect.TypeFor[SchemaTestAnonymousToken]()) {
+		t.Fatalf("anonymous ValueIndexer VIType=%q", f.VIType)
 	}
 	if acc, ok := rt.IndexedByName["SchemaTestAnonymousToken"]; !ok || acc.PatchOrdinal < 0 {
 		t.Fatalf("anonymous ValueIndexer index accessor=(%+v,%v)", acc, ok)
@@ -641,6 +643,8 @@ func TestCompileUntaggedAnonymousValueIndexerStructPromotesChildren(t *testing.T
 	}
 	if f := rt.Fields["SchemaTestAnonymousVIEmbedded"]; f == nil || !f.UseVI || !slices.Equal(f.Index, []int{0}) {
 		t.Fatalf("anonymous ValueIndexer option field=%+v", f)
+	} else if f.VIType != fieldTypeID(reflect.TypeFor[schemaTestAnonymousVIEmbeddedRec]().Field(0).Type) {
+		t.Fatalf("anonymous ValueIndexer option VIType=%q", f.VIType)
 	}
 	if acc, ok := rt.IndexedByName["SchemaTestAnonymousVIEmbedded"]; !ok || acc.PatchOrdinal < 0 {
 		t.Fatalf("anonymous ValueIndexer option accessor=(%+v,%v)", acc, ok)

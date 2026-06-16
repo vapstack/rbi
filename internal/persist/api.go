@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -84,16 +85,16 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 
 	reader := bufio.NewReaderSize(f, fileBufferSize)
 
-	ver, err := reader.ReadByte()
+	ver, err := readPersistedIndexHeader(reader)
 	if err != nil {
-		return LoadResult{}, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", rbierrors.ErrPersistedIndexInvalid, err))
+		return LoadResult{}, diag.wrap("read_header", err)
 	}
 	diag.version = ver
 	diag.versionKnown = true
 
 	switch ver {
-	case 29:
-		result, err = loadV29(reader, cfg)
+	case 30:
+		result, err = loadV30(reader, cfg)
 	default:
 		return LoadResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", rbierrors.ErrPersistedIndexInvalid, ver))
 	}
@@ -133,7 +134,7 @@ func Store(cfg StoreConfig) (err error) {
 	}()
 
 	buf := bufio.NewWriterSize(f, fileBufferSize)
-	if err = storeV29(buf, cfg); err != nil {
+	if err = storeV30(buf, cfg); err != nil {
 		return err
 	}
 
@@ -159,7 +160,22 @@ func Store(cfg StoreConfig) (err error) {
 	return nil
 }
 
-func loadV29(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
+func readPersistedIndexHeader(reader *bufio.Reader) (byte, error) {
+	var magic [3]byte
+	if _, err := io.ReadFull(reader, magic[:]); err != nil {
+		return 0, fmt.Errorf("%w: reading magic: %w", rbierrors.ErrPersistedIndexInvalid, err)
+	}
+	if magic != [3]byte{'R', 'B', 'I'} {
+		return 0, fmt.Errorf("%w: invalid persisted index magic %q", rbierrors.ErrPersistedIndexInvalid, string(magic[:]))
+	}
+	ver, err := reader.ReadByte()
+	if err != nil {
+		return 0, fmt.Errorf("%w: reading version: %w", rbierrors.ErrPersistedIndexInvalid, err)
+	}
+	return ver, nil
+}
+
+func loadV30(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("%w: decode: reading bucket sequence: %w", rbierrors.ErrPersistedIndexInvalid, err)
@@ -357,9 +373,16 @@ func loadPayloadWithKey(reader *bufio.Reader, s *schema.Schema, strKey, strKeyIn
 	}, nil
 }
 
-func storeV29(writer *bufio.Writer, cfg StoreConfig) error {
-	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
-		return fmt.Errorf("store: writing version: %w", err)
+func writePersistedIndexHeader(writer *bufio.Writer) error {
+	if _, err := writer.WriteString(persistedIndexMagic); err != nil {
+		return err
+	}
+	return writer.WriteByte(currentPersistedIndexVersion)
+}
+
+func storeV30(writer *bufio.Writer, cfg StoreConfig) error {
+	if err := writePersistedIndexHeader(writer); err != nil {
+		return fmt.Errorf("store: writing header: %w", err)
 	}
 	if err := writeSidecarUvarint(writer, cfg.BucketSeq); err != nil {
 		return fmt.Errorf("store: writing bucket sequence: %w", err)

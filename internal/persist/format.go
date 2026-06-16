@@ -14,7 +14,10 @@ import (
 	"github.com/vapstack/rbi/rbistats"
 )
 
-const currentPersistedIndexVersion = 29
+const (
+	persistedIndexMagic          = "RBI"
+	currentPersistedIndexVersion = 30
+)
 
 const (
 	keyStorageNumeric byte = iota
@@ -65,6 +68,9 @@ func writeField(writer *bufio.Writer, name string, f *schema.Field) error {
 		return err
 	}
 	if err := writeSidecarBool(writer, f.UseVI); err != nil {
+		return err
+	}
+	if err := writeSidecarString(writer, f.VIType); err != nil {
 		return err
 	}
 	if err := writeSidecarString(writer, f.DBName); err != nil {
@@ -122,6 +128,10 @@ func readFieldCompatibilityEntry(reader *bufio.Reader, current map[string]*schem
 	if err != nil {
 		return "", false, err
 	}
+	viType, err := readSidecarString(reader)
+	if err != nil {
+		return "", false, err
+	}
 	dbName, err := readSidecarString(reader)
 	if err != nil {
 		return "", false, err
@@ -139,6 +149,7 @@ func readFieldCompatibilityEntry(reader *bufio.Reader, current map[string]*schem
 		cur.Ptr != ptr ||
 		cur.Slice != slice ||
 		cur.UseVI != useVI ||
+		cur.VIType != viType ||
 		cur.DBName != dbName ||
 		len(cur.Index) != int(valIndexLen)) {
 		compatible = false

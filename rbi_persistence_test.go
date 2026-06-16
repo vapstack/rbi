@@ -244,7 +244,7 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 
 	var enc [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(enc[:], seq)
-	corrupted := append([]byte{readPersistedIndexFormatByte(t, rbiPath)}, enc[:n]...)
+	corrupted := append([]byte{'R', 'B', 'I', readPersistedIndexFormatByte(t, rbiPath)}, enc[:n]...)
 	corrupted = append(corrupted, 0xff, 0xff, 0xff, 0xff)
 	if err = os.WriteFile(rbiPath, corrupted, 0o600); err != nil {
 		t.Fatalf("corrupt .rbi: %v", err)
@@ -1241,6 +1241,74 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	}
 }
 
+type persistedVIOld int
+
+func (v persistedVIOld) IndexingValue() string {
+	return fmt.Sprintf("old:%d", v)
+}
+
+type persistedVINew int
+
+func (v persistedVINew) IndexingValue() string {
+	return fmt.Sprintf("new:%d", v)
+}
+
+type persistedVIOldRec struct {
+	Code persistedVIOld `db:"code" rbi:"index"`
+}
+
+type persistedVINewRec struct {
+	Code persistedVINew `db:"code" rbi:"index"`
+}
+
+func TestIndexPersistence_RebuildsValueIndexerFieldAfterTypeChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vi_type_change.db")
+	opts := testOptions(Options{BucketName: "vi_type_change"})
+
+	raw, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("initial bbolt.Open: %v", err)
+	}
+	db, err := New[uint64, persistedVIOldRec](raw, opts)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("initial New: %v", err)
+	}
+	if err = db.Set(1, &persistedVIOldRec{Code: 7}); err != nil {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("Set: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		_ = raw.Close()
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err = raw.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+
+	raw2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	db2, err := New[uint64, persistedVINewRec](raw2, opts)
+	if err != nil {
+		_ = raw2.Close()
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+	defer func() { _ = raw2.Close() }()
+
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("code", persistedVINew(7))))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("ids=%v want [1]", ids)
+	}
+}
+
 type schemaSubsetRec struct {
 	Name string `db:"name" rbi:"index"`
 	Age  int    `db:"age"  rbi:"index"`
@@ -1276,9 +1344,7 @@ func readPersistedIndexSequence(tb testing.TB, path string) uint64 {
 	defer func() { _ = f.Close() }()
 
 	reader := bufio.NewReader(f)
-	if _, err = reader.ReadByte(); err != nil {
-		tb.Fatalf("read persisted index format byte: %v", err)
-	}
+	readPersistedIndexFormatByteFromReader(tb, reader)
 	seq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		tb.Fatalf("read persisted index sequence: %v", err)
@@ -1296,6 +1362,21 @@ func readPersistedIndexFormatByte(tb testing.TB, path string) byte {
 	defer func() { _ = f.Close() }()
 
 	reader := bufio.NewReader(f)
+	return readPersistedIndexFormatByteFromReader(tb, reader)
+}
+
+func readPersistedIndexFormatByteFromReader(tb testing.TB, reader *bufio.Reader) byte {
+	tb.Helper()
+
+	for _, want := range []byte("RBI") {
+		got, err := reader.ReadByte()
+		if err != nil {
+			tb.Fatalf("read persisted index magic: %v", err)
+		}
+		if got != want {
+			tb.Fatalf("persisted index magic byte=%q want %q", got, want)
+		}
+	}
 	ver, err := reader.ReadByte()
 	if err != nil {
 		tb.Fatalf("read persisted index format byte: %v", err)

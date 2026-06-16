@@ -63,6 +63,9 @@ func TestReadFieldRejectsOutOfRangePersistedIndexKind(t *testing.T) {
 	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write use vi: %v", err)
 	}
+	if err := writeSidecarString(writer, ""); err != nil {
+		t.Fatalf("write vi type: %v", err)
+	}
 	if err := writeSidecarString(writer, "field"); err != nil {
 		t.Fatalf("write db name: %v", err)
 	}
@@ -109,6 +112,9 @@ func TestReadFieldCompatibilitySkipsLongMismatchedIndex(t *testing.T) {
 	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write use vi: %v", err)
 	}
+	if err := writeSidecarString(writer, ""); err != nil {
+		t.Fatalf("write vi type: %v", err)
+	}
 	if err := writeSidecarString(writer, "field"); err != nil {
 		t.Fatalf("write db name: %v", err)
 	}
@@ -120,6 +126,39 @@ func TestReadFieldCompatibilitySkipsLongMismatchedIndex(t *testing.T) {
 	}
 	if err := writeSidecarUvarint(writer, 1); err != nil {
 		t.Fatalf("write index 1: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	name, compatible, err := readFieldCompatibilityEntry(bufio.NewReader(&buf), map[string]*schema.Field{"field": current})
+	if err != nil {
+		t.Fatalf("readFieldCompatibilityEntry: %v", err)
+	}
+	if name != "field" {
+		t.Fatalf("name=%q, want field", name)
+	}
+	if compatible {
+		t.Fatalf("compatible=true, want false")
+	}
+}
+
+func TestReadFieldCompatibilityRejectsValueIndexerTypeMismatch(t *testing.T) {
+	current := &schema.Field{
+		IndexKind: schema.IndexDefault,
+		Kind:      reflect.Int,
+		UseVI:     true,
+		VIType:    "new",
+		DBName:    "field",
+		Index:     []int{0},
+	}
+	stored := *current
+	stored.VIType = "old"
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := writeField(writer, "field", &stored); err != nil {
+		t.Fatalf("write field: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -368,8 +407,8 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
-		t.Fatalf("write version: %v", err)
+	if err := writePersistedIndexHeader(writer); err != nil {
+		t.Fatalf("write header: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 11); err != nil {
 		t.Fatalf("write seq: %v", err)
@@ -475,8 +514,8 @@ func TestLoadedFieldAndMeasureStorageRelease(t *testing.T) {
 func TestLoadRejectsStaleSequence(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
-		t.Fatalf("write version: %v", err)
+	if err := writePersistedIndexHeader(writer); err != nil {
+		t.Fatalf("write header: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 10); err != nil {
 		t.Fatalf("write seq: %v", err)
@@ -507,7 +546,7 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 
 func TestLoadRejectsTruncatedSequenceAsInvalid(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "truncated-seq.rbi")
-	if err := os.WriteFile(file, []byte{currentPersistedIndexVersion}, 0o600); err != nil {
+	if err := os.WriteFile(file, []byte{'R', 'B', 'I', currentPersistedIndexVersion}, 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
 
@@ -528,7 +567,7 @@ func TestLoadRejectsTruncatedSequenceAsInvalid(t *testing.T) {
 
 func TestLoadRejectsUnsupportedVersion(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "unsupported.rbi")
-	if err := os.WriteFile(file, []byte{99}, 0o600); err != nil {
+	if err := os.WriteFile(file, []byte{'R', 'B', 'I', 99}, 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
 
@@ -711,6 +750,13 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(file + ".temp"); !os.IsNotExist(err) {
 		t.Fatalf("temp file stat err=%v, want not exist", err)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	if len(data) < 4 || string(data[:3]) != persistedIndexMagic || data[3] != currentPersistedIndexVersion {
+		t.Fatalf("sidecar header=%v, want %q+%d", data[:min(len(data), 4)], persistedIndexMagic, currentPersistedIndexVersion)
 	}
 
 	result, err := Load(LoadConfig{
@@ -942,8 +988,8 @@ func TestReadKeyIndexSectionRejectsInvalidState(t *testing.T) {
 func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writer.WriteByte(currentPersistedIndexVersion); err != nil {
-		t.Fatalf("write version: %v", err)
+	if err := writePersistedIndexHeader(writer); err != nil {
+		t.Fatalf("write header: %v", err)
 	}
 	if err := writeSidecarUvarint(writer, 1); err != nil {
 		t.Fatalf("write seq: %v", err)

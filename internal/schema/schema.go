@@ -21,6 +21,7 @@ type Field struct {
 	Ptr        bool
 	Slice      bool
 	UseVI      bool
+	VIType     string
 	KeyKind    FieldKeyKind
 	DBName     string
 	QueryName  string
@@ -152,6 +153,24 @@ func inferFieldWriteKeyKind(kind reflect.Kind, useVI, nativeTime bool) FieldKeyK
 	default:
 		return FieldWriteKeysString
 	}
+}
+
+func fieldTypeID(t reflect.Type) string {
+	if name := t.Name(); name != "" {
+		if pkg := t.PkgPath(); pkg != "" {
+			return pkg + "." + name
+		}
+		return name
+	}
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + fieldTypeID(t.Elem())
+	case reflect.Slice:
+		return "[]" + fieldTypeID(t.Elem())
+	case reflect.Array:
+		return "[" + strconv.Itoa(t.Len()) + "]" + fieldTypeID(t.Elem())
+	}
+	return t.String()
 }
 
 type fieldCollector struct {
@@ -661,10 +680,14 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		slice      bool
 		useVI      bool
 		nativeTime bool
+		viTypeID   string
 	)
 
 	useVI = sf.Type.Implements(viType)
 	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
+	if useVI {
+		viTypeID = fieldTypeID(sf.Type)
+	}
 
 	if indexKind == IndexMeasure {
 		if useVI || nativeTime {
@@ -698,6 +721,9 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		elem := sf.Type.Elem()
 		kind = elem.Kind()
 		useVI = elem.Implements(viType)
+		if useVI {
+			viTypeID = fieldTypeID(elem)
+		}
 		if !useVI {
 			switch kind {
 			case reflect.Bool,
@@ -778,6 +804,7 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		Ptr:       ptr,
 		Slice:     slice,
 		UseVI:     useVI,
+		VIType:    viTypeID,
 		KeyKind:   inferFieldWriteKeyKind(kind, useVI, nativeTime),
 		DBName:    dbname,
 		Index:     slices.Clone(index),
