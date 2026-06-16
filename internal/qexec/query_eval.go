@@ -1479,6 +1479,9 @@ func (qv *View) exprNumericKeyValueToDistinctLookupKeyBuf(expr qir.Expr) ([]keyc
 		return nil, false, false, nil
 	}
 	if v.Len() == 0 {
+		if expr.Op == qir.OpIN {
+			return nil, true, false, fmt.Errorf("%w: %v: no values provided", rbierrors.ErrInvalidQuery, expr.Op)
+		}
 		return nil, true, false, nil
 	}
 	valsBuf := keycodec.GetIndexLookupKeySlice(v.Len())

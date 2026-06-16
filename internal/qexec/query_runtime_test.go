@@ -1,6 +1,7 @@
 package qexec
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -8,7 +9,9 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbitrace"
 )
 
@@ -68,6 +71,7 @@ func TestRuntimeNumericKeyPredicatesAndOrderUseUniverse(t *testing.T) {
 		{name: "eq_float_2_64_empty", q: qx.Query(qx.EQ(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: nil},
 		{name: "in", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{uint64(1), int64(-1), 4.5, 6})), want: []uint64{1, 6}},
 		{name: "in_float_2_64_skipped", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{uint64(2), math.Ldexp(1, 64), math.Ldexp(1, 65), 8})), want: []uint64{2, 8}},
+		{name: "in_all_impossible_empty", q: qx.Query(qx.IN(schema.ReservedKeyFieldName, []any{int64(-1), 4.5})), want: nil},
 		{name: "range", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, 3), qx.LT(schema.ReservedKeyFieldName, 7)), want: []uint64{3, 4, 5, 6}},
 		{name: "range_gte_float_2_64_empty", q: qx.Query(qx.GTE(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: nil},
 		{name: "range_lt_float_2_64_full", q: qx.Query(qx.LT(schema.ReservedKeyFieldName, math.Ldexp(1, 64))), want: []uint64{1, 2, 3, 4, 5, 6, 7, 8}},
@@ -95,6 +99,35 @@ func TestRuntimeNumericKeyPredicatesAndOrderUseUniverse(t *testing.T) {
 	}
 	if _, err := db.query(qx.Query(qx.PREFIX(schema.ReservedKeyFieldName, 3))); err == nil {
 		t.Fatal("numeric $key PREFIX predicate succeeded")
+	}
+}
+
+func TestRuntimeNumericKeyRejectsEmptyIN(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.enableNumericKeyCatalog()
+	db.seedData(t, 4)
+
+	for _, expr := range []qx.Expr{
+		qx.IN(schema.ReservedKeyFieldName, []uint64{}),
+		qx.IN(schema.ReservedKeyFieldName, []any{}),
+	} {
+		q := qx.Query(expr)
+		if _, err := db.query(q); !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("query err=%v, want ErrInvalidQuery", err)
+		}
+
+		prepared, err := qir.PrepareCountExprsResolved(db.exec, expr)
+		if err != nil {
+			t.Fatalf("PrepareCountExprsResolved: %v", err)
+		}
+		ids, err := db.view().Filter(prepared)
+		prepared.Release()
+		if err == nil {
+			ids.Release()
+		}
+		if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+			t.Fatalf("Filter err=%v, want ErrInvalidQuery", err)
+		}
 	}
 }
 
