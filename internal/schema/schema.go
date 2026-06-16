@@ -686,6 +686,9 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	useVI = sf.Type.Implements(viType)
 	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
 	if useVI {
+		if kind == reflect.Pointer && sf.Type.Elem().Implements(viType) {
+			return nil, fmt.Errorf("cannot index field %v of type %v: ValueIndexer method has value receiver and cannot handle nil pointers", sf.Name, sf.Type)
+		}
 		viTypeID = fieldTypeID(sf.Type)
 	}
 
@@ -722,6 +725,9 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		kind = elem.Kind()
 		useVI = elem.Implements(viType)
 		if useVI {
+			if kind == reflect.Pointer && elem.Elem().Implements(viType) {
+				return nil, fmt.Errorf("cannot index field %v of type %v: ValueIndexer element method has value receiver and cannot handle nil pointers", sf.Name, sf.Type)
+			}
 			viTypeID = fieldTypeID(elem)
 		}
 		if !useVI {

@@ -96,6 +96,31 @@ func TestCompileTagsRejectDuplicateIndexNames(t *testing.T) {
 	}
 }
 
+type schemaTestValueReceiverVIPtrRec struct {
+	Key *schemaTestVI `db:"key" rbi:"index"`
+}
+
+type schemaTestValueReceiverVIPtrSliceRec struct {
+	Keys []*schemaTestVI `db:"keys" rbi:"index"`
+}
+
+type schemaTestPointerReceiverVIPtrRec struct {
+	Key  *schemaTestPtrFoldedString   `db:"key" rbi:"index"`
+	Keys []*schemaTestPtrFoldedString `db:"keys" rbi:"index"`
+}
+
+func TestCompileRejectsNilUnsafeValueIndexerPointers(t *testing.T) {
+	if _, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrRec](), Config{}); err == nil || !strings.Contains(err.Error(), "ValueIndexer method has value receiver") {
+		t.Fatalf("scalar pointer Compile err=%v want nil-unsafe ValueIndexer rejection", err)
+	}
+	if _, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrSliceRec](), Config{}); err == nil || !strings.Contains(err.Error(), "ValueIndexer element method has value receiver") {
+		t.Fatalf("pointer slice Compile err=%v want nil-unsafe ValueIndexer rejection", err)
+	}
+	if _, err := Compile(reflect.TypeFor[schemaTestPointerReceiverVIPtrRec](), Config{}); err != nil {
+		t.Fatalf("pointer receiver Compile: %v", err)
+	}
+}
+
 type SchemaTestOptionLeft struct {
 	ID string `db:"left_id"`
 }
