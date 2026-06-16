@@ -562,6 +562,49 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	}
 }
 
+func TestAtomicSetEmptyPayloadThenPatchSameBatch(t *testing.T) {
+	var events []string
+	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	ex.rejectEmptyPayload = false
+	ex.ops.Encode = func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+		v := (*attemptRec)(ptr).V
+		if v != 0 {
+			_ = buf.WriteByte(v)
+		}
+		return nil
+	}
+	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
+		if len(data) == 0 {
+			return unsafe.Pointer(&attemptRec{}), nil
+		}
+		return unsafe.Pointer(&attemptRec{V: data[0]}), nil
+	}
+
+	rec := attemptRec{}
+	setReq, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&rec), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	defer ex.releaseRequest(setReq)
+	// A pooled empty buffer may keep capacity; this forces the nil-backed empty payload path.
+	*setReq.setPayload = bytes.Buffer{}
+	patchReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(7)}}, true)
+
+	ex.runAtomic([]*request{setReq, patchReq})
+
+	if setReq.Err != nil {
+		t.Fatalf("set request error = %v", setReq.Err)
+	}
+	if patchReq.Err != nil {
+		t.Fatalf("patch request error = %v", patchReq.Err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{7}) {
+		t.Fatalf("payload after set+patch = %v, want [7]", got)
+	}
+}
+
 func TestSharedSetValidateIndexFailureCommitsRest(t *testing.T) {
 	validateErr := errors.New("validate index failed")
 	var events []string
@@ -837,7 +880,7 @@ func TestLoadStateDecodeErrorClearsDiscardedStateSlot(t *testing.T) {
 		if state.key != nil || state.value != nil || state.ownedPayload != nil || state.borrowedPayload != nil {
 			return fmt.Errorf("discarded state kept references: %+v", state)
 		}
-		if state.idx != 0 || state.idxKnown || state.idxNew || state.exists || state.payloadOff != 0 {
+		if state.idx != 0 || state.idxKnown || state.idxNew || state.exists || state.payloadOff != 0 || state.payloadKnown {
 			return fmt.Errorf("discarded state kept scalar state: %+v", state)
 		}
 		return nil

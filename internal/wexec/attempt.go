@@ -48,6 +48,7 @@ type recordState struct {
 	value           unsafe.Pointer
 	ownedPayload    *bytes.Buffer
 	payloadOff      uint8
+	payloadKnown    bool
 	borrowedPayload []byte
 }
 
@@ -241,7 +242,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	if state.value == nil {
 		return
 	}
-	if state.ownedPayload == nil && state.borrowedPayload == nil {
+	if !state.payloadKnown {
 		req.Err = formatPrepareErr(prepareErrRedecodeEmpty, nil)
 		return
 	}
@@ -824,18 +825,21 @@ func (st *recordState) payloadBytes() []byte {
 func (st *recordState) setOwnedPayload(buf *bytes.Buffer, payloadOff uint8) {
 	st.ownedPayload = buf
 	st.payloadOff = payloadOff
+	st.payloadKnown = true
 	st.borrowedPayload = nil
 }
 
 func (st *recordState) setBorrowedPayload(payload []byte) {
 	st.ownedPayload = nil
 	st.payloadOff = 0
+	st.payloadKnown = true
 	st.borrowedPayload = payload
 }
 
 func (st *recordState) clearPayload() {
 	st.ownedPayload = nil
 	st.payloadOff = 0
+	st.payloadKnown = false
 	st.borrowedPayload = nil
 }
 

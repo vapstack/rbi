@@ -110,7 +110,7 @@ func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 	if len(st.stateByUintID) != 0 || len(st.stateByStringID) != 0 {
 		t.Fatalf("attempt cleanup kept state maps: uint=%d string=%d", len(st.stateByUintID), len(st.stateByStringID))
 	}
-	if st.release != nil || st.state.value != nil || st.state.borrowedPayload != nil {
+	if st.release != nil || st.state.value != nil || st.state.payloadKnown || st.state.borrowedPayload != nil {
 		t.Fatalf("attempt cleanup kept current state: release=%p state=%+v", st.release, st.state)
 	}
 }
