@@ -862,7 +862,7 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc, foldExactComplements bool) 
 
 	for i, ch := range expr.Operands {
 		n, c := normalizeExprPost(ch, alloc, foldExactComplements)
-		drop := n.Op == OpConst && !n.Not
+		drop := IsTrueConst(n)
 		flatten := n.Op == OpAND && !n.Not
 		if !changed && !c && !drop && !flatten {
 			continue
@@ -911,7 +911,7 @@ func normalizeORPost(e Expr, alloc exprBufAlloc, foldExactComplements bool) (Exp
 
 	for i, ch := range e.Operands {
 		n, c := normalizeExprPost(ch, alloc, foldExactComplements)
-		drop := n.Op == OpConst && !n.Not
+		drop := IsFalseConst(n)
 		if !changed && !c && !drop {
 			continue
 		}

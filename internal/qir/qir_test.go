@@ -763,3 +763,63 @@ func TestNormalizeExpr_MalformedConstComplementStaysMalformed(t *testing.T) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, in)
 	}
 }
+
+func TestNormalizeExpr_MalformedConstSurvivesANDPost(t *testing.T) {
+	leaf := Expr{Op: OpEQ, FieldOrdinal: 2, Value: "active"}
+	bad := Expr{Op: OpConst, FieldOrdinal: 1}
+	in := Expr{
+		Op:           OpAND,
+		FieldOrdinal: NoFieldOrdinal,
+		Operands: []Expr{
+			bad,
+			{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: []Expr{leaf}},
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+
+	want := Expr{
+		Op:           OpAND,
+		FieldOrdinal: NoFieldOrdinal,
+		Operands: []Expr{
+			leaf,
+			bad,
+		},
+	}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
+	}
+}
+
+func TestNormalizeExpr_MalformedConstSurvivesORPost(t *testing.T) {
+	leaf := Expr{Op: OpEQ, FieldOrdinal: 2, Value: "active"}
+	bad := Expr{Op: OpConst, FieldOrdinal: 1}
+	in := Expr{
+		Op:           OpOR,
+		FieldOrdinal: NoFieldOrdinal,
+		Operands: []Expr{
+			bad,
+			{Op: OpOR, FieldOrdinal: NoFieldOrdinal, Operands: []Expr{leaf}},
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+
+	want := Expr{
+		Op:           OpOR,
+		FieldOrdinal: NoFieldOrdinal,
+		Operands: []Expr{
+			bad,
+			leaf,
+		},
+	}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
+	}
+}
