@@ -210,18 +210,7 @@ func parseBenchmarkFile(path string) (benchmarkSet, error) {
 			continue
 		}
 
-		bench := set.Benchmarks[name]
-		if bench == nil {
-			bench = &benchmarkData{
-				Name:        name,
-				DisplayName: normalizeBenchmarkName(name),
-				Runs:        make([]benchRun, 0, 1),
-			}
-			set.Benchmarks[name] = bench
-			set.Order = append(set.Order, name)
-		}
-
-		bench.Runs = append(bench.Runs, run)
+		appendBenchmarkRun(&set, name, run)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -272,6 +261,64 @@ func parseBenchmarkLine(line string) (string, benchRun, bool) {
 func normalizeBenchmarkName(name string) string {
 	name = strings.TrimPrefix(name, "Benchmark")
 	return strings.TrimLeft(name, "_")
+}
+
+func benchmarkMatchKey(name string) string {
+	dash := strings.LastIndexByte(name, '-')
+	if dash < 0 || dash == len(name)-1 {
+		return name
+	}
+	for i := dash + 1; i < len(name); i++ {
+		c := name[i]
+		if c < '0' || c > '9' {
+			return name
+		}
+	}
+	return name[:dash]
+}
+
+type benchmarkSummaryIndex struct {
+	exact map[string]benchmarkSummary
+	match map[string]benchmarkSummary
+}
+
+func newBenchmarkSummaryIndex(summaries map[string]benchmarkSummary) benchmarkSummaryIndex {
+	match := make(map[string]benchmarkSummary, len(summaries))
+	var duplicates map[string]struct{}
+	for name, summary := range summaries {
+		key := benchmarkMatchKey(name)
+		if duplicates != nil {
+			if _, duplicate := duplicates[key]; duplicate {
+				continue
+			}
+		}
+		if _, exists := match[key]; exists {
+			delete(match, key)
+			if duplicates == nil {
+				duplicates = make(map[string]struct{})
+			}
+			duplicates[key] = struct{}{}
+			continue
+		}
+		match[key] = summary
+	}
+	return benchmarkSummaryIndex{exact: summaries, match: match}
+}
+
+func (index benchmarkSummaryIndex) lookupPrevious(name string, current benchmarkSummaryIndex) (benchmarkSummary, bool) {
+	summary, ok := index.exact[name]
+	if ok {
+		return summary, true
+	}
+
+	key := benchmarkMatchKey(name)
+	currentSummary, ok := current.match[key]
+	if !ok || currentSummary.Name != name {
+		return benchmarkSummary{}, false
+	}
+
+	summary, ok = index.match[key]
+	return summary, ok
 }
 
 func summarizeSet(set benchmarkSet) map[string]benchmarkSummary {
@@ -362,6 +409,8 @@ func median(values []float64) float64 {
 
 func buildRows(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, hideInsignificant bool, useColor bool) []outputRow {
 	rows := make([]outputRow, 0, len(order))
+	previousIndex := newBenchmarkSummaryIndex(previousSummaries)
+	currentIndex := newBenchmarkSummaryIndex(currentSummaries)
 
 	for _, name := range order {
 		currentSummary, ok := currentSummaries[name]
@@ -369,7 +418,7 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 			continue
 		}
 
-		previousSummary, ok := previousSummaries[name]
+		previousSummary, ok := previousIndex.lookupPrevious(name, currentIndex)
 		if !ok {
 			rows = append(rows, buildNewBenchmarkRow(currentSummary, useColor))
 			continue
@@ -445,6 +494,8 @@ func buildNewBenchmarkRow(currentSummary benchmarkSummary, useColor bool) output
 }
 
 func buildSummaryRow(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, useColor bool) outputRow {
+	previousIndex := newBenchmarkSummaryIndex(previousSummaries)
+	currentIndex := newBenchmarkSummaryIndex(currentSummaries)
 	var knownCount int
 	var newCount int
 	var previousNS float64
@@ -460,7 +511,7 @@ func buildSummaryRow(previousSummaries map[string]benchmarkSummary, order []stri
 			continue
 		}
 
-		previousSummary, ok := previousSummaries[name]
+		previousSummary, ok := previousIndex.lookupPrevious(name, currentIndex)
 		if !ok {
 			newCount++
 			continue

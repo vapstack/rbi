@@ -37,6 +37,32 @@ func TestParseBenchmarkLineIgnoresExtraMetrics(t *testing.T) {
 	}
 }
 
+func TestBenchmarkMatchKeyDropsGOMAXPROCSSuffix(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{
+			name: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100-16",
+			want: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100",
+		},
+		{
+			name: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100",
+			want: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100",
+		},
+		{
+			name: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100-x",
+			want: "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100-x",
+		},
+	} {
+		if got := benchmarkMatchKey(tc.name); got != tc.want {
+			t.Fatalf("benchmarkMatchKey(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestRunCLIHelpExitsCleanly(t *testing.T) {
 	t.Parallel()
 
@@ -418,6 +444,82 @@ func TestRunCLIRendersAllRowsByDefault(t *testing.T) {
 	}
 }
 
+func TestRunCLIMatchesBenchmarkWithGOMAXPROCSSuffix(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	previous := filepath.Join(dir, "previous.txt")
+	current := filepath.Join(dir, "current.txt")
+
+	previousText := "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100-16 100 1000 ns/op 100 B/op 1 allocs/op"
+	currentText := "BenchmarkQueryPreparedShape/Rows100K/NoFilter_Limit100 100 800 ns/op 100 B/op 1 allocs/op"
+
+	if err := os.WriteFile(previous, []byte(previousText), 0o644); err != nil {
+		t.Fatalf("write previous: %v", err)
+	}
+	if err := os.WriteFile(current, []byte(currentText), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{previous, current}, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("unexpected exit code %d, stderr=%q", code, stderr.String())
+	}
+
+	output := stdout.String()
+	for _, fragment := range []string{"QueryPreparedShape/Rows100K/NoFilter_Limit100", "800ns/op", "-20%", "1/1 | 100%"} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("expected output to contain %q, got %q", fragment, output)
+		}
+	}
+	if strings.Contains(output, "1/1 | 100% | +1") {
+		t.Fatalf("benchmark with GOMAXPROCS suffix was treated as new: %q", output)
+	}
+}
+
+func TestRunCLIPreservesMultipleCPUVariants(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	previous := filepath.Join(dir, "previous.txt")
+	current := filepath.Join(dir, "current.txt")
+
+	previousText := strings.Join([]string{
+		"Benchmark__Foo-1 100 1000 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Foo-2 100 2000 ns/op 200 B/op 2 allocs/op",
+	}, "\n")
+	currentText := strings.Join([]string{
+		"Benchmark__Foo-1 100 1100 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Foo-2 100 1800 ns/op 200 B/op 2 allocs/op",
+	}, "\n")
+
+	if err := os.WriteFile(previous, []byte(previousText), 0o644); err != nil {
+		t.Fatalf("write previous: %v", err)
+	}
+	if err := os.WriteFile(current, []byte(currentText), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{previous, current}, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("unexpected exit code %d, stderr=%q", code, stderr.String())
+	}
+
+	output := stdout.String()
+	for _, fragment := range []string{"Foo-1", "1_100ns/op", "+10%", "Foo-2", "1_800ns/op", "-10%", "2/2 | 100%"} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("expected output to contain %q, got %q", fragment, output)
+		}
+	}
+	if strings.Count(output, "Foo-") != 2 {
+		t.Fatalf("expected separate rows for CPU variants, got %q", output)
+	}
+}
+
 func TestRunCLIRendersSummaryAsLastLine(t *testing.T) {
 	t.Parallel()
 
@@ -747,6 +849,42 @@ func TestFollowReaderWaitsForSeriesEndBeforeRendering(t *testing.T) {
 	}
 	if len(changed) != 1 || changed[0] != "Benchmark__Foo-16" {
 		t.Fatalf("unexpected completed series: %#v", changed)
+	}
+}
+
+func TestFollowReaderPreservesCPUVariants(t *testing.T) {
+	t.Parallel()
+
+	current := newBenchmarkSet()
+	reader := followReader{}
+
+	changed, stop, err := reader.consume(&current, strings.Join([]string{
+		"Benchmark__Foo-1 100 800 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Foo-2 100 900 ns/op 100 B/op 1 allocs/op",
+		"",
+	}, "\n"))
+	if err != nil {
+		t.Fatalf("consume first chunk: %v", err)
+	}
+	if stop {
+		t.Fatal("did not expect stop before series end")
+	}
+	if len(changed) != 1 || changed[0] != "Benchmark__Foo-1" {
+		t.Fatalf("unexpected completed series: %#v", changed)
+	}
+
+	changed, stop, err = reader.consume(&current, "Benchmark__Bar-1 100 2400 ns/op 200 B/op 2 allocs/op\n")
+	if err != nil {
+		t.Fatalf("consume second chunk: %v", err)
+	}
+	if stop {
+		t.Fatal("did not expect stop on next benchmark")
+	}
+	if len(changed) != 1 || changed[0] != "Benchmark__Foo-2" {
+		t.Fatalf("unexpected completed series: %#v", changed)
+	}
+	if len(current.Order) != 3 {
+		t.Fatalf("unexpected current order: %#v", current.Order)
 	}
 }
 
