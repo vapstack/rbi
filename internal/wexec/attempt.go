@@ -524,13 +524,17 @@ func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, att *attempt
 		if err != nil {
 			rawErr := err
 			err = formatBoltWriteErr(err, op.req.op, op.req.id.Format(b.strKey), op.idx, op.key, op.payload)
-			if errors.Is(rawErr, errEmptyPayload) {
+			requestErr := errors.Is(rawErr, errEmptyPayload)
+			if !requestErr && !atomicAll {
+				requestErr = errors.Is(rawErr, bbolt.ErrKeyTooLarge) || errors.Is(rawErr, bbolt.ErrValueTooLarge)
+			}
+			if requestErr {
 				op.req.Err = err
 			}
 			if stats {
 				b.sched.stats.TxOpErrors.Add(1)
 			}
-			if errors.Is(rawErr, errEmptyPayload) && !atomicAll {
+			if requestErr && !atomicAll {
 				callbackFailedReq = op.req
 				break
 			}

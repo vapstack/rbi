@@ -14,6 +14,38 @@ import (
 	"go.etcd.io/bbolt"
 )
 
+func TestStringWritesRejectEmptyKey(t *testing.T) {
+	db, _ := openTempDBString(t, Options{AutoBatchMax: 1})
+	rec := &Rec{Name: "empty"}
+
+	beforeProcessCalled := false
+	if err := db.Set("", rec, BeforeProcess(func(string, *Rec) error {
+		beforeProcessCalled = true
+		return nil
+	})); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("Set empty key error = %v, want ErrKeyRequired", err)
+	}
+	if beforeProcessCalled {
+		t.Fatalf("BeforeProcess ran for empty Set key")
+	}
+
+	if err := db.BatchSet([]string{"ok", ""}, []*Rec{{Name: "ok"}, rec}); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("BatchSet empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := db.Patch("", []Field{{Name: "name", Value: "x"}}); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("Patch empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := db.BatchPatch([]string{"ok", ""}, []Field{{Name: "name", Value: "x"}}); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("BatchPatch empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := db.Delete(""); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("Delete empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := db.BatchDelete([]string{"ok", ""}); !errors.Is(err, bbolt.ErrKeyRequired) {
+		t.Fatalf("BatchDelete empty key error = %v, want ErrKeyRequired", err)
+	}
+}
+
 func TestIOExt_Patch_CorruptPayloadReturnsErrorAndLeavesOtherRowsReadable(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 	ioExtMustSetRec(t, db, 1, &Rec{Name: "one", Age: 10})

@@ -562,6 +562,28 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	}
 }
 
+func TestSharedStringSetKeyTooLargeCommitsRest(t *testing.T) {
+	var events []string
+	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+
+	badReq := stringSetAttemptReq(strings.Repeat("x", bbolt.MaxKeySize+1), 3)
+	goodReq := stringSetAttemptReq("good", 2)
+
+	executeBatchForTest(ex, []*request{badReq, goodReq})
+
+	if err := <-badReq.Done; !errors.Is(err, bbolt.ErrKeyTooLarge) {
+		t.Fatalf("bad request error = %v, want key too large", err)
+	}
+	if err := <-goodReq.Done; err != nil {
+		t.Fatalf("good request error = %v", err)
+	}
+	if got := readStringAttemptPayload(t, raw, bucket, "good"); !reflect.DeepEqual(got, []byte{2}) {
+		t.Fatalf("good request payload = %v, want [2]", got)
+	}
+}
+
 func TestAtomicSetEmptyPayloadThenPatchSameBatch(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {

@@ -321,6 +321,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	cfg := db.resolveExecOptions(execOpts)
 
 	key := keycodec.DataKeyFromUserKey(id, db.strKey)
+	if db.strKey && key.String() == "" {
+		return bbolt.ErrKeyRequired
+	}
 	if len(cfg.beforeProcess) != 0 {
 		for _, fn := range cfg.beforeProcess {
 			if err := fn(key, unsafe.Pointer(newVal)); err != nil {
@@ -387,6 +390,10 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 
 		for i := range newVals {
 			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
+			if db.strKey && key.String() == "" {
+				keycodec.ReleaseDataKeySlice(keyScratch)
+				return fmt.Errorf("%w: ids[%d]", bbolt.ErrKeyRequired, i)
+			}
 			for _, fn := range cfg.beforeProcess {
 				if err := fn(key, unsafe.Pointer(newVals[i])); err != nil {
 					keycodec.ReleaseDataKeySlice(keyScratch)
@@ -408,6 +415,9 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 		if keyScratch != nil {
 			key = keyScratch[i]
+		} else if db.strKey && key.String() == "" {
+			batch.Cancel()
+			return fmt.Errorf("%w: ids[%d]", bbolt.ErrKeyRequired, i)
 		}
 		if err := batch.AddSet(key, unsafe.Pointer(newVals[i]), cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); err != nil {
 			batch.Cancel()
@@ -450,8 +460,12 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 			return err
 		}
 	}
+	key := keycodec.DataKeyFromUserKey(id, db.strKey)
+	if db.strKey && key.String() == "" {
+		return bbolt.ErrKeyRequired
+	}
 	batch := db.batcher.NewBatch(1)
-	batch.AddPatch(keycodec.DataKeyFromUserKey(id, db.strKey), patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+	batch.AddPatch(key, patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 	return batch.Submit(cfg.noBatch)
 }
 
@@ -487,7 +501,12 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {
-		batch.AddPatch(keycodec.DataKeyFromUserKey(ids[i], db.strKey), patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
+		if db.strKey && key.String() == "" {
+			batch.Cancel()
+			return fmt.Errorf("%w: ids[%d]", bbolt.ErrKeyRequired, i)
+		}
+		batch.AddPatch(key, patchItems, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 	}
 	return batch.Submit(true)
 }
@@ -504,8 +523,12 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	}
 	cfg := db.resolveExecOptions(execOpts)
 
+	key := keycodec.DataKeyFromUserKey(id, db.strKey)
+	if db.strKey && key.String() == "" {
+		return bbolt.ErrKeyRequired
+	}
 	batch := db.batcher.NewBatch(1)
-	batch.AddDelete(keycodec.DataKeyFromUserKey(id, db.strKey), cfg.beforeCommit)
+	batch.AddDelete(key, cfg.beforeCommit)
 	return batch.Submit(cfg.noBatch)
 }
 
@@ -528,7 +551,12 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	batch := db.batcher.NewBatch(len(ids))
 
 	for i := range ids {
-		batch.AddDelete(keycodec.DataKeyFromUserKey(ids[i], db.strKey), cfg.beforeCommit)
+		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
+		if db.strKey && key.String() == "" {
+			batch.Cancel()
+			return fmt.Errorf("%w: ids[%d]", bbolt.ErrKeyRequired, i)
+		}
+		batch.AddDelete(key, cfg.beforeCommit)
 	}
 	return batch.Submit(true)
 }
