@@ -522,6 +522,43 @@ func TestReadFieldStorageFlatStringKeysSurviveBufferGrowth(t *testing.T) {
 	}
 }
 
+func TestReadFieldStorageFlatMixedKeysPreservesNumericKey(t *testing.T) {
+	const numericKey = 0x0102030405060708
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
+		t.Fatalf("write storage tag: %v", err)
+	}
+	if err := writeUvarint(writer, 2); err != nil {
+		t.Fatalf("write count: %v", err)
+	}
+	if err := writeKey(writer, keycodec.FromString("")); err != nil {
+		t.Fatalf("write string key: %v", err)
+	}
+	if err := posting.WriteSingleton(writer, 11); err != nil {
+		t.Fatalf("write string posting: %v", err)
+	}
+	if err := writeKey(writer, keycodec.FromU64(numericKey)); err != nil {
+		t.Fatalf("write numeric key: %v", err)
+	}
+	if err := posting.WriteSingleton(writer, 22); err != nil {
+		t.Fatalf("write numeric posting: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	storage, err := ReadFieldStorage(bufio.NewReader(bytes.NewReader(raw.Bytes())), true, "test", "field")
+	if err != nil {
+		t.Fatalf("read flat storage: %v", err)
+	}
+	defer storage.Release()
+
+	fieldStorageAssertPostingContains(t, storage, "", 11)
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(numericKey), 22)
+}
+
 func TestReadFieldStorageRejectsUnsortedFlatKeys(t *testing.T) {
 	var raw bytes.Buffer
 	writer := bufio.NewWriter(&raw)

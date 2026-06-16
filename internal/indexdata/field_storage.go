@@ -477,6 +477,9 @@ func newFlatFieldStorage(entries []Entry, stringData []byte) FieldStorage {
 	if stringData == nil && !entries[0].Key.IsNumeric() {
 		totalBytes := 0
 		for i := range entries {
+			if entries[i].Key.IsNumeric() {
+				continue
+			}
 			n := entries[i].Key.ByteLen()
 			if n > fieldIndexStringRefMax {
 				panic("field Entry string key len exceeds uint16")
@@ -487,6 +490,9 @@ func newFlatFieldStorage(entries []Entry, stringData []byte) FieldStorage {
 			stringData = fieldByteSlice(totalBytes)
 			off := 0
 			for i := range entries {
+				if entries[i].Key.IsNumeric() {
+					continue
+				}
 				n := copy(stringData[off:], entries[i].Key.UnsafeString())
 				entries[i].Key = keycodec.FromBytes(stringData[off : off+n])
 				off += n
