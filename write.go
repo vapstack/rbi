@@ -469,7 +469,7 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	if len(ids) == 0 || len(patch) == 0 {
+	if len(patch) == 0 {
 		return nil
 	}
 	cfg := db.resolveExecOptions(execOpts)
@@ -480,6 +480,9 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		if err := db.schema.Patch.ValidateNames(patchItems); err != nil {
 			return err
 		}
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 	batch := db.batcher.NewBatch(len(ids))
 

@@ -1444,6 +1444,15 @@ func TestPatchStrictOption_UnknownFieldOnMissingTarget(t *testing.T) {
 	}
 }
 
+func TestPatchStrictOption_UnknownFieldOnEmptyBatchPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	err := db.BatchPatch([]uint64{}, []Field{{Name: "does_not_exist", Value: 123}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field does_not_exist") {
+		t.Fatalf("BatchPatch empty ids error=%v, want strict unknown field error", err)
+	}
+}
+
 func TestBatchPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	type tc struct {
 		name  string
