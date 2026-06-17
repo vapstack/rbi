@@ -48,12 +48,16 @@ type Config struct {
 	BucketFillPercent  float64
 	RejectEmptyPayload bool
 
-	PublishMu        *sync.RWMutex
-	Indexed          bool
-	Ops              *RecordOps
-	Schema           *schema.Schema
-	Unique           UniqueContext
-	SnapshotOps      SnapshotOps
+	PublishMu   *sync.RWMutex
+	Indexed     bool
+	Ops         *RecordOps
+	Schema      *schema.Schema
+	Unique      UniqueContext
+	SnapshotOps SnapshotOps
+
+	// PublishCommitted runs after a successful Bolt commit. It must publish the
+	// passed snapshot before returning nil; a non-nil error is a terminal publish
+	// failure, and the batcher drops the staged snapshot before assigning the error.
 	PublishCommitted func(uint64, string, *snapshot.View) error
 }
 

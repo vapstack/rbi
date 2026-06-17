@@ -740,6 +740,7 @@ func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, er
 	name := opName(active[0].op, len(active), atomicAll, b.sched.maxOps)
 	err = b.publishCommitted(seq, name, snap)
 	if err != nil {
+		b.snapshotOps.Manager.DropStaged(seq)
 		assignPreparedErr(att.accepted, err)
 	}
 

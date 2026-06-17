@@ -14,6 +14,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 )
@@ -86,8 +87,7 @@ func TestAttemptPublishRunsAfterSuccessfulCommit(t *testing.T) {
 	}
 }
 
-func TestAttemptPublishErrorAssignsRequestAfterCommit(t *testing.T) {
-	publishErr := errors.New("publish failed")
+func TestAttemptPublishBrokenDropsStagedAfterCommit(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		events = append(events, "commit")
@@ -97,8 +97,13 @@ func TestAttemptPublishErrorAssignsRequestAfterCommit(t *testing.T) {
 		if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
 			t.Fatalf("publish ran before committed payload was visible: %v", got)
 		}
+		staged, ref, ok := ex.snapshotOps.Manager.PinBySeq(seq)
+		if !ok || staged != snap {
+			t.Fatalf("snapshot was not staged before publish error: staged=%#v snap=%#v ok=%v", staged, snap, ok)
+		}
+		ex.snapshotOps.Manager.Unpin(seq, ref)
 		events = append(events, "publish")
-		return publishErr
+		return rbierrors.ErrBroken
 	}
 
 	req := setAttemptReq(1, 9)
@@ -108,11 +113,15 @@ func TestAttemptPublishErrorAssignsRequestAfterCommit(t *testing.T) {
 	if retry != nil || !done || fatalErr != nil {
 		t.Fatalf("attempt = retry %p done %v fatal %v", retry, done, fatalErr)
 	}
-	if !errors.Is(req.Err, publishErr) {
-		t.Fatalf("request error = %v, want %v", req.Err, publishErr)
+	if !errors.Is(req.Err, rbierrors.ErrBroken) {
+		t.Fatalf("request error = %v, want %v", req.Err, rbierrors.ErrBroken)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
 		t.Fatalf("committed payload after publish error = %v, want [9]", got)
+	}
+	if snap, ref, ok := ex.snapshotOps.Manager.PinBySeq(1); ok {
+		ex.snapshotOps.Manager.Unpin(1, ref)
+		t.Fatalf("staged snapshot remained after publish error: %#v", snap)
 	}
 	want := []string{"commit", "publish"}
 	if !reflect.DeepEqual(events, want) {
