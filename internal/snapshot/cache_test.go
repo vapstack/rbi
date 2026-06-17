@@ -1369,6 +1369,83 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 	}
 }
 
+func TestManagerStageReplaceUnpinnedStagedReleasesOldSnapshot(t *testing.T) {
+	m := NewRegistry(true)
+
+	first := testMatPredView(2, 0)
+	first.Seq = 21
+	first.KeyIndex = testStorage("old")
+	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("stage-old"), testPosting(1))
+	m.Stage(first)
+
+	second := &View{Seq: first.Seq}
+	m.Stage(second)
+
+	if first.KeyIndex.KeyCount() != 0 || first.matPredCache != nil {
+		t.Fatal("expected replaced unpinned staged snapshot to be released")
+	}
+
+	m.DropStaged(second.Seq)
+}
+
+func TestManagerStageReplacePinnedStagedReleasesOldSnapshotAfterLastUnpin(t *testing.T) {
+	m := NewRegistry(true)
+
+	first := testMatPredView(2, 0)
+	first.Seq = 22
+	first.KeyIndex = testStorage("old")
+	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("stage-pinned-old"), testPosting(1))
+	m.Stage(first)
+
+	pinned, ref, ok := m.PinBySeq(first.Seq)
+	if !ok || pinned != first {
+		t.Fatal("expected first staged snapshot to be pinnable")
+	}
+
+	second := &View{Seq: first.Seq}
+	m.Stage(second)
+	if first.KeyIndex.KeyCount() == 0 || first.matPredCache == nil {
+		t.Fatal("expected replaced pinned staged snapshot to survive until unpin")
+	}
+
+	m.Unpin(first.Seq, ref)
+	if first.KeyIndex.KeyCount() != 0 || first.matPredCache != nil {
+		t.Fatal("expected replaced pinned staged snapshot to be released after last unpin")
+	}
+
+	m.DropStaged(second.Seq)
+}
+
+func TestManagerPublishReplaceStagedReleasesOldSnapshotAfterLastUnpin(t *testing.T) {
+	m := NewRegistry(true)
+
+	m.Publish(&View{Seq: 1})
+	staged := testMatPredView(2, 0)
+	staged.Seq = 23
+	staged.KeyIndex = testStorage("old")
+	staged.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("publish-staged-old"), testPosting(1))
+	m.Stage(staged)
+
+	pinned, ref, ok := m.PinBySeq(staged.Seq)
+	if !ok || pinned != staged {
+		t.Fatal("expected staged snapshot to be pinnable")
+	}
+
+	current := &View{Seq: staged.Seq}
+	m.Publish(current)
+	if staged.KeyIndex.KeyCount() == 0 || staged.matPredCache == nil {
+		t.Fatal("expected replaced pinned staged snapshot to survive until unpin")
+	}
+
+	m.Unpin(staged.Seq, ref)
+	if staged.KeyIndex.KeyCount() != 0 || staged.matPredCache != nil {
+		t.Fatal("expected replaced pinned staged snapshot to be released after last unpin")
+	}
+	if m.Current() != current {
+		t.Fatal("expected published replacement to remain current")
+	}
+}
+
 func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnpin(t *testing.T) {
 	m := NewRegistry(true)
 

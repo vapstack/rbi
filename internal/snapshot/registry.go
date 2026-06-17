@@ -77,7 +77,7 @@ func (sm *Registry) releaseRetiredSnapshots(buf []*View) {
 	numRangeRetired.Release()
 }
 
-func (sm *Registry) publishRef(s *View) []*View {
+func (sm *Registry) publishRef(s *View) ([]*View, []*View) {
 	sm.mu.Lock()
 
 	prev := sm.current.Load()
@@ -87,7 +87,7 @@ func (sm *Registry) publishRef(s *View) []*View {
 		sm.bySeq[s.Seq] = ref
 	}
 	var retired []*View
-	if prev != nil && prev.Seq == s.Seq && ref.snap != nil && ref.snap != s {
+	if ref.snap != nil && ref.snap != s {
 		if ref.refs.Load() != 0 {
 			ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
 		} else {
@@ -97,11 +97,12 @@ func (sm *Registry) publishRef(s *View) []*View {
 	ref.snap = s
 	sm.current.Store(s)
 	sm.currentRef.Store(ref)
+	var prevRetired []*View
 	if prev != nil && prev.Seq != s.Seq {
-		retired = sm.retireSnapshotLocked(prev.Seq)
+		prevRetired = sm.retireSnapshotLocked(prev.Seq)
 	}
 	sm.mu.Unlock()
-	return retired
+	return retired, prevRetired
 }
 
 func (sm *Registry) Stage(s *View) {
@@ -112,8 +113,20 @@ func (sm *Registry) Stage(s *View) {
 		ref = snapshotRefPool.Get()
 		sm.bySeq[s.Seq] = ref
 	}
+	var retired []*View
+	if ref.snap != nil && ref.snap != s {
+		if ref.refs.Load() != 0 {
+			ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
+		} else {
+			retired = appendRetiredSnapshot(retired, ref.snap)
+		}
+	}
 	ref.snap = s
 	sm.mu.Unlock()
+
+	if retired != nil {
+		sm.releaseRetiredSnapshots(retired)
+	}
 }
 
 func (sm *Registry) DropStaged(seq uint64) {
@@ -178,16 +191,18 @@ func (sm *Registry) Unpin(seq uint64, ref *Ref) {
 	refsZero := held == ref && held.refs.Load() == 0
 	if held == ref && refsZero && held.snap == nil {
 		retired = sm.releaseRetiredSnapshotRefLocked(seq, held)
-	} else if refsZero && held.snap != nil && held == sm.currentRef.Load() {
+	} else if refsZero && held.snap != nil {
 		if held.retired != nil {
 			retired = held.retired
 			held.retired = nil
 		}
-		if held.snap.matPredCache != nil {
-			matPredRetired = held.snap.matPredCache.TakeRetired()
-		}
-		if held.snap.numericRangeBucketCache != nil {
-			numRangeRetired = held.snap.numericRangeBucketCache.TakeRetired()
+		if held == sm.currentRef.Load() {
+			if held.snap.matPredCache != nil {
+				matPredRetired = held.snap.matPredCache.TakeRetired()
+			}
+			if held.snap.numericRangeBucketCache != nil {
+				numRangeRetired = held.snap.numericRangeBucketCache.TakeRetired()
+			}
 		}
 	}
 	sm.mu.Unlock()
@@ -240,8 +255,13 @@ func (sm *Registry) Current() *View {
 }
 
 func (sm *Registry) Publish(s *View) {
-	retired := sm.publishRef(s)
-	sm.releaseRetiredSnapshots(retired)
+	retired, prevRetired := sm.publishRef(s)
+	if retired != nil {
+		sm.releaseRetiredSnapshots(retired)
+	}
+	if prevRetired != nil {
+		sm.releaseRetiredSnapshots(prevRetired)
+	}
 }
 
 func (sm *Registry) PinCurrent() (*View, uint64, *Ref) {
