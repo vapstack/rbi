@@ -14,7 +14,7 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func buildNoActive(cfg Config, state State) (Result, error) {
+func finishLoadedStorage(cfg Config, state State) (Result, error) {
 	if cfg.StrKey {
 		maxStringIdx, ok := state.Universe.Maximum()
 		if ok {

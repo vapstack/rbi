@@ -77,7 +77,7 @@ func Build(cfg Config, state State) (Result, error) {
 		if cfg.StrKey && cfg.StrKeyIndex && !cfg.KeyIndexLoaded {
 			return buildKeyOnly(cfg, state)
 		}
-		return buildNoActive(cfg, state)
+		return finishLoadedStorage(cfg, state)
 	}
 
 	start := time.Now()
