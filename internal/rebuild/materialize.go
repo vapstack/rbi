@@ -2,6 +2,7 @@ package rebuild
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"time"
 
@@ -10,9 +11,29 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
+	"go.etcd.io/bbolt"
 )
 
 func buildNoActive(cfg Config, state State) (Result, error) {
+	if cfg.StrKey {
+		maxStringIdx, ok := state.Universe.Maximum()
+		if ok {
+			err := cfg.Bolt.View(func(tx *bbolt.Tx) error {
+				stringMap := tx.Bucket(cfg.StrMapBucket)
+				if stringMap == nil {
+					return fmt.Errorf("string storage format: missing string map bucket %q", cfg.StrMapBucket)
+				}
+				seq := stringMap.Sequence()
+				if seq < maxStringIdx {
+					return fmt.Errorf("string storage format: string map sequence %d lower than max live idx %d", seq, maxStringIdx)
+				}
+				return nil
+			})
+			if err != nil {
+				return Result{}, err
+			}
+		}
+	}
 	if state.LenLoaded {
 		return Result{KeyIndexLoaded: cfg.KeyIndexLoaded}, nil
 	}

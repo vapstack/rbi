@@ -817,6 +817,57 @@ func TestBuildStringKeyOnlyRejectsStringMapSequenceBelowLiveID(t *testing.T) {
 	}
 }
 
+func TestBuildStringNoActiveRejectsStringMapSequenceBelowLiveID(t *testing.T) {
+	bucket := []byte("rebuild_no_active_bad_sequence")
+	db := openRebuildTestBolt(t, bucket)
+	rt := compileRebuildTestSchema(t)
+	mapBucket := createRebuildStringMap(t, db, bucket)
+
+	id := putRebuildTestStringRec(t, db, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+
+	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg.StrKey = true
+	cfg.StrMapBucket = mapBucket
+	cfg.StrKeyIndex = true
+	full, err := Build(cfg, newRebuildTestState(rt))
+	if err != nil {
+		t.Fatalf("full Build: %v", err)
+	}
+	defer full.Storage.Release()
+
+	if err = db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(mapBucket).SetSequence(id - 1)
+	}); err != nil {
+		t.Fatalf("lower string map sequence: %v", err)
+	}
+
+	_, err = Build(Config{
+		Bolt:              db,
+		StrMapBucket:      mapBucket,
+		Schema:            rt,
+		StrKey:            true,
+		StrKeyIndex:       true,
+		KeyIndexLoaded:    true,
+		SkipFields:        map[string]struct{}{"name": {}, "tags": {}},
+		SkipMeasureFields: map[string]struct{}{"score": {}},
+	}, State{
+		Index:             full.Storage.Index,
+		KeyIndex:          full.Storage.KeyIndex,
+		NilIndex:          full.Storage.NilIndex,
+		LenIndex:          full.Storage.LenIndex,
+		LenZeroComplement: full.Storage.LenZeroComplement,
+		Measure:           full.Storage.Measure,
+		Universe:          full.Storage.Universe,
+		LenLoaded:         true,
+	})
+	if err == nil {
+		t.Fatalf("expected string map sequence error")
+	}
+	if msg := err.Error(); !strings.Contains(msg, fmt.Sprintf("string map sequence %d lower than max live idx %d", id-1, id)) {
+		t.Fatalf("unexpected string map sequence error: %v", err)
+	}
+}
+
 func TestMaterializeStringKeyMeasureRunsSortByNumericID(t *testing.T) {
 	rt := compileRebuildTestSchema(t)
 	score := rt.MeasuresByName["score"]
