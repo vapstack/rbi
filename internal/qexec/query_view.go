@@ -38,9 +38,13 @@ type normalizedScalarBoundCacheKind uint8
 const (
 	normalizedScalarBoundCacheNone normalizedScalarBoundCacheKind = iota
 	normalizedScalarBoundCacheString
+	normalizedScalarBoundCacheVIString
 	normalizedScalarBoundCacheSigned
+	normalizedScalarBoundCacheVISigned
 	normalizedScalarBoundCacheUnsigned
+	normalizedScalarBoundCacheVIUnsigned
 	normalizedScalarBoundCacheFloat
+	normalizedScalarBoundCacheVIFloat
 	normalizedScalarBoundCacheUnixTime
 )
 
@@ -48,6 +52,7 @@ type normalizedScalarBoundCacheEntry struct {
 	fieldOrdinal int
 	op           qir.Op
 	kind         normalizedScalarBoundCacheKind
+	typ          reflect.Type
 	str          string
 	i64          int64
 	u64          uint64
@@ -76,7 +81,7 @@ func newView(snap *snapshot.View, exec *Runtime) View {
 	}
 }
 
-func normalizedScalarBoundCacheValue(v reflect.Value, fm *schema.Field) (normalizedScalarBoundCacheEntry, bool) {
+func normalizedScalarBoundCacheValue(raw any, v reflect.Value, fm *schema.Field) (normalizedScalarBoundCacheEntry, bool) {
 	if !v.IsValid() {
 		return normalizedScalarBoundCacheEntry{}, false
 	}
@@ -90,27 +95,70 @@ func normalizedScalarBoundCacheValue(v reflect.Value, fm *schema.Field) (normali
 		}
 	}
 
+	var viType reflect.Type
+	if fm != nil && fm.UseVI {
+		rt := reflect.TypeOf(raw)
+		if rt != nil && rt.Implements(schema.ValueIndexerType) {
+			if rt.Kind() == reflect.Pointer && !rt.Elem().Implements(schema.ValueIndexerType) {
+				return normalizedScalarBoundCacheEntry{}, false
+			}
+			viType = rt
+		} else if vt := v.Type(); vt != rt && v.CanInterface() && vt.Implements(schema.ValueIndexerType) {
+			viType = vt
+		} else if v.Kind() != reflect.String {
+			return normalizedScalarBoundCacheEntry{}, false
+		}
+	}
+
 	switch v.Kind() {
 
 	case reflect.String:
+		if viType != nil {
+			return normalizedScalarBoundCacheEntry{
+				kind: normalizedScalarBoundCacheVIString,
+				typ:  viType,
+				str:  v.String(),
+			}, true
+		}
 		return normalizedScalarBoundCacheEntry{
 			kind: normalizedScalarBoundCacheString,
 			str:  v.String(),
 		}, true
 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if viType != nil {
+			return normalizedScalarBoundCacheEntry{
+				kind: normalizedScalarBoundCacheVISigned,
+				typ:  viType,
+				i64:  v.Int(),
+			}, true
+		}
 		return normalizedScalarBoundCacheEntry{
 			kind: normalizedScalarBoundCacheSigned,
 			i64:  v.Int(),
 		}, true
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if viType != nil {
+			return normalizedScalarBoundCacheEntry{
+				kind: normalizedScalarBoundCacheVIUnsigned,
+				typ:  viType,
+				u64:  v.Uint(),
+			}, true
+		}
 		return normalizedScalarBoundCacheEntry{
 			kind: normalizedScalarBoundCacheUnsigned,
 			u64:  v.Uint(),
 		}, true
 
 	case reflect.Float32, reflect.Float64:
+		if viType != nil {
+			return normalizedScalarBoundCacheEntry{
+				kind: normalizedScalarBoundCacheVIFloat,
+				typ:  viType,
+				f64:  math.Float64bits(v.Float()),
+			}, true
+		}
 		return normalizedScalarBoundCacheEntry{
 			kind: normalizedScalarBoundCacheFloat,
 			f64:  math.Float64bits(v.Float()),
@@ -122,7 +170,7 @@ func normalizedScalarBoundCacheValue(v reflect.Value, fm *schema.Field) (normali
 }
 
 func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (normalizedScalarBound, bool) {
-	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
+	key, ok := normalizedScalarBoundCacheValue(expr.Value, v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
 	if !ok {
 		return normalizedScalarBound{}, false
 	}
@@ -143,8 +191,16 @@ func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (norma
 			if entry.str == key.str {
 				return entry.bound, true
 			}
+		case normalizedScalarBoundCacheVIString:
+			if entry.typ == key.typ && entry.str == key.str {
+				return entry.bound, true
+			}
 		case normalizedScalarBoundCacheSigned:
 			if entry.i64 == key.i64 {
+				return entry.bound, true
+			}
+		case normalizedScalarBoundCacheVISigned:
+			if entry.typ == key.typ && entry.i64 == key.i64 {
 				return entry.bound, true
 			}
 		case normalizedScalarBoundCacheUnixTime:
@@ -155,8 +211,16 @@ func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (norma
 			if entry.u64 == key.u64 {
 				return entry.bound, true
 			}
+		case normalizedScalarBoundCacheVIUnsigned:
+			if entry.typ == key.typ && entry.u64 == key.u64 {
+				return entry.bound, true
+			}
 		case normalizedScalarBoundCacheFloat:
 			if entry.f64 == key.f64 {
+				return entry.bound, true
+			}
+		case normalizedScalarBoundCacheVIFloat:
+			if entry.typ == key.typ && entry.f64 == key.f64 {
 				return entry.bound, true
 			}
 		}
@@ -165,7 +229,7 @@ func (qv *View) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (norma
 }
 
 func (qv *View) storeNormalizedScalarBound(expr qir.Expr, v reflect.Value, bound normalizedScalarBound) {
-	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
+	key, ok := normalizedScalarBoundCacheValue(expr.Value, v, qv.fieldMetaByOrdinal(expr.FieldOrdinal))
 	if !ok {
 		return
 	}

@@ -21,8 +21,24 @@ func (s reflectFoldedString) IndexingValue() string {
 	return strings.ToLower(string(s))
 }
 
+type reflectOrdinalVI int
+
+func (v reflectOrdinalVI) IndexingValue() string {
+	return string(rune('a' + v))
+}
+
+type reflectReverseOrdinalVI int
+
+func (v reflectReverseOrdinalVI) IndexingValue() string {
+	return string(rune('z' - v))
+}
+
 type reflectScalarVIRec struct {
 	Code reflectFoldedString `db:"code" rbi:"index"`
+}
+
+type reflectOrdinalVIRec struct {
+	Code reflectOrdinalVI `db:"code" rbi:"index"`
 }
 
 type reflectScalarVIUniqueRec struct {
@@ -316,6 +332,58 @@ func TestReflectExt_QueryValueIndexerScalarPlainString_UsesCanonicalKey(t *testi
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	assertUint64Set(t, got, []uint64{1, 2})
+}
+
+func TestReflectExt_QueryValueIndexerScalarMixedTypedAndPlainStringBounds(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectScalarVIRec](t, "reflect_scalar_vi_mixed_bounds.db")
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectScalarVIRec{
+			{Code: reflectFoldedString("AA")},
+			{Code: reflectFoldedString("aa")},
+			{Code: reflectFoldedString("zz")},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	q := qx.Query(qx.AND(
+		qx.LTE("code", reflectFoldedString("AA")),
+		qx.NOT(qx.LTE("code", "AA")),
+	))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	assertUint64Set(t, got, []uint64{1, 2})
+}
+
+func TestReflectExt_QueryValueIndexerScalarMixedValueIndexerTypesBounds(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectOrdinalVIRec](t, "reflect_ordinal_vi_mixed_bounds.db")
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectOrdinalVIRec{
+			{Code: reflectOrdinalVI(1)},
+			{Code: reflectOrdinalVI(2)},
+			{Code: reflectOrdinalVI(25)},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	q := qx.Query(qx.AND(
+		qx.LTE("code", reflectReverseOrdinalVI(1)),
+		qx.NOT(qx.LTE("code", reflectOrdinalVI(1))),
+	))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	assertUint64Set(t, got, []uint64{2})
 }
 
 func TestReflectExt_UniqueValueIndexerScalarNamedString_UsesIndexingValue(t *testing.T) {
