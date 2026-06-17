@@ -140,6 +140,10 @@ func setReflectValue(fv reflect.Value, val any) error {
 		return err
 	}
 
+	if dstKind == reflect.String && isReflectNumericKind(srcKind) {
+		return fmt.Errorf("type mismatch: cannot convert %v to %v", sv.Type(), fv.Type())
+	}
+
 	if sv.Type().ConvertibleTo(fv.Type()) {
 		fv.Set(sv.Convert(fv.Type()))
 		return nil

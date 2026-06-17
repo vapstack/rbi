@@ -1219,24 +1219,26 @@ type SchemaTestPatchApplyEmbedded struct {
 
 type schemaTestPatchApplyRec struct {
 	SchemaTestPatchApplyEmbedded
-	GoName   string
-	DBName   string `db:"db_name"`
-	JSONName string `json:"jsonName"`
-	Ptr      *int
-	PtrTags  *[]int16
-	PtrPtr   **int
-	PtrAny   *any
-	Tags     []int16
-	Named    schemaTestNamedStrings
-	Nested   schemaTestPatchNested
-	Any      any
-	Anys     []any
-	I8       int8
-	U8       uint8
-	UPtr     uintptr
-	F32      float32
-	VI       schemaTestVI
-	VIPtr    *schemaTestVI
+	GoName    string
+	DBName    string `db:"db_name"`
+	JSONName  string `json:"jsonName"`
+	Ptr       *int
+	PtrTags   *[]int16
+	PtrPtr    **int
+	PtrAny    *any
+	StringPtr *string
+	Strings   []string
+	Tags      []int16
+	Named     schemaTestNamedStrings
+	Nested    schemaTestPatchNested
+	Any       any
+	Anys      []any
+	I8        int8
+	U8        uint8
+	UPtr      uintptr
+	F32       float32
+	VI        schemaTestVI
+	VIPtr     *schemaTestVI
 }
 
 func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
@@ -1414,6 +1416,51 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	}
 	if rec.VI != "aa" || rec.VIPtr == nil || *rec.VIPtr != "BB" {
 		t.Fatalf("ValueIndexer assignment failed: VI=%q VIPtr=%v", rec.VI, rec.VIPtr)
+	}
+}
+
+func TestPatchRuntimeApplyRejectsNumericStringConversions(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestPatchApplyRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	ptr := "old"
+	rec := schemaTestPatchApplyRec{
+		GoName:    "old",
+		StringPtr: &ptr,
+		Strings:   []string{"old"},
+		VI:        "old",
+	}
+
+	for _, p := range []PatchItem{
+		{Name: "GoName", Value: 65},
+		{Name: "StringPtr", Value: 65},
+		{Name: "Strings", Value: []int{65}},
+		{Name: "VI", Value: 65},
+	} {
+		if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{p}, false); err == nil || !strings.Contains(err.Error(), "type mismatch") {
+			t.Fatalf("Apply(%s) error=%v, want type mismatch", p.Name, err)
+		}
+	}
+
+	if rec.GoName != "old" || rec.StringPtr != &ptr || !slices.Equal(rec.Strings, []string{"old"}) || rec.VI != "old" {
+		t.Fatalf("failed numeric string patch changed record: %+v", rec)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "VI", Value: "new"}}, false); err != nil {
+		t.Fatalf("Apply named string: %v", err)
+	}
+	if rec.VI != "new" {
+		t.Fatalf("named string patch failed: %q", rec.VI)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{
+		{Name: "GoName", Value: []byte("bytes")},
+		{Name: "StringPtr", Value: []rune("runes")},
+	}, false); err != nil {
+		t.Fatalf("Apply byte/rune string conversions: %v", err)
+	}
+	if rec.GoName != "bytes" || rec.StringPtr == nil || *rec.StringPtr != "runes" {
+		t.Fatalf("byte/rune string conversions failed: %+v", rec)
 	}
 }
 
