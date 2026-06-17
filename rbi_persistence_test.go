@@ -216,6 +216,226 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 	}
 }
 
+func TestIndexPersistence_RejectsSidecarAfterBoltReplacementSameSequence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "replace_same_seq.db")
+	opts := Options{BucketName: "replace_same_seq"}
+
+	db1, raw1 := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	if err := db1.Set(1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
+		t.Fatalf("old Set: %v", err)
+	}
+	sidecar := db1.rbiFile
+	oldSeq := readBucketSequence(t, raw1, db1.dataBucket)
+	if err := db1.Close(); err != nil {
+		t.Fatalf("old Close: %v", err)
+	}
+	if err := raw1.Close(); err != nil {
+		t.Fatalf("old raw Close: %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove old bolt: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName:        opts.BucketName,
+		DisableIndexLoad:  true,
+		DisableIndexStore: true,
+	})
+	if err := db2.Set(1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
+		t.Fatalf("new Set: %v", err)
+	}
+	newSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	if newSeq != oldSeq {
+		t.Fatalf("test requires matching sequence: old=%d new=%d", oldSeq, newSeq)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("new Close: %v", err)
+	}
+	if err := raw2.Close(); err != nil {
+		t.Fatalf("new raw Close: %v", err)
+	}
+	if got := readPersistedIndexSequence(t, sidecar); got != oldSeq {
+		t.Fatalf("old sidecar sequence changed: got=%d want %d", got, oldSeq)
+	}
+
+	var logBuf bytes.Buffer
+	db3, raw3 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName: opts.BucketName,
+		Logger:     log.New(&logBuf, "", 0),
+	})
+	defer func() {
+		_ = db3.Close()
+		_ = raw3.Close()
+	}()
+
+	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
+		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
+	}
+	if cnt, err := db3.Count(qx.EQ("age", 10)); err != nil {
+		t.Fatalf("Count(old age): %v", err)
+	} else if cnt != 0 {
+		t.Fatalf("Count(old age)=%d want 0", cnt)
+	}
+	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	if err != nil {
+		t.Fatalf("QueryKeys(new age): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(new age)=%v want [1]", ids)
+	}
+}
+
+func TestIndexPersistence_RegeneratesUIDAfterDataBucketRecreateSameSequence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recreate_bucket_same_seq.db")
+	opts := Options{BucketName: "recreate_bucket_same_seq"}
+
+	db1, raw1 := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	if err := db1.Set(1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
+		t.Fatalf("old Set: %v", err)
+	}
+	sidecar := db1.rbiFile
+	oldSeq := readBucketSequence(t, raw1, db1.dataBucket)
+	if err := db1.Close(); err != nil {
+		t.Fatalf("old Close: %v", err)
+	}
+	if err := raw1.Close(); err != nil {
+		t.Fatalf("old raw Close: %v", err)
+	}
+
+	rawDelete, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("delete reopen bbolt.Open: %v", err)
+	}
+	if err = rawDelete.Update(func(tx *bbolt.Tx) error {
+		return tx.DeleteBucket([]byte(opts.BucketName))
+	}); err != nil {
+		_ = rawDelete.Close()
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if err = rawDelete.Close(); err != nil {
+		t.Fatalf("delete raw Close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName:        opts.BucketName,
+		DisableIndexLoad:  true,
+		DisableIndexStore: true,
+	})
+	if err := db2.Set(1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
+		t.Fatalf("new Set: %v", err)
+	}
+	newSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	if newSeq != oldSeq {
+		t.Fatalf("test requires matching sequence: old=%d new=%d", oldSeq, newSeq)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("new Close: %v", err)
+	}
+	if err := raw2.Close(); err != nil {
+		t.Fatalf("new raw Close: %v", err)
+	}
+	if got := readPersistedIndexSequence(t, sidecar); got != oldSeq {
+		t.Fatalf("old sidecar sequence changed: got=%d want %d", got, oldSeq)
+	}
+
+	var logBuf bytes.Buffer
+	db3, raw3 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName: opts.BucketName,
+		Logger:     log.New(&logBuf, "", 0),
+	})
+	defer func() {
+		_ = db3.Close()
+		_ = raw3.Close()
+	}()
+
+	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
+		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
+	}
+	if cnt, err := db3.Count(qx.EQ("age", 10)); err != nil {
+		t.Fatalf("Count(old age): %v", err)
+	} else if cnt != 0 {
+		t.Fatalf("Count(old age)=%d want 0", cnt)
+	}
+	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	if err != nil {
+		t.Fatalf("QueryKeys(new age): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(new age)=%v want [1]", ids)
+	}
+}
+
+func TestIndexPersistence_RejectsPersistedIndexPathReusedForAnotherBucketSameSequence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reuse_sidecar.db")
+	sidecar := filepath.Join(dir, "shared.rbi")
+
+	dbA, rawA := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName:         "reuse_sidecar_a",
+		PersistedIndexPath: sidecar,
+	})
+	if err := dbA.Set(1, &schemaSubsetRec{Name: "a", Age: 10}); err != nil {
+		t.Fatalf("Set bucket A: %v", err)
+	}
+	seqA := readBucketSequence(t, rawA, dbA.dataBucket)
+	if err := dbA.Close(); err != nil {
+		t.Fatalf("Close bucket A: %v", err)
+	}
+	if err := rawA.Close(); err != nil {
+		t.Fatalf("raw Close bucket A: %v", err)
+	}
+
+	dbB, rawB := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName:         "reuse_sidecar_b",
+		PersistedIndexPath: sidecar,
+		DisableIndexLoad:   true,
+		DisableIndexStore:  true,
+	})
+	if err := dbB.Set(1, &schemaSubsetRec{Name: "b", Age: 20}); err != nil {
+		t.Fatalf("Set bucket B: %v", err)
+	}
+	seqB := readBucketSequence(t, rawB, dbB.dataBucket)
+	if seqB != seqA {
+		t.Fatalf("test requires matching sequence: bucketA=%d bucketB=%d", seqA, seqB)
+	}
+	if err := dbB.Close(); err != nil {
+		t.Fatalf("Close bucket B seed: %v", err)
+	}
+	if err := rawB.Close(); err != nil {
+		t.Fatalf("raw Close bucket B seed: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	dbB2, rawB2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+		BucketName:         "reuse_sidecar_b",
+		PersistedIndexPath: sidecar,
+		Logger:             log.New(&logBuf, "", 0),
+	})
+	defer func() {
+		_ = dbB2.Close()
+		_ = rawB2.Close()
+	}()
+
+	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
+		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
+	}
+	if cnt, err := dbB2.Count(qx.EQ("age", 10)); err != nil {
+		t.Fatalf("Count(bucket A age): %v", err)
+	} else if cnt != 0 {
+		t.Fatalf("Count(bucket A age)=%d want 0", cnt)
+	}
+	ids, err := dbB2.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	if err != nil {
+		t.Fatalf("QueryKeys(bucket B age): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(bucket B age)=%v want [1]", ids)
+	}
+}
+
 func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupted_index.db")

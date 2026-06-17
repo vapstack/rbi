@@ -16,7 +16,8 @@ import (
 
 const (
 	persistedIndexMagic          = "RBI"
-	currentPersistedIndexVersion = 30
+	currentPersistedIndexVersion = 31
+	UIDLen                       = 8
 )
 
 const (

@@ -24,6 +24,7 @@ type LoadConfig struct {
 	DBPath      string
 	Bucket      []byte
 	CurrentSeq  uint64
+	UID         [UIDLen]byte
 	Schema      *schema.Schema
 	StrKey      bool
 	StrKeyIndex bool
@@ -41,6 +42,7 @@ type LoadResult struct {
 type StoreConfig struct {
 	File           string
 	BucketSeq      uint64
+	UID            [UIDLen]byte
 	Schema         *schema.Schema
 	StrKey         bool
 	StrKeyIndex    bool
@@ -93,8 +95,8 @@ func Load(cfg LoadConfig) (result LoadResult, err error) {
 	diag.versionKnown = true
 
 	switch ver {
-	case 30:
-		result, err = loadV30(reader, cfg)
+	case 31:
+		result, err = loadV31(reader, cfg)
 	default:
 		return LoadResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", rbierrors.ErrPersistedIndexInvalid, ver))
 	}
@@ -134,7 +136,7 @@ func Store(cfg StoreConfig) (err error) {
 	}()
 
 	buf := bufio.NewWriterSize(f, fileBufferSize)
-	if err = storeV30(buf, cfg); err != nil {
+	if err = storeV31(buf, cfg); err != nil {
 		return err
 	}
 
@@ -175,13 +177,21 @@ func readPersistedIndexHeader(reader *bufio.Reader) (byte, error) {
 	return ver, nil
 }
 
-func loadV30(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
+func loadV31(reader *bufio.Reader, cfg LoadConfig) (LoadResult, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return LoadResult{}, fmt.Errorf("%w: decode: reading bucket sequence: %w", rbierrors.ErrPersistedIndexInvalid, err)
 	}
 	if storedSeq != cfg.CurrentSeq {
 		return LoadResult{}, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", rbierrors.ErrPersistedIndexStale, storedSeq, cfg.CurrentSeq)
+	}
+
+	var storedUID [UIDLen]byte
+	if _, err = io.ReadFull(reader, storedUID[:]); err != nil {
+		return LoadResult{}, fmt.Errorf("%w: decode: reading bucket id: %w", rbierrors.ErrPersistedIndexInvalid, err)
+	}
+	if storedUID != cfg.UID {
+		return LoadResult{}, fmt.Errorf("%w: bucket id mismatch", rbierrors.ErrPersistedIndexStale)
 	}
 
 	if err = readKeyStorageHeader(reader, cfg); err != nil {
@@ -380,12 +390,15 @@ func writePersistedIndexHeader(writer *bufio.Writer) error {
 	return writer.WriteByte(currentPersistedIndexVersion)
 }
 
-func storeV30(writer *bufio.Writer, cfg StoreConfig) error {
+func storeV31(writer *bufio.Writer, cfg StoreConfig) error {
 	if err := writePersistedIndexHeader(writer); err != nil {
 		return fmt.Errorf("store: writing header: %w", err)
 	}
 	if err := writeSidecarUvarint(writer, cfg.BucketSeq); err != nil {
 		return fmt.Errorf("store: writing bucket sequence: %w", err)
+	}
+	if _, err := writer.Write(cfg.UID[:]); err != nil {
+		return fmt.Errorf("store: writing bucket id: %w", err)
 	}
 	if err := writeKeyStorageHeader(writer, cfg); err != nil {
 		return err

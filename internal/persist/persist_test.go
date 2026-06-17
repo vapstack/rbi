@@ -413,6 +413,9 @@ func TestLoadCorruptedFieldStorageWrapsInvalidSentinel(t *testing.T) {
 	if err := writeSidecarUvarint(writer, 11); err != nil {
 		t.Fatalf("write seq: %v", err)
 	}
+	if _, err := writer.Write(make([]byte, UIDLen)); err != nil {
+		t.Fatalf("write bucket id: %v", err)
+	}
 	if err := writer.WriteByte(keyStorageNumeric); err != nil {
 		t.Fatalf("write key storage kind: %v", err)
 	}
@@ -541,6 +544,44 @@ func TestLoadRejectsStaleSequence(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bucket sequence mismatch") {
 		t.Fatalf("Load err=%v, want sequence mismatch diagnostic", err)
+	}
+}
+
+func TestLoadRejectsStaleBucketID(t *testing.T) {
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := writePersistedIndexHeader(writer); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if err := writeSidecarUvarint(writer, 10); err != nil {
+		t.Fatalf("write seq: %v", err)
+	}
+	var storedID [UIDLen]byte
+	storedID[0] = 1
+	if _, err := writer.Write(storedID[:]); err != nil {
+		t.Fatalf("write bucket id: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	file := filepath.Join(t.TempDir(), "stale-id.rbi")
+	if err := os.WriteFile(file, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	_, err := Load(LoadConfig{
+		File:       file,
+		DBPath:     "test.db",
+		Bucket:     []byte("bucket"),
+		CurrentSeq: 10,
+		Schema:     &schema.Schema{},
+	})
+	if !errors.Is(err, rbierrors.ErrPersistedIndexStale) {
+		t.Fatalf("Load err=%v, want stale sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "bucket id mismatch") {
+		t.Fatalf("Load err=%v, want bucket id mismatch diagnostic", err)
 	}
 }
 
@@ -993,6 +1034,9 @@ func TestLoadRecoversPanicWithDiagnostic(t *testing.T) {
 	}
 	if err := writeSidecarUvarint(writer, 1); err != nil {
 		t.Fatalf("write seq: %v", err)
+	}
+	if _, err := writer.Write(make([]byte, UIDLen)); err != nil {
+		t.Fatalf("write bucket id: %v", err)
 	}
 	if err := writer.WriteByte(keyStorageNumeric); err != nil {
 		t.Fatalf("write key storage kind: %v", err)

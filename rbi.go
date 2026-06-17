@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/engine"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vapstack/rbi/rbierrors"
@@ -329,7 +331,12 @@ type Field struct {
 	Value any
 }
 
-const stringMapBucketSuffix = ".rbimap"
+const (
+	stringMapBucketSuffix = ".rbimap"
+	rbiDataBucketSuffix   = ".rbidata"
+)
+
+var rbiUIDKey = []byte("uid")
 
 // DB wraps a bbolt database and maintains secondary indexes over values of type *V
 // stored in a single bucket. It supports efficient equality and range queries,
@@ -343,6 +350,7 @@ type DB[K ~string | ~uint64, V any] struct {
 	bolt         *bbolt.DB
 	dataBucket   []byte
 	strmapBucket []byte
+	metaBucket   []byte
 
 	options     *Options
 	execOptions execOptions[K, V]
@@ -357,6 +365,7 @@ type DB[K ~string | ~uint64, V any] struct {
 
 	boltPath string
 	rbiFile  string
+	rbiUID   [persist.UIDLen]byte
 
 	encodeFn func(*V, io.Writer) error
 	decodeFn func(*V, io.Reader) error
@@ -457,8 +466,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
 		db.strKey = true
-		db.strmapBucket = append(db.dataBucket, stringMapBucketSuffix...)
+		db.strmapBucket = append(slices.Clone(db.dataBucket), stringMapBucketSuffix...)
 	}
+	db.metaBucket = append(slices.Clone(db.dataBucket), rbiDataBucketSuffix...)
 	strKeyIndex := db.strKey && options.EnableStringKeyIndex
 
 	var schemaIndex map[string]schema.IndexKind
@@ -504,11 +514,30 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	db.stats.UniqueFieldCount = len(db.schema.Unique)
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
+		dataExists := tx.Bucket(db.dataBucket) != nil
 		if _, e := tx.CreateBucketIfNotExists(db.dataBucket); e != nil {
 			return e
 		}
+		rbiMeta, e := tx.CreateBucketIfNotExists(db.metaBucket)
+		if e != nil {
+			return e
+		}
+		id := rbiMeta.Get(rbiUIDKey)
+		if id == nil || !dataExists {
+			if _, e = rand.Read(db.rbiUID[:]); e != nil {
+				return fmt.Errorf("generate rbi uid: %w", e)
+			}
+			if e = rbiMeta.Put(rbiUIDKey, db.rbiUID[:]); e != nil {
+				return fmt.Errorf("store rbi uid: %w", e)
+			}
+		} else {
+			if len(id) != len(db.rbiUID) {
+				return fmt.Errorf("invalid rbi uid length: %d", len(id))
+			}
+			copy(db.rbiUID[:], id)
+		}
 		if db.strKey {
-			_, e := createStrMapBucket(tx, db.dataBucket)
+			_, e = createStrMapBucket(tx, db.dataBucket)
 			return e
 		}
 		return nil
@@ -722,7 +751,7 @@ func (db *DB[K, V]) loadIndex() (
 		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
 	}
 	start := time.Now()
-	result, err := db.index.LoadIndex(db.rbiFile, db.boltPath, db.dataBucket, currentSeq)
+	result, err := db.index.LoadIndex(db.rbiFile, db.boltPath, db.dataBucket, currentSeq, db.rbiUID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -732,7 +761,7 @@ func (db *DB[K, V]) loadIndex() (
 }
 
 func (db *DB[K, V]) storeIndex() error {
-	return db.index.StoreIndex(db.rbiFile, db.bolt, db.dataBucket)
+	return db.index.StoreIndex(db.rbiFile, db.bolt, db.dataBucket, db.rbiUID)
 }
 
 // disableSync disables fsync for bolt writes. Can help with batch inserts.

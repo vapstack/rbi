@@ -15,6 +15,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
@@ -639,7 +640,7 @@ func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	file := filepath.Join(t.TempDir(), "runtime.rbi")
-	if err := r.StoreIndex(file, db, bucket); err != nil {
+	if err := r.StoreIndex(file, db, bucket, [persist.UIDLen]byte{}); err != nil {
 		t.Fatalf("StoreIndex: %v", err)
 	}
 
@@ -655,7 +656,7 @@ func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
 	}
 	defer r.snapshot.Unpin(seq, ref)
 
-	if _, err = r.LoadIndex(file, db.Path(), bucket, seq); err != nil {
+	if _, err = r.LoadIndex(file, db.Path(), bucket, seq, [persist.UIDLen]byte{}); err != nil {
 		t.Fatalf("LoadIndex: %v", err)
 	}
 	if got := r.snapshot.Current(); got == nil || got == old || got.Seq != 2 {
@@ -876,7 +877,7 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	r.RefreshPlannerStatsLocked()
 
 	file := filepath.Join(t.TempDir(), "runtime.rbi")
-	if err := r.StoreIndex(file, db, bucket); err != nil {
+	if err := r.StoreIndex(file, db, bucket, [persist.UIDLen]byte{}); err != nil {
 		t.Fatalf("StoreIndex: %v", err)
 	}
 
@@ -885,7 +886,7 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}
-	result, err := loaded.LoadIndex(file, db.Path(), bucket, seq)
+	result, err := loaded.LoadIndex(file, db.Path(), bucket, seq, [persist.UIDLen]byte{})
 	if err != nil {
 		t.Fatalf("LoadIndex: %v", err)
 	}

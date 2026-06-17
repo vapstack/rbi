@@ -403,12 +403,13 @@ func (index *Index) BuildIndex(
 	}, nil
 }
 
-func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, currentSeq uint64) (LoadResult, error) {
+func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, currentSeq uint64, uid [persist.UIDLen]byte) (LoadResult, error) {
 	result, err := persist.Load(persist.LoadConfig{
 		File:        file,
 		DBPath:      dbPath,
 		Bucket:      bucket,
 		CurrentSeq:  currentSeq,
+		UID:         uid,
 		Schema:      index.schema,
 		StrKey:      index.strKey,
 		StrKeyIndex: index.keyMode == qexec.KeyModeString,
@@ -442,7 +443,7 @@ func (index *Index) LoadIndex(file string, dbPath string, bucket []byte, current
 	}, nil
 }
 
-func (index *Index) StoreIndex(file string, bolt *bbolt.DB, bucket []byte) error {
+func (index *Index) StoreIndex(file string, bolt *bbolt.DB, bucket []byte, uid [persist.UIDLen]byte) error {
 	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return fmt.Errorf("store: reading bucket sequence: %w", err)
@@ -463,6 +464,7 @@ func (index *Index) StoreIndex(file string, bolt *bbolt.DB, bucket []byte) error
 	return persist.Store(persist.StoreConfig{
 		File:           file,
 		BucketSeq:      seq,
+		UID:            uid,
 		Schema:         index.schema,
 		StrKey:         index.strKey,
 		StrKeyIndex:    index.keyMode == qexec.KeyModeString,
