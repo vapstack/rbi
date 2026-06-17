@@ -532,6 +532,33 @@ func TestPrepareCountExpr_NormalizedTreeAvoidsExtraOwnedCopy(t *testing.T) {
 	}
 }
 
+func TestQuerySetNormalizedExpr_FlatOperandsStayQueryOwned(t *testing.T) {
+	q := Query{}
+	outer := q.newOwnedExprSlice(2)
+	inner := q.newOwnedExprSlice(5)
+	inner[0] = Expr{Op: OpEQ, FieldOrdinal: 1, Value: "active"}
+	inner[1] = Expr{Op: OpEQ, FieldOrdinal: 1, Value: "pending"}
+	inner[2] = Expr{Op: OpEQ, FieldOrdinal: 3, Value: "us"}
+	inner[3] = Expr{Op: OpPREFIX, FieldOrdinal: 2, Value: "go"}
+	inner[4] = Expr{Op: OpPREFIX, FieldOrdinal: 2, Value: "ops"}
+	outer[0] = Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: inner}
+	outer[1] = Expr{Op: OpEQ, FieldOrdinal: 1, Value: "banned", Not: true}
+
+	q.setNormalizedExpr(Expr{Op: OpAND, FieldOrdinal: NoFieldOrdinal, Operands: outer})
+
+	ops := q.Expr.Operands
+	if q.Expr.Op != OpAND || len(ops) != 6 {
+		t.Fatalf("expected flattened AND with six leaves, got %+v", q.Expr)
+	}
+
+	q.releaseOwned()
+	for i, expr := range ops {
+		if expr.Op != 0 || expr.FieldOrdinal != 0 || expr.Value != nil || expr.Operands != nil {
+			t.Fatalf("normalized operand %d was not query-owned: %+v", i, expr)
+		}
+	}
+}
+
 func TestCollectAndLeavesInto_ExtractRejectsNegatedAndGroup(t *testing.T) {
 	e := Expr{
 		Op: OpAND,

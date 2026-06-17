@@ -773,6 +773,11 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc, foldExactComplem
 				out = alloc(len(e.Operands))
 				out = append(out, e.Operands[:i]...)
 			}
+			if need := len(out) + len(nc.Operands) + len(e.Operands) - i - 1; need > cap(out) {
+				next := alloc(need)
+				next = append(next, out...)
+				out = next
+			}
 			out = append(out, nc.Operands...)
 			if childPost {
 				postNeeded = true
@@ -904,6 +909,11 @@ func normalizeANDPost(expr Expr, alloc exprBufAlloc, foldExactComplements bool) 
 			continue
 		}
 		if flatten {
+			if need := len(out) + len(n.Operands) + len(expr.Operands) - i - 1; need > cap(out) {
+				next := alloc(need)
+				next = append(next, out...)
+				out = next
+			}
 			out = append(out, n.Operands...)
 			continue
 		}
