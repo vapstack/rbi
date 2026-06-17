@@ -55,10 +55,11 @@ const ReservedKeyFieldName = "$key"
 //
 // A type that implements ValueIndexer is responsible for ensuring that
 // IndexingValue returns a valid and stable string for every value that may
-// appear in indexed data. This includes handling nil receivers if the type
-// is a pointer or otherwise nillable. Nil scalar interface values are
-// indexed as null, and nil interface elements in slices do not emit index
-// keys. Other nil receivers are passed to IndexingValue.
+// appear in indexed data. Nil interface values and nil pointers to
+// value-receiver ValueIndexer values are indexed as null, including typed
+// nils held in ValueIndexer interfaces. Nil interface and nil pointer
+// elements in slices do not emit index keys. Other nil receivers are passed
+// to IndexingValue.
 //
 // IndexingValue must return a deterministic string: the same value must
 // always produce the same indexing key.
@@ -92,12 +93,20 @@ func isEmbeddedPointerContainerType(t reflect.Type) bool {
 	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct && !isNativeTimeScalarType(t.Elem())
 }
 
+func isValueReceiverValueIndexerPointer(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer && t.Implements(viType) && t.Elem().Implements(viType)
+}
+
 func IsNativeTimeField(f *Field) bool {
 	return f != nil && !f.Slice && !f.UseVI && f.Kind == reflect.Struct && f.KeyKind == FieldWriteKeysOrderedU64
 }
 
 func FieldUsesOrderedNumericKeys(f *Field) bool {
 	return f != nil && !f.Slice && f.KeyKind == FieldWriteKeysOrderedU64
+}
+
+func FieldUsesNilIndex(f *Field) bool {
+	return f != nil && (f.Ptr || (!f.Slice && f.UseVI && f.Kind == reflect.Interface))
 }
 
 func QueryValueToUnixSeconds(v reflect.Value) (int64, bool) {
@@ -126,8 +135,9 @@ func UnwrapQueryValue(v reflect.Value) (reflect.Value, bool) {
 
 		case reflect.Pointer:
 			if v.IsNil() {
-				if v.Type().Implements(viType) {
-					return v, false
+				t := v.Type()
+				if t.Implements(viType) {
+					return v, t.Elem().Implements(viType)
 				}
 				return v, true
 			}
@@ -687,7 +697,8 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
 	if useVI {
 		if kind == reflect.Pointer && sf.Type.Elem().Implements(viType) {
-			return nil, fmt.Errorf("cannot index field %v of type %v: ValueIndexer method has value receiver and cannot handle nil pointers", sf.Name, sf.Type)
+			ptr = true
+			kind = sf.Type.Elem().Kind()
 		}
 		viTypeID = fieldTypeID(sf.Type)
 	}
@@ -725,9 +736,6 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		kind = elem.Kind()
 		useVI = elem.Implements(viType)
 		if useVI {
-			if kind == reflect.Pointer && elem.Elem().Implements(viType) {
-				return nil, fmt.Errorf("cannot index field %v of type %v: ValueIndexer element method has value receiver and cannot handle nil pointers", sf.Name, sf.Type)
-			}
 			viTypeID = fieldTypeID(elem)
 		}
 		if !useVI {

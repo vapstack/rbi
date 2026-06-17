@@ -764,7 +764,7 @@ func countBucketPostsAllNotBuf(posts []posting.List, bucket posting.List) (uint6
 
 func (qv *View) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
 	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
-	if fm == nil || fm.Slice || fm.Ptr {
+	if fm == nil || fm.Slice || schema.FieldUsesNilIndex(fm) {
 		return false
 	}
 	if !qv.indexViewByOrdinal(o.FieldOrdinal).HasData() {
@@ -4430,7 +4430,7 @@ func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateR
 			activeBuf = append(activeBuf, i)
 		}
 
-		if !fm.Ptr {
+		if !schema.FieldUsesNilIndex(fm) {
 			exactChecksBuf := pooled.GetIntSlice(len(activeBuf))
 			defer pooled.ReleaseIntSlice(exactChecksBuf)
 
@@ -4476,7 +4476,7 @@ func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateR
 		active = append(active, i)
 	}
 
-	if !fm.Ptr {
+	if !schema.FieldUsesNilIndex(fm) {
 		var (
 			exactChecksInline    [plannerPredicateFastPathMaxLeaves]int
 			residualChecksInline [plannerPredicateFastPathMaxLeaves]int

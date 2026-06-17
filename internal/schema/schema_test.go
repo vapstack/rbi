@@ -109,13 +109,23 @@ type schemaTestPointerReceiverVIPtrRec struct {
 	Keys []*schemaTestPtrFoldedString `db:"keys" rbi:"index"`
 }
 
-func TestCompileRejectsNilUnsafeValueIndexerPointers(t *testing.T) {
-	if _, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrRec](), Config{}); err == nil || !strings.Contains(err.Error(), "ValueIndexer method has value receiver") {
-		t.Fatalf("scalar pointer Compile err=%v want nil-unsafe ValueIndexer rejection", err)
+func TestCompileAllowsValueReceiverValueIndexerPointers(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrRec](), Config{})
+	if err != nil {
+		t.Fatalf("scalar pointer Compile: %v", err)
 	}
-	if _, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrSliceRec](), Config{}); err == nil || !strings.Contains(err.Error(), "ValueIndexer element method has value receiver") {
-		t.Fatalf("pointer slice Compile err=%v want nil-unsafe ValueIndexer rejection", err)
+	if f := rt.Fields["key"]; f == nil || !f.UseVI || !f.Ptr || f.Slice || f.Kind != reflect.String {
+		t.Fatalf("scalar pointer field=%+v", f)
 	}
+
+	rt, err = Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrSliceRec](), Config{})
+	if err != nil {
+		t.Fatalf("pointer slice Compile: %v", err)
+	}
+	if f := rt.Fields["keys"]; f == nil || !f.UseVI || f.Ptr || !f.Slice {
+		t.Fatalf("pointer slice field=%+v", f)
+	}
+
 	if _, err := Compile(reflect.TypeFor[schemaTestPointerReceiverVIPtrRec](), Config{}); err != nil {
 		t.Fatalf("pointer receiver Compile: %v", err)
 	}
@@ -1518,6 +1528,13 @@ func TestUnwrapQueryValuePreservesTypedNilValueIndexer(t *testing.T) {
 	}
 	if got := v.Interface().(ValueIndexer).IndexingValue(); got != "<nil>" {
 		t.Fatalf("typed nil ValueIndexer key=%q want %q", got, "<nil>")
+	}
+}
+
+func TestUnwrapQueryValueTreatsNilValueReceiverValueIndexerPointerAsNil(t *testing.T) {
+	var vi *schemaTestVI
+	if _, isNil := UnwrapQueryValue(reflect.ValueOf(vi)); !isNil {
+		t.Fatal("typed nil pointer to value-receiver ValueIndexer was not reported as nil")
 	}
 }
 

@@ -886,7 +886,7 @@ func (qv *View) orderedLimitBoundsScanCandidate(
 	if len(facts.baseOps) == 0 {
 		return orderScan, true
 	}
-	if q.Offset > 0 && facts.orderMeta.Ptr && facts.nilTailField == "" {
+	if q.Offset > 0 && schema.FieldUsesNilIndex(facts.orderMeta) && facts.nilTailField == "" {
 		return orderScan, false
 	}
 	maxResiduals := 3
@@ -1482,7 +1482,7 @@ func (qv *View) collectOrderedLimitFacts(q *qir.Shape, facts *orderedLimitFacts)
 
 	facts.nilTailField = orderNilTailField(fm, facts.orderField, rb)
 	if orderEqNil {
-		if !fm.Ptr {
+		if !schema.FieldUsesNilIndex(fm) {
 			facts.empty = true
 			facts.validateBase = true
 			return true, nil

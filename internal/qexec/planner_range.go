@@ -682,7 +682,7 @@ func (core *preparedScalarRangePredicate) runtimeReuse(est uint64, useComplement
 
 func (core *preparedScalarRangePredicate) hasNilTail() bool {
 	return core.fm != nil &&
-		core.fm.Ptr &&
+		schema.FieldUsesNilIndex(core.fm) &&
 		core.qv.nilIndexViewByOrdinal(core.expr.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 }
 
@@ -1058,7 +1058,7 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	}
 	fm := qv.fieldMeta(op.field, op.fieldOrdinal)
 	universe := qv.snap.Universe.Cardinality()
-	nilTail := fm != nil && fm.Ptr &&
+	nilTail := schema.FieldUsesNilIndex(fm) &&
 		qv.nilIndexViewByOrdinal(op.fieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 	totalBuckets := ov.KeyCount()
 	useComplementProbe := !nilTail && totalBuckets > buckets && totalBuckets-buckets < buckets

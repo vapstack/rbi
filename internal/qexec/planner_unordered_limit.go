@@ -7,6 +7,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/mathutil"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/rbitrace"
 )
 
@@ -635,7 +636,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		if fm != nil && !fm.Slice && ov.HasData() {
 			directBR = ov.RangeForBounds(facts.directBounds)
 			directBucketTotal = ov.KeyCount()
-			directHasNilTail = fm.Ptr &&
+			directHasNilTail = schema.FieldUsesNilIndex(fm) &&
 				qv.nilIndexViewByOrdinal(facts.directOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) > 0
 			directRangeOK = true
 			if directBR.Empty() {

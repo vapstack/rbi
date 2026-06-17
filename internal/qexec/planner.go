@@ -1473,7 +1473,7 @@ func (qv *View) collectORFacts(q *qir.Shape, facts *plannerORFacts) bool {
 	if o.Kind != qir.OrderKindBasic {
 		return false
 	}
-	if fm := qv.fieldMetaByOrdinal(o.FieldOrdinal); fm != nil && fm.Ptr {
+	if schema.FieldUsesNilIndex(qv.fieldMetaByOrdinal(o.FieldOrdinal)) {
 		return false
 	}
 	facts.ordered = true

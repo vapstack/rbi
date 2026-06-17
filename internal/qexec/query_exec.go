@@ -737,7 +737,7 @@ func (qv *View) runOrderBasicBaseQuery(
 	if trace == nil && !base.neg && nilTailField == "" {
 		baseCard := baseBM.Cardinality()
 		if len(residualActive) == 0 {
-			if fm := qv.fieldMetaByOrdinal(order.FieldOrdinal); fm == nil || !fm.Ptr {
+			if !schema.FieldUsesNilIndex(qv.fieldMetaByOrdinal(order.FieldOrdinal)) {
 				keyCount := uint64(ov.KeyCount())
 				dense := baseCard >= (keyCount+3)/4
 				sparseWarm := baseCard > 128 && baseCard <= 512 && keyCount >= baseCard*8
@@ -992,7 +992,7 @@ func applyRangeOp(rb *indexdata.Bounds, op qir.Op, key string) bool {
 }
 
 func orderNilTailField(fm *schema.Field, field string, bounds indexdata.Bounds) string {
-	if fm == nil || !fm.Ptr || field == "" {
+	if !schema.FieldUsesNilIndex(fm) || field == "" {
 		return ""
 	}
 	if bounds.Empty || bounds.HasLo || bounds.HasHi || bounds.HasPrefix {
@@ -1985,7 +1985,7 @@ DISPATCH:
 		}
 
 	DONE:
-		if q.Offset == 0 || !fm.Ptr || nilTailField != "" {
+		if q.Offset == 0 || !schema.FieldUsesNilIndex(fm) || nilTailField != "" {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, order.FieldOrdinal, needWindow)
 			if err != nil {
 				return nil, true, "", err

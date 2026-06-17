@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/vapstack/rbi/rbierrors"
 	"math"
 	"path/filepath"
 	"slices"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbistats"
 	"github.com/vapstack/rbi/rbitrace"
 	"go.etcd.io/bbolt"

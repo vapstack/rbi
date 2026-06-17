@@ -31,6 +31,15 @@ type schemaTestValueIndexerInterfaceNilRec struct {
 	Tags []ValueIndexer `db:"tags" rbi:"index"`
 }
 
+type schemaTestValueIndexerCustomInterface interface {
+	ValueIndexer
+}
+
+type schemaTestValueIndexerCustomInterfaceNilRec struct {
+	Key  schemaTestValueIndexerCustomInterface   `db:"key" rbi:"unique"`
+	Tags []schemaTestValueIndexerCustomInterface `db:"tags" rbi:"index"`
+}
+
 func TestIndexedAccessorVariantsEmitKeys(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestAccessorVariantRec](), Config{})
 	if err != nil {
@@ -135,6 +144,78 @@ func TestIndexedAccessorVariantsEmitNilForNilPointers(t *testing.T) {
 	}
 }
 
+func TestIndexedAccessorValueReceiverValueIndexerPointerNil(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	rec := schemaTestValueReceiverVIPtrRec{}
+	ptr := unsafe.Pointer(&rec)
+
+	if err = rt.IndexedByName["key"].Validate(ptr); err != nil {
+		t.Fatalf("Validate nil pointer: %v", err)
+	}
+
+	var scratch WriteScratch
+	rt.IndexedByName["key"].WriteScratch(ptr, &scratch)
+	if !scratch.ok || !scratch.isNil {
+		t.Fatalf("nil pointer scratch=%+v, want nil marker", scratch)
+	}
+
+	var state IndexState
+	rt.IndexedByName["key"].CollectIndexValue(ptr, 7, &state)
+	nilStorage := state.MaterializeNilStorage()
+	defer nilStorage.Release()
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 7) {
+		t.Fatal("nil pointer field was not added to nil index")
+	}
+
+	same := rec
+	if rt.IndexedByName["key"].Modified(ptr, unsafe.Pointer(&same)) {
+		t.Fatal("two nil pointers must not be modified")
+	}
+
+	value := schemaTestVI("AA")
+	withValue := schemaTestValueReceiverVIPtrRec{Key: &value}
+	if !rt.IndexedByName["key"].Modified(ptr, unsafe.Pointer(&withValue)) {
+		t.Fatal("nil/non-nil pointer change was not detected")
+	}
+
+	scratch.reset()
+	rt.IndexedByName["key"].WriteScratch(unsafe.Pointer(&withValue), &scratch)
+	if !scratch.ok || scratch.isNil || !slices.Equal(scratch.strings, []string{"aa"}) {
+		t.Fatalf("value pointer scratch=%+v, want canonical key", scratch)
+	}
+}
+
+func TestIndexedAccessorValueReceiverValueIndexerPointerSliceSkipsNilElements(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestValueReceiverVIPtrSliceRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	a := schemaTestVI("AA")
+	b := schemaTestVI("BB")
+	rec := schemaTestValueReceiverVIPtrSliceRec{Keys: []*schemaTestVI{nil, &a, nil, &b, &a}}
+	ptr := unsafe.Pointer(&rec)
+
+	if err = rt.IndexedByName["keys"].Validate(ptr); err != nil {
+		t.Fatalf("Validate pointer slice: %v", err)
+	}
+
+	var scratch WriteScratch
+	rt.IndexedByName["keys"].WriteScratch(ptr, &scratch)
+	if !scratch.ok || scratch.length != 2 || !slices.Equal(scratch.strings, []string{"aa", "bb"}) {
+		t.Fatalf("pointer slice scratch=%+v", scratch)
+	}
+
+	nilOnly := schemaTestValueReceiverVIPtrSliceRec{Keys: []*schemaTestVI{nil, nil}}
+	scratch.reset()
+	rt.IndexedByName["keys"].WriteScratch(unsafe.Pointer(&nilOnly), &scratch)
+	if !scratch.ok || scratch.length != 0 || len(scratch.strings) != 0 {
+		t.Fatalf("nil-only pointer slice scratch=%+v, want empty indexed value set", scratch)
+	}
+}
+
 func TestIndexedAccessorValueIndexerInterfaceScalarNil(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestValueIndexerInterfaceNilRec](), Config{})
 	if err != nil {
@@ -190,14 +271,52 @@ func TestIndexedAccessorValueIndexerInterfaceTypedNilReceiverStillRuns(t *testin
 	}
 }
 
+func TestIndexedAccessorValueIndexerInterfaceTypedNilValueReceiverIsNil(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestValueIndexerInterfaceNilRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var vi *schemaTestVI
+	rec := schemaTestValueIndexerInterfaceNilRec{Key: vi}
+	ptr := unsafe.Pointer(&rec)
+
+	_, ok, isNil := rt.IndexedByName["key"].UniqueGetter(ptr)
+	if !ok || !isNil {
+		t.Fatalf("UniqueGetter ok=%v isNil=%v, want nil unique value", ok, isNil)
+	}
+	if err = rt.IndexedByName["key"].Validate(ptr); err != nil {
+		t.Fatalf("Validate typed nil value receiver: %v", err)
+	}
+
+	var scratch WriteScratch
+	rt.IndexedByName["key"].WriteScratch(ptr, &scratch)
+	if !scratch.ok || !scratch.isNil {
+		t.Fatalf("typed nil value-receiver scratch=%+v, want nil marker", scratch)
+	}
+
+	var state IndexState
+	rt.IndexedByName["key"].CollectIndexValue(ptr, 7, &state)
+	nilStorage := state.MaterializeNilStorage()
+	defer nilStorage.Release()
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 7) {
+		t.Fatal("typed nil value-receiver interface was not added to nil index")
+	}
+
+	nilIface := schemaTestValueIndexerInterfaceNilRec{}
+	if rt.IndexedByName["key"].Modified(ptr, unsafe.Pointer(&nilIface)) {
+		t.Fatal("typed nil value-receiver interface and nil interface must have the same indexed value")
+	}
+}
+
 func TestIndexedAccessorValueIndexerInterfaceSliceSkipsNilElements(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestValueIndexerInterfaceNilRec](), Config{})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	var folded *schemaTestPtrFoldedString
+	var typedNil *schemaTestVI
 	rec := schemaTestValueIndexerInterfaceNilRec{
-		Tags: []ValueIndexer{nil, folded, schemaTestVI("AA"), nil, schemaTestVI("AA")},
+		Tags: []ValueIndexer{nil, typedNil, folded, schemaTestVI("AA"), nil, schemaTestVI("AA")},
 	}
 	ptr := unsafe.Pointer(&rec)
 
@@ -211,10 +330,40 @@ func TestIndexedAccessorValueIndexerInterfaceSliceSkipsNilElements(t *testing.T)
 		t.Fatalf("interface slice scratch=%+v", scratch)
 	}
 
-	nilOnly := schemaTestValueIndexerInterfaceNilRec{Tags: []ValueIndexer{nil, nil}}
+	nilOnly := schemaTestValueIndexerInterfaceNilRec{Tags: []ValueIndexer{nil, typedNil, nil}}
 	scratch.reset()
 	rt.IndexedByName["tags"].WriteScratch(unsafe.Pointer(&nilOnly), &scratch)
 	if !scratch.ok || scratch.length != 0 || len(scratch.strings) != 0 {
 		t.Fatalf("nil-only interface slice scratch=%+v, want empty indexed value set", scratch)
+	}
+}
+
+func TestIndexedAccessorCustomValueIndexerInterfaceTypedNilValueReceiverIsNil(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestValueIndexerCustomInterfaceNilRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var typedNil *schemaTestVI
+	rec := schemaTestValueIndexerCustomInterfaceNilRec{
+		Key:  typedNil,
+		Tags: []schemaTestValueIndexerCustomInterface{nil, typedNil, schemaTestVI("AA")},
+	}
+	ptr := unsafe.Pointer(&rec)
+
+	_, ok, isNil := rt.IndexedByName["key"].UniqueGetter(ptr)
+	if !ok || !isNil {
+		t.Fatalf("UniqueGetter ok=%v isNil=%v, want nil unique value", ok, isNil)
+	}
+
+	var scratch WriteScratch
+	rt.IndexedByName["key"].WriteScratch(ptr, &scratch)
+	if !scratch.ok || !scratch.isNil {
+		t.Fatalf("typed nil custom interface scratch=%+v, want nil marker", scratch)
+	}
+
+	scratch.reset()
+	rt.IndexedByName["tags"].WriteScratch(ptr, &scratch)
+	if !scratch.ok || scratch.length != 1 || !slices.Equal(scratch.strings, []string{"aa"}) {
+		t.Fatalf("custom interface slice scratch=%+v", scratch)
 	}
 }

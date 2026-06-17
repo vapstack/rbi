@@ -160,6 +160,12 @@ func valueIndexerAt(tab unsafe.Pointer, data unsafe.Pointer) ValueIndexer {
 	return vi
 }
 
+// valueIndexerNilPointerUsesValueReceiver runs only after an interface data word was already observed as nil.
+func valueIndexerNilPointerUsesValueReceiver(vi ValueIndexer) bool {
+	t := reflect.TypeOf(vi)
+	return t.Kind() == reflect.Pointer && t.Elem().Implements(viType)
+}
+
 func slicesEqualExact[T comparable](lhs, rhs []T) bool {
 	if (lhs == nil) != (rhs == nil) {
 		return false
@@ -478,7 +484,11 @@ func addDistinctValueIndexerInterfaceStringsToSink[S stringValueSink](vals refle
 		if elem.IsNil() {
 			return 0
 		}
-		sink.addString(elem.Interface().(ValueIndexer).IndexingValue())
+		vi := elem.Interface().(ValueIndexer)
+		if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+			return 0
+		}
+		sink.addString(vi.IndexingValue())
 		return 1
 	}
 	if n <= smallDistinctLimit {
@@ -489,7 +499,11 @@ func addDistinctValueIndexerInterfaceStringsToSink[S stringValueSink](vals refle
 			if elem.IsNil() {
 				continue
 			}
-			cur := elem.Interface().(ValueIndexer).IndexingValue()
+			vi := elem.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				continue
+			}
+			cur := vi.IndexingValue()
 			seen := false
 			for j := 0; j < distinct; j++ {
 				if keys[j] == cur {
@@ -513,7 +527,68 @@ func addDistinctValueIndexerInterfaceStringsToSink[S stringValueSink](vals refle
 		if elem.IsNil() {
 			continue
 		}
-		cur := elem.Interface().(ValueIndexer).IndexingValue()
+		vi := elem.Interface().(ValueIndexer)
+		if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+			continue
+		}
+		cur := vi.IndexingValue()
+		if _, ok := seen[cur]; ok {
+			continue
+		}
+		seen[cur] = struct{}{}
+		distinct++
+		sink.addString(cur)
+	}
+	stringSetPool.Put(seen)
+	return distinct
+}
+
+func addDistinctValueIndexerInterfaceValuesToSink[S stringValueSink](vals []ValueIndexer, sink S) int {
+	n := len(vals)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		vi := vals[0]
+		if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+			return 0
+		}
+		sink.addString(vi.IndexingValue())
+		return 1
+	}
+	if n <= smallDistinctLimit {
+		var keys [smallDistinctLimit]string
+		distinct := 0
+		for i := 0; i < n; i++ {
+			vi := vals[i]
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				continue
+			}
+			cur := vi.IndexingValue()
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addString(cur)
+		}
+		return distinct
+	}
+	seen := stringSetPool.Get()
+	distinct := 0
+	for i := 0; i < n; i++ {
+		vi := vals[i]
+		if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+			continue
+		}
+		cur := vi.IndexingValue()
 		if _, ok := seen[cur]; ok {
 			continue
 		}
@@ -558,6 +633,62 @@ func addDistinctValueIndexerPtrStringsToSink[S stringValueSink](data unsafe.Poin
 	distinct := 0
 	for i := 0; i < n; i++ {
 		cur := valueIndexerAt(tab, unsafe.Add(data, uintptr(i)*size)).IndexingValue()
+		if _, ok := seen[cur]; ok {
+			continue
+		}
+		seen[cur] = struct{}{}
+		distinct++
+		sink.addString(cur)
+	}
+	stringSetPool.Put(seen)
+	return distinct
+}
+
+func addDistinctValueIndexerValuePtrStringsToSink[S stringValueSink](data unsafe.Pointer, n int, size uintptr, tab unsafe.Pointer, sink S) int {
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		elem := *(*unsafe.Pointer)(data)
+		if elem == nil {
+			return 0
+		}
+		sink.addString(valueIndexerAt(tab, elem).IndexingValue())
+		return 1
+	}
+	if n <= smallDistinctLimit {
+		var keys [smallDistinctLimit]string
+		distinct := 0
+		for i := 0; i < n; i++ {
+			elem := *(*unsafe.Pointer)(unsafe.Add(data, uintptr(i)*size))
+			if elem == nil {
+				continue
+			}
+			cur := valueIndexerAt(tab, elem).IndexingValue()
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addString(cur)
+		}
+		return distinct
+	}
+	seen := stringSetPool.Get()
+	distinct := 0
+	for i := 0; i < n; i++ {
+		elem := *(*unsafe.Pointer)(unsafe.Add(data, uintptr(i)*size))
+		if elem == nil {
+			continue
+		}
+		cur := valueIndexerAt(tab, elem).IndexingValue()
 		if _, ok := seen[cur]; ok {
 			continue
 		}
@@ -855,26 +986,35 @@ func floatSlicesModified[T floatFieldValue](lhs, rhs []T) bool {
 	return false
 }
 
-func writeScalarValueIndexerInterfaceField[S nilStringValueSink](ptr unsafe.Pointer, sink S, fieldType reflect.Type, offset uintptr) {
-	fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
-	if fv.IsNil() {
-		sink.setNil()
-		return
-	}
-	sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
-}
-
 func valueIndexerScalarInterfaceAccessorBundle(field string, fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+	if fieldType == viType {
+		return valueIndexerScalarValueIndexerInterfaceAccessorBundle(field, offset)
+	}
+
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			if fv.IsNil() {
 				return keycodec.IndexLookupKey{}, true, true
 			}
-			return keycodec.IndexLookupString(fv.Interface().(ValueIndexer).IndexingValue()), true, false
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				return keycodec.IndexLookupKey{}, true, true
+			}
+			return keycodec.IndexLookupString(vi.IndexingValue()), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
-			writeScalarValueIndexerInterfaceField(ptr, sink, fieldType, offset)
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			if fv.IsNil() {
+				sink.setNil()
+				return
+			}
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
 		},
 		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
@@ -882,7 +1022,12 @@ func valueIndexerScalarInterfaceAccessorBundle(field string, fieldType reflect.T
 				sink.setNil()
 				return nil
 			}
-			key := fv.Interface().(ValueIndexer).IndexingValue()
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return nil
+			}
+			key := vi.IndexingValue()
 			if err := validateStringKey(field, key); err != nil {
 				return err
 			}
@@ -890,30 +1035,154 @@ func valueIndexerScalarInterfaceAccessorBundle(field string, fieldType reflect.T
 			return nil
 		},
 		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
-			writeScalarValueIndexerInterfaceField(ptr, sink, fieldType, offset)
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			if fv.IsNil() {
+				sink.setNil()
+				return
+			}
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
 		},
 		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
-			writeScalarValueIndexerInterfaceField(ptr, sink, fieldType, offset)
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			if fv.IsNil() {
+				sink.setNil()
+				return
+			}
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
 		},
 		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
-			writeScalarValueIndexerInterfaceField(ptr, sink, fieldType, offset)
+			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
+			if fv.IsNil() {
+				sink.setNil()
+				return
+			}
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
 		},
 		validate: func(ptr unsafe.Pointer) error {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			if fv.IsNil() {
 				return nil
 			}
-			return validateStringKey(field, fv.Interface().(ValueIndexer).IndexingValue())
+			vi := fv.Interface().(ValueIndexer)
+			if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				return nil
+			}
+			return validateStringKey(field, vi.IndexingValue())
 		},
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			fv1 := reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem()
 			fv2 := reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem()
-			nil1 := fv1.IsNil()
-			nil2 := fv2.IsNil()
-			if nil1 || nil2 {
-				return nil1 != nil2
+			ok1 := !fv1.IsNil()
+			ok2 := !fv2.IsNil()
+			var vi1 ValueIndexer
+			var vi2 ValueIndexer
+			if ok1 {
+				vi1 = fv1.Interface().(ValueIndexer)
+				ok1 = (*ifaceWords)(unsafe.Pointer(&vi1)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi1)
 			}
-			return fv1.Interface().(ValueIndexer).IndexingValue() != fv2.Interface().(ValueIndexer).IndexingValue()
+			if ok2 {
+				vi2 = fv2.Interface().(ValueIndexer)
+				ok2 = (*ifaceWords)(unsafe.Pointer(&vi2)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi2)
+			}
+			if !ok1 || !ok2 {
+				return ok1 != ok2
+			}
+			return vi1.IndexingValue() != vi2.IndexingValue()
+		},
+	}
+}
+
+func valueIndexerScalarValueIndexerInterfaceAccessorBundle(field string, offset uintptr) fieldAccessorBundle {
+	return fieldAccessorBundle{
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				return keycodec.IndexLookupKey{}, true, true
+			}
+			return keycodec.IndexLookupString(vi.IndexingValue()), true, false
+		},
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return nil
+			}
+			key := vi.IndexingValue()
+			if err := validateStringKey(field, key); err != nil {
+				return err
+			}
+			sink.addString(key)
+			return nil
+		},
+		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				sink.setNil()
+				return
+			}
+			sink.addString(vi.IndexingValue())
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			vi := *(*ValueIndexer)(unsafe.Add(ptr, offset))
+			if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+				return nil
+			}
+			return validateStringKey(field, vi.IndexingValue())
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			vi1 := *(*ValueIndexer)(unsafe.Add(v1, offset))
+			vi2 := *(*ValueIndexer)(unsafe.Add(v2, offset))
+			ok1 := vi1 != nil
+			ok2 := vi2 != nil
+			if ok1 {
+				ok1 = (*ifaceWords)(unsafe.Pointer(&vi1)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi1)
+			}
+			if ok2 {
+				ok2 = (*ifaceWords)(unsafe.Pointer(&vi2)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi2)
+			}
+			if !ok1 || !ok2 {
+				return ok1 != ok2
+			}
+			return vi1.IndexingValue() != vi2.IndexingValue()
 		},
 	}
 }
@@ -923,6 +1192,9 @@ func valueIndexerScalarReflectAccessorBundle(field string, fieldType reflect.Typ
 	case reflect.Interface:
 		return valueIndexerScalarInterfaceAccessorBundle(field, fieldType, offset)
 	case reflect.Pointer:
+		if isValueReceiverValueIndexerPointer(fieldType) {
+			return valueIndexerScalarValuePtrAccessorBundle(field, fieldType, offset)
+		}
 	default:
 		return valueIndexerScalarPtrAccessorBundle(field, fieldType, offset)
 	}
@@ -965,6 +1237,79 @@ func valueIndexerScalarReflectAccessorBundle(field string, fieldType reflect.Typ
 			fv1 := reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem()
 			fv2 := reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem()
 			return fv1.Interface().(ValueIndexer).IndexingValue() != fv2.Interface().(ValueIndexer).IndexingValue()
+		},
+	}
+}
+
+func valueIndexerScalarValuePtrAccessorBundle(field string, fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+	tab := valueIndexerPtrTab(fieldType.Elem())
+	return fieldAccessorBundle{
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				return keycodec.IndexLookupKey{}, true, true
+			}
+			return keycodec.IndexLookupString(valueIndexerAt(tab, data).IndexingValue()), true, false
+		},
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				sink.setNil()
+				return
+			}
+			sink.addString(valueIndexerAt(tab, data).IndexingValue())
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				sink.setNil()
+				return nil
+			}
+			key := valueIndexerAt(tab, data).IndexingValue()
+			if err := validateStringKey(field, key); err != nil {
+				return err
+			}
+			sink.addString(key)
+			return nil
+		},
+		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				sink.setNil()
+				return
+			}
+			sink.addString(valueIndexerAt(tab, data).IndexingValue())
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				sink.setNil()
+				return
+			}
+			sink.addString(valueIndexerAt(tab, data).IndexingValue())
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				sink.setNil()
+				return
+			}
+			sink.addString(valueIndexerAt(tab, data).IndexingValue())
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			data := *(*unsafe.Pointer)(unsafe.Add(ptr, offset))
+			if data == nil {
+				return nil
+			}
+			return validateStringKey(field, valueIndexerAt(tab, data).IndexingValue())
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			data1 := *(*unsafe.Pointer)(unsafe.Add(v1, offset))
+			data2 := *(*unsafe.Pointer)(unsafe.Add(v2, offset))
+			if data1 == nil || data2 == nil {
+				return data1 != data2
+			}
+			return valueIndexerAt(tab, data1).IndexingValue() != valueIndexerAt(tab, data2).IndexingValue()
 		},
 	}
 }
@@ -1019,6 +1364,10 @@ func writeValueIndexerInterfaceSliceField[S lenStringValueSink](ptr unsafe.Point
 }
 
 func valueIndexerSliceInterfaceAccessorBundle(field string, sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+	if sliceType.Elem() == viType {
+		return valueIndexerSliceValueIndexerInterfaceAccessorBundle(field, offset)
+	}
+
 	return fieldAccessorBundle{
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			writeValueIndexerInterfaceSliceField(ptr, sink, sliceType, offset)
@@ -1045,7 +1394,11 @@ func valueIndexerSliceInterfaceAccessorBundle(field string, sliceType reflect.Ty
 				if elem.IsNil() {
 					continue
 				}
-				if err := validateStringKey(field, elem.Interface().(ValueIndexer).IndexingValue()); err != nil {
+				vi := elem.Interface().(ValueIndexer)
+				if (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+					continue
+				}
+				if err := validateStringKey(field, vi.IndexingValue()); err != nil {
 					return err
 				}
 			}
@@ -1060,15 +1413,94 @@ func valueIndexerSliceInterfaceAccessorBundle(field string, sliceType reflect.Ty
 			for i := 0; i < fv1.Len(); i++ {
 				elem1 := fv1.Index(i)
 				elem2 := fv2.Index(i)
-				nil1 := elem1.IsNil()
-				nil2 := elem2.IsNil()
-				if nil1 || nil2 {
-					if nil1 != nil2 {
+				ok1 := !elem1.IsNil()
+				ok2 := !elem2.IsNil()
+				var vi1 ValueIndexer
+				var vi2 ValueIndexer
+				if ok1 {
+					vi1 = elem1.Interface().(ValueIndexer)
+					ok1 = (*ifaceWords)(unsafe.Pointer(&vi1)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi1)
+				}
+				if ok2 {
+					vi2 = elem2.Interface().(ValueIndexer)
+					ok2 = (*ifaceWords)(unsafe.Pointer(&vi2)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi2)
+				}
+				if !ok1 || !ok2 {
+					if ok1 != ok2 {
 						return true
 					}
 					continue
 				}
-				if elem1.Interface().(ValueIndexer).IndexingValue() != elem2.Interface().(ValueIndexer).IndexingValue() {
+				if vi1.IndexingValue() != vi2.IndexingValue() {
+					return true
+				}
+			}
+			return false
+		},
+	}
+}
+
+func valueIndexerSliceValueIndexerInterfaceAccessorBundle(field string, offset uintptr) fieldAccessorBundle {
+	return fieldAccessorBundle{
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			sink.setLen(addDistinctValueIndexerInterfaceValuesToSink(vals, sink))
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			checked := checkedBuildSink{sink: sink, field: field}
+			checked.setLen(addDistinctValueIndexerInterfaceValuesToSink(vals, &checked))
+			return checked.err
+		},
+		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			sink.setLen(addDistinctValueIndexerInterfaceValuesToSink(vals, sink))
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			sink.setLen(addDistinctValueIndexerInterfaceValuesToSink(vals, sink))
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			sink.setLen(addDistinctValueIndexerInterfaceValuesToSink(vals, sink))
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			vals := sliceFieldValue[ValueIndexer](ptr, offset)
+			for i := 0; i < len(vals); i++ {
+				vi := vals[i]
+				if vi == nil || (*ifaceWords)(unsafe.Pointer(&vi)).data == nil && valueIndexerNilPointerUsesValueReceiver(vi) {
+					continue
+				}
+				if err := validateStringKey(field, vi.IndexingValue()); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			vals1 := sliceFieldValue[ValueIndexer](v1, offset)
+			vals2 := sliceFieldValue[ValueIndexer](v2, offset)
+			if len(vals1) != len(vals2) {
+				return true
+			}
+			for i := 0; i < len(vals1); i++ {
+				vi1 := vals1[i]
+				vi2 := vals2[i]
+				ok1 := vi1 != nil
+				ok2 := vi2 != nil
+				if ok1 {
+					ok1 = (*ifaceWords)(unsafe.Pointer(&vi1)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi1)
+				}
+				if ok2 {
+					ok2 = (*ifaceWords)(unsafe.Pointer(&vi2)).data != nil || !valueIndexerNilPointerUsesValueReceiver(vi2)
+				}
+				if !ok1 || !ok2 {
+					if ok1 != ok2 {
+						return true
+					}
+					continue
+				}
+				if vi1.IndexingValue() != vi2.IndexingValue() {
 					return true
 				}
 			}
@@ -1083,6 +1515,9 @@ func valueIndexerSliceReflectAccessorBundle(field string, sliceType reflect.Type
 	case reflect.Interface:
 		return valueIndexerSliceInterfaceAccessorBundle(field, sliceType, offset)
 	case reflect.Pointer:
+		if isValueReceiverValueIndexerPointer(elemType) {
+			return valueIndexerSliceValuePtrAccessorBundle(field, sliceType, offset)
+		}
 	default:
 		return valueIndexerSlicePtrAccessorBundle(field, sliceType, offset)
 	}
@@ -1129,6 +1564,71 @@ func valueIndexerSliceReflectAccessorBundle(field string, sliceType reflect.Type
 			for i := 0; i < fv1.Len(); i++ {
 				if fv1.Index(i).Interface().(ValueIndexer).IndexingValue() !=
 					fv2.Index(i).Interface().(ValueIndexer).IndexingValue() {
+					return true
+				}
+			}
+			return false
+		},
+	}
+}
+
+func valueIndexerSliceValuePtrAccessorBundle(field string, sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+	elemType := sliceType.Elem()
+	tab := valueIndexerPtrTab(elemType.Elem())
+	size := elemType.Size()
+	return fieldAccessorBundle{
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerValuePtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
+			data, n := sliceFieldData(ptr, offset)
+			checked := checkedBuildSink{sink: sink, field: field}
+			addDistinct := addDistinctValueIndexerValuePtrStringsToSink(data, n, size, tab, &checked)
+			checked.setLen(addDistinct)
+			return checked.err
+		},
+		writeIndex: func(ptr unsafe.Pointer, sink IndexSink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerValuePtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerValuePtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerValuePtrStringsToSink(data, n, size, tab, sink))
+		},
+		validate: func(ptr unsafe.Pointer) error {
+			data, n := sliceFieldData(ptr, offset)
+			for i := 0; i < n; i++ {
+				elem := *(*unsafe.Pointer)(unsafe.Add(data, uintptr(i)*size))
+				if elem == nil {
+					continue
+				}
+				if err := validateStringKey(field, valueIndexerAt(tab, elem).IndexingValue()); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			data1, n1 := sliceFieldData(v1, offset)
+			data2, n2 := sliceFieldData(v2, offset)
+			if n1 != n2 {
+				return true
+			}
+			for i := 0; i < n1; i++ {
+				elem1 := *(*unsafe.Pointer)(unsafe.Add(data1, uintptr(i)*size))
+				elem2 := *(*unsafe.Pointer)(unsafe.Add(data2, uintptr(i)*size))
+				if elem1 == nil || elem2 == nil {
+					if elem1 != elem2 {
+						return true
+					}
+					continue
+				}
+				if valueIndexerAt(tab, elem1).IndexingValue() != valueIndexerAt(tab, elem2).IndexingValue() {
 					return true
 				}
 			}

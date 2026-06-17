@@ -1241,6 +1241,19 @@ func sliceValueToLookupKeyBuf(v reflect.Value, fm *schema.Field) ([]keycodec.Ind
 			hasNil = true
 			continue
 		}
+		if fm != nil && fm.UseVI {
+			// ValueIndexer elements stay scalar even when their underlying kind is slice.
+			if vi, ok := raw.(schema.ValueIndexer); ok {
+				ixsBuf = append(ixsBuf, keycodec.IndexLookupString(vi.IndexingValue()))
+				continue
+			}
+			if elem.IsValid() && elem.CanInterface() {
+				if vi, ok := elem.Interface().(schema.ValueIndexer); ok {
+					ixsBuf = append(ixsBuf, keycodec.IndexLookupString(vi.IndexingValue()))
+					continue
+				}
+			}
+		}
 		if elem.Kind() == reflect.Slice {
 			keycodec.ReleaseIndexLookupKeySlice(ixsBuf)
 			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())

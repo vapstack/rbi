@@ -40,21 +40,23 @@ const (
 // ValueIndexer defines how a field value is converted into a canonical string
 // representation used as an index key in rbi.
 //
-// A type that implements ValueIndexer is responsible for ensuring that
-// IndexingValue returns a valid and stable string for every value that may
-// appear in indexed data. This includes handling nil receivers if the type
-// is a pointer or otherwise nillable. The caller does not perform nil
-// checks before invoking IndexingValue.
+// IndexingValue method must return a stable, deterministic string.
+// Equal field values must produce equal indexing strings.
+// The returned string must not exceed 65535 bytes.
 //
-// IndexingValue must return a deterministic string: the same value must
-// always produce the same indexing key.
+// Nil ValueIndexer interface scalar values are indexed as null. For a type T
+// that implements ValueIndexer with a value receiver, nil *T scalar values are
+// also indexed as null, including when the nil *T is stored in a ValueIndexer
+// interface. In slice indexes, nil interface elements and nil *T elements for
+// value-receiver T do not emit index keys.
+//
+// Nil pointer-receiver values are passed to IndexingValue;
+// nil handling is the responsibility of the implementation.
 //
 // The returned string is compared lexicographically when evaluating
 // range queries (>, >=, <, <=). Implementation must ensure that the
 // produced ordering matches the intent.
-type ValueIndexer interface {
-	IndexingValue() string
-}
+type ValueIndexer = schema.ValueIndexer
 
 // Codec overrides default msgpack encoding/decoding for *V.
 //

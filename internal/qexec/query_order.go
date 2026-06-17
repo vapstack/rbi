@@ -484,7 +484,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 	fm := qv.fieldMetaByOrdinal(o.FieldOrdinal)
 	isSliceOrderField := fm != nil && fm.Slice
 	if !result.neg && !isSliceOrderField && !all && need > 0 && resultCard <= 4096 {
-		if (fm == nil || !fm.Ptr) && uint64(ov.KeyCount()) >= resultCard*8 {
+		if !schema.FieldUsesNilIndex(fm) && uint64(ov.KeyCount()) >= resultCard*8 {
 			return qv.queryOrderBasicSingletonChunks(result, ov, br, o, resultCard, skip, need), nil
 		}
 	}
@@ -501,7 +501,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 			}
 			out = appendMaterializedNumericPostingResultKeys(out, ids, result)
 		}
-		if includeNilTail && fm != nil && fm.Ptr {
+		if includeNilTail && schema.FieldUsesNilIndex(fm) {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
 				qv.nilIndexViewByOrdinal(o.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey),
@@ -533,7 +533,7 @@ func (qv *View) queryOrderBasicRange(result postingResult, ov indexdata.FieldInd
 		}
 	}
 
-	if includeNilTail && fm != nil && fm.Ptr {
+	if includeNilTail && schema.FieldUsesNilIndex(fm) {
 		nilIDs := qv.nilIndexViewByOrdinal(o.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool
@@ -1048,7 +1048,7 @@ func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field st
 	}
 
 	nilOV := indexdata.FieldIndexView{}
-	if fm := qv.fieldMeta(field, fieldOrdinal); fm != nil && fm.Ptr {
+	if schema.FieldUsesNilIndex(qv.fieldMeta(field, fieldOrdinal)) {
 		nilOV = qv.nilIndexViewRef(field, fieldOrdinal)
 	}
 
@@ -1233,6 +1233,20 @@ func (qv *View) orderDataValues(v any, fm *schema.Field) ([]keycodec.IndexLookup
 					}
 				}
 				continue
+			}
+
+			if fm != nil && fm.UseVI {
+				// ValueIndexer elements stay scalar even when their underlying kind is slice.
+				if vi, ok := raw.(schema.ValueIndexer); ok {
+					valsBuf = append(valsBuf, keycodec.IndexLookupString(vi.IndexingValue()))
+					continue
+				}
+				if elem.IsValid() && elem.CanInterface() {
+					if vi, ok := elem.Interface().(schema.ValueIndexer); ok {
+						valsBuf = append(valsBuf, keycodec.IndexLookupString(vi.IndexingValue()))
+						continue
+					}
+				}
 			}
 
 			if elem.Kind() == reflect.Slice {

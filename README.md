@@ -501,9 +501,17 @@ The returned value is used as the indexed representation.
 ### Contract:
 - Must return a stable, deterministic value.
 - Equal values must produce equal indexing values.
-- `nil` handling is the responsibility of the implementation.
-- `IndexingValue` may be called on a nil receiver.
-- `IndexingValue` must not return more than 65,535 bytes.
+- The returned string must not exceed 65535 bytes.
+- For a type `T` that implements `ValueIndexer` with a value receiver,
+  nil `*T` scalar values are indexed as null.
+- The same nil `*T` value-receiver rule applies when the value is stored
+  in a `ValueIndexer` interface.
+- In slice indexes, nil interface elements and nil `*T` elements for 
+  value-receiver `T` do not emit index keys.
+- Nil pointer-receiver values are passed to `IndexingValue`;
+  nil handling is the responsibility of the implementation.
+- If the field is used in range queries, lexicographic ordering of indexing
+  strings must match the intended value ordering.
 
 > Incorrect implementations may cause panics or undefined query behavior.
 
