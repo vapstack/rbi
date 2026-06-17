@@ -442,6 +442,62 @@ func TestExecuteDistinctWindowCanReturnNilValue(t *testing.T) {
 	}
 }
 
+func TestExecuteDistinctOrderLimitKeepsNilTail(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	prepared, err := Prepare(
+		qx.Aggregate(qx.DISTINCT("segment").AS("segment")).
+			SortOut("segment").
+			Limit(1),
+		db.rt,
+		db.rt.IndexedByName,
+	)
+	if err != nil {
+		t.Fatalf("Prepare distinct nil order limit: %v", err)
+	}
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute distinct nil order limit: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"segment"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireQaggString(t, result.Rows[0][0], "core")
+}
+
+func TestExecuteGroupedOrderLimitKeepsNilTail(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	prepared, err := Prepare(
+		qx.Group("segment").
+			Metrics(qx.ROWCOUNT().AS("rows")).
+			SortOut("segment").
+			Limit(1),
+		db.rt,
+		db.rt.IndexedByName,
+	)
+	if err != nil {
+		t.Fatalf("Prepare grouped nil order limit: %v", err)
+	}
+	view := db.view()
+	result, err := Execute(view, db.snap, prepared)
+	db.exec.ReleaseView(view)
+	prepared.Release()
+	if err != nil {
+		t.Fatalf("Execute grouped nil order limit: %v", err)
+	}
+	requireQaggLayout(t, result.Layout, []string{"segment", "rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireQaggString(t, result.Rows[0][0], "core")
+	requireQaggUint(t, result.Rows[0][1], 2)
+}
+
 func TestExecuteNumericMetricsOverMeasureAndOrdinaryFields(t *testing.T) {
 	db := newQaggTestDB(t, nil)
 	prepared, err := Prepare(

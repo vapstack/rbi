@@ -3210,7 +3210,17 @@ func (s aggregateRowSorter) Less(i int, j int) bool {
 func aggregateRowsLess(orders []aggregateOrder, left Row, right Row) bool {
 	for k := range orders {
 		order := orders[k]
-		cmp := aggregateCompareOrderValues(left[order.index], right[order.index])
+		lv := left[order.index]
+		rv := right[order.index]
+		lk := lv.Kind()
+		rk := rv.Kind()
+		if lk == ValueKindNone || rk == ValueKindNone {
+			if lk == rk {
+				continue
+			}
+			return lk != ValueKindNone
+		}
+		cmp := aggregateCompareOrderValues(lv, rv, lk, rk)
 		if cmp == 0 {
 			continue
 		}
@@ -3321,12 +3331,7 @@ func aggregateComparePredicateValues(a Value, b Value) (int, bool) {
 	}
 }
 
-func aggregateCompareOrderValues(a Value, b Value) int {
-	ak := a.Kind()
-	bk := b.Kind()
-	if ak == ValueKindNone || bk == ValueKindNone {
-		return compareInt64(int64(ak), int64(bk))
-	}
+func aggregateCompareOrderValues(a Value, b Value, ak ValueKind, bk ValueKind) int {
 	if (ak == ValueKindInt || ak == ValueKindUint || ak == ValueKindFloat) &&
 		(bk == ValueKindInt || bk == ValueKindUint || bk == ValueKindFloat) {
 		cmp, _ := aggregateCompareNumericValues(a, b)

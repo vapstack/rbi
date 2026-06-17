@@ -567,9 +567,9 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	if len(result.Rows) != 2 {
 		t.Fatalf("null having rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
 	}
-	requireAggregateNone(t, result.Rows[0][0])
+	requireAggregateString(t, result.Rows[0][0], "b")
 	requireAggregateNone(t, result.Rows[0][1])
-	requireAggregateString(t, result.Rows[1][0], "b")
+	requireAggregateNone(t, result.Rows[1][0])
 	requireAggregateNone(t, result.Rows[1][1])
 
 	var nilFloat *float64
@@ -582,8 +582,8 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	if len(result.Rows) != 2 {
 		t.Fatalf("typed nil EQ rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
 	}
-	requireAggregateNone(t, result.Rows[0][0])
-	requireAggregateString(t, result.Rows[1][0], "b")
+	requireAggregateString(t, result.Rows[0][0], "b")
+	requireAggregateNone(t, result.Rows[1][0])
 
 	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.IN(qx.OUT("avg_amount"), []*float64{nilFloat})).
@@ -594,8 +594,8 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	if len(result.Rows) != 2 {
 		t.Fatalf("typed nil IN rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
 	}
-	requireAggregateNone(t, result.Rows[0][0])
-	requireAggregateString(t, result.Rows[1][0], "b")
+	requireAggregateString(t, result.Rows[0][0], "b")
+	requireAggregateNone(t, result.Rows[1][0])
 
 	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.GTE(qx.OUT("avg_amount"), nil)))
