@@ -132,7 +132,8 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) 
 	for _, idx := range ids {
 		v := bucket.Get(keycodec.U64BytesWithBuf(idx, &key))
 		if v == nil {
-			continue
+			db.ReleaseRecords(out...)
+			return nil, fmt.Errorf("missing numeric data for id %d", idx)
 		}
 		value, err := db.decodeStoredValue(v)
 		if err != nil {

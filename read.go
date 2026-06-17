@@ -173,29 +173,33 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 
 	var keyBuf [8]byte
 	key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf))
-	if key == nil {
+	if db.strKey {
+		for key != nil {
+			val, err := db.decodeStoredValue(value)
+			if err != nil {
+				return fmt.Errorf("decode: %w", err)
+			}
+			more, err := fn(keycodec.UserKeyFromBytes[K](key, true), val)
+			if err != nil || !more {
+				return err
+			}
+			key, value = c.Next()
+		}
 		return nil
 	}
-	val, err := db.decodeStoredValue(value)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-
-	more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), val)
-	if err != nil {
-		return err
-	}
-	for more {
-		key, value = c.Next()
-		if key == nil {
-			return nil
+	for key != nil {
+		if len(key) != 8 {
+			return fmt.Errorf("invalid numeric data key length: %d", len(key))
 		}
-		if val, err = db.decodeStoredValue(value); err != nil {
+		val, err := db.decodeStoredValue(value)
+		if err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
-		if more, err = fn(keycodec.UserKeyFromBytes[K](key, db.strKey), val); err != nil {
+		more, err := fn(keycodec.UserKeyFromBytes[K](key, false), val)
+		if err != nil || !more {
 			return err
 		}
+		key, value = c.Next()
 	}
 	return nil
 }

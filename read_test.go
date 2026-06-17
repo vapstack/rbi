@@ -302,6 +302,46 @@ func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
 	expectBucketErr("Query", err)
 }
 
+func TestQuery_NumericIndexMissingDataRecordReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	mustSetAPIRec(t, db, 1, &Rec{Name: "one", Age: 1})
+	mustSetAPIRec(t, db, 2, &Rec{Name: "two", Age: 2})
+
+	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(db.dataBucket)
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		var keyBuf [8]byte
+		return b.Delete(keycodec.UserKeyBytesWithBuf(uint64(2), false, &keyBuf))
+	}); err != nil {
+		t.Fatalf("delete raw record: %v", err)
+	}
+
+	keys, err := db.QueryKeys(qx.Query())
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !slices.Equal(keys, []uint64{1, 2}) {
+		t.Fatalf("QueryKeys=%v want [1 2]", keys)
+	}
+	if count, err := db.Count(); err != nil {
+		t.Fatalf("Count: %v", err)
+	} else if count != 2 {
+		t.Fatalf("Count=%d want 2", count)
+	}
+
+	items, err := db.Query(qx.Query())
+	if err == nil || !strings.Contains(err.Error(), "missing numeric data") {
+		releaseUniqueRecords(db, items...)
+		t.Fatalf("Query err=%v want missing numeric data", err)
+	}
+	if len(items) != 0 {
+		releaseUniqueRecords(db, items...)
+		t.Fatalf("Query returned %d items with error", len(items))
+	}
+}
+
 func TestIOExt_Get_CorruptPayloadReturnsDecodeError(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 	ioExtMustSetRec(t, db, 1, &Rec{Name: "good-1"})
@@ -364,6 +404,62 @@ func TestIOExt_SeqScan_CorruptPayloadStopsAtBadRecord(t *testing.T) {
 	v3 := ioExtMustGetRec(t, db, 3)
 	if v3.Name != "three" {
 		t.Fatalf("unexpected id=3 after failed SeqScan: %#v", v3)
+	}
+}
+
+func TestIOExt_SeqScan_InvalidFirstNumericKeyLengthReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
+	raw := ioExtMustReadUint64Raw(t, db, 1)
+
+	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(db.dataBucket)
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		var keyBuf [8]byte
+		if err := b.Delete(keycodec.UserKeyBytesWithBuf(uint64(1), false, &keyBuf)); err != nil {
+			return err
+		}
+		return b.Put([]byte{1}, raw)
+	}); err != nil {
+		t.Fatalf("corrupt key: %v", err)
+	}
+
+	err := db.SeqScan(0, func(uint64, *Rec) (bool, error) {
+		t.Fatal("SeqScan callback called for invalid key")
+		return true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid numeric data key length: 1") {
+		t.Fatalf("SeqScan err=%v want invalid numeric key length", err)
+	}
+}
+
+func TestIOExt_SeqScan_InvalidNextNumericKeyLengthReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
+	raw := ioExtMustReadUint64Raw(t, db, 1)
+
+	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(db.dataBucket)
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		return b.Put([]byte{1}, raw)
+	}); err != nil {
+		t.Fatalf("corrupt key: %v", err)
+	}
+
+	var seen []uint64
+	err := db.SeqScan(0, func(id uint64, _ *Rec) (bool, error) {
+		seen = append(seen, id)
+		return true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid numeric data key length: 1") {
+		t.Fatalf("SeqScan err=%v want invalid numeric key length", err)
+	}
+	if !slices.Equal(seen, []uint64{1}) {
+		t.Fatalf("SeqScan seen=%v want [1]", seen)
 	}
 }
 
