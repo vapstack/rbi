@@ -2,6 +2,7 @@ package qexec
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
@@ -18,6 +19,11 @@ import (
 
 type correctnessRowLess func(aID uint64, a *Rec, bID uint64, b *Rec) bool
 type correctnessRowMatch func(id uint64, r *Rec) bool
+
+type numericRangeImpossibleEQRec struct {
+	Signed   int64  `db:"signed"   rbi:"index"`
+	Unsigned uint64 `db:"unsigned" rbi:"index"`
+}
 
 func newCorrectnessDB(t *testing.T, options ...Options) *DB[uint64, Rec] {
 	t.Helper()
@@ -45,6 +51,48 @@ func newCorrectnessDB(t *testing.T, options ...Options) *DB[uint64, Rec] {
 		t.Fatalf("BatchSet: %v", err)
 	}
 	return db
+}
+
+func TestQueryCorrectness_MergedNumericRangeImpossibleEQIsEmpty(t *testing.T) {
+	db, raw := openBoltAndNew[uint64, numericRangeImpossibleEQRec](t, t.TempDir()+"/impossible_numeric_eq.db", Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	ids := []uint64{1, 2, 3}
+	vals := []*numericRangeImpossibleEQRec{
+		{Signed: 1, Unsigned: 1},
+		{Signed: 2, Unsigned: 2},
+		{Signed: 3, Unsigned: 3},
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "signed_uint_above_max",
+			q:    qx.Query(qx.EQ("signed", uint64(math.MaxInt64)+1), qx.GTE("signed", 0)),
+		},
+		{
+			name: "unsigned_float_at_2_64",
+			q:    qx.Query(qx.EQ("unsigned", math.Ldexp(1, 64)), qx.GTE("unsigned", 0)),
+		},
+	}
+
+	for i := range cases {
+		got, err := db.QueryKeys(cases[i].q)
+		if err != nil {
+			t.Fatalf("%s QueryKeys: %v", cases[i].name, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("%s returned %v, want empty result", cases[i].name, got)
+		}
+	}
 }
 
 func expectedRecIDs(db *DB[uint64, Rec], match correctnessRowMatch, less correctnessRowLess, offset, limit int) []uint64 {

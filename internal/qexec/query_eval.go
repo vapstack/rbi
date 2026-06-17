@@ -826,7 +826,7 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 		u := v.Uint()
 		if u > math.MaxInt64 {
 			switch op {
-			case qir.OpGT, qir.OpGTE:
+			case qir.OpGT, qir.OpGTE, qir.OpEQ:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
@@ -839,7 +839,7 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
-			case qir.OpGT, qir.OpGTE:
+			case qir.OpGT, qir.OpGTE, qir.OpEQ:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
@@ -922,7 +922,7 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
-			case qir.OpGT, qir.OpGTE:
+			case qir.OpGT, qir.OpGTE, qir.OpEQ:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
@@ -947,7 +947,7 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 		case f == math.Trunc(f):
 			if f >= maxUint64FloatExclusive {
 				switch op {
-				case qir.OpGT, qir.OpGTE:
+				case qir.OpGT, qir.OpGTE, qir.OpEQ:
 					return normalizedScalarBound{empty: true}
 				default:
 					return normalizedScalarBound{full: true}
