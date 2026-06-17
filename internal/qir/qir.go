@@ -197,13 +197,13 @@ func PrepareQuery(src *qx.QX, resolve FieldResolver) (*Query, error) {
 		return nil, fmt.Errorf("QX is nil")
 	}
 	if src.HasReduction() {
-		return nil, fmt.Errorf("rbi does not support reduction/group/having")
+		return nil, fmt.Errorf("%w: reduction/group/having is not supported", rbierrors.ErrInvalidQuery)
 	}
 	if len(src.Projection) > 0 {
-		return nil, fmt.Errorf("rbi does not support projection/select")
+		return nil, fmt.Errorf("%w: projection/select is not supported", rbierrors.ErrInvalidQuery)
 	}
 	if len(src.Order) > 1 {
-		return nil, fmt.Errorf("rbi does not support multi-column ordering")
+		return nil, fmt.Errorf("%w: multi-column ordering is not supported", rbierrors.ErrInvalidQuery)
 	}
 
 	query := queryPool.Get()
@@ -371,7 +371,7 @@ func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, err
 			return Expr{}, err
 		}
 		if info.Caps&FieldCapNilPredicate == 0 {
-			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+			return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 		}
 		return Expr{
 			Op:           OpEQ,
@@ -408,18 +408,18 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 		return Expr{}, fmt.Errorf("%w: predicate literal for field %q must not have arguments", rbierrors.ErrInvalidQuery, field)
 	}
 	if (op == OpHASALL || op == OpHASANY) && info.Caps&FieldCapArrayPredicate == 0 {
-		return Expr{}, fmt.Errorf("rbi does not support array predicates for %s", field)
+		return Expr{}, fmt.Errorf("%w: array predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 	}
 	if info.Caps&FieldCapNilPredicate == 0 {
 		value := args[1].Value
 		if value == nil {
-			return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+			return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 		}
 		if op == OpIN || op == OpHASALL || op == OpHASANY {
 			v := reflect.ValueOf(value)
 			for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
 				if v.IsNil() {
-					return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+					return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 				}
 				v = v.Elem()
 			}
@@ -430,7 +430,7 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 						elem := v.Index(i)
 						for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
 							if elem.IsNil() {
-								return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+								return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 							}
 							elem = elem.Elem()
 						}
@@ -448,7 +448,7 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 				v := reflect.ValueOf(value)
 				for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
 					if v.IsNil() {
-						return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+						return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 					}
 					v = v.Elem()
 				}
@@ -456,7 +456,7 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 					k := v.Kind()
 					if k == reflect.Slice {
 						if v.IsNil() {
-							return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+							return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 						}
 					}
 					if k == reflect.Slice || k == reflect.Array {
@@ -466,7 +466,7 @@ func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Ex
 								elem := v.Index(i)
 								for elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
 									if elem.IsNil() {
-										return Expr{}, fmt.Errorf("rbi does not support nil predicates for %s", field)
+										return Expr{}, fmt.Errorf("%w: nil predicates are not supported for %s", rbierrors.ErrInvalidQuery, field)
 									}
 									elem = elem.Elem()
 								}
@@ -533,7 +533,7 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 				return Order{}, err
 			}
 			if info.Caps&FieldCapLenOrder == 0 {
-				return Order{}, fmt.Errorf("rbi does not support LEN order for %s", field)
+				return Order{}, fmt.Errorf("%w: LEN order is not supported for %s", rbierrors.ErrInvalidQuery, field)
 			}
 			return Order{
 				FieldOrdinal: info.Ordinal,
@@ -550,7 +550,7 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 				return Order{}, err
 			}
 			if info.Caps&FieldCapPosOrder == 0 {
-				return Order{}, fmt.Errorf("rbi does not support POS order for %s", field)
+				return Order{}, fmt.Errorf("%w: POS order is not supported for %s", rbierrors.ErrInvalidQuery, field)
 			}
 			if by.Args[1].Kind != qx.KindLIT {
 				return Order{}, fmt.Errorf("%w: POS order values for field %q must be a literal", rbierrors.ErrInvalidQuery, field)
@@ -562,7 +562,7 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 				return Order{}, fmt.Errorf("%w: POS order literal for field %q must not have arguments", rbierrors.ErrInvalidQuery, field)
 			}
 			if posOrderLiteralIsScalarString(by.Args[1].Value) {
-				return Order{}, fmt.Errorf("rbi does not support scalar-string POS order values for field %q", field)
+				return Order{}, fmt.Errorf("%w: scalar-string POS order values are not supported for field %q", rbierrors.ErrInvalidQuery, field)
 			}
 			return Order{
 				FieldOrdinal: info.Ordinal,
@@ -572,10 +572,10 @@ func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
 			}, nil
 		}
 	default:
-		return Order{}, fmt.Errorf("rbi does not support order expression")
+		return Order{}, fmt.Errorf("%w: order expression is not supported", rbierrors.ErrInvalidQuery)
 	}
 
-	return Order{}, fmt.Errorf("rbi does not support order expression")
+	return Order{}, fmt.Errorf("%w: order expression is not supported", rbierrors.ErrInvalidQuery)
 }
 
 func posOrderLiteralIsScalarString(v any) bool {

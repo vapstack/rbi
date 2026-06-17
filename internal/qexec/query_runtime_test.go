@@ -22,6 +22,14 @@ func TestRuntimeQueryFieldCatalogResolvesStringKey(t *testing.T) {
 	if !ok || info.Ordinal != ageOrdinal {
 		t.Fatalf("ResolveField(age)=(%+v,%v), want ordinal %d", info, ok, ageOrdinal)
 	}
+	wantAgeCaps := qir.FieldCapNilPredicate | qir.FieldCapPosOrder
+	if info.Caps != wantAgeCaps {
+		t.Fatalf("ResolveField(age) caps=%d want %d", info.Caps, wantAgeCaps)
+	}
+	info, ok = db.exec.ResolveField("tags")
+	if !ok || info.Caps != qir.FieldCapAll {
+		t.Fatalf("ResolveField(tags) caps=%d ok=%v want %d", info.Caps, ok, qir.FieldCapAll)
+	}
 	if _, ok = db.exec.ResolveField(schema.ReservedKeyFieldName); ok {
 		t.Fatalf("disabled %s resolved", schema.ReservedKeyFieldName)
 	}
@@ -46,6 +54,39 @@ func TestRuntimeQueryFieldCatalogResolvesStringKey(t *testing.T) {
 	info, ok = db.exec.ResolveField("age")
 	if !ok || info.Ordinal != ageOrdinal {
 		t.Fatalf("ResolveField(age) after key catalog=(%+v,%v), want ordinal %d", info, ok, ageOrdinal)
+	}
+}
+
+func TestRuntimeResolveFieldCapsValidateQueryShape(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+
+	valid := []*qx.QX{
+		qx.Query(qx.ISNULL("age")),
+		qx.Query(qx.NOTNULL("age")),
+		qx.Query(qx.HASANY("tags", []string{"go"})),
+		qx.Query().SortBy(qx.LEN("tags"), qx.ASC),
+		qx.Query().SortBy(qx.POS("tags", []string{"go"}), qx.ASC),
+		qx.Query().SortBy(qx.POS("age", []int{1}), qx.ASC),
+	}
+	for i := range valid {
+		q, err := qir.PrepareQuery(valid[i], db.exec)
+		if err != nil {
+			t.Fatalf("PrepareQuery(valid[%d]): %v", i, err)
+		}
+		q.Release()
+	}
+
+	invalid := []*qx.QX{
+		qx.Query(qx.HASANY("age", []int{1})),
+		qx.Query(qx.HASALL("age", []int{1})),
+		qx.Query().SortBy(qx.LEN("age"), qx.ASC),
+	}
+	for i := range invalid {
+		q, err := qir.PrepareQuery(invalid[i], db.exec)
+		if err == nil {
+			q.Release()
+			t.Fatalf("PrepareQuery(invalid[%d]) succeeded", i)
+		}
 	}
 }
 

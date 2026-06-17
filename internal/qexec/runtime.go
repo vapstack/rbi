@@ -174,7 +174,7 @@ func (r *Runtime) ResolveField(name string) (qir.FieldInfo, bool) {
 	field := r.fields[ordinal]
 	info := qir.FieldInfo{Ordinal: field.ordinal}
 	if field.kind == queryFieldOrdinary {
-		info.Caps = qir.FieldCapAll
+		info.Caps = schema.FieldQueryCaps(field.meta)
 	}
 	return info, true
 }

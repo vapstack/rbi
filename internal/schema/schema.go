@@ -109,6 +109,15 @@ func FieldUsesNilIndex(f *Field) bool {
 	return f != nil && (f.Ptr || (!f.Slice && f.UseVI && f.Kind == reflect.Interface))
 }
 
+func FieldQueryCaps(f *Field) qir.FieldCaps {
+	if f.Slice {
+		return qir.FieldCapAll
+	}
+	// Nil predicates on scalar fields are valid even when the nil posting is
+	// always empty for non-nullable field types.
+	return qir.FieldCapNilPredicate | qir.FieldCapPosOrder
+}
+
 func QueryValueToUnixSeconds(v reflect.Value) (int64, bool) {
 	if !v.IsValid() {
 		return 0, false
@@ -223,7 +232,7 @@ func (m IndexedFieldMap) ResolveField(name string) (qir.FieldInfo, bool) {
 	if !ok {
 		return qir.FieldInfo{Ordinal: qir.NoFieldOrdinal}, false
 	}
-	return qir.FieldInfo{Ordinal: acc.Ordinal, Caps: qir.FieldCapAll}, true
+	return qir.FieldInfo{Ordinal: acc.Ordinal, Caps: FieldQueryCaps(acc.Field)}, true
 }
 
 type MeasureFieldMap map[string]MeasureFieldAccessor

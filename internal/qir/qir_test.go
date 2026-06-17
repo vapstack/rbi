@@ -302,9 +302,8 @@ func TestPrepareCountExpr_UnsupportedArrayPredicateRejectedBeforeNilElements(t *
 		q.Release()
 		t.Fatal("expected PrepareCountExprResolved to reject unsupported array predicate")
 	}
-	want := "rbi does not support array predicates for $key"
-	if err.Error() != want {
-		t.Fatalf("unexpected error: got %q want %q", err.Error(), want)
+	if !errors.Is(err, rbierrors.ErrInvalidQuery) {
+		t.Fatalf("err=%v, want ErrInvalidQuery", err)
 	}
 }
 

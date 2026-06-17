@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type schemaTestVI string
@@ -1493,6 +1494,14 @@ func TestRuntimeLookupHelpers(t *testing.T) {
 	info, ok := rt.IndexedByName.ResolveField("name")
 	if !ok || info.Ordinal != rt.IndexedByName["name"].Ordinal {
 		t.Fatalf("ResolveField(name)=(%d,%v)", info.Ordinal, ok)
+	}
+	wantScalarCaps := qir.FieldCapNilPredicate | qir.FieldCapPosOrder
+	if info.Caps != wantScalarCaps {
+		t.Fatalf("ResolveField(name) caps=%d want %d", info.Caps, wantScalarCaps)
+	}
+	info, ok = rt.IndexedByName.ResolveField("tags")
+	if !ok || info.Caps != qir.FieldCapAll {
+		t.Fatalf("ResolveField(tags) caps=%d ok=%v want %d", info.Caps, ok, qir.FieldCapAll)
 	}
 	if _, ok = rt.IndexedByName.ResolveField("missing"); ok {
 		t.Fatal("ResolveField(missing) succeeded")
