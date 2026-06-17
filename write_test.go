@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 func TestStringWritesRejectEmptyKey(t *testing.T) {
@@ -22,26 +23,26 @@ func TestStringWritesRejectEmptyKey(t *testing.T) {
 	if err := db.Set("", rec, BeforeProcess(func(string, *Rec) error {
 		beforeProcessCalled = true
 		return nil
-	})); !errors.Is(err, bbolt.ErrKeyRequired) {
+	})); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("Set empty key error = %v, want ErrKeyRequired", err)
 	}
 	if beforeProcessCalled {
 		t.Fatalf("BeforeProcess ran for empty Set key")
 	}
 
-	if err := db.BatchSet([]string{"ok", ""}, []*Rec{{Name: "ok"}, rec}); !errors.Is(err, bbolt.ErrKeyRequired) {
+	if err := db.BatchSet([]string{"ok", ""}, []*Rec{{Name: "ok"}, rec}); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("BatchSet empty key error = %v, want ErrKeyRequired", err)
 	}
-	if err := db.Patch("", []Field{{Name: "name", Value: "x"}}); !errors.Is(err, bbolt.ErrKeyRequired) {
+	if err := db.Patch("", []Field{{Name: "name", Value: "x"}}); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("Patch empty key error = %v, want ErrKeyRequired", err)
 	}
-	if err := db.BatchPatch([]string{"ok", ""}, []Field{{Name: "name", Value: "x"}}); !errors.Is(err, bbolt.ErrKeyRequired) {
+	if err := db.BatchPatch([]string{"ok", ""}, []Field{{Name: "name", Value: "x"}}); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("BatchPatch empty key error = %v, want ErrKeyRequired", err)
 	}
-	if err := db.Delete(""); !errors.Is(err, bbolt.ErrKeyRequired) {
+	if err := db.Delete(""); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("Delete empty key error = %v, want ErrKeyRequired", err)
 	}
-	if err := db.BatchDelete([]string{"ok", ""}); !errors.Is(err, bbolt.ErrKeyRequired) {
+	if err := db.BatchDelete([]string{"ok", ""}); !errors.Is(err, berrors.ErrKeyRequired) {
 		t.Fatalf("BatchDelete empty key error = %v, want ErrKeyRequired", err)
 	}
 }

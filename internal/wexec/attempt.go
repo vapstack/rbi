@@ -11,6 +11,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 type prepared struct {
@@ -526,7 +527,7 @@ func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, att *attempt
 			err = formatBoltWriteErr(err, op.req.op, op.req.id.Format(b.strKey), op.idx, op.key, op.payload)
 			requestErr := errors.Is(rawErr, errEmptyPayload)
 			if !requestErr && !atomicAll {
-				requestErr = errors.Is(rawErr, bbolt.ErrKeyTooLarge) || errors.Is(rawErr, bbolt.ErrValueTooLarge)
+				requestErr = errors.Is(rawErr, berrors.ErrKeyTooLarge) || errors.Is(rawErr, berrors.ErrValueTooLarge)
 			}
 			if requestErr {
 				op.req.Err = err

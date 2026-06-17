@@ -137,7 +137,7 @@ func TestNumericRangeBucketCacheInitClearsSlotsFieldIndexAndEntries(t *testing.T
 	if cache.fieldIndexLen != 0 {
 		t.Fatalf("fieldIndexLen after init=%d want 0", cache.fieldIndexLen)
 	}
-	if fieldIndex != nil && len(fieldIndex) != 0 {
+	if len(fieldIndex) != 0 {
 		t.Fatalf("expected init to clear field index, got %d entries", len(fieldIndex))
 	}
 	if _, ok := cache.LoadSlot("age", 0); ok {

@@ -15,6 +15,7 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 func TestAttemptCommitFailureDropsStagedSnapshotAndSkipsPublish(t *testing.T) {
@@ -573,7 +574,7 @@ func TestSharedStringSetKeyTooLargeCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, bbolt.ErrKeyTooLarge) {
+	if err := <-badReq.Done; !errors.Is(err, berrors.ErrKeyTooLarge) {
 		t.Fatalf("bad request error = %v, want key too large", err)
 	}
 	if err := <-goodReq.Done; err != nil {
