@@ -590,6 +590,64 @@ func TestBuildPreparedKeepsPreviousZeroComplementLenIndexImmutableAcrossEmptyUpd
 	if snapshotBatchLenContains(next, "Tags", 1, 1) {
 		t.Fatal("next snapshot kept stale len=1 posting")
 	}
+	if next.LenZeroComplement[acc.Ordinal] {
+		t.Fatal("next snapshot kept zero-complement flag without non-empty postings")
+	}
+	if _, ok := next.LenFieldNameSet()["Tags"]; !ok {
+		t.Fatal("next snapshot omitted normalized len index field")
+	}
+	for _, id := range [...]uint64{1, 2, 3, 4} {
+		if !snapshotBatchLenContains(next, "Tags", 0, id) {
+			t.Fatalf("next snapshot is missing normalized len=0 posting for id=%d", id)
+		}
+	}
+	if indexdata.NewFieldIndexViewFromStorage(next.LenIndex[acc.Ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) != 0 {
+		t.Fatal("next snapshot kept non-empty marker after last non-empty slice became empty")
+	}
+}
+
+func TestBuildPreparedNormalizesZeroComplementLenIndexAfterLastNonEmptyDelete(t *testing.T) {
+	rt := snapshotBatchStorageRuntime(t)
+	oldRecords := []snapshotBatchStorageRec{
+		{Name: "u1", Tags: []string{"go"}},
+		{Name: "u2"},
+		{Name: "u3"},
+		{Name: "u4"},
+	}
+	prev := Build(1, nil, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, New: unsafe.Pointer(&oldRecords[0])},
+		{ID: 2, New: unsafe.Pointer(&oldRecords[1])},
+		{ID: 3, New: unsafe.Pointer(&oldRecords[2])},
+		{ID: 4, New: unsafe.Pointer(&oldRecords[3])},
+	})
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	acc := prev.IndexedFieldByName["Tags"]
+	if !prev.LenZeroComplement[acc.Ordinal] {
+		t.Fatal("expected previous snapshot to use zero-complement len index")
+	}
+
+	next := Build(2, prev, rt, CacheConfig{}, rt.Patch.Fields, []BatchEntry{
+		{ID: 1, Old: unsafe.Pointer(&oldRecords[0])},
+	})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if next.LenZeroComplement[acc.Ordinal] {
+		t.Fatal("next snapshot kept zero-complement flag without non-empty postings")
+	}
+	if _, ok := next.LenFieldNameSet()["Tags"]; !ok {
+		t.Fatal("next snapshot omitted normalized len index field")
+	}
+	for _, id := range [...]uint64{2, 3, 4} {
+		if !snapshotBatchLenContains(next, "Tags", 0, id) {
+			t.Fatalf("next snapshot is missing normalized len=0 posting for id=%d", id)
+		}
+	}
+	if snapshotBatchLenContains(next, "Tags", 0, 1) {
+		t.Fatal("next snapshot kept deleted id in normalized len=0 posting")
+	}
 }
 
 // Build views must own or retain all storage they expose before the

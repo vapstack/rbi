@@ -786,6 +786,16 @@ func buildPreparedSnapshotAggregatedNormalized(
 		if lenDiff := state.LenDiff(); lenDiff != nil {
 			baseLen := next.LenIndex[ordinal]
 			if storage := baseLen.ApplyLenPostingDiff(lenDiff); storage != baseLen {
+				if storage.KeyCount() == 0 && next.LenZeroComplement[ordinal] {
+					// Empty zero-complement storage cannot carry the complement marker through persistence.
+					next.LenZeroComplement[ordinal] = false
+					if !next.Universe.IsEmpty() {
+						lengths := indexdata.GetLenPostingMap()
+						lengths[0] = next.Universe.Clone()
+						storage, _ = indexdata.NewLenFieldStorageFromMapOwned(next.Universe, lengths)
+						indexdata.ReleaseLenPostingMap(lengths)
+					}
+				}
 				next.LenIndex[ordinal] = storage
 			}
 		}
