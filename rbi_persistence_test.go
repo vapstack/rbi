@@ -1002,6 +1002,70 @@ func TestIndexPersistence_RelativeBoltPathKeepsSidecarWithOriginalCWD(t *testing
 	}
 }
 
+func TestRegistry_RelativeBoltPathUsesBoltHandleIdentity(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "db")
+	otherDir := filepath.Join(dir, "other")
+	if err := os.Mkdir(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir db dir: %v", err)
+	}
+	if err := os.Mkdir(otherDir, 0o755); err != nil {
+		t.Fatalf("mkdir other dir: %v", err)
+	}
+
+	name := "relative_registry.db"
+	opts := testOptions(Options{BucketName: "relative_registry", DisableIndexStore: true})
+	if err := os.Chdir(dbDir); err != nil {
+		t.Fatalf("chdir db dir: %v", err)
+	}
+
+	raw, err := bbolt.Open(name, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := os.Chdir(otherDir); err != nil {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("chdir other dir: %v", err)
+	}
+	db2, err := New[uint64, schemaSubsetRec](raw, opts)
+	if err == nil {
+		_ = db2.Close()
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("New accepted second DB wrapper for same Bolt handle and bucket")
+	}
+	if !strings.Contains(err.Error(), "already open") {
+		_ = db.Close()
+		_ = raw.Close()
+		t.Fatalf("New err=%v want already open", err)
+	}
+
+	if err := db.Close(); err != nil {
+		_ = raw.Close()
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+}
+
 func TestIndexPersistence_PersistedIndexPathOverridesRelativeBoltPathCWD(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {

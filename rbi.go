@@ -432,10 +432,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 	}
 
-	if err = regInstance(boltPath, vname); err != nil {
+	if err = regInstance(bolt, boltPath, vname); err != nil {
 		return nil, err
 	}
-	defer unregInstanceOnError(&err, boltPath, vname)
+	defer unregInstanceOnError(&err, bolt, vname)
 
 	db = &DB[K, V]{
 		vtype:      vtype,
@@ -867,9 +867,9 @@ func (db *DB[K, V]) IndexStats() rbistats.Index {
 	return db.index.IndexStats()
 }
 
-func unregInstanceOnError(err *error, boltPath string, vname string) {
+func unregInstanceOnError(err *error, bolt *bbolt.DB, vname string) {
 	if *err != nil {
-		unregInstance(boltPath, vname)
+		unregInstance(bolt, vname)
 	}
 }
 
@@ -912,7 +912,7 @@ func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer unregInstance(db.boltPath, string(db.dataBucket))
+	defer unregInstance(db.bolt, string(db.dataBucket))
 
 	db.stopAnalyzeLoop()
 
@@ -1156,14 +1156,19 @@ func validateBucketName(name string) error {
 
 var (
 	registryMu sync.Mutex
-	registry   = make(map[string]struct{})
+	registry   = make(map[registryKey]struct{})
 )
 
-func regInstance(dbPath, bucket string) error {
+type registryKey struct {
+	bolt   *bbolt.DB
+	bucket string
+}
+
+func regInstance(bolt *bbolt.DB, dbPath string, bucket string) error {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 
-	key := dbPath + "::" + bucket
+	key := registryKey{bolt: bolt, bucket: bucket}
 	if _, exists := registry[key]; exists {
 		return fmt.Errorf("rbi is already open for \"%v\" at %v", bucket, dbPath)
 	}
@@ -1172,10 +1177,9 @@ func regInstance(dbPath, bucket string) error {
 	return nil
 }
 
-func unregInstance(dbPath, bucket string) {
+func unregInstance(bolt *bbolt.DB, bucket string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 
-	key := dbPath + "::" + bucket
-	delete(registry, key)
+	delete(registry, registryKey{bolt: bolt, bucket: bucket})
 }
