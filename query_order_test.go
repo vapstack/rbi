@@ -169,6 +169,28 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	runChecks("mutated", mutatedQueries)
 }
 
+func TestQuery_ArrayPosOrder_AcceptsArrayPriorityLiteral(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3, 4},
+		[]*Rec{
+			{Meta: Meta{Country: "PL"}},
+			{Meta: Meta{Country: "DE"}},
+			{Meta: Meta{Country: "NL"}},
+			{Meta: Meta{Country: "DE"}},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query().SortBy(qx.POS("country", [2]string{"DE", "NL"}), qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	assertSameSlice(t, got, []uint64{2, 4, 3, 1})
+}
+
 func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 	cases := []struct {
 		name  string
