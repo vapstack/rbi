@@ -176,6 +176,9 @@ type FieldIndexRange struct {
 
 	startPos fieldIndexChunkPos
 	endPos   fieldIndexChunkPos
+
+	filterPrefix    string
+	filterPrefixSet bool
 }
 
 type FieldIndexCursor struct {
@@ -192,6 +195,9 @@ type FieldIndexCursor struct {
 	refIdx   int
 	chunk    *fieldIndexChunk
 	desc     bool
+
+	filterPrefix    string
+	filterPrefixSet bool
 }
 
 func (br FieldIndexRange) Empty() bool {
@@ -203,6 +209,11 @@ func (br FieldIndexRange) Len() int {
 		return 0
 	}
 	return br.BaseEnd - br.BaseStart
+}
+
+// ExactRankSpan reports whether every rank in [BaseStart, BaseEnd) belongs to the range.
+func (br FieldIndexRange) ExactRankSpan() bool {
+	return !br.filterPrefixSet
 }
 
 func NewFieldIndexViewFromStorage(storage FieldStorage) FieldIndexView {
@@ -267,6 +278,24 @@ func (o FieldIndexView) RangeRows(start, end int) uint64 {
 func (o FieldIndexView) RangeStats(br FieldIndexRange) (int, uint64) {
 	if br.BaseStart >= br.BaseEnd {
 		return 0, 0
+	}
+	if br.filterPrefixSet {
+		cur := o.NewCursor(br, false)
+		var buckets int
+		var rows uint64
+		for {
+			ids, _, single, ok := cur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			buckets++
+			if single {
+				rows++
+			} else {
+				rows += ids.Cardinality()
+			}
+		}
+		return buckets, rows
 	}
 	if o.chunked != nil {
 		start := br.startPos
@@ -412,10 +441,13 @@ func (o FieldIndexView) RangeForBounds(b Bounds) FieldIndexRange {
 	}
 
 	if b.HasPrefix {
-		ps := o.LowerBound(b.Prefix)
-		pe := o.PrefixRangeEnd(b.Prefix, ps)
+		ps, pe, filter := prefixRangeIndex(o.base, b.Prefix, o.LowerBound(b.Prefix))
 		br.BaseStart = max(br.BaseStart, ps)
 		br.BaseEnd = min(br.BaseEnd, pe)
+		if filter {
+			br.filterPrefix = b.Prefix
+			br.filterPrefixSet = true
+		}
 	}
 
 	if b.HasLo {
@@ -466,6 +498,14 @@ func (o FieldIndexView) RangeForBounds(b Bounds) FieldIndexRange {
 	if br.BaseStart > br.BaseEnd {
 		br.BaseStart = br.BaseEnd
 	}
+	if br.filterPrefixSet {
+		cur := o.NewCursor(br, false)
+		if _, _, ok := cur.Next(); !ok {
+			br.BaseEnd = br.BaseStart
+			br.filterPrefix = ""
+			br.filterPrefixSet = false
+		}
+	}
 
 	return br
 }
@@ -488,7 +528,7 @@ func (o FieldIndexView) rangeForBoundsChunked(b Bounds) FieldIndexRange {
 
 	if b.HasPrefix {
 		ps, psRank := o.chunked.lowerBoundPos(b.Prefix)
-		pe, peRank := o.chunked.prefixRangeEndPos(b.Prefix, ps, psRank)
+		pe, peRank, filter := o.chunked.prefixRangeEndPos(b.Prefix, &ps, &psRank)
 		if psRank > br.BaseStart {
 			br.BaseStart = psRank
 			br.startPos = ps
@@ -496,6 +536,10 @@ func (o FieldIndexView) rangeForBoundsChunked(b Bounds) FieldIndexRange {
 		if peRank < br.BaseEnd {
 			br.BaseEnd = peRank
 			br.endPos = pe
+		}
+		if filter {
+			br.filterPrefix = b.Prefix
+			br.filterPrefixSet = true
 		}
 	}
 
@@ -559,6 +603,15 @@ func (o FieldIndexView) rangeForBoundsChunked(b Bounds) FieldIndexRange {
 		br.BaseStart = br.BaseEnd
 		br.startPos = br.endPos
 	}
+	if br.filterPrefixSet {
+		cur := o.NewCursor(br, false)
+		if _, _, ok := cur.Next(); !ok {
+			br.BaseEnd = br.BaseStart
+			br.endPos = br.startPos
+			br.filterPrefix = ""
+			br.filterPrefixSet = false
+		}
+	}
 	return br
 }
 
@@ -588,6 +641,9 @@ func (o FieldIndexView) NewCursor(br FieldIndexRange, desc bool) FieldIndexCurso
 		base:    o.base,
 		chunked: o.chunked,
 		desc:    desc,
+
+		filterPrefix:    br.filterPrefix,
+		filterPrefixSet: br.filterPrefixSet,
 	}
 	if o.chunked != nil {
 		c.remaining = br.BaseEnd - br.BaseStart
@@ -631,6 +687,17 @@ func (o FieldIndexView) NewCursor(br FieldIndexRange, desc bool) FieldIndexCurso
 }
 
 func (c *FieldIndexCursor) Next() (keycodec.IndexKey, posting.List, bool) {
+	if c.filterPrefixSet {
+		key, ids, idx, single, ok := c.NextKeyPostingOrSingle()
+		if !ok {
+			return keycodec.IndexKey{}, posting.List{}, false
+		}
+		if single {
+			var p posting.List
+			return key, p.BuildAdded(idx), true
+		}
+		return key, ids, true
+	}
 	if c.desc {
 		if c.chunked != nil {
 			if c.remaining <= 0 || c.chunk == nil {
@@ -702,6 +769,10 @@ func (c *FieldIndexCursor) Next() (keycodec.IndexKey, posting.List, bool) {
 }
 
 func (c *FieldIndexCursor) NextPostingOrSingle() (posting.List, uint64, bool, bool) {
+	if c.filterPrefixSet {
+		_, ids, idx, single, ok := c.NextKeyPostingOrSingle()
+		return ids, idx, single, ok
+	}
 	if c.desc {
 		if c.chunked != nil {
 			if c.remaining <= 0 || c.chunk == nil {
@@ -827,6 +898,70 @@ func (c *FieldIndexCursor) NextPostingOrSingle() (posting.List, uint64, bool, bo
 }
 
 func (c *FieldIndexCursor) NextKeyPostingOrSingle() (keycodec.IndexKey, posting.List, uint64, bool, bool) {
+	if !c.filterPrefixSet {
+		return c.nextKeyPostingOrSingle()
+	}
+	if c.chunked != nil {
+		for c.remaining > 0 && c.chunk != nil {
+			if c.chunk.hasStringKeys() {
+				return c.nextKeyPostingOrSingle()
+			}
+			if c.desc {
+				n := c.entryIdx + 1
+				if n > c.remaining {
+					n = c.remaining
+				}
+				c.remaining -= n
+				if c.remaining <= 0 {
+					break
+				}
+				c.chunkIdx--
+				if c.refIdx > 0 {
+					c.refIdx--
+				} else {
+					c.pageIdx--
+					if c.pageIdx < 0 {
+						c.chunk = nil
+						break
+					}
+					c.refIdx = len(c.chunked.pages[c.pageIdx].refs) - 1
+				}
+				c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+				c.entryIdx = c.chunk.keyCount() - 1
+				continue
+			}
+			n := c.chunk.keyCount() - c.entryIdx
+			if n > c.remaining {
+				n = c.remaining
+			}
+			c.remaining -= n
+			if c.remaining <= 0 {
+				break
+			}
+			c.chunkIdx++
+			c.refIdx++
+			if c.refIdx >= len(c.chunked.pages[c.pageIdx].refs) {
+				c.pageIdx++
+				if c.pageIdx >= len(c.chunked.pages) {
+					c.chunk = nil
+					break
+				}
+				c.refIdx = 0
+			}
+			c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+			c.entryIdx = 0
+		}
+		return keycodec.IndexKey{}, posting.List{}, 0, false, false
+	}
+	for {
+		key, ids, idx, single, ok := c.nextKeyPostingOrSingle()
+		if !ok || keycodec.HasPrefixString(key, c.filterPrefix) {
+			return key, ids, idx, single, ok
+		}
+	}
+}
+
+func (c *FieldIndexCursor) nextKeyPostingOrSingle() (keycodec.IndexKey, posting.List, uint64, bool, bool) {
 	if c.desc {
 		if c.chunked != nil {
 			if c.remaining <= 0 || c.chunk == nil {
@@ -966,6 +1101,50 @@ func (o FieldIndexView) AppendPostingFilter(out []uint64, br FieldIndexRange, de
 	var examined uint64
 	var filterCur posting.ContainsCursor
 	filterCur.Reset(filter)
+
+	if br.filterPrefixSet {
+		cur := o.NewCursor(br, desc)
+		for {
+			ids, idx, single, ok := cur.NextPostingOrSingle()
+			if !ok {
+				return out, examined, true
+			}
+			if single {
+				examined++
+				if filterCur.Contains(idx) {
+					if skip > 0 {
+						skip--
+					} else {
+						out = append(out, idx)
+						need--
+						if need == 0 {
+							return out, examined, true
+						}
+					}
+				}
+				continue
+			}
+			it := ids.Iter()
+			for it.HasNext() {
+				idx := it.Next()
+				examined++
+				if !filterCur.Contains(idx) {
+					continue
+				}
+				if skip > 0 {
+					skip--
+					continue
+				}
+				out = append(out, idx)
+				need--
+				if need == 0 {
+					it.Release()
+					return out, examined, true
+				}
+			}
+			it.Release()
+		}
+	}
 
 	if o.chunked == nil {
 		if desc {
@@ -1233,25 +1412,41 @@ func upperBoundIndex(s []Entry, key string) int {
 }
 
 func prefixRangeEndIndex(s []Entry, prefix string, start int) int {
-	if start < 0 || start >= len(s) {
-		return start
-	}
-	if keycodec.CompareString(s[start].Key, prefix) < 0 || !keycodec.HasPrefixString(s[start].Key, prefix) {
-		return start
-	}
-	upper, ok := keycodec.NewPrefixUpperBound(prefix)
-	if !ok {
-		return len(s)
-	}
+	_, end, _ := prefixRangeIndex(s, prefix, start)
+	return end
+}
 
-	lo, hi := start, len(s)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if keycodec.ComparePrefixUpperBound(s[mid].Key, upper) >= 0 {
-			hi = mid
-		} else {
-			lo = mid + 1
+func prefixRangeIndex(s []Entry, prefix string, start int) (int, int, bool) {
+	if start < 0 || start >= len(s) {
+		return start, start, false
+	}
+	end := len(s)
+	upper, ok := keycodec.NewPrefixUpperBound(prefix)
+	if ok {
+		lo, hi := start, len(s)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if keycodec.ComparePrefixUpperBound(s[mid].Key, upper) >= 0 {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		end = lo
+	}
+	if prefix == "" {
+		return start, end, false
+	}
+	for start < end && !keycodec.HasPrefixString(s[start].Key, prefix) {
+		start++
+	}
+	if start >= end {
+		return start, start, false
+	}
+	for i := start + 1; i < end; i++ {
+		if !keycodec.HasPrefixString(s[i].Key, prefix) {
+			return start, end, true
 		}
 	}
-	return lo
+	return start, end, false
 }

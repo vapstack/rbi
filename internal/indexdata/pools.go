@@ -75,6 +75,7 @@ var (
 			r.rowPrefix = nil
 			r.keyCount = 0
 			r.chunkCount = 0
+			r.mixedKeys = false
 			r.refs.Store(0)
 		},
 	}

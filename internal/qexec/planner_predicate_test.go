@@ -736,6 +736,66 @@ func TestBuildPredRangeCandidate_FullUniversePrefixBecomesAlwaysTrue(t *testing.
 	}
 }
 
+func TestFieldIndexRangeProbeDisablesComplementForFilteredPrefix(t *testing.T) {
+	fixed := indexdata.GetFixedPostingMap()
+	fixed[0x6100000000000000] = (posting.List{}).BuildAdded(10)
+	fixed[0x612f000000000000] = (posting.List{}).BuildAdded(30)
+	fixedRun := indexdata.NewFixedFieldStorageRunFromPostingMap(fixed)
+	indexdata.ReleaseFixedPostingMap(fixed)
+
+	strings := indexdata.GetPostingMap()
+	strings["a/"] = (posting.List{}).BuildAdded(20)
+	strings["a/0"] = (posting.List{}).BuildAdded(40)
+	strings["a/1"] = (posting.List{}).BuildAdded(50)
+	strings["b"] = (posting.List{}).BuildAdded(60)
+	stringRun := indexdata.NewStringFieldStorageRunFromPostingMap(strings)
+	indexdata.ReleasePostingMap(strings)
+
+	storage := indexdata.NewRegularFieldStorageFromRunsOwned([]indexdata.FieldStorageRun{fixedRun, stringRun})
+	defer storage.Release()
+
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
+	br := ov.RangeForBounds(indexdata.Bounds{HasPrefix: true, Prefix: "a/"})
+	if br.Empty() || br.ExactRankSpan() {
+		t.Fatalf("expected filtered mixed prefix range")
+	}
+	if before, after, ok := fieldIndexComplementRangeSpans(ov, br); ok || !before.Empty() || !after.Empty() {
+		t.Fatalf("filtered prefix range must not expose rank-only complement spans")
+	}
+
+	probe := newFieldIndexRangeProbe(ov, br, true, -1, 0)
+	if probe.useComplement {
+		t.Fatalf("filtered prefix range probe must fall back from complement")
+	}
+
+	pos := fieldIndexRangePredicateState{
+		ov:            ov,
+		br:            br,
+		probe:         probe,
+		keepProbeHits: !probe.useComplement,
+	}
+	if !pos.matches(20) || !pos.matches(40) || !pos.matches(50) {
+		t.Fatalf("positive prefix probe missed string prefix rows")
+	}
+	if pos.matches(10) || pos.matches(30) || pos.matches(60) {
+		t.Fatalf("positive prefix probe matched non-prefix rows")
+	}
+
+	neg := fieldIndexRangePredicateState{
+		ov:            ov,
+		br:            br,
+		probe:         probe,
+		neg:           true,
+		keepProbeHits: probe.useComplement,
+	}
+	if neg.matches(20) || neg.matches(40) || neg.matches(50) {
+		t.Fatalf("negated prefix probe matched string prefix rows")
+	}
+	if !neg.matches(10) || !neg.matches(30) || !neg.matches(60) {
+		t.Fatalf("negated prefix probe missed non-prefix rows")
+	}
+}
+
 func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallback(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 

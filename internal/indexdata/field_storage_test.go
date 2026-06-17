@@ -359,6 +359,37 @@ func TestRegularFieldStorageFlatCopiesBorrowedStringKeyBytes(t *testing.T) {
 	fieldStorageAssertPostingContains(t, storage, "flat/charlie", 3, 1003)
 }
 
+func TestRegularFieldStorageFlatMixedCopiesBorrowedStringKeyBytesAfterNumeric(t *testing.T) {
+	keys := [][]byte{
+		[]byte("mixed-flat/alpha"),
+		[]byte("mixed-flat/bravo"),
+	}
+	entries := GetFieldEntrySlice(3)[:3]
+	entries[0] = Entry{
+		Key: keycodec.FromU64(1),
+		IDs: fieldStoragePosting(1, 1001),
+	}
+	for i := range keys {
+		id := uint64(i + 2)
+		entries[i+1] = Entry{
+			Key: keycodec.FromBytes(keys[i]),
+			IDs: fieldStoragePosting(id, id+1000),
+		}
+	}
+
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+	if storage.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(1), 1, 1001)
+	fieldStorageAssertPostingContains(t, storage, "mixed-flat/alpha", 2, 1002)
+	fieldStorageAssertPostingContains(t, storage, "mixed-flat/bravo", 3, 1003)
+}
+
 func TestFlatFieldStorageFromPostingMapOwnedCopiesCallerStringKeyBytes(t *testing.T) {
 	keys := [][]byte{
 		[]byte("map-flat/alpha"),
@@ -408,6 +439,40 @@ func TestRegularFieldStorageChunkedCopiesBorrowedStringKeyBytes(t *testing.T) {
 	fieldStorageAssertPostingContains(t, storage, "chunk/0000", 1)
 	fieldStorageAssertPostingContains(t, storage, "chunk/0192", 193)
 	fieldStorageAssertPostingContains(t, storage, "chunk/0383", 384)
+}
+
+func TestRegularFieldStorageChunkedMixedPreservesStringKeysAfterNumericChunkStart(t *testing.T) {
+	const numericKeys = 7
+	const total = fieldIndexChunkThreshold
+
+	keys := make([][]byte, total-numericKeys)
+	entries := GetFieldEntrySlice(total)[:total]
+	for i := 0; i < numericKeys; i++ {
+		entries[i] = Entry{
+			Key: keycodec.FromU64(uint64(i + 1)),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+	for i := range keys {
+		key := fmt.Sprintf("mixed-chunk/%04d", i)
+		keys[i] = []byte(key)
+		entries[numericKeys+i] = Entry{
+			Key: keycodec.FromBytes(keys[i]),
+			IDs: fieldStorageSingleton(uint64(numericKeys + i + 1)),
+		}
+	}
+
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(1), 1)
+	fieldStorageAssertPostingContains(t, storage, "mixed-chunk/0000", 8)
+	fieldStorageAssertPostingContains(t, storage, "mixed-chunk/0376", 384)
 }
 
 func TestRegularFieldStorageFromPostingMapOwnedChunkedCopiesCallerStringKeyBytes(t *testing.T) {
@@ -693,6 +758,48 @@ func TestFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testing.T
 	}
 }
 
+func TestFieldIndexChunkRefsWithInsertedEntrySplitsMixedKeyTypes(t *testing.T) {
+	t.Run("NumericChunkStringInsert", func(t *testing.T) {
+		ref := fieldStorageOwnedChunkRef(4, true)
+		add := Entry{
+			Key: keycodec.FromString("mixed-insert/string"),
+			IDs: fieldStorageSingleton(900_001),
+		}
+
+		replRefs := ref.chunk.refsWithInsertedEntry(ref.chunk.keyCount(), add)
+		if len(replRefs) != 2 {
+			t.Fatalf("expected numeric and string replacement chunks, got %d", len(replRefs))
+		}
+		replRoot := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPageOwned(replRefs)})
+		replStorage := newChunkedFieldStorage(replRoot)
+		defer replStorage.Release()
+		defer posting.ReleaseAll(ref.chunk.posts)
+
+		fieldStorageAssertPostingContainsKey(t, replStorage, keycodec.FromU64(0), 1, 1_000_001)
+		fieldStorageAssertPostingContains(t, replStorage, "mixed-insert/string", 900_001)
+	})
+
+	t.Run("StringChunkNumericInsert", func(t *testing.T) {
+		ref := fieldStorageOwnedChunkRef(4, false)
+		add := Entry{
+			Key: keycodec.FromU64(1),
+			IDs: fieldStorageSingleton(900_002),
+		}
+
+		replRefs := ref.chunk.refsWithInsertedEntry(0, add)
+		if len(replRefs) != 2 {
+			t.Fatalf("expected numeric and string replacement chunks, got %d", len(replRefs))
+		}
+		replRoot := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPageOwned(replRefs)})
+		replStorage := newChunkedFieldStorage(replRoot)
+		defer replStorage.Release()
+		defer posting.ReleaseAll(ref.chunk.posts)
+
+		fieldStorageAssertPostingContainsKey(t, replStorage, keycodec.FromU64(1), 900_002)
+		fieldStorageAssertPostingContains(t, replStorage, "k/0000", 1, 1_000_001)
+	})
+}
+
 func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -756,6 +863,36 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFieldIndexChunkStreamBuilder_MixedKeysSwitchType(t *testing.T) {
+	const numericKeys = 5
+	const total = fieldIndexChunkThreshold + 17
+
+	builder := newFieldIndexChunkBuilder(total)
+	stream := newFieldIndexChunkStreamBuilder(true)
+	keys := make([][]byte, total-numericKeys)
+	for i := 0; i < numericKeys; i++ {
+		stream.append(&builder, keycodec.FromU64(uint64(i+1)), fieldStorageSingleton(uint64(i+1)))
+	}
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("mixed-stream/%04d", i))
+		stream.append(&builder, keycodec.FromBytes(keys[i]), fieldStorageSingleton(uint64(numericKeys+i+1)))
+	}
+	stream.finish(&builder)
+
+	root := builder.root()
+	if root == nil {
+		t.Fatalf("expected chunked root")
+	}
+	storage := newChunkedFieldStorage(root)
+	defer storage.Release()
+
+	poisonBytes(keys...)
+
+	fieldStorageAssertPostingContainsKey(t, storage, keycodec.FromU64(1), 1)
+	fieldStorageAssertPostingContains(t, storage, "mixed-stream/0000", 6)
+	fieldStorageAssertPostingContains(t, storage, "mixed-stream/0395", 401)
 }
 
 func TestFieldStorageBuilder_RoundTrip(t *testing.T) {

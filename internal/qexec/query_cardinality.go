@@ -3224,13 +3224,12 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 	}
 
 	br := ov.RangeForBounds(rb)
-	start, end := br.BaseStart, br.BaseEnd
 
-	if start >= end {
+	if br.Empty() {
 		pooled.ReleaseBoolSlice(covered)
 		return 0, 0, true
 	}
-	if end-start < 4 {
+	if br.Len() < 4 {
 		pooled.ReleaseBoolSlice(covered)
 		return 0, 0, false
 	}
@@ -3275,7 +3274,7 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 	var bucketWork posting.List
 	var extraWork posting.List
 
-	cur := ov.NewCursor(ov.RangeByRanks(start, end), false)
+	cur := ov.NewCursor(br, false)
 	for {
 		_, ids, ok := cur.Next()
 		if !ok {

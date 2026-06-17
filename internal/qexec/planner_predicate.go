@@ -1364,8 +1364,11 @@ func rangeBoundsForOp(op qir.Op, key string) (indexdata.Bounds, bool) {
 	return rb, true
 }
 
-func fieldIndexComplementRangeSpans(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (before, after indexdata.FieldIndexRange) {
-	return ov.RangeByRanks(0, br.BaseStart), ov.RangeByRanks(br.BaseEnd, ov.KeyCount())
+func fieldIndexComplementRangeSpans(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (before, after indexdata.FieldIndexRange, ok bool) {
+	if !br.ExactRankSpan() {
+		return indexdata.FieldIndexRange{}, indexdata.FieldIndexRange{}, false
+	}
+	return ov.RangeByRanks(0, br.BaseStart), ov.RangeByRanks(br.BaseEnd, ov.KeyCount()), true
 }
 
 type fieldIndexRangeIter struct {
@@ -1823,7 +1826,11 @@ func (qv *View) extractOrderRangeCoverageIndexViewWithBoundsReader(field string,
 		return indexdata.Bounds{}, indexdata.FieldIndexRange{}, nil, false
 	}
 
-	return rb, ov.RangeForBounds(rb), covered, true
+	br := ov.RangeForBounds(rb)
+	if !br.ExactRankSpan() {
+		covered = covered[:0]
+	}
+	return rb, br, covered, true
 }
 
 func (qv *View) extractOrderRangeCoverageIndexViewReader(field string, preds predicateReader, ov indexdata.FieldIndexView) (indexdata.FieldIndexRange, []bool, bool) {
@@ -3637,20 +3644,24 @@ func newFieldIndexRangeProbe(
 	precomputedProbeEst uint64,
 ) fieldIndexRangeProbe {
 
-	p := fieldIndexRangeProbe{ov: ov, useComplement: useComplement}
+	p := fieldIndexRangeProbe{ov: ov}
 
 	if useComplement {
-		before, after := fieldIndexComplementRangeSpans(ov, br)
-		if !before.Empty() {
-			p.spans[p.spanCnt] = before
-			p.spanCnt++
-		}
-		if !after.Empty() {
-			p.spans[p.spanCnt] = after
-			p.spanCnt++
+		before, after, ok := fieldIndexComplementRangeSpans(ov, br)
+		if ok {
+			p.useComplement = true
+			if !before.Empty() {
+				p.spans[p.spanCnt] = before
+				p.spanCnt++
+			}
+			if !after.Empty() {
+				p.spans[p.spanCnt] = after
+				p.spanCnt++
+			}
 		}
 
-	} else if !br.Empty() {
+	}
+	if !p.useComplement && !br.Empty() {
 		p.spans[0] = br
 		p.spanCnt = 1
 	}

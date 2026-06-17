@@ -721,7 +721,7 @@ func (core *preparedScalarRangePredicate) planFieldIndexRange(ov indexdata.Field
 		br:                  br,
 		bucketCount:         bucketCount,
 		est:                 est,
-		useComplement:       totalBuckets-bucketCount < bucketCount,
+		useComplement:       br.ExactRankSpan() && totalBuckets-bucketCount < bucketCount,
 		runtimeProbeBuckets: bucketCount,
 		runtimeProbeEst:     est,
 	}
@@ -1105,7 +1105,10 @@ func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (sc
 	}
 
 	br := ov.RangeForBounds(core.bounds)
-	before, after := fieldIndexComplementRangeSpans(ov, br)
+	before, after, ok := fieldIndexComplementRangeSpans(ov, br)
+	if !ok {
+		return scalarComplementMaterializationPlan{}, false
+	}
 	nilPosting := core.qv.nilIndexViewByOrdinal(core.expr.FieldOrdinal).LookupPostingRetained(indexdata.NilIndexEntryKey)
 
 	plan := scalarComplementMaterializationPlan{

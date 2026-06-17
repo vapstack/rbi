@@ -456,6 +456,80 @@ func TestFieldIndexViewRangeForBounds_PrefixIntersectsRange(t *testing.T) {
 	}
 }
 
+func TestFieldIndexViewRangeForBounds_MixedPrefixSkipsNumericKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		rows int
+	}{
+		{name: "Flat", rows: 12},
+		{name: "Chunked", rows: fieldIndexChunkThreshold + 17},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := GetFieldEntrySlice(tc.rows)[:tc.rows]
+			entries[0] = Entry{Key: keycodec.FromU64(0x6100000000000000), IDs: fieldStorageSingleton(10)}
+			entries[1] = Entry{Key: keycodec.FromString("a/"), IDs: fieldStorageSingleton(20)}
+			entries[2] = Entry{Key: keycodec.FromU64(0x612f000000000000), IDs: fieldStorageSingleton(30)}
+			entries[3] = Entry{Key: keycodec.FromString("a/0"), IDs: fieldStorageSingleton(40)}
+			entries[4] = Entry{Key: keycodec.FromString("a/1"), IDs: fieldStorageSingleton(50)}
+			entries[5] = Entry{Key: keycodec.FromString("b"), IDs: fieldStorageSingleton(60)}
+			for i := 6; i < tc.rows; i++ {
+				entries[i] = Entry{
+					Key: keycodec.FromString(fmt.Sprintf("z/%06d", i)),
+					IDs: fieldStorageSingleton(uint64(i + 100)),
+				}
+			}
+
+			storage := newRegularFieldStorage(entries)
+			defer storage.Release()
+			if storage.IsChunked() != (tc.rows >= fieldIndexChunkThreshold) {
+				t.Fatalf("unexpected storage layout")
+			}
+			ov := NewFieldIndexViewFromStorage(storage)
+
+			br := ov.RangeForBounds(Bounds{HasPrefix: true, Prefix: "a/"})
+			buckets, rows := ov.RangeStats(br)
+			if buckets != 3 || rows != 3 {
+				t.Fatalf("prefix stats: buckets=%d rows=%d want 3/3", buckets, rows)
+			}
+			cur := ov.NewCursor(br, false)
+			for i, want := range []string{"a/", "a/0", "a/1"} {
+				key, ids, ok := cur.Next()
+				if !ok {
+					t.Fatalf("missing prefix key %d", i)
+				}
+				if !keycodec.EqualsString(key, want) {
+					t.Fatalf("prefix key %d: got %q want %q", i, key.UnsafeString(), want)
+				}
+				if ids.Cardinality() != 1 {
+					t.Fatalf("prefix posting %d: %v", i, ids)
+				}
+			}
+			if key, _, ok := cur.Next(); ok {
+				t.Fatalf("unexpected extra prefix key %q", key.UnsafeString())
+			}
+
+			cur = ov.NewCursor(br, true)
+			for i, want := range []string{"a/1", "a/0", "a/"} {
+				key, ids, ok := cur.Next()
+				if !ok {
+					t.Fatalf("missing descending prefix key %d", i)
+				}
+				if !keycodec.EqualsString(key, want) {
+					t.Fatalf("descending prefix key %d: got %q want %q", i, key.UnsafeString(), want)
+				}
+				if ids.Cardinality() != 1 {
+					t.Fatalf("descending prefix posting %d: %v", i, ids)
+				}
+			}
+			if key, _, ok := cur.Next(); ok {
+				t.Fatalf("unexpected extra descending prefix key %q", key.UnsafeString())
+			}
+		})
+	}
+}
+
 func TestFieldIndexViewRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T) {
 	tests := []struct {
 		name    string
