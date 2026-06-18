@@ -296,7 +296,7 @@ func BenchmarkIndexedAccessorWriteBuild(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				state := NewBuildFieldLocalState(numeric, slice)
+				state := NewBuildFieldLocalState(numeric, slice, BuildFieldRunTargetEntries)
 				acc.WriteBuild(ptr, BuildSink{
 					State: &state,
 					Idx:   uint64(i + 1),
@@ -316,7 +316,7 @@ func BenchmarkBuildFieldStateFlushMaterialize(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		local := NewBuildFieldLocalState(false, true)
+		local := NewBuildFieldLocalState(false, true, BuildFieldRunTargetEntries)
 		state := NewBuildFieldState(true)
 		acc.WriteBuild(ptr, BuildSink{
 			State: &local,

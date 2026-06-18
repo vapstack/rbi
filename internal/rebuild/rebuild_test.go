@@ -877,9 +877,9 @@ func TestMaterializeStringKeyMeasureRunsSortByNumericID(t *testing.T) {
 		indexdata.MeasureEntry{ID: 1, Value: 10},
 	)
 
-	localMeasures := make([][][]indexdata.MeasureEntry, 1)
-	localMeasures[0] = make([][]indexdata.MeasureEntry, len(rt.Measures))
-	localMeasures[0][score.Ordinal] = buf
+	localMeasures := make([][][][]indexdata.MeasureEntry, 1)
+	localMeasures[0] = make([][][]indexdata.MeasureEntry, len(rt.Measures))
+	localMeasures[0][score.Ordinal] = [][]indexdata.MeasureEntry{buf}
 
 	result := materialize(
 		Config{Schema: rt, StrKey: true},

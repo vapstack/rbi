@@ -1605,7 +1605,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	}
 	ptr := unsafe.Pointer(&rec)
 
-	stringLocal := NewBuildFieldLocalState(false, false)
+	stringLocal := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
 	rt.IndexedByName["name"].WriteBuild(ptr, BuildSink{State: &stringLocal, Idx: 1})
 	stringState := NewBuildFieldState(false)
 	stringLocal.FlushRegularInto(stringState)
@@ -1615,7 +1615,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 		t.Fatal("string build materialization lost posting")
 	}
 
-	fixedLocal := NewBuildFieldLocalState(true, true)
+	fixedLocal := NewBuildFieldLocalState(true, true, BuildFieldRunTargetEntries)
 	rt.IndexedByName["scores"].WriteBuild(ptr, BuildSink{State: &fixedLocal, Idx: 2})
 	fixedState := NewBuildFieldState(true)
 	fixedLocal.FlushAllInto(fixedState)
@@ -1631,7 +1631,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 		t.Fatal("len build materialization lost posting")
 	}
 
-	nilLocal := NewBuildFieldLocalState(true, false)
+	nilLocal := NewBuildFieldLocalState(true, false, BuildFieldRunTargetEntries)
 	rt.IndexedByName["maybe"].WriteBuild(ptr, BuildSink{State: &nilLocal, Idx: 3})
 	nilState := NewBuildFieldState(false)
 	nilLocal.FlushAllInto(nilState)
@@ -1641,15 +1641,15 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 		t.Fatal("nil build materialization lost posting")
 	}
 
-	flushLocal := NewBuildFieldLocalState(false, false)
-	for i := 0; i < buildIndexRunTargetEntries; i++ {
+	flushLocal := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
+	for i := 0; i < BuildFieldRunTargetEntries; i++ {
 		flushLocal.addValue(keycodec.U64ByteString(uint64(i)), uint64(i+10))
 	}
 	if !flushLocal.ShouldFlushRegular() {
 		t.Fatal("string local state should be ready to flush")
 	}
-	flushFixed := NewBuildFieldLocalState(true, false)
-	for i := 0; i < buildIndexRunTargetEntries; i++ {
+	flushFixed := NewBuildFieldLocalState(true, false, BuildFieldRunTargetEntries)
+	for i := 0; i < BuildFieldRunTargetEntries; i++ {
 		flushFixed.addFixedValue(uint64(i), uint64(i+10))
 	}
 	if !flushFixed.ShouldFlushRegular() {

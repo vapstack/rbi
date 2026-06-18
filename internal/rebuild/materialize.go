@@ -3,6 +3,7 @@ package rebuild
 import (
 	"cmp"
 	"fmt"
+	"runtime"
 	"slices"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
 )
+
+const fieldMaterializeGCTargets = 4
 
 func finishLoadedStorage(cfg Config, state State) (Result, error) {
 	if cfg.StrKey {
@@ -148,7 +151,38 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 		keyIndexLoaded = true
 	}
 
+	fieldOrder := pooled.GetIntSlice(len(build.fieldStates))
+	fieldRunKeys := pooled.GetIntSlice(len(build.fieldStates))[:len(build.fieldStates)]
+	fieldWork := pooled.GetUint64Slice(len(build.fieldStates))[:len(build.fieldStates)]
+
+	var totalFieldWork uint64
 	for i := range build.fieldStates {
+		runKeys, work := build.fieldStates[i].MaterializeStats()
+		fieldRunKeys[i] = runKeys
+		fieldWork[i] = work
+		totalFieldWork += work
+		fieldOrder = append(fieldOrder, i)
+	}
+	for i := 1; i < len(fieldOrder); i++ {
+		field := fieldOrder[i]
+		keys := fieldRunKeys[field]
+		j := i
+		for j > 0 && fieldRunKeys[fieldOrder[j-1]] < keys {
+			fieldOrder[j] = fieldOrder[j-1]
+			j--
+		}
+		fieldOrder[j] = field
+	}
+	var fieldGCWork uint64
+	if totalFieldWork > 0 {
+		fieldGCWork = totalFieldWork / fieldMaterializeGCTargets
+		if totalFieldWork%fieldMaterializeGCTargets != 0 {
+			fieldGCWork++
+		}
+	}
+
+	var pendingFieldGCWork uint64
+	for pos, i := range fieldOrder {
 		ordinal := active[i].acc.Ordinal
 		if storage := build.fieldStates[i].MaterializeStorage(); storage.KeyCount() > 0 {
 			nextIndex[ordinal] = storage
@@ -171,7 +205,17 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 				nextLenZeroComplement[ordinal] = true
 			}
 		}
+		pendingFieldGCWork += fieldWork[i]
+		if fieldGCWork > 0 &&
+			(pos+1 < len(fieldOrder) || len(activeMeasures) > 0) &&
+			(pendingFieldGCWork >= fieldGCWork || (pos+1 == len(fieldOrder) && pendingFieldGCWork > 0)) {
+			runtime.GC()
+			pendingFieldGCWork = 0
+		}
 	}
+	pooled.ReleaseUint64Slice(fieldWork)
+	pooled.ReleaseIntSlice(fieldRunKeys)
+	pooled.ReleaseIntSlice(fieldOrder)
 
 	if len(activeMeasures) > 0 {
 		for _, acc := range activeMeasures {
@@ -181,17 +225,23 @@ func materialize(cfg Config, state State, active []buildField, activeMeasures []
 				if i >= len(build.localMeasureStates[worker]) {
 					continue
 				}
-				buf := build.localMeasureStates[worker][i]
-				if buf == nil {
+				bufs := build.localMeasureStates[worker][i]
+				if bufs == nil {
 					continue
 				}
-				if cfg.StrKey && len(buf) > 1 {
-					// Bolt scans string keys lexicographically; durable string ids can follow older assignment order.
-					slices.SortFunc(buf, func(a, b indexdata.MeasureEntry) int {
-						return cmp.Compare(a.ID, b.ID)
-					})
+				if cfg.StrKey {
+					for j := range bufs {
+						if len(bufs[j]) > 1 {
+							// Bolt scans string keys lexicographically; durable string ids can follow older assignment order.
+							slices.SortFunc(bufs[j], func(a, b indexdata.MeasureEntry) int {
+								return cmp.Compare(a.ID, b.ID)
+							})
+						}
+					}
 				}
-				runs = append(runs, buf)
+				runs = append(runs, bufs...)
+				clear(bufs)
+				indexdata.ReleaseMeasureEntrySlots(bufs)
 				build.localMeasureStates[worker][i] = nil
 			}
 			nextMeasure[i] = indexdata.NewMeasureStorageFromSortedRunsOwned(runs)

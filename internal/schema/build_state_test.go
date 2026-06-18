@@ -14,7 +14,7 @@ func buildStateSingleton(id uint64) posting.List {
 
 func TestBuildFieldLocalStateOwnsStringKeyUntilFlush(t *testing.T) {
 	buf := []byte("mutable-name")
-	state := NewBuildFieldLocalState(false, false)
+	state := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
 	state.addValue(unsafe.String(unsafe.SliceData(buf), len(buf)), 11)
 
 	for i := range buf {
@@ -36,7 +36,7 @@ func TestBuildFieldLocalStateOwnsStringKeyUntilFlush(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateReleaseClearsVals(t *testing.T) {
-	state := NewBuildFieldLocalState(false, false)
+	state := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addValue("name", uint64(i))
 	}
@@ -48,7 +48,7 @@ func TestBuildFieldLocalStateReleaseClearsVals(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateReleaseClearsFixed(t *testing.T) {
-	state := NewBuildFieldLocalState(true, false)
+	state := NewBuildFieldLocalState(true, false, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addFixedValue(42, uint64(i))
 	}
@@ -60,7 +60,7 @@ func TestBuildFieldLocalStateReleaseClearsFixed(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateReleaseClearsLenMap(t *testing.T) {
-	state := NewBuildFieldLocalState(false, true)
+	state := NewBuildFieldLocalState(false, true, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addLen(3, uint64(i))
 	}
@@ -72,7 +72,7 @@ func TestBuildFieldLocalStateReleaseClearsLenMap(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateReleaseClearsNils(t *testing.T) {
-	state := NewBuildFieldLocalState(false, false)
+	state := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addNil(uint64(i))
 	}
@@ -84,7 +84,7 @@ func TestBuildFieldLocalStateReleaseClearsNils(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateFlushAllIntoMergesNilSource(t *testing.T) {
-	state := NewBuildFieldLocalState(false, false)
+	state := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addNil(uint64(i))
 	}
@@ -102,7 +102,7 @@ func TestBuildFieldLocalStateFlushAllIntoMergesNilSource(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
-	state := NewBuildFieldLocalState(false, true)
+	state := NewBuildFieldLocalState(false, true, BuildFieldRunTargetEntries)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.addLen(3, uint64(i))
 	}
@@ -120,7 +120,7 @@ func TestBuildFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
 }
 
 func TestBuildFieldLocalStateFlushAllIntoDropsOversizedLenMap(t *testing.T) {
-	state := NewBuildFieldLocalState(false, true)
+	state := NewBuildFieldLocalState(false, true, BuildFieldRunTargetEntries)
 	for i := 0; i <= indexdata.LenPostingMapMaxRetainedLen; i++ {
 		state.addLen(i, uint64(i+1))
 	}
@@ -134,6 +134,62 @@ func TestBuildFieldLocalStateFlushAllIntoDropsOversizedLenMap(t *testing.T) {
 	}
 }
 
+func TestBuildFieldLocalStateUsesRunTarget(t *testing.T) {
+	stringState := NewBuildFieldLocalState(false, false, 3)
+	stringState.addValue("a", 1)
+	stringState.addValue("b", 2)
+	if stringState.ShouldFlushRegular() {
+		t.Fatalf("string state flushed before run target")
+	}
+	stringState.addValue("c", 3)
+	if !stringState.ShouldFlushRegular() {
+		t.Fatalf("string state did not flush at run target")
+	}
+	stringState.Release()
+
+	fixedState := NewBuildFieldLocalState(true, false, 2)
+	fixedState.addFixedValue(1, 1)
+	if fixedState.ShouldFlushRegular() {
+		t.Fatalf("fixed state flushed before run target")
+	}
+	fixedState.addFixedValue(2, 2)
+	if !fixedState.ShouldFlushRegular() {
+		t.Fatalf("fixed state did not flush at run target")
+	}
+	fixedState.Release()
+}
+
+func TestBuildFieldLocalStateFlushesByPostingAdds(t *testing.T) {
+	if !buildFieldFlushByPostingAdds {
+		t.Skip("posting-add flush disabled")
+	}
+
+	state := NewBuildFieldLocalState(false, false, 2)
+	defer state.Release()
+
+	target := 2 * buildFieldRunTargetPostingAddMultiplier
+	for i := 1; i < target; i++ {
+		state.addValue("hot", uint64(i))
+	}
+	if state.ShouldFlushRegular() {
+		t.Fatalf("state flushed before posting-add target")
+	}
+	state.addValue("hot", uint64(target))
+	if !state.ShouldFlushRegular() {
+		t.Fatalf("state did not flush at posting-add target")
+	}
+
+	dst := NewBuildFieldState(false)
+	defer dst.Release()
+	state.FlushRegularInto(dst)
+	if state.regularAdds != 0 {
+		t.Fatalf("regularAdds=%d want 0 after flush", state.regularAdds)
+	}
+	if state.ShouldFlushRegular() {
+		t.Fatalf("state still wants regular flush after flush")
+	}
+}
+
 func TestBuildFieldStateMaterializeStorageDetachesRuns(t *testing.T) {
 	state := NewBuildFieldState(false)
 	state.runs = []indexdata.FieldStorageRun{{}}
@@ -142,6 +198,38 @@ func TestBuildFieldStateMaterializeStorageDetachesRuns(t *testing.T) {
 	defer storage.Release()
 	if len(state.runs) != 0 {
 		t.Fatalf("expected runs to be detached during materialization")
+	}
+}
+
+func TestBuildFieldStateMaterializeStatsCountsRunKeys(t *testing.T) {
+	left := indexdata.GetPostingMap()
+	ids := posting.List{}
+	ids = ids.BuildAdded(1)
+	ids = ids.BuildAdded(2)
+	left["a"] = ids
+	left["b"] = buildStateSingleton(3)
+	runLeft := indexdata.NewStringFieldStorageRunFromPostingMap(left)
+	indexdata.ReleasePostingMap(left)
+
+	right := indexdata.GetPostingMap()
+	ids = posting.List{}
+	ids = ids.BuildAdded(4)
+	ids = ids.BuildAdded(5)
+	ids = ids.BuildAdded(6)
+	right["c"] = ids
+	runRight := indexdata.NewStringFieldStorageRunFromPostingMap(right)
+	indexdata.ReleasePostingMap(right)
+
+	state := NewBuildFieldState(false)
+	state.runs = []indexdata.FieldStorageRun{runLeft, runRight}
+	defer state.Release()
+
+	keys, work := state.MaterializeStats()
+	if keys != 3 {
+		t.Fatalf("keys=%d want 3", keys)
+	}
+	if work != 3 {
+		t.Fatalf("work=%d want 3", work)
 	}
 }
 

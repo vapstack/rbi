@@ -179,6 +179,10 @@ var (
 		Clear:   pooled.ClearCap,
 		Cleanup: ReleaseMeasureEntryBufs,
 	}
+	measureEntryRunCursorSlicePool = pooled.Slices[measureEntryRunCursor]{
+		MaxCap: 4 << 10,
+		Clear:  pooled.NoClear,
+	}
 	measureBatchDeltaSlicePool = pooled.Slices[MeasureDelta]{
 		MaxCap: 8 << 10,
 		Clear:  pooled.NoClear,

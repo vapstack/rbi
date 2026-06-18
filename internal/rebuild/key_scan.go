@@ -2,6 +2,7 @@ package rebuild
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/vapstack/pooled"
@@ -34,7 +35,6 @@ func buildKeyOnly(cfg Config, state State) (Result, error) {
 		}
 
 		nextGCAt := uint64(indexBuildGCStride)
-		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			if len(v) < 8 {
@@ -69,13 +69,8 @@ func buildKeyOnly(cfg Config, state State) (Result, error) {
 			}
 			scanned++
 
-			if scanned >= nextReleaseAt {
-				cleanupMemory(true)
-				nextReleaseAt += indexBuildReleaseOSMemoryStride
-				nextGCAt = scanned + indexBuildGCStride
-
-			} else if scanned >= nextGCAt {
-				cleanupMemory(false)
+			if scanned >= nextGCAt {
+				runtime.GC()
 				nextGCAt += indexBuildGCStride
 			}
 		}

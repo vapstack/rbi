@@ -1748,9 +1748,16 @@ func stringFieldAccessorBundle(field string, offset uintptr, ptr bool) fieldAcce
 
 			writeBuild: func(ptr unsafe.Pointer, sink BuildSink) { writePtrStringField(ptr, sink, offset) },
 			writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
-				checked := checkedBuildSink{sink: sink, field: field}
-				writePtrStringField(ptr, &checked, offset)
-				return checked.err
+				v := ptrFieldValue[string](ptr, offset)
+				if v == nil {
+					sink.setNil()
+					return nil
+				}
+				if err := validateStringKey(field, *v); err != nil {
+					return err
+				}
+				sink.addString(*v)
+				return nil
 			},
 			writeIndex:   func(ptr unsafe.Pointer, sink IndexSink) { writePtrStringField(ptr, sink, offset) },
 			writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writePtrStringField(ptr, sink, offset) },
@@ -2026,9 +2033,60 @@ func stringSliceAccessorBundle(field string, offset uintptr) fieldAccessorBundle
 	return fieldAccessorBundle{
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) { writeStringSliceField(ptr, sink, offset) },
 		writeChecked: func(ptr unsafe.Pointer, sink BuildSink) error {
-			checked := checkedBuildSink{sink: sink, field: field}
-			writeStringSliceField(ptr, &checked, offset)
-			return checked.err
+			vals := sliceFieldValue[string](ptr, offset)
+			if len(vals) == 0 {
+				sink.setLen(0)
+				return nil
+			}
+			if len(vals) == 1 {
+				if err := validateStringKey(field, vals[0]); err != nil {
+					return err
+				}
+				sink.addString(vals[0])
+				sink.setLen(1)
+				return nil
+			}
+			if len(vals) <= smallDistinctLimit {
+				distinct := 0
+				for i := range vals {
+					cur := vals[i]
+					seen := false
+					for j := 0; j < i; j++ {
+						if vals[j] == cur {
+							seen = true
+							break
+						}
+					}
+					if seen {
+						continue
+					}
+					if err := validateStringKey(field, cur); err != nil {
+						return err
+					}
+					distinct++
+					sink.addString(cur)
+				}
+				sink.setLen(distinct)
+				return nil
+			}
+			seen := stringSetPool.Get()
+			distinct := 0
+			for i := range vals {
+				cur := vals[i]
+				if _, ok := seen[cur]; ok {
+					continue
+				}
+				if err := validateStringKey(field, cur); err != nil {
+					stringSetPool.Put(seen)
+					return err
+				}
+				seen[cur] = struct{}{}
+				distinct++
+				sink.addString(cur)
+			}
+			stringSetPool.Put(seen)
+			sink.setLen(distinct)
+			return nil
 		},
 		writeIndex:   func(ptr unsafe.Pointer, sink IndexSink) { writeStringSliceField(ptr, sink, offset) },
 		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeStringSliceField(ptr, sink, offset) },

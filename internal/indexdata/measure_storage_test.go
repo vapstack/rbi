@@ -3,6 +3,8 @@ package indexdata
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"slices"
 	"testing"
 )
 
@@ -281,6 +283,35 @@ func TestMeasureStorageFromSortedRunsOwned(t *testing.T) {
 			measureStorageAssertValue(t, storage, uint64(tc.rows), uint64(tc.rows*10))
 		})
 	}
+}
+
+func TestMeasureStorageFromSortedRunsOwnedManyRuns(t *testing.T) {
+	const runCount = 128
+	const rows = MeasureChunkThreshold + 257
+	runs := GetMeasureEntrySlots(runCount)
+	for i := 0; i < runCount; i++ {
+		run := GetMeasureEntrySlice(0)
+		for id := i + 1; id <= rows; id += runCount {
+			run = append(run, MeasureEntry{ID: uint64(id), Value: uint64(id * 10)})
+		}
+		runs[i] = run
+	}
+	runs[runCount-1] = append(runs[runCount-1], MeasureEntry{ID: 257, Value: 99_999})
+	slices.SortFunc(runs[runCount-1], func(a, b MeasureEntry) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+
+	storage := NewMeasureStorageFromSortedRunsOwned(runs)
+	defer storage.Release()
+	if !storage.IsChunked() {
+		t.Fatalf("expected chunked storage")
+	}
+	if got := storage.Rows(); got != rows {
+		t.Fatalf("rows: got %d want %d", got, rows)
+	}
+	measureStorageAssertValue(t, storage, 1, 10)
+	measureStorageAssertValue(t, storage, 257, 99_999)
+	measureStorageAssertValue(t, storage, rows, rows*10)
 }
 
 func TestMeasureStorageFromSortedRunsOwnedCoalescesDuplicateIDsFlat(t *testing.T) {

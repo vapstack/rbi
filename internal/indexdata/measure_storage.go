@@ -19,6 +19,17 @@ type MeasureEntry struct {
 	Value uint64
 }
 
+type measureEntryRunCursor struct {
+	run   int
+	pos   int
+	entry MeasureEntry
+}
+
+type measureEntryRunHeap struct {
+	runs [][]MeasureEntry
+	buf  []measureEntryRunCursor
+}
+
 type MeasureDelta struct {
 	ID    uint64
 	NewOK bool
@@ -303,15 +314,23 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 		return MeasureStorage{}
 	}
 
-	pos := pooled.GetIntSlice(len(runs))[:len(runs)]
-	clear(pos)
+	h := measureEntryRunHeap{
+		runs: runs,
+		buf:  measureEntryRunCursorSlicePool.Get(len(runs)),
+	}
+	for i := range runs {
+		if len(runs[i]) > 0 {
+			h.buf = append(h.buf, measureEntryRunCursor{run: i, entry: runs[i][0]})
+		}
+	}
+	h.init()
 	if total <= MeasureChunkThreshold {
 		root := measureFlatRootPool.Get()
 		root.ids = pooled.GetUint64Slice(total)[:total]
 		root.values = pooled.GetUint64Slice(total)[:total]
 		rows := 0
 		for {
-			entry, ok := popUniqueMeasureEntryRun(runs, pos)
+			entry, ok := h.popUnique()
 			if !ok {
 				break
 			}
@@ -322,8 +341,8 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 		root.ids = root.ids[:rows]
 		root.values = root.values[:rows]
 		root.refs.Store(1)
+		h.release()
 		releaseMeasureEntryRunsOwned(runs)
-		pooled.ReleaseIntSlice(pos)
 		return MeasureStorage{flat: root}
 	}
 
@@ -332,7 +351,7 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 	var chunk *measureChunk
 	rows := 0
 	for {
-		entry, ok := popUniqueMeasureEntryRun(runs, pos)
+		entry, ok := h.popUnique()
 		if !ok {
 			break
 		}
@@ -371,54 +390,112 @@ func NewMeasureStorageFromSortedRunsOwned(runs [][]MeasureEntry) MeasureStorage 
 		}
 		flat.refs.Store(1)
 		root.release()
+		h.release()
 		releaseMeasureEntryRunsOwned(runs)
-		pooled.ReleaseIntSlice(pos)
 		return MeasureStorage{flat: flat}
 	}
 
+	h.release()
 	releaseMeasureEntryRunsOwned(runs)
-	pooled.ReleaseIntSlice(pos)
 	return MeasureStorage{chunked: root}
 }
 
-func popUniqueMeasureEntryRun(runs [][]MeasureEntry, pos []int) (MeasureEntry, bool) {
-	best := -1
-	bestID := uint64(0)
-	duplicateHead := false
-	for i := range runs {
-		p := pos[i]
-		if p == len(runs[i]) {
-			continue
-		}
-		id := runs[i][p].ID
-		if best < 0 || id < bestID {
-			best = i
-			bestID = id
-			duplicateHead = false
-			continue
-		}
-		if id == bestID {
-			duplicateHead = true
-		}
+func (h measureEntryRunHeap) Len() int { return len(h.buf) }
+
+func (h measureEntryRunHeap) less(i, j int) bool {
+	a := h.buf[i]
+	b := h.buf[j]
+	if a.entry.ID != b.entry.ID {
+		return a.entry.ID < b.entry.ID
 	}
-	if best < 0 {
+	if a.run != b.run {
+		return a.run < b.run
+	}
+	return a.pos < b.pos
+}
+
+func (h measureEntryRunHeap) swap(i, j int) {
+	h.buf[i], h.buf[j] = h.buf[j], h.buf[i]
+}
+
+func (h *measureEntryRunHeap) init() {
+	for i := len(h.buf)/2 - 1; i >= 0; i-- {
+		h.down(i)
+	}
+}
+
+func (h *measureEntryRunHeap) down(pos int) {
+	for {
+		left := pos*2 + 1
+		if left >= len(h.buf) {
+			return
+		}
+		smallest := left
+		right := left + 1
+		if right < len(h.buf) && h.less(right, left) {
+			smallest = right
+		}
+		if !h.less(smallest, pos) {
+			return
+		}
+		h.swap(pos, smallest)
+		pos = smallest
+	}
+}
+
+func (h *measureEntryRunHeap) up(pos int) {
+	for pos > 0 {
+		parent := (pos - 1) >> 1
+		if !h.less(pos, parent) {
+			return
+		}
+		h.swap(parent, pos)
+		pos = parent
+	}
+}
+
+func (h *measureEntryRunHeap) push(run, pos int) {
+	if pos == len(h.runs[run]) {
+		return
+	}
+	h.buf = append(h.buf, measureEntryRunCursor{
+		run:   run,
+		pos:   pos,
+		entry: h.runs[run][pos],
+	})
+	h.up(len(h.buf) - 1)
+}
+
+func (h *measureEntryRunHeap) pop() measureEntryRunCursor {
+	item := h.buf[0]
+	last := len(h.buf) - 1
+	h.buf[0] = h.buf[last]
+	h.buf = h.buf[:last]
+	if len(h.buf) > 0 {
+		h.down(0)
+	}
+	return item
+}
+
+func (h *measureEntryRunHeap) popUnique() (MeasureEntry, bool) {
+	if len(h.buf) == 0 {
 		return MeasureEntry{}, false
 	}
-	entry := runs[best][pos[best]]
-	next := pos[best] + 1
-	if !duplicateHead && (next == len(runs[best]) || runs[best][next].ID != bestID) {
-		pos[best] = next
-		return entry, true
-	}
-	for i := range runs {
-		p := pos[i]
-		for p < len(runs[i]) && runs[i][p].ID == bestID {
-			entry = runs[i][p]
-			p++
-		}
-		pos[i] = p
+	item := h.pop()
+	entry := item.entry
+	id := entry.ID
+	h.push(item.run, item.pos+1)
+	for len(h.buf) > 0 && h.buf[0].entry.ID == id {
+		item = h.pop()
+		entry = item.entry
+		h.push(item.run, item.pos+1)
 	}
 	return entry, true
+}
+
+func (h *measureEntryRunHeap) release() {
+	measureEntryRunCursorSlicePool.Put(h.buf)
+	h.buf = nil
 }
 
 func releaseMeasureEntryRunsOwned(runs [][]MeasureEntry) {

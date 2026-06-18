@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"runtime/debug"
 	"sync"
 
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -32,7 +31,7 @@ type rawdata struct {
 type buildData struct {
 	fieldStates        []*schema.BuildFieldState
 	localUniverse      []posting.List
-	localMeasureStates [][][]indexdata.MeasureEntry
+	localMeasureStates [][][][]indexdata.MeasureEntry
 	keyIndex           indexdata.FieldStorage
 	workerErrs         []error
 	ok                 bool
@@ -44,11 +43,25 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 		fieldStates[i] = schema.NewBuildFieldState(active[i].slice)
 	}
 
-	workers := runtime.NumCPU()
+	workers := min(4, runtime.GOMAXPROCS(0))
+	runTarget := schema.BuildFieldRunTargetEntries
+	if len(activeMeasures) == 0 {
+		scalarOnly := true
+		for i := range active {
+			if active[i].slice {
+				scalarOnly = false
+				break
+			}
+		}
+		if scalarOnly {
+			runTarget = scalarBuildFieldRunTargetEntries
+		}
+	}
+
 	data := &buildData{
 		fieldStates:        fieldStates,
 		localUniverse:      make([]posting.List, workers),
-		localMeasureStates: make([][][]indexdata.MeasureEntry, workers),
+		localMeasureStates: make([][][][]indexdata.MeasureEntry, workers),
 		workerErrs:         make([]error, workers),
 	}
 	defer cleanupBuildFailure(&data.ok, data.fieldStates, data.localUniverse)
@@ -65,7 +78,7 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 		}()
 	}
 
-	jobs := make(chan rawdata, 10000)
+	jobs := make(chan rawdata, workers*64)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -81,15 +94,15 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 			lu = posting.List{}
 			localStates := make([]schema.BuildFieldLocalState, len(active))
 			for i := range active {
-				localStates[i] = schema.NewBuildFieldLocalState(active[i].numeric, active[i].slice)
+				localStates[i] = schema.NewBuildFieldLocalState(active[i].numeric, active[i].slice, runTarget)
 			}
 			defer cleanupLocalStates(localStates)
 
-			localMeasures := make([][]indexdata.MeasureEntry, len(cfg.Schema.Measures))
+			localMeasures := make([][][]indexdata.MeasureEntry, len(cfg.Schema.Measures))
 			measureOK := false
 			defer func() {
 				if !measureOK {
-					indexdata.ReleaseMeasureEntryBufs(localMeasures)
+					releaseMeasureRuns(localMeasures)
 				}
 			}()
 
@@ -147,13 +160,21 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 
 				for _, acc := range activeMeasures {
 					if value, ok := acc.Read(ptr); ok {
-						buf := localMeasures[acc.Ordinal]
-						if buf == nil {
-							buf = indexdata.GetMeasureEntrySlice(0)
-							localMeasures[acc.Ordinal] = buf
+						runs := localMeasures[acc.Ordinal]
+						if runs == nil {
+							runs = indexdata.GetMeasureEntrySlots(0)
 						}
+						if len(runs) == 0 || len(runs[len(runs)-1]) == measureBuildRunTargetEntries {
+							capHint := 0
+							if len(runs) > 0 {
+								capHint = measureBuildRunTargetEntries
+							}
+							runs = append(runs, indexdata.GetMeasureEntrySlice(capHint))
+						}
+						buf := runs[len(runs)-1]
 						buf = append(buf, indexdata.MeasureEntry{ID: idx, Value: value})
-						localMeasures[acc.Ordinal] = buf
+						runs[len(runs)-1] = buf
+						localMeasures[acc.Ordinal] = runs
 					}
 				}
 				cfg.Release(ptr)
@@ -189,8 +210,6 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 		done := ctx.Done()
 		c := b.Cursor()
 
-		nextGCAt := uint64(indexBuildGCStride)
-		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		scanned := uint64(0)
 		maxStringIdx := uint64(0)
 
@@ -249,16 +268,6 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 			}
 
 			scanned++
-
-			if scanned >= nextReleaseAt {
-				cleanupMemory(true)
-				nextReleaseAt += indexBuildReleaseOSMemoryStride
-				nextGCAt = scanned + indexBuildGCStride
-
-			} else if scanned >= nextGCAt {
-				cleanupMemory(false)
-				nextGCAt += indexBuildGCStride
-			}
 		}
 		if cfg.StrKey && stringMap.Sequence() < maxStringIdx {
 			return fmt.Errorf("string storage format: string map sequence %d lower than max live idx %d", stringMap.Sequence(), maxStringIdx)
@@ -287,17 +296,10 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 /**/
 
 const (
-	indexBuildGCStride              = 100_000
-	indexBuildReleaseOSMemoryStride = 1_000_000
+	indexBuildGCStride               = 500_000
+	scalarBuildFieldRunTargetEntries = max(2<<10, indexdata.FieldChunkTargetEntries*4)
+	measureBuildRunTargetEntries     = 16 << 10
 )
-
-func cleanupMemory(releaseOSMemory bool) {
-	if releaseOSMemory {
-		debug.FreeOSMemory()
-		return
-	}
-	runtime.GC()
-}
 
 func cleanupBuildFailure(ok *bool, fieldStates []*schema.BuildFieldState, localUniverse []posting.List) {
 	if *ok {
@@ -317,12 +319,21 @@ func cleanupLocalStates(localStates []schema.BuildFieldLocalState) {
 	}
 }
 
-func cleanupMeasureStates(ok *bool, states [][][]indexdata.MeasureEntry) {
+func cleanupMeasureStates(ok *bool, states [][][][]indexdata.MeasureEntry) {
 	if *ok {
 		return
 	}
 	for i := range states {
-		indexdata.ReleaseMeasureEntryBufs(states[i])
+		releaseMeasureRuns(states[i])
+	}
+}
+
+func releaseMeasureRuns(states [][][]indexdata.MeasureEntry) {
+	for i := range states {
+		if states[i] != nil {
+			indexdata.ReleaseMeasureEntrySlots(states[i])
+			states[i] = nil
+		}
 	}
 }
 

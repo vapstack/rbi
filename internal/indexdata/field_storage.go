@@ -881,8 +881,18 @@ func (h *fieldStorageRunHeap) down(pos int) {
 }
 
 func (h *fieldStorageRunHeap) push(run, pos int) {
-	cur := h.runs[run]
-	if pos < 0 || pos >= cur.KeyCount() {
+	cur := &h.runs[run]
+	if pos >= cur.KeyCount() {
+		// takePosting has detached every posting by the time a run is exhausted.
+		// String key headers stay alive until the flat/chunk builders copy key bytes.
+		if cur.u64Buf != nil {
+			pooled.ReleaseUint64Slice(cur.u64Buf)
+			cur.u64Buf = nil
+		}
+		if cur.postBuf != nil {
+			posting.ReleaseSlice(cur.postBuf)
+			cur.postBuf = nil
+		}
 		return
 	}
 	h.buf = append(h.buf, fieldStorageRunCursor{

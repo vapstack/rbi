@@ -1077,6 +1077,55 @@ func TestFieldStorageRunFromPostingMapOwned_DrainsMaps(t *testing.T) {
 	}
 }
 
+func TestFieldStorageRunHeapKeepsStringKeysWhenRunExhausted(t *testing.T) {
+	m := GetPostingMap()
+	m["a"] = fieldStoragePosting(1)
+	run := NewStringFieldStorageRunFromPostingMap(m)
+	ReleasePostingMap(m)
+
+	h := fieldStorageRunHeap{runs: []FieldStorageRun{run}}
+	item := fieldStorageRunCursor{run: 0, pos: 0, key: run.keyAt(0)}
+	ids := h.runs[item.run].takePosting(item.pos)
+	h.push(item.run, item.pos+1)
+
+	if h.runs[0].stringBuf == nil {
+		t.Fatalf("string run keys were released before key bytes were copied")
+	}
+	if h.runs[0].postBuf != nil {
+		t.Fatalf("exhausted string run postings were not released")
+	}
+	if keycodec.Compare(item.key, keycodec.FromString("a")) != 0 {
+		t.Fatalf("exhausted string run key changed before copy")
+	}
+
+	ids.Release()
+	h.runs[0].ReleaseOwned()
+}
+
+func TestFieldStorageRunHeapReleasesFixedKeysWhenRunExhausted(t *testing.T) {
+	m := GetFixedPostingMap()
+	m[1] = fieldStoragePosting(1)
+	run := NewFixedFieldStorageRunFromPostingMap(m)
+	ReleaseFixedPostingMap(m)
+
+	h := fieldStorageRunHeap{runs: []FieldStorageRun{run}}
+	item := fieldStorageRunCursor{run: 0, pos: 0, key: run.keyAt(0)}
+	ids := h.runs[item.run].takePosting(item.pos)
+	h.push(item.run, item.pos+1)
+
+	if h.runs[0].u64Buf != nil {
+		t.Fatalf("exhausted fixed run keys were not released")
+	}
+	if h.runs[0].postBuf != nil {
+		t.Fatalf("exhausted fixed run postings were not released")
+	}
+	if item.key.U64() != 1 {
+		t.Fatalf("fixed key changed after run release")
+	}
+
+	ids.Release()
+}
+
 func TestFieldStorageFromRunsOwned_MergesFixedRuns(t *testing.T) {
 	left := GetFixedPostingMap()
 	left[4] = fieldStoragePosting(40)

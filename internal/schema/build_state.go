@@ -20,11 +20,13 @@ type BuildFieldState struct {
 }
 
 type BuildFieldLocalState struct {
-	numeric bool
-	vals    map[string]posting.List
-	fixed   map[uint64]posting.List
-	lenMap  map[uint32]posting.List
-	nils    posting.List
+	numeric     bool
+	runTarget   int
+	regularAdds int
+	vals        map[string]posting.List
+	fixed       map[uint64]posting.List
+	lenMap      map[uint32]posting.List
+	nils        posting.List
 }
 
 type BuildSink struct {
@@ -32,7 +34,12 @@ type BuildSink struct {
 	Idx   uint64
 }
 
-const buildIndexRunTargetEntries = max(4<<10, indexdata.FieldChunkTargetEntries*16)
+const (
+	BuildFieldRunTargetEntries = max(16<<10, indexdata.FieldChunkTargetEntries*16)
+
+	buildFieldFlushByPostingAdds            = false
+	buildFieldRunTargetPostingAddMultiplier = 64
+)
 
 func NewBuildFieldState(slice bool) *BuildFieldState {
 	state := &BuildFieldState{}
@@ -42,8 +49,8 @@ func NewBuildFieldState(slice bool) *BuildFieldState {
 	return state
 }
 
-func NewBuildFieldLocalState(numeric bool, slice bool) BuildFieldLocalState {
-	state := BuildFieldLocalState{numeric: numeric}
+func NewBuildFieldLocalState(numeric bool, slice bool, runTarget int) BuildFieldLocalState {
+	state := BuildFieldLocalState{numeric: numeric, runTarget: runTarget}
 	if slice {
 		state.lenMap = indexdata.GetLenPostingMap()
 	}
@@ -59,6 +66,10 @@ func (s *BuildFieldLocalState) addValue(key string, idx uint64) {
 		key = strings.Clone(key)
 	}
 	s.vals[key] = ids.BuildAdded(idx)
+
+	if buildFieldFlushByPostingAdds {
+		s.regularAdds++
+	}
 }
 
 func (s *BuildFieldLocalState) addFixedValue(key uint64, idx uint64) {
@@ -66,6 +77,7 @@ func (s *BuildFieldLocalState) addFixedValue(key uint64, idx uint64) {
 		s.fixed = indexdata.GetFixedPostingMap()
 	}
 	s.fixed[key] = s.fixed[key].BuildAdded(idx)
+	s.regularAdds++
 }
 
 func (s *BuildFieldLocalState) addNil(idx uint64) {
@@ -81,10 +93,13 @@ func (s *BuildFieldLocalState) addLen(length int, idx uint64) {
 }
 
 func (s *BuildFieldLocalState) ShouldFlushRegular() bool {
-	if s.numeric {
-		return len(s.fixed) >= buildIndexRunTargetEntries
+	if buildFieldFlushByPostingAdds && s.regularAdds >= s.runTarget*buildFieldRunTargetPostingAddMultiplier {
+		return true
 	}
-	return len(s.vals) >= buildIndexRunTargetEntries
+	if s.numeric {
+		return len(s.fixed) >= s.runTarget
+	}
+	return len(s.vals) >= s.runTarget
 }
 
 func (s *BuildFieldState) appendRun(run indexdata.FieldStorageRun) {
@@ -97,6 +112,7 @@ func (s *BuildFieldState) appendRun(run indexdata.FieldStorageRun) {
 }
 
 func (s *BuildFieldLocalState) FlushRegularInto(dst *BuildFieldState) {
+	s.regularAdds = 0
 	if s.numeric {
 		if run := indexdata.NewFixedFieldStorageRunFromPostingMap(s.fixed); run.KeyCount() > 0 {
 			dst.appendRun(run)
@@ -137,6 +153,8 @@ func (s *BuildFieldLocalState) FlushAllInto(dst *BuildFieldState) {
 }
 
 func (s *BuildFieldLocalState) Release() {
+	s.regularAdds = 0
+
 	posting.ReleaseMapString(s.vals)
 	indexdata.ReleasePostingMap(s.vals)
 	s.vals = nil
@@ -160,6 +178,14 @@ func (s *BuildFieldState) MaterializeStorage() indexdata.FieldStorage {
 	runs := s.runs
 	s.runs = nil
 	return indexdata.NewRegularFieldStorageFromRunsOwned(runs)
+}
+
+func (s *BuildFieldState) MaterializeStats() (int, uint64) {
+	var keys int
+	for i := range s.runs {
+		keys += s.runs[i].KeyCount()
+	}
+	return keys, uint64(keys)
 }
 
 func (s *BuildFieldState) Release() {

@@ -1,6 +1,7 @@
 package rebuild
 
 import (
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -86,8 +87,12 @@ func Build(cfg Config, state State) (Result, error) {
 		return Result{}, err
 	}
 
+	runtime.GC()
+
 	result := materialize(cfg, state, active, activeMeasures, build, start)
 	build.ok = true
-	cleanupMemory(true)
+
+	runtime.GC()
+
 	return result, nil
 }
