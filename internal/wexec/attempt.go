@@ -131,6 +131,11 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 
 	oldVal := state.value
 	snapOld := oldVal
+
+	// key-only indexed snapshots exist only for string keys
+	//
+	// numeric key DB without indexed fields runs in transparent mode,
+	// so wexec is not configured as indexed there
 	if snapOld == nil && state.exists && b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() {
 		snapOld = unsafe.Pointer(&snapshotOldValueExists)
 	}

@@ -150,19 +150,25 @@ func releaseRuntimeTestRec(ptr unsafe.Pointer) {
 	*(*runtimeTestRec)(ptr) = runtimeTestRec{}
 }
 
+func TestRuntimeNumericKeyOnlySchemaDoesNotCreateIndex(t *testing.T) {
+	rt, err := schema.Compile(reflect.TypeOf(runtimeTestNoIndexRec{}), schema.Config{Index: map[string]schema.IndexKind{}})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	r, err := NewIndex(Config{Schema: rt, StrKey: false, StrKeyIndex: true})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	if r != nil {
+		t.Fatal("numeric key-only schema must not create indexed runtime")
+	}
+}
+
 func TestRuntimeStringKeyIndexOnlyCreatesRuntimeAndResolvesKey(t *testing.T) {
 	rt, err := schema.Compile(reflect.TypeOf(runtimeTestNoIndexRec{}), schema.Config{Index: map[string]schema.IndexKind{}})
 	if err != nil {
 		t.Fatalf("schema.Compile: %v", err)
 	}
-	numeric, err := NewIndex(Config{Schema: rt, StrKey: false, StrKeyIndex: true})
-	if err != nil {
-		t.Fatalf("numeric NewIndex: %v", err)
-	}
-	if numeric != nil {
-		t.Fatal("numeric StringKeyIndex must not activate key-index-only runtime")
-	}
-
 	r, err := NewIndex(Config{Schema: rt, StrKey: true, StrKeyIndex: true})
 	if err != nil {
 		t.Fatalf("NewIndex: %v", err)
