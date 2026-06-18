@@ -91,6 +91,8 @@ const NoFieldOrdinal = -1
 type FieldCaps uint8
 
 const (
+	// FieldCapNilPredicate lets preparation accept nil predicate inputs.
+	// It does not imply that the field has a physical nil posting.
 	FieldCapNilPredicate FieldCaps = 1 << iota
 	FieldCapArrayPredicate
 	FieldCapLenOrder

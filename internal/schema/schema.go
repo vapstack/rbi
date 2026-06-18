@@ -105,12 +105,17 @@ func FieldUsesOrderedNumericKeys(f *Field) bool {
 	return f != nil && !f.Slice && f.KeyKind == FieldWriteKeysOrderedU64
 }
 
+// FieldUsesNilIndex reports whether writes maintain a physical nil posting
+// for the field. Slice fields store element postings and length only.
 func FieldUsesNilIndex(f *Field) bool {
 	return f != nil && (f.Ptr || (!f.Slice && f.UseVI && f.Kind == reflect.Interface))
 }
 
 func FieldQueryCaps(f *Field) qir.FieldCaps {
 	if f.Slice {
+		// Nil capability on slice fields is a query-shape contract:
+		// nil elements in RHS slices are accepted and ignored by value lookup.
+		// It is not a physical nil index contract, FieldUsesNilIndex remains false.
 		return qir.FieldCapAll
 	}
 	// Nil predicates on scalar fields are valid even when the nil posting is
