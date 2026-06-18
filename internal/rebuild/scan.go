@@ -269,6 +269,14 @@ func scan(cfg Config, active []buildField, activeMeasures []schema.MeasureFieldA
 
 			scanned++
 		}
+
+		// rbimap is trusted durable storage owned by the writer path
+		//
+		// rebuild is not a string-map verifier:
+		// checking every live id would add bbolt lookup per string key
+		// and force rebuild to touch the whole reverse-map working set
+		//
+		// sequence check only proves that future writers cannot reuse a live id
 		if cfg.StrKey && stringMap.Sequence() < maxStringIdx {
 			return fmt.Errorf("string storage format: string map sequence %d lower than max live idx %d", stringMap.Sequence(), maxStringIdx)
 		}
