@@ -396,6 +396,28 @@ func TestBoundsApplyKeepsTightestEdges(t *testing.T) {
 	if numHi.HiIndex.U64() != 8 || !numHi.HiInc {
 		t.Fatalf("numeric upper bound did not move to lower key: %+v", numHi)
 	}
+
+	var mixedLo Bounds
+	mixedLo.ApplyLo("z", true)
+	mixedLo.ApplyLoIndex(keycodec.FromU64(0), true)
+	if !mixedLo.HasLo || mixedLo.LoNumeric || mixedLo.LoKey != "z" || !mixedLo.LoInc || keycodec.Compare(mixedLo.LoIndex, keycodec.FromString("z")) != 0 {
+		t.Fatalf("mixed lower bound loosened string edge: %+v", mixedLo)
+	}
+	mixedLo.ApplyLoIndex(keycodec.FromU64(^uint64(0)), false)
+	if !mixedLo.LoNumeric || mixedLo.LoIndex.U64() != ^uint64(0) || mixedLo.LoInc {
+		t.Fatalf("mixed lower bound did not move to higher numeric key: %+v", mixedLo)
+	}
+
+	var mixedHi Bounds
+	mixedHi.ApplyHi("m", true)
+	mixedHi.ApplyHiIndex(keycodec.FromU64(0), true)
+	if !mixedHi.HasHi || !mixedHi.HiNumeric || mixedHi.HiIndex.U64() != 0 || !mixedHi.HiInc {
+		t.Fatalf("mixed upper bound did not move to lower numeric key: %+v", mixedHi)
+	}
+	mixedHi.ApplyHi("z", false)
+	if !mixedHi.HiNumeric || mixedHi.HiIndex.U64() != 0 || !mixedHi.HiInc {
+		t.Fatalf("mixed upper bound loosened numeric edge: %+v", mixedHi)
+	}
 }
 
 func TestBoundsApplyPrefixIntersectionAndContradiction(t *testing.T) {
@@ -525,6 +547,60 @@ func TestFieldIndexViewRangeForBounds_MixedPrefixSkipsNumericKeys(t *testing.T) 
 			}
 			if key, _, ok := cur.Next(); ok {
 				t.Fatalf("unexpected extra descending prefix key %q", key.UnsafeString())
+			}
+		})
+	}
+}
+
+func TestFieldIndexViewRangeForBounds_MixedAppliedBoundsUseActiveKeyOrder(t *testing.T) {
+	tests := []struct {
+		name string
+		rows int
+	}{
+		{name: "Flat", rows: 16},
+		{name: "Chunked", rows: fieldIndexChunkThreshold + 17},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := GetFieldEntrySlice(tc.rows)[:tc.rows]
+			entries[0] = Entry{Key: keycodec.FromU64(0), IDs: fieldStorageSingleton(10)}
+			for i := 1; i < tc.rows-1; i++ {
+				entries[i] = Entry{
+					Key: keycodec.FromString(fmt.Sprintf("k/%06d", i)),
+					IDs: fieldStorageSingleton(uint64(i + 100)),
+				}
+			}
+			entries[tc.rows-1] = Entry{Key: keycodec.FromU64(^uint64(0)), IDs: fieldStorageSingleton(20)}
+
+			storage := newRegularFieldStorage(entries)
+			defer storage.Release()
+			ov := NewFieldIndexViewFromStorage(storage)
+
+			var lo Bounds
+			lo.ApplyLo("k/000010", true)
+			lo.ApplyLoIndex(keycodec.FromU64(0), true)
+			cur := ov.NewCursor(ov.RangeForBounds(lo), false)
+			key, _, ok := cur.Next()
+			if !ok || !keycodec.EqualsString(key, "k/000010") {
+				t.Fatalf("mixed lower range first key: got=%q ok=%v", key.UnsafeString(), ok)
+			}
+
+			var hi Bounds
+			hi.ApplyHi("k/000010", true)
+			hi.ApplyHiIndex(keycodec.FromU64(0), true)
+			br := ov.RangeForBounds(hi)
+			buckets, rows := ov.RangeStats(br)
+			if buckets != 1 || rows != 1 {
+				t.Fatalf("mixed upper range stats: buckets=%d rows=%d want 1/1", buckets, rows)
+			}
+			cur = ov.NewCursor(br, false)
+			key, _, ok = cur.Next()
+			if !ok || keycodec.Compare(key, keycodec.FromU64(0)) != 0 {
+				t.Fatalf("mixed upper range first key: got=%q ok=%v", key.UnsafeString(), ok)
+			}
+			if key, _, ok = cur.Next(); ok {
+				t.Fatalf("mixed upper range included extra key %q", key.UnsafeString())
 			}
 		})
 	}
@@ -706,11 +782,6 @@ func TestBoundsNormalizeComparesEndpoints(t *testing.T) {
 		t.Fatalf("numeric bounds not marked empty")
 	}
 
-	defer func() {
-		if recover() == nil {
-			t.Fatalf("expected mixed bound representation panic")
-		}
-	}()
 	mixedBounds := Bounds{
 		HasLo:     true,
 		LoKey:     "a",
@@ -721,6 +792,23 @@ func TestBoundsNormalizeComparesEndpoints(t *testing.T) {
 		HiInc:     true,
 	}
 	mixedBounds.Normalize()
+	if !mixedBounds.Empty {
+		t.Fatalf("mixed bounds not marked empty")
+	}
+
+	mixedBounds = Bounds{
+		HasLo:     true,
+		LoIndex:   keycodec.FromU64(1),
+		LoNumeric: true,
+		LoInc:     true,
+		HasHi:     true,
+		HiKey:     "a",
+		HiInc:     true,
+	}
+	mixedBounds.Normalize()
+	if mixedBounds.Empty {
+		t.Fatalf("mixed bounds marked empty")
+	}
 }
 
 func TestFieldIndexViewRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) {

@@ -37,6 +37,12 @@ func (b *Bounds) Normalize() {
 	if b.Empty {
 		return
 	}
+	if b.HasLo && !b.LoNumeric {
+		b.LoIndex = keycodec.FromString(b.LoKey)
+	}
+	if b.HasHi && !b.HiNumeric {
+		b.HiIndex = keycodec.FromString(b.HiKey)
+	}
 
 	if b.HasLo && b.HasHi {
 		cmp := b.compareLoHi()
@@ -51,10 +57,7 @@ func (b *Bounds) Normalize() {
 	}
 
 	if b.HasHi {
-		cmp := strings.Compare(b.HiKey, b.Prefix)
-		if b.HiNumeric {
-			cmp = keycodec.CompareString(b.HiIndex, b.Prefix)
-		}
+		cmp := keycodec.CompareString(b.hiIndex(), b.Prefix)
 		if cmp < 0 || (cmp == 0 && !b.HiInc) {
 			b.SetEmpty()
 			return
@@ -63,10 +66,7 @@ func (b *Bounds) Normalize() {
 
 	if b.HasLo {
 		if upper, ok := keycodec.NewPrefixUpperBound(b.Prefix); ok {
-			cmp := keycodec.CompareStringPrefixUpperBound(b.LoKey, upper)
-			if b.LoNumeric {
-				cmp = keycodec.ComparePrefixUpperBound(b.LoIndex, upper)
-			}
+			cmp := keycodec.ComparePrefixUpperBound(b.loIndex(), upper)
 			if cmp >= 0 {
 				b.SetEmpty()
 			}
@@ -78,24 +78,37 @@ func (b Bounds) IsPointRange() bool {
 	return !b.HasPrefix && b.HasLo && b.HasHi && b.LoInc && b.HiInc && b.compareLoHi() == 0
 }
 
-func (b Bounds) compareLoHi() int {
-	if b.LoNumeric != b.HiNumeric {
-		panic("rbi: mixed range bound key representations")
-	}
+func (b Bounds) loIndex() keycodec.IndexKey {
 	if b.LoNumeric {
-		return keycodec.Compare(b.LoIndex, b.HiIndex)
+		return b.LoIndex
 	}
-	return strings.Compare(b.LoKey, b.HiKey)
+	return keycodec.FromString(b.LoKey)
+}
+
+func (b Bounds) hiIndex() keycodec.IndexKey {
+	if b.HiNumeric {
+		return b.HiIndex
+	}
+	return keycodec.FromString(b.HiKey)
+}
+
+func (b Bounds) compareLoHi() int {
+	return keycodec.Compare(b.loIndex(), b.hiIndex())
 }
 
 func (b *Bounds) ApplyLo(key string, inc bool) {
 	if b.Empty {
 		return
 	}
-	if !b.HasLo || b.LoKey < key || (b.LoKey == key && b.LoInc && !inc) {
+	idxKey := keycodec.FromString(key)
+	cmp := -1
+	if b.HasLo {
+		cmp = keycodec.Compare(b.loIndex(), idxKey)
+	}
+	if !b.HasLo || cmp < 0 || (cmp == 0 && b.LoInc && !inc) {
 		b.HasLo = true
 		b.LoKey = key
-		b.LoIndex = keycodec.IndexKey{}
+		b.LoIndex = idxKey
 		b.LoNumeric = false
 		b.LoInc = inc
 	}
@@ -106,7 +119,11 @@ func (b *Bounds) ApplyLoIndex(key keycodec.IndexKey, inc bool) {
 	if b.Empty {
 		return
 	}
-	if !b.HasLo || keycodec.Compare(b.LoIndex, key) < 0 || (keycodec.Compare(b.LoIndex, key) == 0 && b.LoInc && !inc) {
+	cmp := -1
+	if b.HasLo {
+		cmp = keycodec.Compare(b.loIndex(), key)
+	}
+	if !b.HasLo || cmp < 0 || (cmp == 0 && b.LoInc && !inc) {
 		b.HasLo = true
 		b.LoKey = ""
 		b.LoIndex = key
@@ -120,10 +137,15 @@ func (b *Bounds) ApplyHi(key string, inc bool) {
 	if b.Empty {
 		return
 	}
-	if !b.HasHi || b.HiKey > key || (b.HiKey == key && b.HiInc && !inc) {
+	idxKey := keycodec.FromString(key)
+	cmp := 1
+	if b.HasHi {
+		cmp = keycodec.Compare(b.hiIndex(), idxKey)
+	}
+	if !b.HasHi || cmp > 0 || (cmp == 0 && b.HiInc && !inc) {
 		b.HasHi = true
 		b.HiKey = key
-		b.HiIndex = keycodec.IndexKey{}
+		b.HiIndex = idxKey
 		b.HiNumeric = false
 		b.HiInc = inc
 	}
@@ -134,7 +156,11 @@ func (b *Bounds) ApplyHiIndex(key keycodec.IndexKey, inc bool) {
 	if b.Empty {
 		return
 	}
-	if !b.HasHi || keycodec.Compare(b.HiIndex, key) > 0 || (keycodec.Compare(b.HiIndex, key) == 0 && b.HiInc && !inc) {
+	cmp := 1
+	if b.HasHi {
+		cmp = keycodec.Compare(b.hiIndex(), key)
+	}
+	if !b.HasHi || cmp > 0 || (cmp == 0 && b.HiInc && !inc) {
 		b.HasHi = true
 		b.HiKey = ""
 		b.HiIndex = key
