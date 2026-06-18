@@ -304,8 +304,13 @@ func deepCopyValue(src any) any {
 }
 
 type deepCopyState struct {
-	refs   map[uintptr]reflect.Value
+	refs   map[refCopyKey]reflect.Value
 	slices map[sliceCopyKey]reflect.Value
+}
+
+type refCopyKey struct {
+	ptr uintptr
+	typ reflect.Type
 }
 
 type sliceCopyKey struct {
@@ -331,14 +336,32 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 		}
 	}
 
+	var refKey refCopyKey
 	switch kind {
-	case reflect.Ptr, reflect.Map:
+	case reflect.Ptr:
+		typ := origin.Type()
+		if typ.Name() != "" {
+			typ = reflect.PointerTo(typ.Elem())
+		}
+		refKey = refCopyKey{ptr: origin.Pointer(), typ: typ}
+	case reflect.Map:
+		typ := origin.Type()
+		if typ.Name() != "" {
+			typ = reflect.MapOf(typ.Key(), typ.Elem())
+		}
+		refKey = refCopyKey{ptr: origin.Pointer(), typ: typ}
+	}
+	if refKey.typ != nil {
 		if state.refs != nil {
-			if clone, ok := state.refs[origin.Pointer()]; ok {
+			if clone, ok := state.refs[refKey]; ok {
+				if clone.Type() != origin.Type() {
+					clone = clone.Convert(origin.Type())
+				}
 				return clone
 			}
 		}
-	case reflect.Slice:
+	}
+	if kind == reflect.Slice {
 		if origin.Len() != 0 && state.slices != nil {
 			key := sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len(), cap: origin.Cap()}
 			if clone, ok := state.slices[key]; ok {
@@ -374,13 +397,16 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 		return s
 
 	case reflect.Ptr:
-		ptr := reflect.New(origin.Elem().Type())
+		ptr := reflect.New(origin.Type().Elem())
 		if state.refs == nil {
-			state.refs = make(map[uintptr]reflect.Value)
+			state.refs = make(map[refCopyKey]reflect.Value)
 		}
-		state.refs[origin.Pointer()] = ptr
+		state.refs[refKey] = ptr
 		clone := deepCopy(origin.Elem(), state)
 		ptr.Elem().Set(clone)
+		if ptr.Type() != origin.Type() {
+			return ptr.Convert(origin.Type())
+		}
 		return ptr
 
 	case reflect.Slice:
@@ -400,9 +426,9 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 	case reflect.Map:
 		m := reflect.MakeMap(origin.Type())
 		if state.refs == nil {
-			state.refs = make(map[uintptr]reflect.Value)
+			state.refs = make(map[refCopyKey]reflect.Value)
 		}
-		state.refs[origin.Pointer()] = m
+		state.refs[refKey] = m
 		for _, key := range origin.MapKeys() {
 			keyClone := deepCopy(key, state)
 			valClone := deepCopy(origin.MapIndex(key), state)

@@ -1241,6 +1241,13 @@ type schemaTestPatchApplyRec struct {
 	VIPtr     *schemaTestVI
 }
 
+type schemaTestNamedIntPtr *int
+
+type schemaTestNamedPointerApplyRec struct {
+	Ptr schemaTestNamedIntPtr
+	Any any
+}
+
 func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestPatchRec](), Config{Index: map[string]IndexKind{"Scalar": IndexDefault, "VI": IndexUnique}})
 	if err != nil {
@@ -1416,6 +1423,34 @@ func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
 	}
 	if rec.VI != "aa" || rec.VIPtr == nil || *rec.VIPtr != "BB" {
 		t.Fatalf("ValueIndexer assignment failed: VI=%q VIPtr=%v", rec.VI, rec.VIPtr)
+	}
+}
+
+func TestPatchRuntimeApplyPreservesNamedPointerTypes(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestNamedPointerApplyRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	value := 11
+	ptr := schemaTestNamedIntPtr(&value)
+	var rec schemaTestNamedPointerApplyRec
+	err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{
+		{Name: "Ptr", Value: ptr},
+		{Name: "Any", Value: ptr},
+	}, false)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if rec.Ptr == nil || *rec.Ptr != 11 {
+		t.Fatalf("named pointer assignment failed: %#v", rec.Ptr)
+	}
+	if rec.Ptr == ptr {
+		t.Fatal("named pointer assignment aliases source")
+	}
+	if got, ok := rec.Any.(schemaTestNamedIntPtr); !ok || got == nil || *got != 11 {
+		t.Fatalf("interface named pointer assignment failed: %#v", rec.Any)
 	}
 }
 

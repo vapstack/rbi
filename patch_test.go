@@ -433,6 +433,20 @@ type patchInterfacePointerRec struct {
 	Values []any
 }
 
+type patchNamedIntPtr *int
+
+type patchNamedPointerRec struct {
+	Name  string `db:"name" rbi:"index"`
+	Value patchNamedIntPtr
+}
+
+type patchNamedAnyMap map[string]any
+
+type patchPointerOverlap struct {
+	Value int
+	Next  int
+}
+
 type patchPointerShapeRec struct {
 	Name  string `db:"name" rbi:"index"`
 	Tags  *[]int
@@ -469,6 +483,237 @@ func TestMakePatch_RoundTripPreservesInterfacePointerValues(t *testing.T) {
 	}
 	if got, ok := applied.Values[1].(*int); !ok || got != nil {
 		t.Fatalf("interface slice typed nil pointer round-trip failed: %#v", applied.Values)
+	}
+}
+
+func TestMakePatch_RoundTripPreservesInterfaceNamedPointerValues(t *testing.T) {
+	db := openTempDBUint64Reflect[patchInterfacePointerRec](t, "patch_interface_named_pointer.db")
+
+	ptr := 11
+	named := patchNamedIntPtr(&ptr)
+	oldVal := &patchInterfacePointerRec{Name: "alice"}
+	newVal := &patchInterfacePointerRec{
+		Name:   "alice",
+		Value:  named,
+		Values: []any{named, &ptr},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	if got, ok := fields["Value"].(patchNamedIntPtr); !ok || got == nil || *got != 11 {
+		t.Fatalf("patch interface named pointer value=%#v", fields["Value"])
+	} else if got == named {
+		t.Fatal("patch interface named pointer aliases source")
+	}
+	if got, ok := fields["Values"].([]any); !ok || len(got) != 2 {
+		t.Fatalf("patch interface named pointer slice=%#v", fields["Values"])
+	} else if namedPtr, ok := got[0].(patchNamedIntPtr); !ok || namedPtr == nil || *namedPtr != 11 {
+		t.Fatalf("patch interface named pointer slice element=%#v", got[0])
+	} else if ptr, ok := got[1].(*int); !ok || ptr == nil || *ptr != 11 {
+		t.Fatalf("patch interface unnamed pointer slice element=%#v", got[1])
+	} else if namedPtr != patchNamedIntPtr(ptr) {
+		t.Fatalf("patch interface pointer aliases were not preserved: %#v", got)
+	}
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+
+	if got, ok := applied.Value.(patchNamedIntPtr); !ok || got == nil || *got != 11 {
+		t.Fatalf("interface named pointer round-trip failed: %#v", applied.Value)
+	}
+	if len(applied.Values) != 2 {
+		t.Fatalf("interface named pointer slice length=%d want 2", len(applied.Values))
+	}
+	if got, ok := applied.Values[0].(patchNamedIntPtr); !ok || got == nil || *got != 11 {
+		t.Fatalf("interface named pointer slice round-trip failed: %#v", applied.Values)
+	} else if ptr, ok := applied.Values[1].(*int); !ok || ptr == nil || *ptr != 11 {
+		t.Fatalf("interface unnamed pointer slice round-trip failed: %#v", applied.Values)
+	} else if got != patchNamedIntPtr(ptr) {
+		t.Fatalf("interface pointer aliases were not preserved: %#v", applied.Values)
+	}
+}
+
+func TestMakePatch_RoundTripPreservesNamedMapAliases(t *testing.T) {
+	db := openTempDBUint64Reflect[patchInterfacePointerRec](t, "patch_named_map_aliases.db")
+
+	shared := map[string]any{"value": 11}
+	namedFirst := patchNamedAnyMap{"value": 33}
+	self := map[string]any{"value": 22}
+	self["self"] = patchNamedAnyMap(self)
+	oldVal := &patchInterfacePointerRec{Name: "alice"}
+	newVal := &patchInterfacePointerRec{
+		Name:   "alice",
+		Values: []any{shared, patchNamedAnyMap(shared), namedFirst, map[string]any(namedFirst), self},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	values, ok := fields["Values"].([]any)
+	if !ok || len(values) != 5 {
+		t.Fatalf("patch named map values=%#v", fields["Values"])
+	}
+	plain, ok := values[0].(map[string]any)
+	if !ok {
+		t.Fatalf("patch plain map value=%#v", values[0])
+	}
+	named, ok := values[1].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("patch named map value=%#v", values[1])
+	}
+	plain["patchedAlias"] = true
+	if named["patchedAlias"] != true {
+		t.Fatalf("patch named map alias was not preserved: %#v", values)
+	}
+	if shared["patchedAlias"] != nil {
+		t.Fatal("patch named map aliases source")
+	}
+	delete(plain, "patchedAlias")
+
+	patchNamedFirst, ok := values[2].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("patch named-first map value=%#v", values[2])
+	}
+	patchNamedFirstPlain, ok := values[3].(map[string]any)
+	if !ok {
+		t.Fatalf("patch named-first plain map value=%#v", values[3])
+	}
+	patchNamedFirst["patchedNamedFirstAlias"] = true
+	if patchNamedFirstPlain["patchedNamedFirstAlias"] != true {
+		t.Fatalf("patch named-first map alias was not preserved: %#v", values)
+	}
+	if namedFirst["patchedNamedFirstAlias"] != nil {
+		t.Fatal("patch named-first map aliases source")
+	}
+	delete(patchNamedFirst, "patchedNamedFirstAlias")
+
+	cyclic, ok := values[4].(map[string]any)
+	if !ok {
+		t.Fatalf("patch cyclic map value=%#v", values[4])
+	}
+	selfRef, ok := cyclic["self"].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("patch named map self value=%#v", cyclic["self"])
+	}
+	cyclic["cycle"] = true
+	if selfRef["cycle"] != true {
+		t.Fatalf("patch named map self alias was not preserved: %#v", cyclic)
+	}
+	if self["cycle"] != nil {
+		t.Fatal("patch named map self aliases source")
+	}
+	delete(cyclic, "cycle")
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+	if len(applied.Values) != 5 {
+		t.Fatalf("named map slice length=%d want 5", len(applied.Values))
+	}
+	appliedPlain, ok := applied.Values[0].(map[string]any)
+	if !ok {
+		t.Fatalf("applied plain map value=%#v", applied.Values[0])
+	}
+	appliedNamed, ok := applied.Values[1].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("applied named map value=%#v", applied.Values[1])
+	}
+	appliedNamed["appliedAlias"] = true
+	if appliedPlain["appliedAlias"] != true {
+		t.Fatalf("applied named map alias was not preserved: %#v", applied.Values)
+	}
+	appliedNamedFirst, ok := applied.Values[2].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("applied named-first map value=%#v", applied.Values[2])
+	}
+	appliedNamedFirstPlain, ok := applied.Values[3].(map[string]any)
+	if !ok {
+		t.Fatalf("applied named-first plain map value=%#v", applied.Values[3])
+	}
+	appliedNamedFirstPlain["appliedNamedFirstAlias"] = true
+	if appliedNamedFirst["appliedNamedFirstAlias"] != true {
+		t.Fatalf("applied named-first map alias was not preserved: %#v", applied.Values)
+	}
+	appliedCyclic, ok := applied.Values[4].(map[string]any)
+	if !ok {
+		t.Fatalf("applied cyclic map value=%#v", applied.Values[4])
+	}
+	appliedSelf, ok := appliedCyclic["self"].(patchNamedAnyMap)
+	if !ok {
+		t.Fatalf("applied named map self value=%#v", appliedCyclic["self"])
+	}
+	appliedSelf["appliedCycle"] = true
+	if appliedCyclic["appliedCycle"] != true {
+		t.Fatalf("applied named map self alias was not preserved: %#v", appliedCyclic)
+	}
+}
+
+func TestMakePatch_RoundTripPreservesOverlappingPointerTypes(t *testing.T) {
+	db := openTempDBUint64Reflect[patchInterfacePointerRec](t, "patch_overlapping_pointer_types.db")
+
+	value := patchPointerOverlap{Value: 11, Next: 22}
+	oldVal := &patchInterfacePointerRec{Name: "alice"}
+	newVal := &patchInterfacePointerRec{
+		Name:   "alice",
+		Values: []any{&value, &value.Value},
+	}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	values, ok := fields["Values"].([]any)
+	if !ok || len(values) != 2 {
+		t.Fatalf("patch overlapping pointer values=%#v", fields["Values"])
+	}
+	if got, ok := values[0].(*patchPointerOverlap); !ok || got == nil || got.Value != 11 || got.Next != 22 {
+		t.Fatalf("patch overlapping struct pointer=%#v", values[0])
+	} else if got == &value {
+		t.Fatal("patch overlapping struct pointer aliases source")
+	}
+	if got, ok := values[1].(*int); !ok || got == nil || *got != 11 {
+		t.Fatalf("patch overlapping field pointer=%#v", values[1])
+	} else if got == &value.Value {
+		t.Fatal("patch overlapping field pointer aliases source")
+	}
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+
+	if len(applied.Values) != 2 {
+		t.Fatalf("overlapping pointer slice length=%d want 2", len(applied.Values))
+	}
+	if got, ok := applied.Values[0].(*patchPointerOverlap); !ok || got == nil || got.Value != 11 || got.Next != 22 {
+		t.Fatalf("overlapping struct pointer round-trip failed: %#v", applied.Values)
+	}
+	if got, ok := applied.Values[1].(*int); !ok || got == nil || *got != 11 {
+		t.Fatalf("overlapping field pointer round-trip failed: %#v", applied.Values)
+	}
+}
+
+func TestMakePatch_RoundTripPreservesNamedPointerValueType(t *testing.T) {
+	db := openTempDBUint64Reflect[patchNamedPointerRec](t, "patch_named_pointer.db")
+
+	ptr := 11
+	oldVal := &patchNamedPointerRec{Name: "alice"}
+	newVal := &patchNamedPointerRec{Name: "alice", Value: patchNamedIntPtr(&ptr)}
+
+	patch := mustMakePatch(t, db, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	if got, ok := fields["Value"].(patchNamedIntPtr); !ok || got == nil || *got != 11 {
+		t.Fatalf("patch named pointer value=%#v", fields["Value"])
+	} else if got == newVal.Value {
+		t.Fatal("patch named pointer aliases source")
+	}
+
+	applied := *oldVal
+	if err := db.schema.Patch.Apply(unsafe.Pointer(&applied), patchItemsForWrite(patch), false); err != nil {
+		t.Fatalf("Patch.Apply: %v", err)
+	}
+	if applied.Value == nil || *applied.Value != 11 {
+		t.Fatalf("named pointer round-trip failed: %#v", applied.Value)
 	}
 }
 
