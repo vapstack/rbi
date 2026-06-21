@@ -30,13 +30,10 @@ var (
 	AllRoles = []string{"member", "trusted", "moderator", "admin", "staff", "bot"}
 )
 
-const stressBoltOpenTimeout = 500 * time.Millisecond
-
-// Keep this timeout fixed and short in stress.
-// Do not make it user-configurable and do not increase it.
-// Stress/bench helpers must not run in parallel against the same DB file; agents
-// are expected to wait for full process exit and DB close instead of masking
-// that mistake with a long lock wait here.
+const (
+	stressBoltOpenTimeout = 500 * time.Millisecond
+	seedBatchSize         = 5_000
+)
 
 type DBConfig struct {
 	DBFile               string
@@ -240,15 +237,17 @@ func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []s
 
 func seedData(db *rbi.DB[uint64, UserBench], maxID *uint64, count int) {
 	rng := mathutil.NewRand(time.Now().UnixNano())
-	batchSize := 50_000
 
-	for i := 0; i < count; i += batchSize {
-		size := batchSize
+	ids := make([]uint64, 0, seedBatchSize)
+	users := make([]*UserBench, 0, seedBatchSize)
+
+	for i := 0; i < count; i += seedBatchSize {
+		size := seedBatchSize
 		if i+size > count {
 			size = count - i
 		}
-		ids := make([]uint64, size)
-		users := make([]*UserBench, size)
+		ids = ids[:size]
+		users = users[:size]
 		for j := 0; j < size; j++ {
 			id := atomic.AddUint64(maxID, 1)
 			ids[j] = id
@@ -257,6 +256,8 @@ func seedData(db *rbi.DB[uint64, UserBench], maxID *uint64, count int) {
 		if err := db.BatchSet(ids, users); err != nil {
 			log.Fatalf("Seeding failed: %v", err)
 		}
+		clear(users)
+
 		if i > 0 && i%500_000 == 0 {
 			log.Printf("Seeded %d records...", i)
 		}
@@ -406,7 +407,6 @@ func pickUserTags(rng *rand.Rand) []string {
 	if hotSpan < 1 {
 		hotSpan = 1
 	}
-	seen := make(map[string]struct{}, n)
 	out := make([]string, 0, n)
 	for len(out) < n {
 		var tag string
@@ -415,10 +415,9 @@ func pickUserTags(rng *rand.Rand) []string {
 		} else {
 			tag = AllTags[rng.IntN(len(AllTags))]
 		}
-		if _, ok := seen[tag]; ok {
+		if stringSliceContains(out, tag) {
 			continue
 		}
-		seen[tag] = struct{}{}
 		out = append(out, tag)
 	}
 	return out
@@ -435,14 +434,12 @@ func sampleRoleSet(rng *rand.Rand) []string {
 	if n > len(AllRoles) {
 		n = len(AllRoles)
 	}
-	seen := make(map[string]struct{}, n)
 	out := make([]string, 0, n)
 	for len(out) < n {
 		role := AllRoles[rng.IntN(len(AllRoles))]
-		if _, ok := seen[role]; ok {
+		if stringSliceContains(out, role) {
 			continue
 		}
-		seen[role] = struct{}{}
 		out = append(out, role)
 	}
 	return out
@@ -455,15 +452,22 @@ func pickRandomSlice(rng *rand.Rand, values []string, n int) []string {
 	if n > len(values) {
 		n = len(values)
 	}
-	seen := make(map[string]struct{}, n)
 	out := make([]string, 0, n)
 	for len(out) < n {
 		v := values[rng.IntN(len(values))]
-		if _, ok := seen[v]; ok {
+		if stringSliceContains(out, v) {
 			continue
 		}
-		seen[v] = struct{}{}
 		out = append(out, v)
 	}
 	return out
+}
+
+func stringSliceContains(values []string, v string) bool {
+	for i := range values {
+		if values[i] == v {
+			return true
+		}
+	}
+	return false
 }
