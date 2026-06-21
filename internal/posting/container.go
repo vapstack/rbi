@@ -199,18 +199,21 @@ func rangeOfOnes(start, last int) container16 {
 	return newContainerRunRange(uint16(start), uint16(last)).toEfficientContainer()
 }
 
-func (ra *containerIndex) runOptimize() {
+func (ra *containerIndex) runOptimize() bool {
+	changed := false
 	for i := range ra.containers {
-		old := ra.getWritableContainerAtIndex(i)
+		old := ra.containers[i]
 		if old == nil {
 			continue
 		}
 		next := old.toEfficientContainer()
-		ra.containers[i] = next
 		if next != old {
+			ra.containers[i] = next
 			old.release()
+			changed = true
 		}
 	}
+	return changed
 }
 
 func (ra *containerIndex) appendContainer(key uint16, value container16) {

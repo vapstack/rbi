@@ -114,6 +114,31 @@ func TestLargePostingCloneSharedIntoPreservesSourceOnMutation(t *testing.T) {
 	}
 }
 
+func TestLargePostingRunOptimizePreservesSharedEfficientBitmap(t *testing.T) {
+	src := newLargePosting()
+	defer src.Release()
+	src.addRange(0, 1024)
+	for i := uint64(0); i < 5000; i++ {
+		src.add((uint64(1) << 16) | (i << 1))
+	}
+	src.addRange(uint64(2)<<16, (uint64(2)<<16)+1024)
+	src.runOptimize()
+
+	dst := src.cloneSharedInto(newLargePosting())
+	defer dst.Release()
+
+	before := dst.highlowcontainer.getContainerAtIndex(0)
+
+	dst.runOptimize()
+
+	if dst.highlowcontainer.getContainerAtIndex(0) != before {
+		t.Fatalf("runOptimize detached already efficient shared bitmap")
+	}
+	if !src.equals(dst) {
+		t.Fatalf("runOptimize changed shared clone contents")
+	}
+}
+
 func TestLargePostingCloneSharedIntoAliasedDestinationKeepsSourceIntact(t *testing.T) {
 	src := newLargePosting()
 	src.addRange(0, 1024)

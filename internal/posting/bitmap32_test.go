@@ -49,6 +49,35 @@ func TestBitmapCloneSharedIntoPreservesSourceOnMutation(t *testing.T) {
 	}
 }
 
+func TestBitmapRunOptimizePreservesSharedEfficientContainers(t *testing.T) {
+	src := getBitmap32()
+	defer src.release()
+	src.addMany([]uint32{1, 3, 7, 11})
+	for i := uint32(0); i < 5000; i++ {
+		src.add((1 << 16) | (i << 1))
+	}
+	src.addRange(uint64(2)<<16, (uint64(2)<<16)+1024)
+	src.runOptimize()
+
+	dst := src.cloneSharedInto(getBitmap32())
+	defer dst.release()
+
+	before0 := dst.highlowcontainer.getContainerAtIndex(0)
+	before1 := dst.highlowcontainer.getContainerAtIndex(1)
+	before2 := dst.highlowcontainer.getContainerAtIndex(2)
+
+	dst.runOptimize()
+
+	if dst.highlowcontainer.getContainerAtIndex(0) != before0 ||
+		dst.highlowcontainer.getContainerAtIndex(1) != before1 ||
+		dst.highlowcontainer.getContainerAtIndex(2) != before2 {
+		t.Fatalf("runOptimize detached already efficient shared containers")
+	}
+	if !src.equals(dst) {
+		t.Fatalf("runOptimize changed shared clone contents")
+	}
+}
+
 func TestBitmapPool_ReusedBitmapStartsEmpty(t *testing.T) {
 	rb := getBitmap32()
 	rb.add(1)

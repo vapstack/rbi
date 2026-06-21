@@ -1300,7 +1300,17 @@ func slicesShareBackingB32(a, b []*bitmap32) bool {
 
 func (la *largeArray) runOptimize() {
 	for i := range la.containers {
-		la.getWritableContainerAtIndex(i).runOptimize()
+		current := la.containers[i]
+		if current.isUniquelyOwned() {
+			current.runOptimize()
+			continue
+		}
+		next := current.cloneSharedInto(getBitmap32())
+		if next.runOptimize() {
+			la.setContainerAtIndex(i, next)
+		} else {
+			next.release()
+		}
 	}
 }
 

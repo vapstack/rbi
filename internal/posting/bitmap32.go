@@ -17,8 +17,8 @@ type bitmap32 struct {
 }
 
 // runOptimize attempts to further compress the runs of consecutive values found in the bitmap.
-func (rb *bitmap32) runOptimize() {
-	rb.highlowcontainer.runOptimize()
+func (rb *bitmap32) runOptimize() bool {
+	return rb.highlowcontainer.runOptimize()
 }
 
 // clear resets the bitmap32 to be logically empty.
