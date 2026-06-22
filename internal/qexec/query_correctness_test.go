@@ -391,6 +391,60 @@ func TestCountScalarInSplit_TautologicalResidualCountsINPostings(t *testing.T) {
 	}
 }
 
+func TestCountScalarInSplit_BroadSingleValueIN(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	const rows = cardinalityNumericBucketExactMinRows
+	ids := make([]uint64, rows)
+	vals := make([]*Rec, rows)
+	var want uint64
+	for i := 0; i < rows; i++ {
+		id := uint64(i + 1)
+		age := 10 + i%80
+		active := i&1 == 0
+		ids[i] = id
+		vals[i] = &Rec{
+			Meta:   Meta{Country: "US"},
+			Name:   fmt.Sprintf("n%05d", i),
+			Email:  fmt.Sprintf("n%05d@test", i),
+			Age:    age,
+			Active: active,
+		}
+		if active && age >= 30 {
+			want++
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.IN("country", []string{"US", "US"}),
+		qx.EQ("active", true),
+		qx.GTE("age", 30),
+	)
+	prepared, compiled, err := prepareTestExpr(db.engine, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr: %v", err)
+	}
+	defer prepared.Release()
+
+	trace := &Trace{}
+	got, ok, err := db.engine.currentQueryViewForTests().TryFilterCardinalityByScalarInSplit(compiled, trace)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByScalarInSplit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("TryFilterCardinalityByScalarInSplit was not used")
+	}
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if trace.Event().Plan != rbitrace.PlanCountScalarInSplit {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanCountScalarInSplit, trace.Event().Plan)
+	}
+}
+
 func TestCardinalityORByPredicates_DisjointScalarEQBranches(t *testing.T) {
 	db := newCorrectnessDB(t)
 

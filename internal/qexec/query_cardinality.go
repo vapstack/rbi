@@ -933,13 +933,33 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		totalVals := 0
 		if valsBuf != nil {
 			totalVals = len(valsBuf)
-			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if hasNil {
 			totalVals++
 		}
-		if err != nil || !isSlice || totalVals < 2 || totalVals > cardinalityScalarInSplitMaxValues {
+		if err != nil || !isSlice || totalVals == 0 || totalVals > cardinalityScalarInSplitMaxValues {
+			if valsBuf != nil {
+				keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+			}
 			continue
+		}
+		if totalVals == 1 {
+			var leadCard uint64
+			if len(valsBuf) != 0 {
+				leadCard = lookupScalarCardinality(qv.indexViewByOrdinal(e.FieldOrdinal), valsBuf[0])
+			}
+			if hasNil {
+				leadCard = mathutil.SatAddUint64(leadCard, qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey))
+			}
+			if leadCard < cardinalityNumericBucketExactMinRows {
+				if valsBuf != nil {
+					keycodec.ReleaseIndexLookupKeySlice(valsBuf)
+				}
+				continue
+			}
+		}
+		if valsBuf != nil {
+			keycodec.ReleaseIndexLookupKeySlice(valsBuf)
 		}
 		if lead == -1 || totalVals < leadVals {
 			lead = i
@@ -976,7 +996,7 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 		totalVals++
 	}
 
-	if totalVals < 2 || totalVals > cardinalityScalarInSplitMaxValues {
+	if totalVals == 0 || totalVals > cardinalityScalarInSplitMaxValues {
 		return 0, false, nil
 	}
 

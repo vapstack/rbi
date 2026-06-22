@@ -123,3 +123,23 @@ func TestFieldIndexViewRangePostingsUnionBatchesUnorderedSingletons(t *testing.T
 	}
 	merged.Release()
 }
+
+func TestFieldIndexPostingUnionBuilderMergesFlushedSingletonChunks(t *testing.T) {
+	var builder fieldIndexPostingUnionBuilder
+	for i := 0; i < fieldIndexSingleChunkCap+257; i++ {
+		builder.addSingle(uint64(fieldIndexSingleChunkCap + 257 - i))
+	}
+
+	got := builder.finish(false)
+	defer got.Release()
+
+	want := uint64(fieldIndexSingleChunkCap + 257)
+	if card := got.Cardinality(); card != want {
+		t.Fatalf("cardinality got %d want %d", card, want)
+	}
+	for _, id := range []uint64{1, 17, uint64(fieldIndexSingleChunkCap), want} {
+		if !got.Contains(id) {
+			t.Fatalf("missing id %d", id)
+		}
+	}
+}

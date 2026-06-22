@@ -140,7 +140,6 @@ func (b *fieldIndexPostingUnionBuilder) finish(optimize bool) posting.List {
 		out = out.Clone()
 	}
 	b.ids = posting.List{}
-	b.singleIDs = posting.List{}
 	b.inlineLen = 0
 	b.lastSingle = 0
 	b.maxSingle = 0
@@ -229,6 +228,26 @@ func (o FieldIndexView) unionRangePostingsBatchCompactEnabled(first, second Fiel
 	return fieldIndexPostingBatchCompactEnabled(mathutil.SatAddUint64(estFirst, estSecond))
 }
 
+func (o FieldIndexView) mergeRangePostingsBatchCompactEnabled(first, second FieldIndexRange, totalSpan int) bool {
+	if totalSpan <= fieldIndexCompactAsSinglesAdaptiveMaxLen {
+		return true
+	}
+	if first.filterPrefixSet || second.filterPrefixSet {
+		return false
+	}
+	bucketsFirst, rowsFirst := o.RangeStats(first)
+	bucketsSecond, rowsSecond := o.RangeStats(second)
+	buckets := bucketsFirst + bucketsSecond
+	if buckets == 0 {
+		return false
+	}
+	rows := mathutil.SatAddUint64(rowsFirst, rowsSecond)
+	if rows <= posting.SmallCap {
+		return false
+	}
+	return rows <= uint64(buckets)*posting.MidCap
+}
+
 func (o FieldIndexView) UnionRangePostings(first, second FieldIndexRange) posting.List {
 	if first.Empty() && second.Empty() {
 		return posting.List{}
@@ -247,7 +266,7 @@ func (o FieldIndexView) MergeRangePostingsInto(dst posting.List, first, second F
 	}
 	const mergeFieldIndexRangeDirectMaxBuckets = 32
 
-	builder := newFieldIndexPostingUnionBuilder(totalSpan <= fieldIndexCompactAsSinglesAdaptiveMaxLen)
+	builder := newFieldIndexPostingUnionBuilder(o.mergeRangePostingsBatchCompactEnabled(first, second, totalSpan))
 	if !dst.IsEmpty() && totalSpan > mergeFieldIndexRangeDirectMaxBuckets {
 		o.appendRangePostingsUnion(&builder, first)
 		o.appendRangePostingsUnion(&builder, second)
