@@ -1,6 +1,10 @@
 package indexdata
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vapstack/rbi/internal/keycodec"
+)
 
 func TestFieldIndexViewRangePostingsUnionAndMerge(t *testing.T) {
 	tests := []struct {
@@ -70,4 +74,52 @@ func TestFieldIndexViewRangePostingsUnionAndMerge(t *testing.T) {
 			merged.Release()
 		})
 	}
+}
+
+func TestFieldIndexViewRangePostingsUnionBatchesUnorderedSingletons(t *testing.T) {
+	const rows = 4097
+	entries := make([]Entry, rows)
+	for i := 0; i < rows; i++ {
+		entries[i] = Entry{
+			Key: keycodec.FromU64(uint64(i)),
+			IDs: fieldStorageSingleton(uint64(rows-i) * 17),
+		}
+	}
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	first := ov.RangeByRanks(0, rows/2)
+	second := ov.RangeByRanks(rows/2, rows)
+
+	union := ov.UnionRangePostings(first, second)
+	if got := union.Cardinality(); got != rows {
+		gotIDs := union.ToArray()
+		union.Release()
+		t.Fatalf("union cardinality: got %d want %d ids=%v", got, rows, gotIDs)
+	}
+	for i := 0; i < rows; i++ {
+		id := uint64(rows-i) * 17
+		if !union.Contains(id) {
+			union.Release()
+			t.Fatalf("union missing id %d", id)
+		}
+	}
+	union.Release()
+
+	const dstID = 1 << 40
+	merged := ov.MergeRangePostingsInto(fieldStorageSingleton(dstID), first, second)
+	if got := merged.Cardinality(); got != rows+1 || !merged.Contains(dstID) {
+		gotIDs := merged.ToArray()
+		merged.Release()
+		t.Fatalf("merge result mismatch: card=%d ids=%v", got, gotIDs)
+	}
+	for i := 0; i < rows; i++ {
+		id := uint64(rows-i) * 17
+		if !merged.Contains(id) {
+			merged.Release()
+			t.Fatalf("merge missing id %d", id)
+		}
+	}
+	merged.Release()
 }
