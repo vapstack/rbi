@@ -100,7 +100,7 @@ func (ac *containerArray) iaddRange(firstOfRange, endx int) container16 {
 	rangelength := endx - firstOfRange
 	newcardinality := indexstart + (ac.getCardinality() - indexend) + rangelength
 	if newcardinality > arrayDefaultMaxSize {
-		a := ac.toBitmapContainer()
+		a := ac.toBitmapContainerForUpdate()
 		return a.iaddRange(firstOfRange, endx)
 	}
 	if cap(ac.content) < newcardinality {
@@ -170,7 +170,7 @@ func (ac *containerArray) notClose(firstOfRange, lastOfRange int) container16 {
 	cardinalityChange := newValuesInRange - currentValuesInRange
 	newCardinality := len(ac.content) + cardinalityChange
 	if newCardinality > arrayDefaultMaxSize {
-		bc := ac.toBitmapContainer()
+		bc := ac.toBitmapContainerForUpdate()
 		result := bc.inot(firstOfRange, lastOfRange+1)
 		if returned, ok := result.(*containerBitmap); !ok || returned != bc {
 			bc.release()
@@ -232,7 +232,13 @@ func (ac *containerArray) equals(o container16) bool {
 }
 
 func (ac *containerArray) toBitmapContainer() *containerBitmap {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
+	bc.loadDataWithRunCount(ac)
+	return bc
+}
+
+func (ac *containerArray) toBitmapContainerForUpdate() *containerBitmap {
+	bc := getContainerBitmap()
 	bc.loadData(ac)
 	return bc
 }
@@ -421,7 +427,7 @@ func (ac *containerArray) orArray(value2 *containerArray) container16 {
 	value1 := ac
 	maxPossibleCardinality := value1.getCardinality() + value2.getCardinality()
 	if maxPossibleCardinality > arrayDefaultMaxSize { // it could be a bitmap!
-		bc := newContainerBitmap()
+		bc := getContainerBitmap()
 		for k := 0; k < len(value2.content); k++ {
 			v := value2.content[k]
 			i := uint(v) >> 6
@@ -529,7 +535,7 @@ func (ac *containerArray) xorArray(value2 *containerArray) container16 {
 	value1 := ac
 	totalCardinality := value1.getCardinality() + value2.getCardinality()
 	if totalCardinality > arrayDefaultMaxSize { // it could be a bitmap!
-		bc := newContainerBitmap()
+		bc := getContainerBitmap()
 		for k := 0; k < len(value2.content); k++ {
 			v := value2.content[k]
 			i := uint(v) >> 6
@@ -708,7 +714,7 @@ func (ac *containerArray) inotClose(firstOfRange, lastOfRange int) container16 {
 	if cardinalityChange > 0 {
 		if newCardinality > len(ac.content) {
 			if newCardinality > arrayDefaultMaxSize {
-				bcRet := ac.toBitmapContainer()
+				bcRet := ac.toBitmapContainerForUpdate()
 				bcRet.inot(firstOfRange, lastOfRange+1)
 				return bcRet
 			}
@@ -889,5 +895,8 @@ func (ac *containerArray) toEfficientContainer() container16 {
 	if card <= arrayDefaultMaxSize {
 		return ac
 	}
-	return ac.toBitmapContainer()
+	bc := getContainerBitmap()
+	bc.loadData(ac)
+	bc.setRunCount(numRuns)
+	return bc
 }

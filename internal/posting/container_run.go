@@ -2125,8 +2125,12 @@ func (rc *containerRun) or(a container16) container16 {
 // orBitmap finds the union of rc and bc.
 func (rc *containerRun) orBitmap(bc *containerBitmap) container16 {
 	answer := bc.clone().(*containerBitmap)
+	cardinality := answer.cardinality
 	for i := range rc.iv {
 		answer.cardinality += setBitmapRangeAndCardinalityChange(answer.bitmap, int(rc.iv[i].start), int(rc.iv[i].last())+1)
+	}
+	if answer.cardinality != cardinality {
+		answer.clearRunCount()
 	}
 	return efficientContainerFromTempBitmap(answer)
 }
@@ -2622,6 +2626,7 @@ func (rc *containerRun) xorBitmap(bc *containerBitmap) container16 {
 	for i := range rc.iv {
 		answer.cardinality += flipBitmapRangeAndCardinalityChange(answer.bitmap, int(rc.iv[i].start), int(rc.iv[i].last())+1)
 	}
+	answer.clearRunCount()
 	return efficientContainerFromTempBitmap(answer)
 }
 

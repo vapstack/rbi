@@ -997,7 +997,7 @@ func postingBenchBitmapWords(shape string, seed uint64) []uint64 {
 }
 
 func postingBenchBitmapContainerFromWords(words []uint64) *containerBitmap {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	copy(bc.bitmap, words)
 	bc.cardinality = int(popcntSlice(bc.bitmap))
 	return bc
@@ -1012,7 +1012,7 @@ func postingBenchUint16Dense(n, start, step int) []uint16 {
 }
 
 func postingBenchContainerBitmapFromValues(values []uint16) *containerBitmap {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	for i := range values {
 		v := values[i]
 		bc.bitmap[v>>6] |= uint64(1) << (v & 63)

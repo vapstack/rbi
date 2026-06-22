@@ -62,7 +62,7 @@ func TestContainerRunConstructionAndIntervalHelpers(t *testing.T) {
 	assertRunIntervalsInvariant(t, fromArray)
 	assertSameContainerSet(t, fromArray, []uint16{1, 2, 3, 10, 20, 21, 22})
 
-	bitmap := newContainerBitmap()
+	bitmap := getContainerBitmap()
 	defer bitmap.release()
 	bitmap.iaddRange(100, 110)
 	bitmap.iaddRange(200, 205)
@@ -343,7 +343,7 @@ func TestContainerRunAndNotBitmapToRunFullSuffixBoundary(t *testing.T) {
 	left := newContainerRunRange(1, MaxUint16)
 	defer left.release()
 
-	right := newContainerBitmap()
+	right := getContainerBitmap()
 	defer right.release()
 	right.iaddRange(1, maxCapacity)
 

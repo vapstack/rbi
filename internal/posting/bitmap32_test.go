@@ -613,7 +613,7 @@ func TestBitmap32WireEncodingAndReadRejectInvalidPayloads(t *testing.T) {
 	defer arrayContainer.release()
 	sparseBitmapContainer := buildContainerBitmap([]uint16{0, 2, 4, 6})
 	defer sparseBitmapContainer.release()
-	denseBitmapContainer := newContainerBitmap()
+	denseBitmapContainer := getContainerBitmap()
 	defer denseBitmapContainer.release()
 	denseBitmapContainer.iaddRange(0, 5000)
 	runContainer := buildContainerRun([]uint16{10, 11, 12, 30, 31})
@@ -641,6 +641,11 @@ func TestBitmap32WireEncodingAndReadRejectInvalidPayloads(t *testing.T) {
 				t.Fatalf("read byte count mismatch: got=%d want=%d", n, len(payload))
 			}
 			assertSameContainerSet(t, read, containerToSlice(tc.c))
+			if bitmap, ok := read.(*containerBitmap); ok {
+				if got, ok := bitmap.runCountValue(); !ok || got != bitmap.computeRunCount() {
+					t.Fatalf("read bitmap run count = (%d,%v), want computed", got, ok)
+				}
+			}
 		})
 	}
 

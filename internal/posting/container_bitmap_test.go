@@ -20,7 +20,7 @@ func TestBitmapRangePrimitivesAndScanningHelpers(t *testing.T) {
 		t.Fatalf("resetBitmapRange delta mismatch: got=%d want=-3", delta)
 	}
 
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	defer bc.release()
 	bc.bitmap = bitmap
 	bc.computeCardinality()
@@ -183,7 +183,7 @@ func TestContainerBitmapCrossTypeOps(t *testing.T) {
 }
 
 func TestContainerBitmapIAndNotRunSparseWideRanges(t *testing.T) {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	bc.iaddRange(0, 6000)
 
 	removedIDs := []uint16{
@@ -212,7 +212,7 @@ func TestContainerBitmapIAndNotRunSparseWideRanges(t *testing.T) {
 }
 
 func TestContainerBitmapConversionsIterationAndLifecycle(t *testing.T) {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	defer bc.release()
 	bc.iaddRange(10, 20)
 	bc.iaddRange(40, 45)
@@ -230,7 +230,7 @@ func TestContainerBitmapConversionsIterationAndLifecycle(t *testing.T) {
 		110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
 	})
 
-	runFriendly := newContainerBitmap()
+	runFriendly := getContainerBitmap()
 	defer runFriendly.release()
 	runFriendly.iaddRange(1, 128)
 	optimized := runFriendly.toEfficientContainer()
@@ -282,12 +282,261 @@ func TestContainerBitmapConversionsIterationAndLifecycle(t *testing.T) {
 		t.Fatalf("fillLeastSignificant16bits mismatch: got=%v", got)
 	}
 
-	temp := newContainerBitmap()
+	temp := getContainerBitmap()
 	temp.iaddRange(5, 15)
 	result := efficientContainerFromTempBitmap(temp)
 	defer result.release()
 	if _, ok := result.(*containerRun); !ok {
 		t.Fatalf("expected run container from efficientContainerFromTempBitmap, got %T", result)
+	}
+}
+
+func TestContainerBitmapRunCountCache(t *testing.T) {
+	bc := buildContainerBitmap([]uint16{1, 3, 5}).(*containerBitmap)
+	defer bc.release()
+
+	if got, ok := bc.runCountValue(); !ok || got != 3 {
+		t.Fatalf("initial run count = (%d,%v), want (3,true)", got, ok)
+	}
+	if bc.iadd(3) {
+		t.Fatalf("duplicate add unexpectedly changed bitmap")
+	}
+	if got, ok := bc.runCountValue(); !ok || got != 3 {
+		t.Fatalf("run count after duplicate add = (%d,%v), want (3,true)", got, ok)
+	}
+	if bc.iremove(99) {
+		t.Fatalf("missing remove unexpectedly changed bitmap")
+	}
+	if got, ok := bc.runCountValue(); !ok || got != 3 {
+		t.Fatalf("run count after missing remove = (%d,%v), want (3,true)", got, ok)
+	}
+	if !bc.iadd(2) {
+		t.Fatalf("expected add to change bitmap")
+	}
+	if got, ok := bc.runCountValue(); !ok || got != 2 {
+		t.Fatalf("run count after point add = (%d,%v), want (2,true)", got, ok)
+	}
+	if got := bc.numberOfRuns(); got != 2 {
+		t.Fatalf("computed run count after point add = %d, want 2", got)
+	}
+	if got, ok := bc.runCountValue(); !ok || got != 2 {
+		t.Fatalf("numberOfRuns changed cached point add run count = (%d,%v), want (2,true)", got, ok)
+	}
+
+	bc.iaddRange(10, 13)
+	if _, ok := bc.runCountValue(); ok {
+		t.Fatalf("bulk range add should invalidate run count")
+	}
+	if got := bc.numberOfRuns(); got != 3 {
+		t.Fatalf("computed run count = %d, want 3", got)
+	}
+	if _, ok := bc.runCountValue(); ok {
+		t.Fatalf("numberOfRuns should not cache after invalidation")
+	}
+}
+
+func TestContainerArrayBitmapMaterializationRunCountModes(t *testing.T) {
+	ac := getContainerArrayFromSlice([]uint16{1, 3, 5})
+	defer ac.release()
+
+	cached := ac.toBitmapContainer()
+	defer cached.release()
+	if got, ok := cached.runCountValue(); !ok || got != 3 {
+		t.Fatalf("cached bitmap run count = (%d,%v), want (3,true)", got, ok)
+	}
+
+	forUpdate := ac.toBitmapContainerForUpdate()
+	defer forUpdate.release()
+	if _, ok := forUpdate.runCountValue(); ok {
+		t.Fatalf("update bitmap materialization should not cache run count")
+	}
+	assertSameContainerSet(t, forUpdate, []uint16{1, 3, 5})
+}
+
+func TestContainerArrayPointPromotionKeepsRunCount(t *testing.T) {
+	ac := getContainerArrayWithLen(arrayDefaultMaxSize)
+	for i := range ac.content {
+		ac.content[i] = uint16(i * 2)
+	}
+	defer ac.release()
+
+	result := ac.iaddReturnMinimized(1)
+	defer result.release()
+	bc, ok := result.(*containerBitmap)
+	if !ok {
+		t.Fatalf("point overflow should promote to bitmap, got %T", result)
+	}
+	if got, ok := bc.runCountValue(); !ok || got != arrayDefaultMaxSize-1 {
+		t.Fatalf("promoted bitmap run count = (%d,%v), want (%d,true)", got, ok, arrayDefaultMaxSize-1)
+	}
+}
+
+func TestContainerBitmapSingleArrayOpsKeepRunCount(t *testing.T) {
+	add := getContainerArrayFromSlice([]uint16{2})
+	defer add.release()
+	remove := getContainerArrayFromSlice([]uint16{2})
+	defer remove.release()
+
+	unionSrc := buildContainerBitmap([]uint16{1, 3, 5}).(*containerBitmap)
+	unionResult := unionSrc.orArray(add)
+	defer unionSrc.release()
+	defer unionResult.release()
+	unionBitmap, ok := unionResult.(*containerBitmap)
+	if !ok {
+		t.Fatalf("single array union should stay bitmap, got %T", unionResult)
+	}
+	if got, ok := unionBitmap.runCountValue(); !ok || got != 2 {
+		t.Fatalf("single array union run count = (%d,%v), want (2,true)", got, ok)
+	}
+
+	iorBitmap := buildContainerBitmap([]uint16{1, 3, 5}).(*containerBitmap)
+	iorResult := iorBitmap.iorArray(add)
+	defer cleanupContainerPair(iorBitmap, iorResult)
+	iorOut, ok := iorResult.(*containerBitmap)
+	if !ok {
+		t.Fatalf("single array in-place union should stay bitmap, got %T", iorResult)
+	}
+	if got, ok := iorOut.runCountValue(); !ok || got != 2 {
+		t.Fatalf("single array in-place union run count = (%d,%v), want (2,true)", got, ok)
+	}
+
+	diffSrc := newContainerBitmapWithRange(0, arrayDefaultMaxSize+1)
+	diffResult := diffSrc.andNotArray(remove)
+	defer diffSrc.release()
+	defer diffResult.release()
+	diffBitmap, ok := diffResult.(*containerBitmap)
+	if !ok {
+		t.Fatalf("single array diff should stay bitmap, got %T", diffResult)
+	}
+	if got, ok := diffBitmap.runCountValue(); !ok || got != 2 {
+		t.Fatalf("single array diff run count = (%d,%v), want (2,true)", got, ok)
+	}
+
+	iandNotBitmap := newContainerBitmapWithRange(0, arrayDefaultMaxSize+1)
+	iandNotResult := iandNotBitmap.iandNotArray(remove)
+	defer cleanupContainerPair(iandNotBitmap, iandNotResult)
+	iandNotOut, ok := iandNotResult.(*containerBitmap)
+	if !ok {
+		t.Fatalf("single array in-place diff should stay bitmap, got %T", iandNotResult)
+	}
+	if got, ok := iandNotOut.runCountValue(); !ok || got != 2 {
+		t.Fatalf("single array in-place diff run count = (%d,%v), want (2,true)", got, ok)
+	}
+}
+
+func TestContainerBitmapRunCountCacheWordBoundaries(t *testing.T) {
+	bc := buildContainerBitmap([]uint16{0, 63, 65}).(*containerBitmap)
+	defer bc.release()
+	if got, ok := bc.runCountValue(); !ok || got != 3 {
+		t.Fatalf("initial run count = (%d,%v), want (3,true)", got, ok)
+	}
+	if !bc.iadd(64) {
+		t.Fatalf("expected boundary bridge add")
+	}
+	if got, ok := bc.runCountValue(); !ok || got != 2 {
+		t.Fatalf("run count after boundary bridge add = (%d,%v), want (2,true)", got, ok)
+	}
+	if got := bc.numberOfRuns(); got != 2 {
+		t.Fatalf("computed run count after boundary add = %d, want 2", got)
+	}
+
+	bc2 := buildContainerBitmap([]uint16{63, 64, 65, MaxUint16 - 1, MaxUint16}).(*containerBitmap)
+	defer bc2.release()
+	if got, ok := bc2.runCountValue(); !ok || got != 2 {
+		t.Fatalf("second initial run count = (%d,%v), want (2,true)", got, ok)
+	}
+	if !bc2.iremove(64) {
+		t.Fatalf("expected boundary split remove")
+	}
+	if got, ok := bc2.runCountValue(); !ok || got != 3 {
+		t.Fatalf("run count after boundary split remove = (%d,%v), want (3,true)", got, ok)
+	}
+	if got := bc2.numberOfRuns(); got != 3 {
+		t.Fatalf("computed run count after boundary remove = %d, want 3", got)
+	}
+	if !bc2.iremove(MaxUint16) {
+		t.Fatalf("expected max boundary remove")
+	}
+	if got, ok := bc2.runCountValue(); !ok || got != 3 {
+		t.Fatalf("run count after max boundary remove = (%d,%v), want (3,true)", got, ok)
+	}
+	if got := bc2.numberOfRuns(); got != 3 {
+		t.Fatalf("computed run count after max boundary remove = %d, want 3", got)
+	}
+}
+
+func TestContainerBitmapToEfficientContainerDoesNotCacheSharedRunCount(t *testing.T) {
+	bc := getContainerBitmap()
+	for i := 0; i <= arrayDefaultMaxSize; i++ {
+		bc.iadd(uint16(i * 2))
+	}
+	if _, ok := bc.runCountValue(); ok {
+		t.Fatalf("newly built bitmap should not have cached run count")
+	}
+
+	bc.retain()
+	defer bc.release()
+	defer bc.release()
+
+	optimized := bc.toEfficientContainer()
+	if optimized != bc {
+		optimized.release()
+		t.Fatalf("alternating bitmap should stay bitmap, got %T", optimized)
+	}
+	if _, ok := bc.runCountValue(); ok {
+		t.Fatalf("shared toEfficientContainer should not cache run count")
+	}
+}
+
+func TestContainerBitmapRunCountInvalidatedBySortedBulkAdd(t *testing.T) {
+	bc := buildContainerBitmap([]uint16{0, 2, 4}).(*containerBitmap)
+	defer bc.release()
+	addSorted32ToBitmap(bc, []uint32{4, 6, 8})
+	if _, ok := bc.runCountValue(); ok {
+		t.Fatalf("addSorted32ToBitmap should invalidate run count")
+	}
+	assertSameContainerSet(t, bc, []uint16{0, 2, 4, 6, 8})
+
+	bc64 := buildContainerBitmap([]uint16{1, 3, 5}).(*containerBitmap)
+	defer bc64.release()
+	addSorted64LowToBitmap(bc64, []uint64{5, 7, 9})
+	if _, ok := bc64.runCountValue(); ok {
+		t.Fatalf("addSorted64LowToBitmap should invalidate run count")
+	}
+	assertSameContainerSet(t, bc64, []uint16{1, 3, 5, 7, 9})
+}
+
+func TestContainerBitmapRunCountInvalidatedByIAndBitmap(t *testing.T) {
+	dense := newContainerBitmapWithRange(0, arrayDefaultMaxSize*3)
+	defer dense.release()
+	if got, ok := dense.runCountValue(); !ok || got != 1 {
+		t.Fatalf("dense run count = (%d,%v), want (1,true)", got, ok)
+	}
+
+	want := make([]uint16, arrayDefaultMaxSize+1)
+	mask := getContainerBitmap()
+	defer mask.release()
+	for i := range want {
+		v := uint16(i * 2)
+		want[i] = v
+		mask.iadd(v)
+	}
+
+	result := dense.iandBitmap(mask)
+	if result != dense {
+		t.Fatalf("intersection should stay bitmap, got %T", result)
+	}
+	if _, ok := dense.runCountValue(); ok {
+		t.Fatalf("iandBitmap should invalidate run count")
+	}
+
+	optimized := dense.toEfficientContainer()
+	if optimized != dense {
+		defer optimized.release()
+	}
+	assertSameContainerSet(t, optimized, want)
+	if got, ok := dense.runCountValue(); !ok || got != len(want) {
+		t.Fatalf("materialized run count = (%d,%v), want (%d,true)", got, ok, len(want))
 	}
 }
 
@@ -324,12 +573,12 @@ func TestContainerBitmapBitmapRunFillHelpers(t *testing.T) {
 }
 
 func TestContainerBitmapPoolReuseStartsClean(t *testing.T) {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	bc.iaddRange(10, 200)
 	bc.iaddRange(500, 900)
 	bc.release()
 
-	reused := newContainerBitmap()
+	reused := getContainerBitmap()
 	defer reused.release()
 	if !testRaceEnabled && reused != bc {
 		t.Fatalf("bitmap container pool did not reuse instance")
@@ -343,7 +592,7 @@ func TestContainerBitmapPoolReuseStartsClean(t *testing.T) {
 }
 
 func TestContainerBitmapMutationHelpersAndEquality(t *testing.T) {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	defer bc.release()
 	bc.iaddRange(0, arrayDefaultMaxSize+1)
 
@@ -360,7 +609,7 @@ func TestContainerBitmapMutationHelpersAndEquality(t *testing.T) {
 	}())
 	result.release()
 
-	bc2 := newContainerBitmap()
+	bc2 := getContainerBitmap()
 	defer bc2.release()
 	bc2.iaddRange(0, 5000)
 	if !bc2.iremove(7) || bc2.iremove(7) {
@@ -376,7 +625,7 @@ func TestContainerBitmapMutationHelpersAndEquality(t *testing.T) {
 	}
 	trimmed.release()
 
-	full := newContainerBitmap()
+	full := getContainerBitmap()
 	defer full.release()
 	full.iaddRange(0, maxCapacity)
 	if !full.isFull() {
@@ -392,7 +641,7 @@ func TestContainerBitmapMutationHelpersAndEquality(t *testing.T) {
 	}
 	flipped.release()
 
-	source := newContainerBitmap()
+	source := getContainerBitmap()
 	defer source.release()
 	source.iaddRange(0, 5000)
 	notResult := source.not(1000, 2000)
@@ -442,11 +691,11 @@ func TestContainerBitmapMutationHelpersAndEquality(t *testing.T) {
 }
 
 func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
-	fullLeft := newContainerBitmap()
+	fullLeft := getContainerBitmap()
 	defer fullLeft.release()
 	fullLeft.iaddRange(0, maxCapacity/2)
 
-	fullRight := newContainerBitmap()
+	fullRight := getContainerBitmap()
 	defer fullRight.release()
 	fullRight.iaddRange(maxCapacity/2, maxCapacity)
 
@@ -479,11 +728,11 @@ func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
 	}
 	assertSameContainerSet(t, xorArray, xorUint16(bitmapIDs, arrayIDs))
 
-	denseLeft := newContainerBitmap()
+	denseLeft := getContainerBitmap()
 	defer denseLeft.release()
 	denseLeft.iaddRange(0, 6000)
 
-	denseRight := newContainerBitmap()
+	denseRight := getContainerBitmap()
 	defer denseRight.release()
 	denseRight.iaddRange(1000, 2000)
 
@@ -496,7 +745,7 @@ func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
 		t.Fatalf("andNotBitmap dense-result mismatch")
 	}
 
-	sparseRight := newContainerBitmap()
+	sparseRight := getContainerBitmap()
 	defer sparseRight.release()
 	sparseRight.iaddRange(1, 6000)
 
@@ -507,14 +756,14 @@ func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
 	}
 	assertSameContainerSet(t, sparseDiff, []uint16{0})
 
-	scan := newContainerBitmap()
+	scan := getContainerBitmap()
 	defer scan.release()
 	scan.iaddRange(0, 64)
 	scan.iadd(130)
 	if got := scan.nextUnsetBit(0); got != 64 {
 		t.Fatalf("nextUnsetBit cross-word mismatch: got=%d want=64", got)
 	}
-	boundaryDense := newContainerBitmap()
+	boundaryDense := getContainerBitmap()
 	defer boundaryDense.release()
 	boundaryDense.iaddRange(1, 65)
 	if got := boundaryDense.nextUnsetBit(1); got != 65 {
@@ -529,11 +778,11 @@ func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
 }
 
 func TestContainerBitmapAndBitmapAndEqualsBranches(t *testing.T) {
-	denseLeft := newContainerBitmap()
+	denseLeft := getContainerBitmap()
 	defer denseLeft.release()
 	denseLeft.iaddRange(0, 6000)
 
-	denseRight := newContainerBitmap()
+	denseRight := getContainerBitmap()
 	defer denseRight.release()
 	denseRight.iaddRange(1000, 7000)
 
@@ -546,7 +795,7 @@ func TestContainerBitmapAndBitmapAndEqualsBranches(t *testing.T) {
 		t.Fatalf("andBitmap dense-result mismatch")
 	}
 
-	sparseRight := newContainerBitmap()
+	sparseRight := getContainerBitmap()
 	defer sparseRight.release()
 	sparseRight.iaddRange(0, 5)
 
@@ -576,7 +825,7 @@ func TestContainerBitmapAndBitmapAndEqualsBranches(t *testing.T) {
 }
 
 func TestContainerBitmapBitmapInPlaceSelfAlias(t *testing.T) {
-	union := newContainerBitmap()
+	union := getContainerBitmap()
 	defer union.release()
 	union.iaddRange(0, 6000)
 
@@ -588,7 +837,7 @@ func TestContainerBitmapBitmapInPlaceSelfAlias(t *testing.T) {
 		t.Fatalf("iorBitmap self-alias changed content")
 	}
 
-	andSelf := newContainerBitmap()
+	andSelf := getContainerBitmap()
 	defer andSelf.release()
 	andSelf.iaddRange(0, 6000)
 
@@ -600,7 +849,7 @@ func TestContainerBitmapBitmapInPlaceSelfAlias(t *testing.T) {
 		t.Fatalf("iandBitmap self-alias changed content")
 	}
 
-	diffSelf := newContainerBitmap()
+	diffSelf := getContainerBitmap()
 	diffSelf.iaddRange(0, 6000)
 
 	diffResult := diffSelf.iandNot(diffSelf)

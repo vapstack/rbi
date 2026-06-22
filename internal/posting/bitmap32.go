@@ -617,7 +617,7 @@ func buildContainerFromSorted32(dat []uint32) container16 {
 		fillArrayFromSorted32(ac.content, dat)
 		return ac
 	}
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	addSorted32ToBitmap(bc, dat)
 	return minimizeFreshSortedBitmapContainer(bc)
 }
@@ -632,7 +632,7 @@ func buildContainerFromSorted64Low(dat []uint64) container16 {
 		fillArrayFromSorted64Low(ac.content, dat)
 		return ac
 	}
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	addSorted64LowToBitmap(bc, dat)
 	return minimizeFreshSortedBitmapContainer(bc)
 }
@@ -652,7 +652,7 @@ func buildContainerFromSortedUnique64Low(dat []uint64) container16 {
 		}
 		return ac
 	}
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	addSorted64LowToBitmap(bc, dat)
 	return minimizeFreshSortedBitmapContainer(bc)
 }
@@ -794,14 +794,29 @@ func addSorted32ToBitmap(bc *containerBitmap, dat []uint32) {
 	if len(dat) == 0 {
 		return
 	}
+	cardinality := bc.cardinality
 	prev := dat[0]
-	bc.iadd(lowbits(prev))
-	for _, v := range dat[1:] {
-		if v == prev {
+	v := lowbits(prev)
+	i := uint(v) >> 6
+	bef := bc.bitmap[i]
+	aft := bef | (uint64(1) << (v % 64))
+	bc.bitmap[i] = aft
+	bc.cardinality += int((bef - aft) >> 63)
+
+	for _, nv := range dat[1:] {
+		if nv == prev {
 			continue
 		}
-		bc.iadd(lowbits(v))
-		prev = v
+		low := lowbits(nv)
+		ni := uint(low) >> 6
+		nbef := bc.bitmap[ni]
+		naft := nbef | (uint64(1) << (low % 64))
+		bc.bitmap[ni] = naft
+		bc.cardinality += int((nbef - naft) >> 63)
+		prev = nv
+	}
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
 	}
 }
 
@@ -809,15 +824,30 @@ func addSorted64LowToBitmap(bc *containerBitmap, dat []uint64) {
 	if len(dat) == 0 {
 		return
 	}
+	cardinality := bc.cardinality
 	prev := lowbits64(dat[0])
-	bc.iadd(lowbits(prev))
-	for _, v := range dat[1:] {
-		low := lowbits64(v)
+	v := lowbits(prev)
+	i := uint(v) >> 6
+	bef := bc.bitmap[i]
+	aft := bef | (uint64(1) << (v % 64))
+	bc.bitmap[i] = aft
+	bc.cardinality += int((bef - aft) >> 63)
+
+	for _, nv := range dat[1:] {
+		low := lowbits64(nv)
 		if low == prev {
 			continue
 		}
-		bc.iadd(lowbits(low))
+		value := lowbits(low)
+		ni := uint(value) >> 6
+		nbef := bc.bitmap[ni]
+		naft := nbef | (uint64(1) << (value % 64))
+		bc.bitmap[ni] = naft
+		bc.cardinality += int((nbef - naft) >> 63)
 		prev = low
+	}
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
 	}
 }
 
@@ -848,7 +878,7 @@ func mergeArrayWithSorted32(ac *containerArray, dat []uint32) container16 {
 	if ac.content[len(ac.content)-1] < first {
 		newCardinality := len(ac.content) + unique
 		if newCardinality > arrayDefaultMaxSize {
-			bc := ac.toBitmapContainer()
+			bc := ac.toBitmapContainerForUpdate()
 			addSorted32ToBitmap(bc, dat)
 			return minimizeFreshSortedBitmapContainer(bc)
 		}
@@ -869,7 +899,7 @@ func mergeArrayWithSorted32(ac *containerArray, dat []uint32) container16 {
 
 	newCardinality := mergedCardinalityArrayAndSorted32(ac.content, dat, arrayDefaultMaxSize+1)
 	if newCardinality > arrayDefaultMaxSize {
-		bc := ac.toBitmapContainer()
+		bc := ac.toBitmapContainerForUpdate()
 		addSorted32ToBitmap(bc, dat)
 		return minimizeFreshSortedBitmapContainer(bc)
 	}
@@ -897,7 +927,7 @@ func mergeArrayWithSorted64Low(ac *containerArray, dat []uint64) container16 {
 	if ac.content[len(ac.content)-1] < first {
 		newCardinality := len(ac.content) + unique
 		if newCardinality > arrayDefaultMaxSize {
-			bc := ac.toBitmapContainer()
+			bc := ac.toBitmapContainerForUpdate()
 			addSorted64LowToBitmap(bc, dat)
 			return minimizeFreshSortedBitmapContainer(bc)
 		}
@@ -918,7 +948,7 @@ func mergeArrayWithSorted64Low(ac *containerArray, dat []uint64) container16 {
 
 	newCardinality := mergedCardinalityArrayAndSorted64Low(ac.content, dat, arrayDefaultMaxSize+1)
 	if newCardinality > arrayDefaultMaxSize {
-		bc := ac.toBitmapContainer()
+		bc := ac.toBitmapContainerForUpdate()
 		addSorted64LowToBitmap(bc, dat)
 		return minimizeFreshSortedBitmapContainer(bc)
 	}
@@ -2383,10 +2413,25 @@ func validateBitmap32ArrayContainer(container *containerArray) error {
 }
 
 func validateBitmap32BitmapContainer(container *containerBitmap) error {
-	actual := int(popcntSlice(container.bitmap))
+	actual := 0
+	var runs uint64
+	nextWord := container.bitmap[0]
+	for i := 0; i < len(container.bitmap)-1; i++ {
+		word := nextWord
+		nextWord = container.bitmap[i+1]
+		actual += int(popcount(word))
+		runs += popcount((^word)&(word<<1)) + ((word >> 63) &^ nextWord)
+	}
+	word := nextWord
+	actual += int(popcount(word))
+	runs += popcount((^word) & (word << 1))
+	if (word & 0x8000000000000000) != 0 {
+		runs++
+	}
 	if actual != container.cardinality {
 		return fmt.Errorf("containerBitmap cardinality mismatch: header=%d actual=%d", container.cardinality, actual)
 	}
+	container.setRunCount(int(runs))
 	return nil
 }
 
@@ -2420,12 +2465,13 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	case bitmap32WireContainerBitmap:
 		cardinality := int(meta) + 1
 		if cardinality <= arrayDefaultMaxSize {
 			return nil, 0, fmt.Errorf("invalid containerBitmap cardinality %d", cardinality)
 		}
-		container := newContainerBitmap()
+		container := getContainerBitmap()
 		container.cardinality = cardinality
 		readBytes, err := readBitmap32Bitmap(reader, container)
 		if err != nil {
@@ -2437,6 +2483,7 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	case bitmap32WireContainerRun:
 		intervalCount := int(meta) + 1
 		container := getRunContainer()
@@ -2452,6 +2499,7 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	default:
 		return nil, 0, fmt.Errorf("invalid bitmap32 container kind %d", kind)
 	}
@@ -2472,12 +2520,13 @@ func readBitmap32WireContainerBufio(reader *bufio.Reader, kind byte, meta uint16
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	case bitmap32WireContainerBitmap:
 		cardinality := int(meta) + 1
 		if cardinality <= arrayDefaultMaxSize {
 			return nil, 0, fmt.Errorf("invalid containerBitmap cardinality %d", cardinality)
 		}
-		container := newContainerBitmap()
+		container := getContainerBitmap()
 		container.cardinality = cardinality
 		readBytes, err := readBitmap32BitmapBufio(reader, container)
 		if err != nil {
@@ -2489,6 +2538,7 @@ func readBitmap32WireContainerBufio(reader *bufio.Reader, kind byte, meta uint16
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	case bitmap32WireContainerRun:
 		intervalCount := int(meta) + 1
 		container := getRunContainer()
@@ -2504,6 +2554,7 @@ func readBitmap32WireContainerBufio(reader *bufio.Reader, kind byte, meta uint16
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
+
 	default:
 		return nil, 0, fmt.Errorf("invalid bitmap32 container kind %d", kind)
 	}

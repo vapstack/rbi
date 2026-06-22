@@ -152,7 +152,7 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 		t.Fatalf("numberOfRuns mismatch: got=%d want=4", got)
 	}
 
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	bc.iaddRange(100, 110)
 	defer bc.release()
 	fromBitmap := newContainerArrayFromBitmap(bc)
@@ -196,7 +196,7 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 		t.Fatalf("expected run container from run-friendly array, got %T", optimized)
 	}
 
-	bitmapRight := newContainerBitmap()
+	bitmapRight := getContainerBitmap()
 	bitmapRight.iaddRange(1000, 6000)
 	defer bitmapRight.release()
 	bitmapUnion := getContainerArrayFromSlice([]uint16{1, 3, 5})

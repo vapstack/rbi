@@ -259,9 +259,9 @@ func buildContainerArray(ids []uint16) container16 {
 }
 
 func buildContainerBitmap(ids []uint16) container16 {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	ac := getContainerArrayFromSlice(canonicalUint16s(ids))
-	bc.loadData(ac)
+	bc.loadDataWithRunCount(ac)
 	ac.Release()
 	return bc
 }

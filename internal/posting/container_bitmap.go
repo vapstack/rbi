@@ -10,8 +10,43 @@ const bitmapContainerWords = maxCapacity / 64
 
 type containerBitmap struct {
 	refs        atomic.Int32
+	runCount    int32
 	cardinality int
 	bitmap      []uint64
+}
+
+func (bc *containerBitmap) setRunCount(runs int) {
+	bc.runCount = int32(runs) + 1
+}
+
+func (bc *containerBitmap) clearRunCount() {
+	bc.runCount = 0
+}
+
+func (bc *containerBitmap) runCountValue() (int, bool) {
+	if bc.runCount == 0 {
+		return 0, false
+	}
+	return int(bc.runCount - 1), true
+}
+
+func (bc *containerBitmap) pointNeighborFlags(wordIdx int, shift uint, previous uint64, mask uint64) uint8 {
+	var neighbors uint8
+	if shift != 0 {
+		if previous&(mask>>1) != 0 {
+			neighbors = 1
+		}
+	} else if wordIdx > 0 && bc.bitmap[wordIdx-1]&(uint64(1)<<63) != 0 {
+		neighbors = 1
+	}
+	if shift != 63 {
+		if previous&(mask<<1) != 0 {
+			neighbors |= 2
+		}
+	} else if wordIdx+1 < len(bc.bitmap) && bc.bitmap[wordIdx+1]&1 != 0 {
+		neighbors |= 2
+	}
+	return neighbors
 }
 
 func bitmapOrSlice(dst, left, right []uint64) int {
@@ -248,10 +283,6 @@ func setBitmapRangeAndCardinalityChange(bitmap []uint64, start int, end int) int
 	return delta
 }
 
-func newContainerBitmap() *containerBitmap {
-	return getContainerBitmap()
-}
-
 func (bc *containerBitmap) retain() container16 {
 	bc.refs.Add(1)
 	return bc
@@ -269,6 +300,7 @@ func (bc *containerBitmap) release() {
 		return
 	}
 	bc.cardinality = 0
+	bc.runCount = 0
 	clear(bc.bitmap)
 	bitmapContainerPool.Put(bc)
 }
@@ -284,8 +316,9 @@ func efficientContainerFromTempBitmap(temp *containerBitmap) container16 {
 }
 
 func newContainerBitmapWithRange(firstOfRun, lastOfRun int) *containerBitmap {
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	bc.cardinality = lastOfRun - firstOfRun + 1
+	bc.setRunCount(1)
 	if bc.cardinality == maxCapacity {
 		fill(bc.bitmap, uint64(0xffffffffffffffff))
 	} else {
@@ -526,12 +559,25 @@ func (bc *containerBitmap) iaddReturnMinimized(i uint16) container16 {
 // iadd adds the arg i, returning true if not already present
 func (bc *containerBitmap) iadd(i uint16) bool {
 	x := int(i)
-	previous := bc.bitmap[x/64]
-	mask := uint64(1) << (uint(x) % 64)
+	wordIdx := x >> 6
+	shift := uint(x) & 63
+	previous := bc.bitmap[wordIdx]
+	mask := uint64(1) << shift
 	newb := previous | mask
-	bc.bitmap[x/64] = newb
-	bc.cardinality += int((previous ^ newb) >> (uint(x) % 64))
-	return newb != previous
+	if newb == previous {
+		return false
+	}
+	if bc.runCount != 0 {
+		switch bc.pointNeighborFlags(wordIdx, shift, previous, mask) {
+		case 0:
+			bc.runCount++
+		case 3:
+			bc.runCount--
+		}
+	}
+	bc.bitmap[wordIdx] = newb
+	bc.cardinality++
+	return true
 }
 
 func (bc *containerBitmap) iremoveReturnMinimized(i uint16) container16 {
@@ -545,13 +591,26 @@ func (bc *containerBitmap) iremoveReturnMinimized(i uint16) container16 {
 
 // iremove returns true if i was found.
 func (bc *containerBitmap) iremove(i uint16) bool {
-	wordIdx := i >> 6
-	shift := i & 63
+	x := int(i)
+	wordIdx := x >> 6
+	shift := uint(x) & 63
 	previous := bc.bitmap[wordIdx]
-	newWord := previous &^ (uint64(1) << shift)
+	mask := uint64(1) << shift
+	newWord := previous &^ mask
+	if newWord == previous {
+		return false
+	}
+	if bc.runCount != 0 {
+		switch bc.pointNeighborFlags(wordIdx, shift, previous, mask) {
+		case 0:
+			bc.runCount--
+		case 3:
+			bc.runCount++
+		}
+	}
 	bc.bitmap[wordIdx] = newWord
-	bc.cardinality -= int((previous ^ newWord) >> shift)
-	return newWord != previous
+	bc.cardinality--
+	return true
 }
 
 func (bc *containerBitmap) isFull() bool {
@@ -567,7 +626,8 @@ func (bc *containerBitmap) isEmpty() bool {
 }
 
 func (bc *containerBitmap) clone() container16 {
-	ptr := newContainerBitmap()
+	ptr := getContainerBitmap()
+	ptr.runCount = bc.runCount
 	ptr.cardinality = bc.cardinality
 	copy(ptr.bitmap, bc.bitmap)
 	return ptr
@@ -575,13 +635,19 @@ func (bc *containerBitmap) clone() container16 {
 
 // add all values in range [firstOfRange,lastOfRange)
 func (bc *containerBitmap) iaddRange(firstOfRange, lastOfRange int) container16 {
-	bc.cardinality += setBitmapRangeAndCardinalityChange(bc.bitmap, firstOfRange, lastOfRange)
+	if delta := setBitmapRangeAndCardinalityChange(bc.bitmap, firstOfRange, lastOfRange); delta != 0 {
+		bc.cardinality += delta
+		bc.clearRunCount()
+	}
 	return bc
 }
 
 // remove all values in range [firstOfRange,lastOfRange)
 func (bc *containerBitmap) iremoveRange(firstOfRange, lastOfRange int) container16 {
-	bc.cardinality += resetBitmapRangeAndCardinalityChange(bc.bitmap, firstOfRange, lastOfRange)
+	if delta := resetBitmapRangeAndCardinalityChange(bc.bitmap, firstOfRange, lastOfRange); delta != 0 {
+		bc.cardinality += delta
+		bc.clearRunCount()
+	}
 	if bc.getCardinality() <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
 	}
@@ -596,6 +662,7 @@ func (bc *containerBitmap) inot(firstOfRange, endx int) container16 {
 	} else {
 		bc.cardinality += flipBitmapRangeAndCardinalityChange(bc.bitmap, firstOfRange, endx)
 	}
+	bc.clearRunCount()
 	if bc.getCardinality() <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
 	}
@@ -648,6 +715,10 @@ func (bc *containerBitmap) ior(a container16) container16 {
 func (bc *containerBitmap) orArray(value2 *containerArray) container16 {
 	answer := bc.clone().(*containerBitmap)
 	c := value2.getCardinality()
+	if c == 1 {
+		answer.iadd(value2.content[0])
+		return answer
+	}
 	for k := 0; k < c; k++ {
 		v := value2.content[k]
 		i := uint(v) >> 6
@@ -656,11 +727,14 @@ func (bc *containerBitmap) orArray(value2 *containerArray) container16 {
 		answer.bitmap[i] = aft
 		answer.cardinality += int((bef - aft) >> 63)
 	}
+	if answer.cardinality != bc.cardinality {
+		answer.clearRunCount()
+	}
 	return answer
 }
 
 func (bc *containerBitmap) orBitmap(value2 *containerBitmap) container16 {
-	answer := newContainerBitmap()
+	answer := getContainerBitmap()
 	answer.cardinality = bitmapOrSlice(answer.bitmap, bc.bitmap, value2.bitmap)
 	if answer.isFull() {
 		return newContainerRunRange(0, MaxUint16)
@@ -674,9 +748,18 @@ func (bc *containerBitmap) andBitmapCardinality(value2 *containerBitmap) int {
 
 func (bc *containerBitmap) computeCardinality() {
 	bc.cardinality = int(popcntSlice(bc.bitmap))
+	bc.clearRunCount()
 }
 
 func (bc *containerBitmap) iorArray(ac *containerArray) container16 {
+	cardinality := bc.cardinality
+	if len(ac.content) == 1 {
+		bc.iadd(ac.content[0])
+		if bc.isFull() {
+			return newContainerRunRange(0, MaxUint16)
+		}
+		return bc
+	}
 	for k := range ac.content {
 		vc := ac.content[k]
 		i := uint(vc) >> 6
@@ -685,6 +768,9 @@ func (bc *containerBitmap) iorArray(ac *containerArray) container16 {
 		bc.bitmap[i] = aft
 		bc.cardinality += int((bef - aft) >> 63)
 	}
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
+	}
 	if bc.isFull() {
 		return newContainerRunRange(0, MaxUint16)
 	}
@@ -692,7 +778,11 @@ func (bc *containerBitmap) iorArray(ac *containerArray) container16 {
 }
 
 func (bc *containerBitmap) iorBitmap(value2 *containerBitmap) container16 {
+	cardinality := bc.cardinality
 	bc.cardinality = bitmapOrSlice(bc.bitmap, bc.bitmap, value2.bitmap)
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
+	}
 	if bc.isFull() {
 		return newContainerRunRange(0, MaxUint16)
 	}
@@ -748,6 +838,9 @@ func (bc *containerBitmap) xorArray(value2 *containerArray) container16 {
 	}
 
 	answer := bc.clone().(*containerBitmap)
+	if c != 0 {
+		answer.clearRunCount()
+	}
 	for k := 0; k < c; k++ {
 		vc := value2.content[k]
 		index := uint(vc) >> 6
@@ -763,7 +856,7 @@ func (bc *containerBitmap) xorArray(value2 *containerArray) container16 {
 }
 
 func (bc *containerBitmap) xorBitmap(value2 *containerBitmap) container16 {
-	result := newContainerBitmap()
+	result := getContainerBitmap()
 	result.cardinality = bitmapXorSlice(result.bitmap, bc.bitmap, value2.bitmap)
 	if result.cardinality > arrayDefaultMaxSize {
 		if result.isFull() {
@@ -850,7 +943,7 @@ func (bc *containerBitmap) andRun(rc *containerRun) container16 {
 		return answer
 	}
 
-	answer := newContainerBitmap()
+	answer := getContainerBitmap()
 	fillBitmapAndRun(answer.bitmap, bc.bitmap, rc.iv)
 	answer.cardinality = cardinality
 	return answer
@@ -900,7 +993,7 @@ func (bc *containerBitmap) getCardinalityInRange(start, end uint) int {
 }
 
 func (bc *containerBitmap) andBitmap(value2 *containerBitmap) container16 {
-	result := newContainerBitmap()
+	result := getContainerBitmap()
 	result.cardinality = bitmapAndSlice(result.bitmap, bc.bitmap, value2.bitmap)
 	if result.cardinality > arrayDefaultMaxSize {
 		return result
@@ -929,7 +1022,15 @@ func (bc *containerBitmap) intersectsBitmap(value2 *containerBitmap) bool {
 }
 
 func (bc *containerBitmap) iandBitmap(value2 *containerBitmap) container16 {
-	bc.cardinality = bitmapAndSlice(bc.bitmap, bc.bitmap, value2.bitmap)
+	if bc.runCount != 0 {
+		cardinality := bc.cardinality
+		bc.cardinality = bitmapAndSlice(bc.bitmap, bc.bitmap, value2.bitmap)
+		if bc.cardinality != cardinality {
+			bc.clearRunCount()
+		}
+	} else {
+		bc.cardinality = bitmapAndSlice(bc.bitmap, bc.bitmap, value2.bitmap)
+	}
 	if bc.cardinality <= arrayDefaultMaxSize {
 		return newContainerArrayFromBitmap(bc)
 	}
@@ -971,6 +1072,16 @@ func (bc *containerBitmap) iandNotArray(ac *containerArray) container16 {
 		return bc
 	}
 
+	if len(ac.content) == 1 {
+		bc.iremove(ac.content[0])
+		if bc.getCardinality() <= arrayDefaultMaxSize {
+			return bc.toArrayContainer()
+		}
+		return bc
+	}
+
+	cardinality := bc.cardinality
+
 	// Word by word, we remove the elements in ac from bc. The approach is to build
 	// a mask of the elements to remove, and then apply it to the bitmap.
 	wordIdx := ac.content[0] / 64
@@ -993,6 +1104,10 @@ func (bc *containerBitmap) iandNotArray(ac *containerArray) container16 {
 	bc.bitmap[wordIdx] &^= mask
 	bc.cardinality -= int(popcount(cleared))
 
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
+	}
+
 	if bc.getCardinality() <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
 	}
@@ -1005,8 +1120,12 @@ func (bc *containerBitmap) iandNotRun(rc *containerRun) container16 {
 		return bc
 	}
 
+	cardinality := bc.cardinality
 	for i := range rc.iv {
 		bc.cardinality += resetBitmapRangeAndCardinalityChange(bc.bitmap, int(rc.iv[i].start), int(rc.iv[i].last())+1)
+	}
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
 	}
 
 	if bc.getCardinality() <= arrayDefaultMaxSize {
@@ -1018,6 +1137,13 @@ func (bc *containerBitmap) iandNotRun(rc *containerRun) container16 {
 func (bc *containerBitmap) andNotArray(value2 *containerArray) container16 {
 	answer := bc.clone().(*containerBitmap)
 	c := value2.getCardinality()
+	if c == 1 {
+		answer.iremove(value2.content[0])
+		if answer.cardinality <= arrayDefaultMaxSize {
+			return answer.toArrayContainer()
+		}
+		return answer
+	}
 	for k := 0; k < c; k++ {
 		vc := value2.content[k]
 		i := uint(vc) >> 6
@@ -1026,6 +1152,9 @@ func (bc *containerBitmap) andNotArray(value2 *containerArray) container16 {
 		answer.bitmap[i] = newv
 		answer.cardinality -= int((oldv ^ newv) >> (vc % 64))
 	}
+	if answer.cardinality != bc.cardinality {
+		answer.clearRunCount()
+	}
 	if answer.cardinality <= arrayDefaultMaxSize {
 		return answer.toArrayContainer()
 	}
@@ -1033,7 +1162,7 @@ func (bc *containerBitmap) andNotArray(value2 *containerArray) container16 {
 }
 
 func (bc *containerBitmap) andNotBitmap(value2 *containerBitmap) container16 {
-	answer := newContainerBitmap()
+	answer := getContainerBitmap()
 	answer.cardinality = bitmapAndNotSlice(answer.bitmap, bc.bitmap, value2.bitmap)
 	if answer.cardinality > arrayDefaultMaxSize {
 		return answer
@@ -1044,7 +1173,11 @@ func (bc *containerBitmap) andNotBitmap(value2 *containerBitmap) container16 {
 }
 
 func (bc *containerBitmap) iandNotBitmapSurely(value2 *containerBitmap) container16 {
+	cardinality := bc.cardinality
 	bc.cardinality = bitmapAndNotSlice(bc.bitmap, bc.bitmap, value2.bitmap)
+	if bc.cardinality != cardinality {
+		bc.clearRunCount()
+	}
 	if bc.getCardinality() <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
 	}
@@ -1070,6 +1203,21 @@ func (bc *containerBitmap) loadData(containerArray *containerArray) {
 		i := int(x) / 64
 		bc.bitmap[i] |= uint64(1) << uint(x%64)
 	}
+}
+
+func (bc *containerBitmap) loadDataWithRunCount(containerArray *containerArray) {
+	bc.cardinality = len(containerArray.content)
+	runs := 0
+	var prev uint16
+	for _, x := range containerArray.content {
+		if runs == 0 || x != prev+1 {
+			runs++
+		}
+		prev = x
+		i := int(x) / 64
+		bc.bitmap[i] |= uint64(1) << uint(x%64)
+	}
+	bc.setRunCount(runs)
 }
 
 func (bc *containerBitmap) toArrayContainer() *containerArray {
@@ -1187,6 +1335,13 @@ func (bc *containerBitmap) uPrevSetBit(i uint) int {
 // reference the java implementation
 // https://github.com/RoaringBitmap/RoaringBitmap/blob/master/src/main/java/org/roaringbitmap/BitmapContainer.java#L875-L892
 func (bc *containerBitmap) numberOfRuns() int {
+	if runs, ok := bc.runCountValue(); ok {
+		return runs
+	}
+	return bc.computeRunCount()
+}
+
+func (bc *containerBitmap) computeRunCount() int {
 	if bc.cardinality == 0 {
 		return 0
 	}
@@ -1211,7 +1366,10 @@ func (bc *containerBitmap) numberOfRuns() int {
 
 // convert to run or array *if needed*
 func (bc *containerBitmap) toEfficientContainer() container16 {
-	numRuns := bc.numberOfRuns()
+	numRuns, cached := bc.runCountValue()
+	if !cached {
+		numRuns = bc.computeRunCount()
+	}
 
 	sizeAsRunContainer := containerRunSerializedSizeInBytes(numRuns)
 	sizeAsBitmapContainer := containerBitmapSizeInBytes()
@@ -1224,6 +1382,9 @@ func (bc *containerBitmap) toEfficientContainer() container16 {
 	if card <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
 	}
+	if !cached && bc.uniquelyOwned() {
+		bc.setRunCount(numRuns)
+	}
 	return bc
 }
 
@@ -1232,11 +1393,12 @@ func newContainerBitmapFromRun(rc *containerRun) *containerBitmap {
 		return newContainerBitmapWithRange(int(rc.iv[0].start), int(rc.iv[0].last()))
 	}
 
-	bc := newContainerBitmap()
+	bc := getContainerBitmap()
 	for i := range rc.iv {
 		setBitmapRange(bc.bitmap, int(rc.iv[i].start), int(rc.iv[i].last())+1)
 		bc.cardinality += int(rc.iv[i].last()) + 1 - int(rc.iv[i].start)
 	}
+	bc.setRunCount(len(rc.iv))
 	// bc.computeCardinality()
 	return bc
 }
