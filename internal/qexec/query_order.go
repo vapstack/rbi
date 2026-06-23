@@ -846,20 +846,73 @@ func (qv *View) collectArrayPosOrderFacts(q *qir.Shape, facts *plannerArrayPosOr
 	}
 
 	e := q.Expr
-	if e.Op != qir.OpHASANY || e.Not || e.FieldOrdinal != q.Order.FieldOrdinal || len(e.Operands) != 0 {
-		return false
+	if e.Op == qir.OpHASANY {
+		if e.Not || e.FieldOrdinal != q.Order.FieldOrdinal || len(e.Operands) != 0 {
+			return false
+		}
+		facts.expr = e
+	} else {
+		if e.Op != qir.OpAND || e.Not || len(e.Operands) == 0 {
+			return false
+		}
+		hasFilter := false
+		for i := 0; i < len(e.Operands); i++ {
+			op := e.Operands[i]
+			if op.Op == qir.OpHASANY && !op.Not && op.FieldOrdinal == q.Order.FieldOrdinal && len(op.Operands) == 0 {
+				if hasFilter {
+					return false
+				}
+				facts.expr = op
+				hasFilter = true
+				continue
+			}
+			if !qv.arrayPosOrderResidualAlwaysTrue(op) {
+				return false
+			}
+		}
+		if !hasFilter {
+			return false
+		}
 	}
 
-	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
+	fm := qv.fieldMetaByOrdinal(facts.expr.FieldOrdinal)
 	if fm == nil || !fm.Slice {
 		return false
 	}
 
-	facts.expr = e
 	facts.order = q.Order
 	facts.fm = fm
 	facts.ov = qv.indexViewByOrdinal(q.Order.FieldOrdinal)
 	return true
+}
+
+func (qv *View) arrayPosOrderResidualAlwaysTrue(e qir.Expr) bool {
+	if e.Op == qir.OpConst {
+		return !e.Not
+	}
+	if e.Not || len(e.Operands) != 0 || !e.Op.IsScalarRangeOrPrefix() || !qv.hasFieldOrdinal(e.FieldOrdinal) {
+		return false
+	}
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
+	if fm == nil || fm.Slice {
+		return false
+	}
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
+	if !ov.HasData() {
+		return false
+	}
+	bounds, ok, err := qv.rangeBoundsForScalarExpr(e)
+	if err != nil || !ok {
+		return false
+	}
+	br := ov.RangeForBounds(bounds)
+	if br.Empty() {
+		return false
+	}
+	if br.BaseStart != 0 || br.BaseEnd != ov.KeyCount() || !br.ExactRankSpan() {
+		return false
+	}
+	return !schema.FieldUsesNilIndex(fm) || qv.nilIndexViewByOrdinal(e.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey) == 0
 }
 
 func (qv *View) selectArrayPosOrder(q *qir.Shape) (plannerArrayPosOrderDecision, bool) {
@@ -925,9 +978,12 @@ func (qv *View) dispatchArrayPosOrder(
 	decision plannerArrayPosOrderDecision,
 	trace *Trace,
 ) ([]uint64, bool, rbitrace.PlanName, error) {
+	dispatchShape := *q
+	dispatchShape.Expr = facts.expr
+
 	switch decision.selected.kind {
 	case plannerArrayPosOrderCandidateMaterializedFallback:
-		return qv.dispatchLimitMaterialized(q)
+		return qv.dispatchLimitMaterialized(&dispatchShape)
 	case plannerArrayPosOrderCandidateSingleHasAny:
 		out, used, err := qv.execSelectedArrayPosOrderSingleHasAny(q, facts, trace)
 		if err != nil {
@@ -935,7 +991,7 @@ func (qv *View) dispatchArrayPosOrder(
 		}
 		if !used {
 			if decision.materializedFallback.kind == plannerArrayPosOrderCandidateMaterializedFallback {
-				return qv.dispatchLimitMaterialized(q)
+				return qv.dispatchLimitMaterialized(&dispatchShape)
 			}
 			return nil, true, "", fmt.Errorf("selected ArrayPos ORDER route %s was not executable", decision.selected.kind.String())
 		}

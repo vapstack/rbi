@@ -633,6 +633,68 @@ func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
 	}
 }
 
+func TestQuery_ArrayPosOrderANDAlwaysTrueResidualUsesSelectorTrace(t *testing.T) {
+	var events []rbitrace.Event
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev rbitrace.Event) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	filter := qx.HASANY("tags", []string{"java", "missing_tag"})
+	order := qx.POS("tags", []string{"java", "go", "db"})
+	q := qx.Query(qx.AND(filter, qx.GTE("age", 1))).
+		SortBy(order, qx.DESC).
+		Limit(128)
+
+	ids, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Fatalf("expected non-empty ids")
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if got := last.ArrayPosOrderRoute.Selected; got != plannerArrayPosOrderCandidateMaterializedFallback.String() {
+		t.Fatalf("selected=%q want %q route=%+v", got, plannerArrayPosOrderCandidateMaterializedFallback.String(), last.ArrayPosOrderRoute)
+	}
+
+	want, err := db.QueryKeys(qx.Query(filter).SortBy(order, qx.DESC).Limit(128))
+	if err != nil {
+		t.Fatalf("reference QueryKeys: %v", err)
+	}
+	if !slices.Equal(ids, want) {
+		t.Fatalf("ids mismatch:\ngot  %v\nwant %v", ids, want)
+	}
+}
+
+func TestArrayPosOrderANDPartialResidualIsNotSelectorCandidate(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.seedData(t, 20_000)
+
+	prepared, shape, err := db.prepareQuery(qx.Query(
+		qx.AND(
+			qx.HASANY("tags", []string{"java", "missing_tag"}),
+			qx.GTE("age", 30),
+		),
+	).SortBy(qx.POS("tags", []string{"java", "go", "db"}), qx.DESC).Limit(128))
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	var facts plannerArrayPosOrderFacts
+	if db.view().collectArrayPosOrderFacts(&shape, &facts) {
+		t.Fatalf("partial residual unexpectedly collected as array-pos selector facts: %+v", facts)
+	}
+}
+
 func TestArrayPosOrderPrioritiesKeepTypedLookupKeysDistinct(t *testing.T) {
 	raw := string([]byte{0, 0, 0, 0, 0, 0, 0, 7})
 	fixed := uint64(7)

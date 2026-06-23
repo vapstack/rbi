@@ -1831,7 +1831,7 @@ func (rc *containerRun) and(a container16) container16 {
 		// result of intersecting two run containers is itself
 		// a containerRun. Hence we convert to an efficient container16.
 		// We only use run containers when they are efficient.
-		return rc.intersect(c).toEfficientContainer()
+		return efficientContainerFromTempRunAuto(rc.intersect(c))
 	case *containerArray:
 		return rc.andArray(c)
 	case *containerBitmap:
@@ -1952,7 +1952,7 @@ func (rc *containerRun) andNot(a container16) container16 {
 	case *containerBitmap:
 		return rc.andNotBitmap(c)
 	case *containerRun:
-		return rc.andNotRun(c).toEfficientContainer()
+		return rc.andNotRun(c)
 	}
 	panic("unsupported container16 type")
 }
@@ -2426,7 +2426,7 @@ func (rc *containerRun) inot(firstOfRange, endx int) container16 {
 }
 
 func (rc *containerRun) andNotRun(b *containerRun) container16 {
-	return rc.andNotRunCopy(b)
+	return efficientContainerFromTempRunAuto(rc.andNotRunCopy(b))
 }
 
 func efficientContainerFromTempRun(temp *containerRun, card int) container16 {

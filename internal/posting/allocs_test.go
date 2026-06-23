@@ -644,3 +644,11 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 		})
 	})
 }
+
+func TestRangeOfOnesTiny_NoAllocsAfterWarmup(t *testing.T) {
+	requireZeroAllocsAfterPoolWarmup(t, func() {
+		c := rangeOfOnes(0, 0)
+		allocBoolSink = c.contains(0)
+		c.release()
+	})
+}

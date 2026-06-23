@@ -36,8 +36,6 @@ func newFieldIndexPostingUnionBuilder(batchCompact bool) fieldIndexPostingUnionB
 }
 
 func (b *fieldIndexPostingUnionBuilder) flushSingles() {
-	var ids posting.List
-
 	if b.singles != nil {
 		if len(b.singles) == 0 {
 			return
@@ -45,7 +43,7 @@ func (b *fieldIndexPostingUnionBuilder) flushSingles() {
 		if b.singlesUnsorted {
 			sortFieldIndexSingles(b.singles, b.maxSingle)
 		}
-		ids = ids.BuildAddedMany(b.singles)
+		b.singleIDs = b.singleIDs.BuildAddedMany(b.singles)
 		b.singles = b.singles[:0]
 		b.lastSingle = 0
 		b.maxSingle = 0
@@ -59,19 +57,12 @@ func (b *fieldIndexPostingUnionBuilder) flushSingles() {
 		if b.singlesUnsorted {
 			sortFieldIndexSingles(singles, b.maxSingle)
 		}
-		ids = ids.BuildAddedMany(singles)
+		b.singleIDs = b.singleIDs.BuildAddedMany(singles)
 		b.inlineLen = 0
 		b.lastSingle = 0
 		b.maxSingle = 0
 		b.singlesUnsorted = false
 	}
-
-	if b.singleIDs.IsEmpty() {
-		b.singleIDs = ids
-		return
-	}
-	b.singleIDs = b.singleIDs.BuildOr(ids)
-	ids.Release()
 }
 
 func (b *fieldIndexPostingUnionBuilder) addSingle(idx uint64) {

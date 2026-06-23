@@ -196,7 +196,18 @@ func rangeOfOnes(start, last int) container16 {
 	if last < 0 {
 		panic("rangeOfOnes called with last < 0")
 	}
-	return newContainerRunRange(uint16(start), uint16(last)).toEfficientContainer()
+	if last < start {
+		panic("rangeOfOnes called with last < start")
+	}
+	card := last - start + 1
+	if card <= 3 {
+		ac := getContainerArrayWithLen(card)
+		for i := range ac.content {
+			ac.content[i] = uint16(start + i)
+		}
+		return ac
+	}
+	return efficientContainerFromTempRunAuto(newContainerRunRange(uint16(start), uint16(last)))
 }
 
 func (ra *containerIndex) runOptimize() bool {
