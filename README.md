@@ -648,8 +648,8 @@ For 10,000,000 measured rows this is roughly:\
 ### Runtime query caches
 
 Runtime query caches are snapshot-local and bounded by `Options`.
-With defaults, the materialized predicate cache keeps up to 24 regular postings
-and skips regular entries above 64K ids. Numeric range acceleration keeps one
+With defaults, the materialized predicate cache keeps up to 32 regular postings
+and skips regular entries above 128K ids. Numeric range acceleration keeps one
 small descriptor per hot numeric field and up to 4 cached full-span postings per
 field, using the same cardinality guard.
 
