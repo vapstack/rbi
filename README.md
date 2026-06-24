@@ -562,13 +562,11 @@ MakePatch uses Go reflect equality.
 
 `MakePatch` and `MakePatchInto` copy changed values into the patch,
 including unexported nested fields (if any), so later mutations of `newVal`
-do not affect ordinary patch data. This is intended for record data graphs:
-scalars, structs, slices, maps, pointers, and interfaces containing data values.
-
-They are not general object cloners. Runtime state such as `sync`/`atomic`
-values, locks, channels, functions, and other unsafe resources are not supported
-and are not diagnosed. These methods do not return errors for such values and 
-copy safety is provided on a best-effort basis.
+do not affect patch data. These methods are not general object cloners.
+Runtime state such as `sync` or atomic values, locks, channels, functions,
+and other unsafe resources are not supported and are not diagnosed.
+These methods do not return errors for such values and copy safety is provided 
+on a best-effort basis.
 
 ## Index persistence and recovery
 
