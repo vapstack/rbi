@@ -115,11 +115,12 @@ type testOptions struct {
 }
 
 type testDB struct {
-	rt   *schema.Schema
-	exec *Runtime
-	snap *snapshot.View
-	seq  uint64
-	cfg  snapshot.CacheConfig
+	rt       *schema.Schema
+	exec     *Runtime
+	registry *snapshot.Registry
+	snap     *snapshot.View
+	seq      uint64
+	cfg      snapshot.CacheConfig
 }
 
 type DB[K ~string | ~uint64, V any] struct {
@@ -226,6 +227,7 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		exec:     exec,
 		cfg:      cfg,
 	}
+	qe.configureAsyncMaterializedPredWarmup()
 	qe.snapshot.Publish(newEmptySnapshotForTests(0, rt, cfg))
 	db := &DB[K, V]{
 		engine:  qe,
@@ -234,6 +236,44 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		path:    path,
 	}
 	return db
+}
+
+func (qe *queryEngine) configureAsyncMaterializedPredWarmup() {
+	qe.exec.ConfigureAsyncMaterializedPredSnapshotOps(AsyncMaterializedPredSnapshotOps{
+		CurrentSeq: func() uint64 {
+			if snap := qe.snapshot.Current(); snap != nil {
+				return snap.Seq
+			}
+			return 0
+		},
+		PinBySeq: qe.snapshot.PinBySeq,
+		Unpin:    qe.snapshot.Unpin,
+	})
+}
+
+func (qe *queryEngine) waitAsyncMaterializedPredWarmupForTests(t testing.TB) {
+	t.Helper()
+	waitAsyncMaterializedPredWarmupForTests(t, qe.exec)
+}
+
+func (db *testDB) waitAsyncMaterializedPredWarmupForTests(t testing.TB) {
+	t.Helper()
+	waitAsyncMaterializedPredWarmupForTests(t, db.exec)
+}
+
+func waitAsyncMaterializedPredWarmupForTests(t testing.TB, exec *Runtime) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stats := exec.AsyncMaterializedPredStats()
+		if stats.InFlight == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("async materialized predicate warmup still in flight: %+v", stats)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (o *Options) setDefaults() {
@@ -649,11 +689,25 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 		MatPredMaxEntries: opts.MatPredCacheMaxEntries,
 		MatPredMaxCard:    opts.MatPredCacheMaxCard,
 	}
+	registry := snapshot.NewRegistry(false)
+	snap := newEmptySnapshotForTests(0, rt, cfg)
+	registry.Publish(snap)
+	exec.ConfigureAsyncMaterializedPredSnapshotOps(AsyncMaterializedPredSnapshotOps{
+		CurrentSeq: func() uint64 {
+			if snap := registry.Current(); snap != nil {
+				return snap.Seq
+			}
+			return 0
+		},
+		PinBySeq: registry.PinBySeq,
+		Unpin:    registry.Unpin,
+	})
 	return &testDB{
-		rt:   rt,
-		exec: exec,
-		snap: newEmptySnapshotForTests(0, rt, cfg),
-		cfg:  cfg,
+		rt:       rt,
+		exec:     exec,
+		registry: registry,
+		snap:     snap,
+		cfg:      cfg,
 	}
 }
 
@@ -719,6 +773,7 @@ func (db *testDB) seedData(t testing.TB, n int) []uint64 {
 
 	db.seq++
 	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, entries)
+	db.registry.Publish(db.snap)
 	return ids
 }
 
@@ -733,6 +788,7 @@ func (db *testDB) seedGeneratedData(t testing.TB, n int, gen func(uint64) testRe
 	}
 	db.seq++
 	db.snap = snapshot.Build(db.seq, db.snap, db.rt, db.cfg, nil, entries)
+	db.registry.Publish(db.snap)
 }
 
 func (db *testDB) prepareQuery(q *qx.QX) (*qir.Query, qir.Shape, error) {

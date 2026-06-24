@@ -3,6 +3,7 @@ package indexdata
 import (
 	"math/bits"
 	"slices"
+	"time"
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/mathutil"
@@ -27,8 +28,33 @@ type fieldIndexPostingUnionBuilder struct {
 	batchCompact    bool
 }
 
+type RangePostingsUnionCancel struct {
+	CurrentSeq    func() uint64
+	Seq           uint64
+	NextProbe     int64
+	ProbeInterval int64
+	Probes        uint32
+}
+
 func fieldIndexPostingBatchCompactEnabled(capHint uint64) bool {
 	return capHint > posting.SmallCap && capHint <= fieldIndexCompactAsSinglesAdaptiveMaxLen
+}
+
+func (c *RangePostingsUnionCancel) Check() bool {
+	c.Probes++
+	if c.Probes&63 != 0 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	if now < c.NextProbe {
+		return false
+	}
+	c.NextProbe = now + c.ProbeInterval
+	return c.Canceled()
+}
+
+func (c *RangePostingsUnionCancel) Canceled() bool {
+	return c.CurrentSeq() != c.Seq
 }
 
 func newFieldIndexPostingUnionBuilder(batchCompact bool) fieldIndexPostingUnionBuilder {
@@ -63,6 +89,43 @@ func (b *fieldIndexPostingUnionBuilder) flushSingles() {
 		b.maxSingle = 0
 		b.singlesUnsorted = false
 	}
+}
+
+func (b *fieldIndexPostingUnionBuilder) flushSinglesUntil(cancel *RangePostingsUnionCancel) bool {
+	if b.singles != nil {
+		if len(b.singles) == 0 {
+			return true
+		}
+		if b.singlesUnsorted && !sortFieldIndexSinglesUntil(b.singles, b.maxSingle, cancel) {
+			return false
+		}
+		b.singleIDs = b.singleIDs.BuildAddedMany(b.singles)
+		if cancel.Canceled() {
+			return false
+		}
+		b.singles = b.singles[:0]
+		b.lastSingle = 0
+		b.maxSingle = 0
+		b.singlesUnsorted = false
+		return true
+	}
+
+	if b.inlineLen == 0 {
+		return true
+	}
+	singles := b.inlineSingles[:b.inlineLen]
+	if b.singlesUnsorted && !sortFieldIndexSinglesUntil(singles, b.maxSingle, cancel) {
+		return false
+	}
+	b.singleIDs = b.singleIDs.BuildAddedMany(singles)
+	if cancel.Canceled() {
+		return false
+	}
+	b.inlineLen = 0
+	b.lastSingle = 0
+	b.maxSingle = 0
+	b.singlesUnsorted = false
+	return true
 }
 
 func (b *fieldIndexPostingUnionBuilder) addSingle(idx uint64) {
@@ -145,6 +208,136 @@ func (b *fieldIndexPostingUnionBuilder) finish(optimize bool) posting.List {
 	return out
 }
 
+func (b *fieldIndexPostingUnionBuilder) finishUntil(optimize bool, cancel *RangePostingsUnionCancel) (posting.List, bool) {
+	if cancel.Canceled() {
+		b.release()
+		return posting.List{}, false
+	}
+	if !b.flushSinglesUntil(cancel) {
+		b.release()
+		return posting.List{}, false
+	}
+	if cancel.Canceled() {
+		b.release()
+		return posting.List{}, false
+	}
+
+	out := b.ids
+	b.ids = posting.List{}
+	if !b.singleIDs.IsEmpty() {
+		singleIDs := b.singleIDs
+		b.singleIDs = posting.List{}
+		if out.IsEmpty() {
+			out = singleIDs
+		} else {
+			if cancel.Canceled() {
+				out.Release()
+				singleIDs.Release()
+				b.release()
+				return posting.List{}, false
+			}
+			out = out.BuildOr(singleIDs)
+			singleIDs.Release()
+		}
+	}
+	if cancel.Canceled() {
+		out.Release()
+		b.release()
+		return posting.List{}, false
+	}
+	if out.IsBorrowed() {
+		out = out.Clone()
+	}
+	b.inlineLen = 0
+	b.lastSingle = 0
+	b.maxSingle = 0
+	b.singlesUnsorted = false
+	if b.singles != nil {
+		pooled.ReleaseUint64Slice(b.singles)
+		b.singles = nil
+	}
+	if cancel.Canceled() {
+		out.Release()
+		return posting.List{}, false
+	}
+	if optimize {
+		out = out.BuildOptimized()
+		if cancel.Canceled() {
+			out.Release()
+			return posting.List{}, false
+		}
+	}
+	return out, true
+}
+
+func (b *fieldIndexPostingUnionBuilder) release() {
+	b.ids.Release()
+	b.singleIDs.Release()
+	if b.singles != nil {
+		pooled.ReleaseUint64Slice(b.singles)
+	}
+	*b = fieldIndexPostingUnionBuilder{}
+}
+
+func sortFieldIndexSinglesUntil(ids []uint64, maxID uint64, cancel *RangePostingsUnionCancel) bool {
+	if len(ids) < 1024 {
+		if cancel.Canceled() {
+			return false
+		}
+		slices.Sort(ids)
+		return !cancel.Canceled()
+	}
+	passes := (bits.Len64(maxID) + 7) >> 3
+	if passes == 0 {
+		return true
+	}
+	if cancel.Canceled() {
+		return false
+	}
+	buf := pooled.GetUint64Slice(len(ids))[:len(ids)]
+	src := ids
+	dst := buf
+	ok := true
+
+	for pass := 0; pass < passes; pass++ {
+		if cancel.Canceled() {
+			ok = false
+			break
+		}
+		var offsets [256]int
+		shift := uint(pass << 3)
+		for i := 0; i < len(src); i++ {
+			offsets[byte(src[i]>>shift)]++
+		}
+		sum := 0
+		for i := 0; i < len(offsets); i++ {
+			count := offsets[i]
+			offsets[i] = sum
+			sum += count
+		}
+		if cancel.Canceled() {
+			ok = false
+			break
+		}
+		for i := 0; i < len(src); i++ {
+			v := src[i]
+			bucket := byte(v >> shift)
+			dst[offsets[bucket]] = v
+			offsets[bucket]++
+		}
+		src, dst = dst, src
+	}
+	if ok && passes&1 != 0 {
+		if cancel.Canceled() {
+			ok = false
+		} else {
+			copy(ids, src)
+		}
+	}
+	pooled.ReleaseUint64Slice(buf)
+	return ok && !cancel.Canceled()
+}
+
 func sortFieldIndexSingles(ids []uint64, maxID uint64) {
 	if len(ids) < 1024 {
 		slices.Sort(ids)
@@ -205,6 +398,30 @@ func (o FieldIndexView) appendRangePostingsUnion(builder *fieldIndexPostingUnion
 	}
 }
 
+func (o FieldIndexView) appendRangePostingsUnionUntil(builder *fieldIndexPostingUnionBuilder, br FieldIndexRange, cancel *RangePostingsUnionCancel) bool {
+	if br.Empty() {
+		return true
+	}
+	cur := o.NewCursor(br, false)
+	for {
+		if cancel.Check() {
+			return false
+		}
+		ids, idx, single, ok := cur.NextPostingOrSingle()
+		if !ok {
+			return true
+		}
+		if single {
+			builder.addSingle(idx)
+			continue
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		builder.addPosting(ids)
+	}
+}
+
 func (o FieldIndexView) unionRangePostingsBatchCompactEnabled(first, second FieldIndexRange) bool {
 	totalSpan := first.Len() + second.Len()
 	if totalSpan == 0 {
@@ -248,6 +465,19 @@ func (o FieldIndexView) UnionRangePostings(first, second FieldIndexRange) postin
 	o.appendRangePostingsUnion(&builder, second)
 
 	return builder.finish(true)
+}
+
+func (o FieldIndexView) UnionRangePostingsUntil(first, second FieldIndexRange, cancel *RangePostingsUnionCancel) (posting.List, bool) {
+	if first.Empty() && second.Empty() {
+		return posting.List{}, true
+	}
+	builder := newFieldIndexPostingUnionBuilder(o.unionRangePostingsBatchCompactEnabled(first, second))
+	if !o.appendRangePostingsUnionUntil(&builder, first, cancel) ||
+		!o.appendRangePostingsUnionUntil(&builder, second, cancel) {
+		builder.release()
+		return posting.List{}, false
+	}
+	return builder.finishUntil(true, cancel)
 }
 
 func (o FieldIndexView) MergeRangePostingsInto(dst posting.List, first, second FieldIndexRange) posting.List {

@@ -124,6 +124,35 @@ func TestFieldIndexViewRangePostingsUnionBatchesUnorderedSingletons(t *testing.T
 	merged.Release()
 }
 
+func TestFieldIndexViewUnionRangePostingsUntilCancelsDuringFinish(t *testing.T) {
+	entries := fieldStorageEntriesForTest(32, true)
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+	ov := NewFieldIndexViewFromStorage(storage)
+
+	calls := 0
+	cancel := RangePostingsUnionCancel{
+		CurrentSeq: func() uint64 {
+			calls++
+			if calls == 1 {
+				return 1
+			}
+			return 2
+		},
+		Seq:       1,
+		NextProbe: 1<<63 - 1,
+	}
+	ids, ok := ov.UnionRangePostingsUntil(ov.RangeByRanks(0, 32), FieldIndexRange{}, &cancel)
+	if ok {
+		ids.Release()
+		t.Fatal("expected finish-phase cancellation")
+	}
+	if !ids.IsEmpty() {
+		ids.Release()
+		t.Fatal("canceled union returned ids")
+	}
+}
+
 func TestFieldIndexPostingUnionBuilderMergesFlushedSingletonChunks(t *testing.T) {
 	var builder fieldIndexPostingUnionBuilder
 	for i := 0; i < fieldIndexSingleChunkCap+257; i++ {

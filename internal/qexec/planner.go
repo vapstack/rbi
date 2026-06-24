@@ -4193,7 +4193,7 @@ func (qv *View) maybeMaterializeOrderedORPredicates(
 	return changed
 }
 
-func (qv *View) promoteOrderedORMaterializedBaseOps(
+func (qv *View) scheduleOrderedORMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
 	branchChecks [plannerORBranchLimit][]int,
@@ -4295,16 +4295,19 @@ func (qv *View) promoteOrderedORMaterializedBaseOps(
 		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
 			continue
 		}
-		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], asyncMaterializedPredObservedThreshold(buildWorksBuf[i])) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
 		predIdx := repPredBuf[i]
-		qv.materializeOrderedORPredicate((&branches.owner[branchIdx]).predPtr(predIdx))
+		plan, ok := qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
+		if ok {
+			qv.scheduleAsyncMaterializedPredWarmup(plan)
+		}
 	}
 }
 
-func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
+func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
 	branchChecks [plannerORBranchLimit][]int,
@@ -4409,12 +4412,15 @@ func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
 		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
 			continue
 		}
-		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], asyncMaterializedPredObservedThreshold(buildWorksBuf[i])) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
 		predIdx := repPredBuf[i]
-		qv.materializeOrderedORPredicate((&branches.owner[branchIdx]).predPtr(predIdx))
+		plan, ok := qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
+		if ok {
+			qv.scheduleAsyncMaterializedPredWarmup(plan)
+		}
 	}
 }
 
@@ -4987,7 +4993,7 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 			it.Release()
 		}
 		if promoteObserved {
-			qv.promoteOrderedORMaterializedBaseOps(q, branches, branchChecks, observed, analysis)
+			qv.scheduleOrderedORMaterializedBaseOps(q, branches, branchChecks, observed, analysis)
 		}
 		releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 		return out, true
@@ -5089,7 +5095,7 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 	trace.SetORBranches(branchMetrics)
 	trace.SetEarlyStopReason(stopReason)
 	if promoteObserved {
-		qv.promoteOrderedORMaterializedBaseOps(q, branches, branchChecks, observed, analysis)
+		qv.scheduleOrderedORMaterializedBaseOps(q, branches, branchChecks, observed, analysis)
 	}
 	releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 	return out, true
@@ -6149,7 +6155,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 	}
 
 	if h.len() == 0 {
-		qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
+		qv.scheduleObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 		if trace != nil {
 			if fullTrace {
 				scanWidth = uint64(bucketSeen.Len())
@@ -6224,7 +6230,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 							rt.projectedExaminedMax,
 						)
 					}
-					qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
+					qv.scheduleObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 					return nil, false, nil
 				}
 			}
@@ -6247,7 +6253,7 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 							rt.projectedExaminedMax,
 						)
 					}
-					qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
+					qv.scheduleObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 					return nil, false, nil
 				}
 			}
@@ -6275,13 +6281,13 @@ func (qv *View) execPlanOROrderKWayWithFallback(
 						rt.projectedExaminedMax,
 					)
 				}
-				qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
+				qv.scheduleObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 				return nil, false, nil
 			}
 		}
 	}
 
-	qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
+	qv.scheduleObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 	if trace != nil {
 		if fullTrace {
 			scanWidth = uint64(bucketSeen.Len())

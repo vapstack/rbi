@@ -2108,6 +2108,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 			t.Fatalf("execPlanOROrderKWay run %d returned no rows", i+1)
 		}
 	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 
 	if got := db.engine.snapshot.Current().MaterializedPredCacheEntryCount(); got == 0 {
 		t.Fatalf("expected repeated ordered OR k-way execution to promote exact-only materialized predicate")

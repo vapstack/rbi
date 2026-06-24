@@ -128,6 +128,16 @@ func NewIndex(cfg Config) (*Index, error) {
 			TraceSampleEvery:               cfg.TraceSampleEvery,
 		}),
 	}
+	r.exec.ConfigureAsyncMaterializedPredSnapshotOps(qexec.AsyncMaterializedPredSnapshotOps{
+		CurrentSeq: func() uint64 {
+			if snap := r.snapshot.Current(); snap != nil {
+				return snap.Seq
+			}
+			return 0
+		},
+		PinBySeq: r.snapshot.PinBySeq,
+		Unpin:    r.snapshot.Unpin,
+	})
 	slotCount := len(cfg.Schema.Indexed)
 	r.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	r.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]

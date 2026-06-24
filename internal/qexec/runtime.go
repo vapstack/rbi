@@ -2,6 +2,7 @@ package qexec
 
 import (
 	"math"
+	goruntime "runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,8 @@ type Config struct {
 	StrKey  bool
 	KeyMode KeyMode
 
+	AsyncMaterializedPredMaxWorkers int
+
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
 	NumericRangeBucketMinSpanKeys  int
@@ -72,7 +75,8 @@ type Runtime struct {
 	Analyzer *Analyzer
 	Tracer   *Tracer
 
-	viewPool pooled.Pointers[View]
+	viewPool                  pooled.Pointers[View]
+	asyncMaterializedPredWarm *asyncMaterializedPredScheduler
 }
 
 func NewRuntime(cfg Config) *Runtime {
@@ -94,7 +98,19 @@ func NewRuntime(cfg Config) *Runtime {
 		viewPool: pooled.Pointers[View]{
 			Clear: true,
 		},
+		asyncMaterializedPredWarm: newAsyncMaterializedPredScheduler(asyncMaterializedPredWorkerLimit(cfg.AsyncMaterializedPredMaxWorkers)),
 	}
+}
+
+func asyncMaterializedPredWorkerLimit(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	n := goruntime.GOMAXPROCS(0) / 4
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 func buildQueryFieldCatalog(s *schema.Schema, mode KeyMode) ([]queryField, map[string]int, int) {

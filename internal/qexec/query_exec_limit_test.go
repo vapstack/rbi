@@ -3386,7 +3386,8 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
-	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
+	view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 	spanHit, ok := view.loadWarmOrderBasicBaseCore(collapsed)
 	if !ok {
 		t.Fatalf("expected collapsed numeric range span to be directly reusable")
@@ -3473,6 +3474,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 
 	view := db.engine.currentQueryViewForTests()
 	leaves := mustLimitQIRLeaves(t, db, q.Filter)
@@ -3543,15 +3545,16 @@ func TestQuery_OrderBasic_BaseCoreObservedWorkAccumulatesBeforePromotion(t *test
 		t.Fatalf("fixture no longer exercises sub-half build work: probe=%d build=%d", probeWork, buildWork)
 	}
 
-	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
+	view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
 	if view.snap.HasMaterializedPredKey(stats.cacheKey) {
 		t.Fatalf("first observed base-core scan unexpectedly promoted materialized predicate")
 	}
 
 	tries := int((buildWork + probeWork - 1) / probeWork)
 	for i := 1; i < tries; i++ {
-		view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
+		view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, observedRows, 10)
 	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 	if !view.snap.HasMaterializedPredKey(stats.cacheKey) {
 		t.Fatalf("repeated observed base-core work did not promote materialized predicate: probe=%d build=%d tries=%d observed=%d", probeWork, buildWork, tries, view.snap.ObservedMaterializedPredWork(stats.cacheKey))
 	}
@@ -3583,7 +3586,8 @@ func TestQuery_OrderBasic_BaseCoreOversizedPromotionStaysBounded(t *testing.T) {
 	if len(baseOps) != 2 {
 		t.Fatalf("baseOps=%d want 2", len(baseOps))
 	}
-	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, uint64(rows), 10)
+	view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, uint64(rows), 10)
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 
 	limit := view.snap.MaterializedPredCacheOversizedLimit()
 	if got := view.snap.MaterializedPredCacheOversizedEntryCount(); got > limit {
@@ -3661,6 +3665,7 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("first QueryKeys: %v", err)
 	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 	view := db.engine.currentQueryViewForTests()
 	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
@@ -3777,6 +3782,7 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
 
 	view := db.engine.currentQueryViewForTests()
 	leaves := mustLimitQIRLeaves(t, db, q.Filter)

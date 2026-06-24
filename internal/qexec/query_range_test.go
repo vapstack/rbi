@@ -972,7 +972,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 	}
 }
 
-func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+func TestBuildAsyncRangeComplementMaterializedPred_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	if testRaceEnabled {
 		t.Skip("testing.AllocsPerRun is not stable under -race")
 	}
@@ -997,17 +997,29 @@ func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWar
 	if !ok || stats.cacheKey.IsZero() || !stats.buildComplement {
 		t.Fatalf("expected complement materialization stats for %v", op)
 	}
+	bound, isSlice, err := qv.normalizedScalarBoundForExpr(op)
+	if err != nil || isSlice || bound.empty || bound.full {
+		t.Fatalf("normalizedScalarBoundForExpr: bound=%+v isSlice=%v err=%v", bound, isSlice, err)
+	}
+	bounds := rangeBoundsForNormalizedScalarBound(bound)
+	currentSeq := func() uint64 { return qv.snap.Seq }
 
-	if !qv.materializeOrderBasicLimitComplementBaseOp(op, stats.cacheKey) {
+	cancel := asyncMaterializedPredCancel{CurrentSeq: currentSeq, Seq: qv.snap.Seq, NextProbe: 1<<63 - 1}
+	ids, status := qv.buildAsyncRangeComplementMaterializedPred(op.FieldOrdinal, bounds, &cancel)
+	if status != asyncMaterializedPredBuildOK {
 		t.Fatal("expected warmup materialization")
 	}
+	ids.Release()
 	db.clearCurrentSnapshotCachesForTesting()
 
 	allocs := testing.AllocsPerRun(100, func() {
 		db.clearCurrentSnapshotCachesForTesting()
-		if !qv.materializeOrderBasicLimitComplementBaseOp(op, stats.cacheKey) {
+		cancel := asyncMaterializedPredCancel{CurrentSeq: currentSeq, Seq: qv.snap.Seq, NextProbe: 1<<63 - 1}
+		ids, status := qv.buildAsyncRangeComplementMaterializedPred(op.FieldOrdinal, bounds, &cancel)
+		if status != asyncMaterializedPredBuildOK {
 			t.Fatal("expected cold materialization")
 		}
+		ids.Release()
 	})
 	if allocs != 0 {
 		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)

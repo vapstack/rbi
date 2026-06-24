@@ -766,33 +766,33 @@ func (qv *View) runOrderBasicBaseQuery(
 		if baseCard > 0 && baseCard <= 4096 {
 			out, examined, ok, fallback := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
 				return out, true, err
 			}
 			if ok {
-				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				return out, true, nil
 			}
 		}
 		if baseCard > 0 && baseCard <= 128 {
 			out, examined, fallback := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
 				return out, true, err
 			}
-			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
 		if baseCard <= 4096 {
 			out, examined, fallback := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive, guard)
 			if fallback {
-				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				out, err := qv.orderBasicMaterializedBaseFallback(q, order, ov, br, baseBM, baseCard, residualPreds, residualActive)
 				return out, true, err
 			}
-			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
 	}
@@ -875,7 +875,7 @@ func (qv *View) runOrderBasicBaseQuery(
 				trace.AddOrderScanWidth(scanWidth)
 				trace.SetEarlyStopReason("limit_reached")
 			}
-			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			tmp.Release()
 			return cursor.out, true, nil
 		}
@@ -940,7 +940,7 @@ func (qv *View) runOrderBasicBaseQuery(
 					trace.AddOrderScanWidth(scanWidth)
 					trace.SetEarlyStopReason("limit_reached")
 				}
-				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				tmp.Release()
 				return cursor.out, true, nil
 			}
@@ -964,7 +964,7 @@ func (qv *View) runOrderBasicBaseQuery(
 		trace.AddOrderScanWidth(scanWidth)
 		trace.SetEarlyStopReason("input_exhausted")
 	}
-	qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+	qv.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 	tmp.Release()
 	return cursor.out, true, nil
 }
@@ -1337,20 +1337,20 @@ func (qv *View) evalOrderBasicBaseCore(core orderBasicBaseCore) (postingResult, 
 	}
 }
 
-func (qv *View) shouldPromoteObservedOrderBasicBaseCore(
+func (qv *View) shouldScheduleObservedOrderBasicBaseCore(
 	orderField string,
 	core orderBasicBaseCore,
 	universe, observedRows, needWindow uint64,
 ) bool {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
-		return qv.shouldPromoteObservedPreparedScalarExactRange(core.collapsed, observedRows, needWindow)
+		return qv.shouldScheduleObservedPreparedScalarExactRange(core.collapsed, observedRows, needWindow)
 
 	case orderBasicBaseCoreRawExpr:
 		if qv.snap.MaterializedPredCacheLimit() <= 0 {
 			return false
 		}
-		return qv.shouldPromoteObservedOrderBasicRawBaseOp(
+		return qv.shouldScheduleObservedOrderBasicRawBaseOp(
 			orderField,
 			core.expr,
 			universe,
@@ -1472,40 +1472,12 @@ func (qv *View) hasLimitLeafPredObservationCandidate(orderField string, preds []
 	return false
 }
 
-func (qv *View) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
-	switch core.kind {
-	case orderBasicBaseCoreCollapsedRange:
-		cacheKey := core.collapsed.cacheKey
-		if !cacheKey.IsZero() {
-			if qv.snap.HasMaterializedPredKey(cacheKey) {
-				return
-			}
-		}
-		ids, err := qv.evalPreparedScalarExactRange(core.collapsed)
-		if err == nil {
-			ids.ids.Release()
-		}
-
-	case orderBasicBaseCoreRawExpr:
-		stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snap.Universe.Cardinality())
-		cacheKey := qcache.MaterializedPredKey{}
-		if ok {
-			cacheKey = stats.cacheKey
-		}
-		if cacheKey.IsZero() {
-			return
-		}
-		if qv.snap.HasMaterializedPredKey(cacheKey) {
-			return
-		}
-		scalarKey := qv.materializedPredKey(core.expr)
-		if cacheKey == scalarKey {
-			ids := qv.evalLazyMaterializedPredicateWithKey(core.expr, cacheKey)
-			ids.Release()
-			return
-		}
-		qv.materializeOrderBasicLimitComplementBaseOp(core.expr, cacheKey)
+func (qv *View) scheduleObservedOrderBasicBaseCore(core orderBasicBaseCore) {
+	plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(core)
+	if !ok {
+		return
 	}
+	qv.scheduleAsyncMaterializedPredWarmup(plan)
 }
 
 func (qv *View) loadFirstWarmOrderBasicBaseCore(cores []orderBasicBaseCore) (int, postingResult, bool) {
@@ -1535,7 +1507,7 @@ func (qv *View) orderBasicRawBaseOpStats(
 	return candidate.core.orderBasicMaterializationStats(universe)
 }
 
-func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
+func (qv *View) shouldScheduleObservedOrderBasicRawBaseOp(
 	orderField string,
 	op qir.Expr,
 	universe, observedRows, needWindow uint64,
@@ -1571,40 +1543,10 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 	if probeWork == 0 {
 		return false
 	}
-	return qv.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, probeWork, buildWork)
+	return qv.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, probeWork, asyncMaterializedPredObservedThreshold(buildWork))
 }
 
-func (qv *View) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey qcache.MaterializedPredKey) bool {
-	if cacheKey.IsZero() || !qv.hasFieldOrdinal(op.FieldOrdinal) {
-		return false
-	}
-	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
-	if !ok {
-		return false
-	}
-	plan, ok := candidate.core.prepareComplementMaterialization()
-	if !ok {
-		return false
-	}
-
-	if plan.est == 0 {
-		qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
-		return true
-	}
-
-	ids := candidate.core.materializeComplement(plan)
-	if ids.IsEmpty() {
-		qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
-		return true
-	}
-
-	ids = tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
-	ids.Release()
-
-	return true
-}
-
-func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
+func (qv *View) scheduleOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(baseOps) == 0 || observedRows == 0 {
 		return
 	}
@@ -1649,7 +1591,7 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 				}
 			}
 		}
-		if !qv.shouldPromoteObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
+		if !qv.shouldScheduleObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
 			continue
 		}
 		key := qcache.MaterializedPredKey{}
@@ -1676,11 +1618,11 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 			continue
 		}
 		keysBuf = append(keysBuf, key)
-		qv.promoteObservedOrderBasicBaseCore(core)
+		qv.scheduleObservedOrderBasicBaseCore(core)
 	}
 }
 
-func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPred, observedRows uint64, needWindow uint64) {
+func (qv *View) scheduleObservedLimitLeafPreds(orderField string, preds []leafPred, observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(preds) == 0 || observedRows == 0 {
 		return
 	}
@@ -1713,7 +1655,7 @@ func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPre
 			}
 		}
 
-		if !qv.shouldPromoteObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
+		if !qv.shouldScheduleObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
 			continue
 		}
 
@@ -1746,7 +1688,7 @@ func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPre
 		}
 		keysBuf = append(keysBuf, key)
 
-		qv.promoteObservedOrderBasicBaseCore(core)
+		qv.scheduleObservedOrderBasicBaseCore(core)
 	}
 }
 
@@ -2045,7 +1987,7 @@ DISPATCH:
 					return qv.dispatchOrderedLimitFallback(q, decision)
 				}
 				if observePreds {
-					qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+					qv.scheduleObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
 				}
 				if predsBuf != nil {
 					leafPredSlicePool.Put(predsBuf)
@@ -2087,7 +2029,7 @@ DISPATCH:
 			return qv.dispatchOrderedLimitFallback(q, decision)
 		}
 		if observeBaseOps {
-			qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+			qv.scheduleOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.RowsExamined()-observedStart, uint64(needWindow))
 		}
 		if trace != nil && trace.ev.Plan != "" {
 			return out, true, "", nil

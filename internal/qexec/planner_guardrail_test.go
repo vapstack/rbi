@@ -601,7 +601,8 @@ func plannerGuardrailOrderedLimitBaseCandidate(
 		}
 	}
 	if warm {
-		view.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, 5_000, uint64(viewQ.Limit))
+		view.scheduleOrderBasicLimitMaterializedBaseOps(orderField, baseOps, 5_000, uint64(viewQ.Limit))
+		db.waitAsyncMaterializedPredWarmupForTests(t)
 	}
 
 	ov := view.fieldIndexViewFromSlotsByOrdinal(view.snap.Index, viewQ.Order.FieldOrdinal)

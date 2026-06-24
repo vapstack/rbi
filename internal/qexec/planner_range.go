@@ -1034,7 +1034,7 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 	return postingResult{ids: ids}, nil
 }
 
-func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarExactRange, observedRows, needWindow uint64) bool {
+func (qv *View) shouldScheduleObservedPreparedScalarExactRange(op preparedScalarExactRange, observedRows, needWindow uint64) bool {
 	if observedRows == 0 {
 		return false
 	}
@@ -1091,7 +1091,7 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	if probeWork == 0 {
 		return false
 	}
-	return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, buildWork)
+	return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, asyncMaterializedPredObservedThreshold(buildWork))
 }
 
 func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (scalarComplementMaterializationPlan, bool) {
