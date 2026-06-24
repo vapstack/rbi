@@ -20,6 +20,17 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	}
 	defer rollback(tx)
 
+	return db.getTx(tx, id)
+}
+
+func (db *DB[K, V]) GetTx(tx *bbolt.Tx, id K) (*V, error) {
+	if err := db.unavailableErr(); err != nil {
+		return nil, err
+	}
+	return db.getTx(tx, id)
+}
+
+func (db *DB[K, V]) getTx(tx *bbolt.Tx, id K) (*V, error) {
 	bucket := tx.Bucket(db.dataBucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
@@ -30,11 +41,11 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	if v == nil {
 		return nil, nil
 	}
+
 	r, err := db.decodeStoredValue(v)
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-
 	return r, nil
 }
 
@@ -45,7 +56,6 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 	if err := db.unavailableErr(); err != nil {
 		return nil, err
 	}
-
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -56,6 +66,16 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 	}
 	defer rollback(tx)
 
+	return db.batchGetTx(tx, ids...)
+}
+
+func (db *DB[K, V]) BatchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
+	if err := db.unavailableErr(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
 	return db.batchGetTx(tx, ids...)
 }
 

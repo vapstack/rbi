@@ -116,6 +116,36 @@ func TestAPI_BatchGet_DuplicateIDsReturnIndependentCopies(t *testing.T) {
 	}
 }
 
+func TestAPI_TxReadsUseCallerTransaction(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(7, &Rec{Name: "committed", Age: 42}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := db.Bolt().View(func(tx *bbolt.Tx) error {
+		got, err := db.GetTx(tx, 7)
+		if err != nil {
+			return fmt.Errorf("GetTx: %w", err)
+		}
+		defer releaseUniqueRecords(db, got)
+		if got == nil || got.Name != "committed" || got.Age != 42 {
+			return fmt.Errorf("GetTx got %#v", got)
+		}
+		vals, err := db.BatchGetTx(tx, 7, 99)
+		if err != nil {
+			return fmt.Errorf("BatchGetTx: %w", err)
+		}
+		defer releaseUniqueRecords(db, vals...)
+		if len(vals) != 2 || vals[0] == nil || vals[0].Name != "committed" || vals[1] != nil {
+			return fmt.Errorf("BatchGetTx got %#v", vals)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("fresh tx reads: %v", err)
+	}
+}
+
 func TestIOExt_Get_ReturnsDetachedCopy(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
