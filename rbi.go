@@ -157,7 +157,7 @@ type Options struct {
 	// (usually smaller file, potentially higher split/relocation cost).
 	//
 	// Values too low can cause excessive file growth and write amplification.
-	// Values too high on churn-heavy workloads can sharply increase write latency.
+	// Values too high on churn-heavy workloads can increase write latency.
 	BucketFillPercent float64
 
 	// SnapshotMaterializedPredCacheMaxEntries controls max number of cached
@@ -165,11 +165,11 @@ type Options struct {
 	//
 	// Negative value disables cache.
 	//
-	// Default: 24
+	// Default: 32
 	//
 	// Typical range: 16..256
 	//
-	// High values on diverse workloads can cause sharp memory growth.
+	// High values on diverse workloads can cause memory growth.
 	SnapshotMaterializedPredCacheMaxEntries int
 
 	// SnapshotMaterializedPredCacheMaxCardinality skips caching very large
@@ -177,10 +177,9 @@ type Options struct {
 	//
 	// Negative value disables the guard.
 	//
-	// Default: 64K
+	// Default: 128K
 	//
-	// Negative (disabled) or very large values can significantly increase memory
-	// usage for broad predicates.
+	// Negative (disabled) or very large values can increase memory usage.
 	SnapshotMaterializedPredCacheMaxCardinality int
 
 	// EnableSnapshotStats enables runtime collection of snapshot diagnostics.
@@ -262,8 +261,8 @@ type Options struct {
 const (
 	defaultOptionsAnalyzeInterval                  = time.Hour
 	defaultBucketFillPercent                       = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries = 24
-	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
+	defaultSnapshotMaterializedPredCacheMaxEntries = 32
+	defaultSnapshotMatPredCacheMaxCardinality      = 128 << 10
 	defaultAutoBatchWindow                         = 50 * time.Microsecond
 	defaultAutoBatchMax                            = 64
 	defaultAutoBatchMaxQueue                       = 512
