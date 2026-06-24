@@ -347,7 +347,7 @@ func (iv interval16) last() uint16 {
 // newRunContainerRange makes a new container16 made of just the specified closed interval [rangeStart,rangeLast]
 func newContainerRunRange(rangeStart uint16, rangeLast uint16) *containerRun {
 	rc := getRunContainer()
-	rc.iv = slices.Grow(rc.iv, max(1, 1))
+	rc.iv = slices.Grow(rc.iv, 1)
 	rc.iv = rc.iv[:1]
 	rc.iv[0] = newInterval16Range(rangeStart, rangeLast)
 	return rc
@@ -362,7 +362,7 @@ func newContainerRunFromBitmap(bc *containerBitmap) *containerRun {
 
 func newContainerRunFromBitmapWithRuns(bc *containerBitmap, nbrRuns int) *containerRun {
 	rc := getRunContainer()
-	rc.iv = slices.Grow(rc.iv, max(nbrRuns, nbrRuns))
+	rc.iv = slices.Grow(rc.iv, nbrRuns)
 	rc.iv = rc.iv[:nbrRuns]
 	if nbrRuns == 0 {
 		return rc
@@ -420,7 +420,7 @@ func newContainerRunFromArray(arr *containerArray) *containerRun {
 
 func newContainerRunFromArrayWithRuns(arr *containerArray, numRuns int) *containerRun {
 	rc := getRunContainer()
-	rc.iv = slices.Grow(rc.iv, max(numRuns, 0))
+	rc.iv = slices.Grow(rc.iv, numRuns)
 	rc.iv = rc.iv[:0]
 	n := arr.getCardinality()
 	if n == 0 {
@@ -527,7 +527,7 @@ func (rc *containerRun) union(b *containerRun) *containerRun {
 	// call it rc for consistency with the rest of the methods.
 
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(b.iv), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+len(b.iv))
 	result.iv = result.iv[:0]
 	m := result.iv[:0]
 
@@ -699,7 +699,7 @@ LOOP:
 				// One interval can intersect multiple intervals on the other side,
 				// so min(numa, numb) is not a safe bound here.
 				output = getRunContainer()
-				output.iv = slices.Grow(output.iv, max(numa+numb-1, 0))
+				output.iv = slices.Grow(output.iv, numa+numb-1)
 				output.iv = output.iv[:0]
 			}
 			output.iv = append(output.iv, intersection)
@@ -1509,19 +1509,19 @@ func (rc *containerRun) invert() *containerRun {
 			return getRunContainer()
 		case cur.start == 0:
 			result := getRunContainer()
-			result.iv = slices.Grow(result.iv, max(1, 1))
+			result.iv = slices.Grow(result.iv, 1)
 			result.iv = result.iv[:1]
 			result.iv[0] = newInterval16Range(cur.last()+1, MaxUint16)
 			return result
 		case cur.last() == MaxUint16:
 			result := getRunContainer()
-			result.iv = slices.Grow(result.iv, max(1, 1))
+			result.iv = slices.Grow(result.iv, 1)
 			result.iv = result.iv[:1]
 			result.iv[0] = newInterval16Range(0, cur.start-1)
 			return result
 		default:
 			result := getRunContainer()
-			result.iv = slices.Grow(result.iv, max(2, 2))
+			result.iv = slices.Grow(result.iv, 2)
 			result.iv = result.iv[:2]
 			result.iv[0] = newInterval16Range(0, cur.start-1)
 			result.iv[1] = newInterval16Range(cur.last()+1, MaxUint16)
@@ -1529,7 +1529,7 @@ func (rc *containerRun) invert() *containerRun {
 		}
 	}
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(ni+1, 0))
+	result.iv = slices.Grow(result.iv, ni+1)
 	result.iv = result.iv[:0]
 	invstart := uint16(0)
 	ult := ni - 1
@@ -1736,7 +1736,7 @@ func (rc *containerRun) andNotRunCopy(b *containerRun) *containerRun {
 	}
 
 	dst := getRunContainer()
-	dst.iv = slices.Grow(dst.iv, max(len(rc.iv), 0))
+	dst.iv = slices.Grow(dst.iv, len(rc.iv))
 	dst.iv = dst.iv[:0]
 	apos := 0
 	bpos := 0
@@ -2055,7 +2055,7 @@ func (rc *containerRun) notCopy(firstOfRange, endx int) *containerRun {
 		return rc.cloneRun()
 	}
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+1, 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+1)
 	result.iv = result.iv[:0]
 	result.iv, _ = flipRunRangeInto(result.iv[:0], rc.iv, firstOfRange, endx)
 	return result
@@ -2153,7 +2153,7 @@ func (rc *containerRun) orArray(ac *containerArray) container16 {
 		return ac.clone()
 	}
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+len(ac.content))
 	result.iv = result.iv[:0]
 	var cardminusone uint16
 	result.iv, cardminusone = runArrayUnionToRuns(rc.iv, ac, result.iv[:0])
@@ -2198,7 +2198,7 @@ func (rc *containerRun) iorArray(ac *containerArray) container16 {
 		rc.iv, cardMinusOne = runArrayUnionToRuns(buf[len(ac.content):len(ac.content)+origLen], ac, buf[:0])
 	} else {
 		donor := getRunContainer()
-		donor.iv = slices.Grow(donor.iv, max(maxIntervals, 0))
+		donor.iv = slices.Grow(donor.iv, maxIntervals)
 		donor.iv = donor.iv[:0]
 		donor.iv, cardMinusOne = runArrayUnionToRuns(rc.iv, ac, donor.iv[:0])
 		answer := donor.toEfficientContainerFromCardinality(int(cardMinusOne) + 1)
@@ -2412,7 +2412,7 @@ func (rc *containerRun) inot(firstOfRange, endx int) container16 {
 	}
 
 	donor := getRunContainer()
-	donor.iv = slices.Grow(donor.iv, max(oldLen+1, 0))
+	donor.iv = slices.Grow(donor.iv, oldLen+1)
 	donor.iv = donor.iv[:0]
 	var cardinality int
 	donor.iv, cardinality = flipRunRangeInto(donor.iv[:0], rc.iv, firstOfRange, endx)
@@ -2447,7 +2447,7 @@ func efficientContainerFromTempRunAuto(temp *containerRun) container16 {
 
 func (rc *containerRun) andNotArrayToRun(ac *containerArray) (*containerRun, int) {
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+len(ac.content))
 	result.iv = result.iv[:0]
 	target := result.iv[:0]
 	cardinality := 0
@@ -2487,7 +2487,7 @@ func (rc *containerRun) andNotArrayToRun(ac *containerArray) (*containerRun, int
 
 func (rc *containerRun) andNotBitmapToRun(bc *containerBitmap) (*containerRun, int) {
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv))
 	result.iv = result.iv[:0]
 	target := result.iv[:0]
 	cardinality := 0
@@ -2598,7 +2598,7 @@ func (rc *containerRun) xorRun(x2 *containerRun) container16 {
 	}
 
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(x2.iv), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+len(x2.iv))
 	result.iv = result.iv[:0]
 	var cardinality int
 	result.iv, cardinality = xorRunsToRun(rc.iv, x2.iv, result.iv[:0])
@@ -2614,7 +2614,7 @@ func (rc *containerRun) xorArray(ac *containerArray) container16 {
 	}
 
 	result := getRunContainer()
-	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = slices.Grow(result.iv, len(rc.iv)+len(ac.content))
 	result.iv = result.iv[:0]
 	var cardinality int
 	result.iv, cardinality = runArrayXorToRuns(rc.iv, ac.content, result.iv[:0])

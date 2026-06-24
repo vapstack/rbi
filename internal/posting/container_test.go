@@ -42,7 +42,7 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 		t.Skip("sync.Pool is unreliable under -race")
 	}
 	rc := getRunContainer()
-	rc.iv = slices.Grow(rc.iv, max(4, 4))
+	rc.iv = slices.Grow(rc.iv, 4)
 	rc.iv = rc.iv[:4]
 	rc.iv[0] = interval16{start: 10, length: 1}
 	rc.iv[1] = interval16{start: 20, length: 2}
@@ -51,7 +51,7 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 	rc.release()
 
 	reused := getRunContainer()
-	reused.iv = slices.Grow(reused.iv, max(4, 4))
+	reused.iv = slices.Grow(reused.iv, 4)
 	reused.iv = reused.iv[:4]
 	defer reused.release()
 	if reused != rc {
@@ -68,7 +68,7 @@ func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T
 		t.Skip("sync.Pool is unreliable under -race")
 	}
 	rc := getRunContainer()
-	rc.iv = slices.Grow(rc.iv, max(4, 4))
+	rc.iv = slices.Grow(rc.iv, 4)
 	rc.iv = rc.iv[:4]
 	rc.iv[0] = interval16{start: 10, length: 1}
 	rc.iv[1] = interval16{start: 20, length: 2}
@@ -78,7 +78,7 @@ func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T
 	rc.release()
 
 	reused := getRunContainer()
-	reused.iv = slices.Grow(reused.iv, max(4, 4))
+	reused.iv = slices.Grow(reused.iv, 4)
 	reused.iv = reused.iv[:4]
 	defer reused.release()
 	if reused != rc {
