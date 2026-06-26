@@ -55,8 +55,9 @@ type asyncMaterializedPredTaskKey struct {
 }
 
 type asyncMaterializedPredScheduler struct {
-	ops   AsyncMaterializedPredSnapshotOps
-	slots chan struct{}
+	ops          AsyncMaterializedPredSnapshotOps
+	slots        chan struct{}
+	statsEnabled bool
 
 	mu       sync.Mutex
 	inFlight map[asyncMaterializedPredTaskKey]struct{}
@@ -82,10 +83,11 @@ const (
 	asyncMaterializedPredBuildFailed
 )
 
-func newAsyncMaterializedPredScheduler(workers int) *asyncMaterializedPredScheduler {
+func newAsyncMaterializedPredScheduler(workers int, statsEnabled bool) *asyncMaterializedPredScheduler {
 	return &asyncMaterializedPredScheduler{
-		slots:    make(chan struct{}, workers),
-		inFlight: make(map[asyncMaterializedPredTaskKey]struct{}, workers),
+		slots:        make(chan struct{}, workers),
+		statsEnabled: statsEnabled,
+		inFlight:     make(map[asyncMaterializedPredTaskKey]struct{}, workers),
 	}
 }
 
@@ -95,6 +97,9 @@ func (r *Runtime) ConfigureAsyncMaterializedPredSnapshotOps(ops AsyncMaterialize
 
 func (r *Runtime) AsyncMaterializedPredStats() AsyncMaterializedPredStats {
 	s := r.asyncMaterializedPredWarm
+	if !s.statsEnabled {
+		return AsyncMaterializedPredStats{}
+	}
 	return AsyncMaterializedPredStats{
 		Scheduled:        s.scheduled.Load(),
 		DroppedInFlight:  s.droppedInFlight.Load(),
@@ -123,8 +128,11 @@ func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMater
 	if ops.CurrentSeq == nil || ops.PinBySeq == nil || ops.Unpin == nil {
 		return false
 	}
+	stats := s.statsEnabled
 	if ops.CurrentSeq() != plan.seq {
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return false
 	}
 
@@ -132,49 +140,66 @@ func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMater
 	s.mu.Lock()
 	if _, ok := s.inFlight[taskKey]; ok {
 		s.mu.Unlock()
-		s.droppedInFlight.Add(1)
+		if stats {
+			s.droppedInFlight.Add(1)
+		}
 		return false
 	}
 	select {
 	case s.slots <- struct{}{}:
 	default:
 		s.mu.Unlock()
-		s.droppedCapacity.Add(1)
+		if stats {
+			s.droppedCapacity.Add(1)
+		}
 		return false
 	}
 	s.inFlight[taskKey] = struct{}{}
-	s.inFlightCount.Add(1)
+	if stats {
+		s.inFlightCount.Add(1)
+	}
 	s.mu.Unlock()
 
 	snap, ref, ok := ops.PinBySeq(plan.seq)
 	if !ok {
 		s.releaseTaskSlot(taskKey)
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return false
 	}
 	if ops.CurrentSeq() != plan.seq {
 		ops.Unpin(plan.seq, ref)
 		s.releaseTaskSlot(taskKey)
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return false
 	}
 
-	s.scheduled.Add(1)
+	if stats {
+		s.scheduled.Add(1)
+	}
 	go s.run(exec, plan, snap, ref)
 	return true
 }
 
 func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializedPredPlan, snap *snapshot.View, ref *snapshot.Ref) {
 	ops := s.ops
+	stats := s.statsEnabled
 	taskKey := asyncMaterializedPredTaskKey{seq: plan.seq, key: plan.key}
 	defer s.finish(ops, plan.seq, ref, taskKey)
 
 	if ops.CurrentSeq() != plan.seq {
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return
 	}
 	if snap.HasMaterializedPredKey(plan.key) {
-		s.skippedCached.Add(1)
+		if stats {
+			s.skippedCached.Add(1)
+		}
 		return
 	}
 
@@ -192,29 +217,41 @@ func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializ
 	case asyncMaterializedPredBuildOK:
 	case asyncMaterializedPredBuildCanceled:
 		ids.Release()
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return
 	default:
 		ids.Release()
-		s.buildFailed.Add(1)
+		if stats {
+			s.buildFailed.Add(1)
+		}
 		return
 	}
 
 	if ops.CurrentSeq() != plan.seq {
 		ids.Release()
-		s.canceled.Add(1)
+		if stats {
+			s.canceled.Add(1)
+		}
 		return
 	}
 	if snap.HasMaterializedPredKey(plan.key) {
 		ids.Release()
-		s.skippedCached.Add(1)
+		if stats {
+			s.skippedCached.Add(1)
+		}
 		return
 	}
 	if storeAsyncMaterializedPred(snap, plan.key, ids) {
-		s.stored.Add(1)
+		if stats {
+			s.stored.Add(1)
+		}
 		return
 	}
-	s.storeRejected.Add(1)
+	if stats {
+		s.storeRejected.Add(1)
+	}
 }
 
 func (s *asyncMaterializedPredScheduler) finish(ops AsyncMaterializedPredSnapshotOps, seq uint64, ref *snapshot.Ref, key asyncMaterializedPredTaskKey) {
@@ -227,7 +264,9 @@ func (s *asyncMaterializedPredScheduler) releaseTaskSlot(key asyncMaterializedPr
 	delete(s.inFlight, key)
 	s.mu.Unlock()
 	<-s.slots
-	s.inFlightCount.Add(-1)
+	if s.statsEnabled {
+		s.inFlightCount.Add(-1)
+	}
 }
 
 func asyncMaterializedPredCheck(c *asyncMaterializedPredCancel) bool {

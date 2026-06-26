@@ -209,6 +209,7 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 
 	exec := NewRuntime(Config{
 		Schema:                         rt,
+		asyncMaterializedPredStats:     true,
 		AnalyzeInterval:                options.AnalyzeInterval,
 		NumericRangeBucketSize:         options.NumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
@@ -678,6 +679,7 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 
 	exec := NewRuntime(Config{
 		Schema:                         rt,
+		asyncMaterializedPredStats:     true,
 		NumericRangeBucketSize:         opts.NumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys: opts.NumericRangeBucketMinFieldKeys,
 		NumericRangeBucketMinSpanKeys:  opts.NumericRangeBucketMinSpanKeys,

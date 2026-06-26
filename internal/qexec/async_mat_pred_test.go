@@ -56,7 +56,7 @@ func TestAsyncMaterializedPredWarmupStoresWhileSnapshotCurrent(t *testing.T) {
 }
 
 func TestAsyncMaterializedPredFinishHoldsWorkerSlotUntilUnpin(t *testing.T) {
-	scheduler := newAsyncMaterializedPredScheduler(1)
+	scheduler := newAsyncMaterializedPredScheduler(1, true)
 	taskKey := asyncMaterializedPredTaskKey{seq: 7}
 	scheduler.slots <- struct{}{}
 	scheduler.inFlight[taskKey] = struct{}{}

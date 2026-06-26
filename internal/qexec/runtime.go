@@ -45,6 +45,7 @@ type Config struct {
 	KeyMode KeyMode
 
 	AsyncMaterializedPredMaxWorkers int
+	asyncMaterializedPredStats      bool
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -98,7 +99,10 @@ func NewRuntime(cfg Config) *Runtime {
 		viewPool: pooled.Pointers[View]{
 			Clear: true,
 		},
-		asyncMaterializedPredWarm: newAsyncMaterializedPredScheduler(asyncMaterializedPredWorkerLimit(cfg.AsyncMaterializedPredMaxWorkers)),
+		asyncMaterializedPredWarm: newAsyncMaterializedPredScheduler(
+			asyncMaterializedPredWorkerLimit(cfg.AsyncMaterializedPredMaxWorkers),
+			cfg.asyncMaterializedPredStats,
+		),
 	}
 }
 
