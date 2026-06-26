@@ -124,8 +124,11 @@ func formatMemoryLine(memory *MemorySnapshot) string {
 		return "mem     n/a"
 	}
 	return fmt.Sprintf(
-		"mem     heap=%s anon=%s dirty=%s dbmap=%s gc=%d next=%s",
+		"mem     heap=%s live=%s objs=%d scan=%s anon=%s dirty=%s dbmap=%s gc=%d next=%s",
 		formatBytes(memory.Go.HeapAllocBytes),
+		formatBytes(memory.Go.HeapLiveBytes),
+		memory.Go.HeapObjects,
+		formatBytes(memory.Go.ScanTotalBytes),
 		formatBytes(memory.Process.AnonymousBytes),
 		formatBytes(memory.Process.PrivateDirtyBytes),
 		formatBytes(memory.Process.BenchDBMapRSSBytes),

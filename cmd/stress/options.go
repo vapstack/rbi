@@ -46,6 +46,7 @@ type options struct {
 	TraceTopN           int
 	QueryStats          bool
 	Jitter              bool
+	ForceGCTelemetry    bool
 	Duration            time.Duration
 	Headless            bool
 	ClassFilter         []string
@@ -112,6 +113,7 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	fs.IntVar(&opts.TraceTopN, "trace-top", opts.TraceTopN, "how many slowest sampled planner traces to keep in the report")
 	fs.BoolVar(&opts.QueryStats, "query-stats", false, "enable per-query breakdowns/latency in headless runs and reports; interactive mode already collects them by default")
 	fs.BoolVar(&opts.Jitter, "jitter", false, "sleep 0.5-1ms with jitter after each completed operation; excluded from metrics")
+	fs.BoolVar(&opts.ForceGCTelemetry, "force-gc-telemetry", false, "force a GC before each memory telemetry sample")
 	fs.DurationVar(&opts.Duration, "duration", 0, "fixed run duration; when >0, stress runs in headless mode")
 	fs.BoolVar(&opts.Headless, "headless", false, "run without interactive UI")
 	fs.BoolVar(&opts.Headless, "no-ui", false, "run without interactive UI")

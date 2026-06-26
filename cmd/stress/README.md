@@ -91,6 +91,8 @@ go run ./cmd/stress -db stress.db -headless -out stress_report.json -r_idx 128 -
 - interactive mode shows per-query counters/TPS/latency by default
 - `-query-stats` : enable the same per-query breakdowns/latency collector in headless runs and
   reports
+- `-force-gc-telemetry` : force a GC before memory telemetry samples, useful for retained live heap
+  and GC scan audits
 - `-class` : keep only specific classes by alias/name, comma-separated
 - `-query` : keep only specific query names, comma-separated
 - `-refresh` : UI/stat counter refresh interval

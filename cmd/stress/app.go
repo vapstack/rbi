@@ -24,19 +24,20 @@ var (
 )
 
 type stressApp struct {
-	handle         *DBHandle
-	startMaxID     uint64
-	classes        []*classController
-	byID           map[int]*classController
-	refreshEvery   time.Duration
-	telemetryEvery time.Duration
-	reportPath     string
-	classFilter    []string
-	queryFilter    []string
-	queryBreakdown bool
-	queryLatency   bool
-	jitter         bool
-	traces         *plannerTraceCollector
+	handle           *DBHandle
+	startMaxID       uint64
+	classes          []*classController
+	byID             map[int]*classController
+	refreshEvery     time.Duration
+	telemetryEvery   time.Duration
+	reportPath       string
+	classFilter      []string
+	queryFilter      []string
+	queryBreakdown   bool
+	queryLatency     bool
+	jitter           bool
+	forceGCTelemetry bool
+	traces           *plannerTraceCollector
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -171,7 +172,7 @@ func newApp(
 	refreshEvery, telemetryEvery time.Duration,
 	reportPath string,
 	classFilter, queryFilter []string,
-	queryBreakdown, queryLatency, jitter bool,
+	queryBreakdown, queryLatency, jitter, forceGCTelemetry bool,
 	traces *plannerTraceCollector,
 ) *stressApp {
 	workCtx := &WorkloadContext{
@@ -180,21 +181,22 @@ func newApp(
 		EmailSamples: handle.EmailSamples,
 	}
 	a := &stressApp{
-		handle:         handle,
-		startMaxID:     handle.MaxID,
-		refreshEvery:   refreshEvery,
-		telemetryEvery: telemetryEvery,
-		reportPath:     reportPath,
-		classFilter:    append([]string(nil), classFilter...),
-		queryFilter:    append([]string(nil), queryFilter...),
-		queryBreakdown: queryBreakdown,
-		queryLatency:   queryLatency,
-		jitter:         jitter,
-		traces:         traces,
-		stopCh:         make(chan struct{}),
-		classes:        make([]*classController, 0, len(catalog)),
-		byID:           make(map[int]*classController, len(catalog)),
-		nextPhaseIndex: 1,
+		handle:           handle,
+		startMaxID:       handle.MaxID,
+		refreshEvery:     refreshEvery,
+		telemetryEvery:   telemetryEvery,
+		reportPath:       reportPath,
+		classFilter:      append([]string(nil), classFilter...),
+		queryFilter:      append([]string(nil), queryFilter...),
+		queryBreakdown:   queryBreakdown,
+		queryLatency:     queryLatency,
+		jitter:           jitter,
+		forceGCTelemetry: forceGCTelemetry,
+		traces:           traces,
+		stopCh:           make(chan struct{}),
+		classes:          make([]*classController, 0, len(catalog)),
+		byID:             make(map[int]*classController, len(catalog)),
+		nextPhaseIndex:   1,
 	}
 	for _, desc := range catalog {
 		ctrl := &classController{
@@ -524,7 +526,7 @@ func (a *stressApp) resetEpochWithMeta(kind, startedByCommand string) {
 	for _, class := range a.classes {
 		class.resetMetrics()
 	}
-	a.epoch.Store(newRunEpoch(a.handle, a.traces, a.nextPhaseID(), kind, startedByCommand))
+	a.epoch.Store(newRunEpoch(a.handle, a.traces, a.nextPhaseID(), kind, startedByCommand, a.forceGCTelemetry))
 }
 
 func (a *stressApp) currentEpoch() *runEpoch {
@@ -532,7 +534,7 @@ func (a *stressApp) currentEpoch() *runEpoch {
 	if epoch != nil {
 		return epoch
 	}
-	epoch = newRunEpoch(a.handle, a.traces, a.nextPhaseID(), "initial", "")
+	epoch = newRunEpoch(a.handle, a.traces, a.nextPhaseID(), "initial", "", a.forceGCTelemetry)
 	a.epoch.Store(epoch)
 	return epoch
 }
@@ -606,7 +608,7 @@ func (a *stressApp) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
 	if epoch == nil {
 		return
 	}
-	memory := CaptureMemorySnapshot(a.handle)
+	memory := CaptureMemorySnapshot(a.handle, a.forceGCTelemetry)
 	var snapRaw rbistats.Snapshot
 	var batchRaw rbistats.AutoBatch
 	if a.handle != nil && a.handle.DB != nil {
@@ -880,9 +882,9 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 	return time.Duration(500+rng.IntN(501)) * time.Microsecond
 }
 
-func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string) *runEpoch {
+func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string, forceGCTelemetry bool) *runEpoch {
 	now := time.Now()
-	memory := CaptureMemorySnapshot(handle)
+	memory := CaptureMemorySnapshot(handle, forceGCTelemetry)
 	var snapshotRaw rbistats.Snapshot
 	var batchRaw rbistats.AutoBatch
 	if handle != nil && handle.DB != nil {

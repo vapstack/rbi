@@ -65,7 +65,13 @@ type GoMemoryStats struct {
 	HeapAllocBytes    uint64 `json:"heap_alloc_bytes"`
 	HeapInuseBytes    uint64 `json:"heap_inuse_bytes"`
 	HeapReleasedBytes uint64 `json:"heap_released_bytes"`
+	HeapLiveBytes     uint64 `json:"heap_live_bytes"`
+	HeapObjectBytes   uint64 `json:"heap_object_bytes"`
 	HeapObjects       uint64 `json:"heap_objects"`
+	ScanHeapBytes     uint64 `json:"scan_heap_bytes"`
+	ScanStackBytes    uint64 `json:"scan_stack_bytes"`
+	ScanGlobalsBytes  uint64 `json:"scan_globals_bytes"`
+	ScanTotalBytes    uint64 `json:"scan_total_bytes"`
 	StackInuseBytes   uint64 `json:"stack_inuse_bytes"`
 	SysBytes          uint64 `json:"sys_bytes"`
 	NextGCBytes       uint64 `json:"next_gc_bytes"`
@@ -97,6 +103,10 @@ type SnapshotMemoryStats struct {
 type MemorySummary struct {
 	MaxHeapAllocBytes     uint64 `json:"max_heap_alloc_bytes"`
 	MaxHeapInuseBytes     uint64 `json:"max_heap_inuse_bytes"`
+	MaxHeapLiveBytes      uint64 `json:"max_heap_live_bytes"`
+	MaxHeapObjectBytes    uint64 `json:"max_heap_object_bytes"`
+	MaxScanHeapBytes      uint64 `json:"max_scan_heap_bytes"`
+	MaxScanTotalBytes     uint64 `json:"max_scan_total_bytes"`
 	MaxRSSBytes           uint64 `json:"max_rss_bytes"`
 	MaxAnonymousBytes     uint64 `json:"max_anonymous_bytes"`
 	MaxPrivateDirtyBytes  uint64 `json:"max_private_dirty_bytes"`

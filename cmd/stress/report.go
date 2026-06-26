@@ -6,7 +6,7 @@ import (
 	"github.com/vapstack/rbi/rbistats"
 )
 
-const reportSchema = "rbi.stress_report/v8"
+const reportSchema = "rbi.stress_report/v9"
 
 type stressReport struct {
 	Schema      string `json:"schema"`

@@ -96,6 +96,7 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 		"-trace-sample", "64",
 		"-trace-top", "7",
 		"-r_smp", "7",
+		"-force-gc-telemetry",
 	}
 
 	opts, err := parseOptions(catalog)
@@ -128,6 +129,9 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 	}
 	if !opts.QueryStats {
 		t.Fatal("QueryStats = false, want true")
+	}
+	if !opts.ForceGCTelemetry {
+		t.Fatal("ForceGCTelemetry = false, want true")
 	}
 	if opts.InitialWorkers["read_simple"] != 7 {
 		t.Fatalf("read_simple workers = %d, want 7", opts.InitialWorkers["read_simple"])
@@ -202,6 +206,7 @@ func TestPhaseReportsTrackManualCommandBoundaries(t *testing.T) {
 		false,
 		false,
 		false,
+		false,
 		nil,
 	)
 
@@ -259,6 +264,7 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 		false,
 		false,
 		false,
+		false,
 		nil,
 	)
 
@@ -302,6 +308,7 @@ func TestRunHeadlessStopsOnWorkerError(t *testing.T) {
 		"/tmp/stress-report.json",
 		nil,
 		nil,
+		false,
 		false,
 		false,
 		false,
@@ -370,6 +377,7 @@ func TestPrintWorkerErrorsIncludesExecutionContext(t *testing.T) {
 		"/tmp/stress-report.json",
 		nil,
 		nil,
+		false,
 		false,
 		false,
 		false,

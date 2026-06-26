@@ -42,7 +42,7 @@ func main() {
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s alloc_profile=%s alloc_source=%s alloc_mode=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s alloc_profile=%s alloc_source=%s alloc_mode=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t force_gc_telemetry=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.AllocProfile,
@@ -55,6 +55,7 @@ func main() {
 		opts.TraceTopN,
 		opts.QueryStats,
 		opts.Jitter,
+		opts.ForceGCTelemetry,
 		opts.ClassFilter,
 		opts.QueryFilter,
 	)
@@ -102,7 +103,7 @@ func main() {
 	}
 	queryBreakdown := !opts.Headless || opts.QueryStats
 	queryLatency := !opts.Headless || opts.QueryStats
-	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, opts.Jitter, traceCollector)
+	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, opts.Jitter, opts.ForceGCTelemetry, traceCollector)
 	app.applyInitialWorkers(initialWorkers)
 
 	baseCtx, cancel := context.WithCancel(context.Background())

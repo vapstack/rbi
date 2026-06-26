@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,10 @@ func applyMemorySummarySample(out *MemorySummary, s *MemorySnapshot) {
 	}
 	out.MaxHeapAllocBytes = max(out.MaxHeapAllocBytes, s.Go.HeapAllocBytes)
 	out.MaxHeapInuseBytes = max(out.MaxHeapInuseBytes, s.Go.HeapInuseBytes)
+	out.MaxHeapLiveBytes = max(out.MaxHeapLiveBytes, s.Go.HeapLiveBytes)
+	out.MaxHeapObjectBytes = max(out.MaxHeapObjectBytes, s.Go.HeapObjectBytes)
+	out.MaxScanHeapBytes = max(out.MaxScanHeapBytes, s.Go.ScanHeapBytes)
+	out.MaxScanTotalBytes = max(out.MaxScanTotalBytes, s.Go.ScanTotalBytes)
 	out.MaxRSSBytes = max(out.MaxRSSBytes, s.Process.RSSBytes)
 	out.MaxAnonymousBytes = max(out.MaxAnonymousBytes, s.Process.AnonymousBytes)
 	out.MaxPrivateDirtyBytes = max(out.MaxPrivateDirtyBytes, s.Process.PrivateDirtyBytes)
@@ -27,17 +32,35 @@ func applyMemorySummarySample(out *MemorySummary, s *MemorySnapshot) {
 	out.MaxUniverseCard = max(out.MaxUniverseCard, s.Snapshot.UniverseCard)
 }
 
-func CaptureMemorySnapshot(db *DBHandle) *MemorySnapshot {
+func CaptureMemorySnapshot(db *DBHandle, forceGC bool) *MemorySnapshot {
+	if forceGC {
+		runtime.GC()
+	}
 	snap := &MemorySnapshot{
 		CapturedAt: time.Now().Format(time.RFC3339Nano),
 	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+	gm := [...]metrics.Sample{
+		{Name: "/gc/heap/live:bytes"},
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/gc/scan/heap:bytes"},
+		{Name: "/gc/scan/stack:bytes"},
+		{Name: "/gc/scan/globals:bytes"},
+		{Name: "/gc/scan/total:bytes"},
+	}
+	metrics.Read(gm[:])
 	snap.Go = GoMemoryStats{
 		HeapAllocBytes:    ms.HeapAlloc,
 		HeapInuseBytes:    ms.HeapInuse,
 		HeapReleasedBytes: ms.HeapReleased,
+		HeapLiveBytes:     gm[0].Value.Uint64(),
+		HeapObjectBytes:   gm[1].Value.Uint64(),
 		HeapObjects:       ms.HeapObjects,
+		ScanHeapBytes:     gm[2].Value.Uint64(),
+		ScanStackBytes:    gm[3].Value.Uint64(),
+		ScanGlobalsBytes:  gm[4].Value.Uint64(),
+		ScanTotalBytes:    gm[5].Value.Uint64(),
 		StackInuseBytes:   ms.StackInuse,
 		SysBytes:          ms.Sys,
 		NextGCBytes:       ms.NextGC,
