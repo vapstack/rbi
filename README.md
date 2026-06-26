@@ -159,8 +159,8 @@ Do not write directly to buckets managed by RBI through raw Bolt APIs.
 ### Automatic batching
 
 Single-record writes always go through internal auto-batcher.
-It cannot be disabled; `AutoBatchMax`, `AutoBatchWindow` and
-`AutoBatchMaxQueue` only tune its behavior.
+It cannot be disabled; `AutoBatchMax` and `AutoBatchWindow` only tune its
+behavior.
 
 The batcher groups concurrent writes, can isolate requests that fail from the
 rest of the batch, and retries operations where the write contract allows it.
@@ -337,9 +337,8 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     TraceSampleEvery: 1000, // 0 uses default (1), < 0 disables tracing    
 
     // Single-op auto-batcher settings
-    AutoBatchWindow: 100 * time.Microsecond,
+    AutoBatchWindow: 100 * time.Microsecond, // < 0 disables coalescing window
     AutoBatchMax: 128,
-    AutoBatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
     
     // ...
 })
@@ -837,7 +836,7 @@ Insertions are typically more expensive than updates.
 Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-record overhead.
 
 Throughput of many parallel single operations can be increased
-using `AutoBatchMax`, `AutoBatchWindow` and `AutoBatchMaxQueue`. 
+using `AutoBatchMax` and `AutoBatchWindow`. 
 
 
 ## Contributing

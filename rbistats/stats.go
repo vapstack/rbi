@@ -162,7 +162,7 @@ type AutoBatch struct {
 	Window time.Duration
 	// MaxBatch is configured maximum auto-batch size.
 	MaxBatch int
-	// MaxQueue is configured maximum queue size (0 means unbounded).
+	// MaxQueue is effective maximum queue size (0 means unbounded).
 	MaxQueue int
 
 	// QueueLen is current pending requests in queue.

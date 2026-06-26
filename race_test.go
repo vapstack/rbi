@@ -939,7 +939,6 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 		AnalyzeInterval:                             -1,
 		AutoBatchWindow:                             25 * time.Microsecond,
 		AutoBatchMax:                                16,
-		AutoBatchMaxQueue:                           1024,
 		SnapshotMaterializedPredCacheMaxEntries:     4,
 		SnapshotMaterializedPredCacheMaxCardinality: 96,
 		NumericRangeBucketSize:                      64,

@@ -30,8 +30,10 @@ type scheduler struct {
 }
 
 func newScheduler(maxOps int, window time.Duration, maxQueue int, statsEnabled bool) scheduler {
-	if maxOps <= 1 || window <= 0 {
+	if maxOps <= 1 {
 		maxOps = 1
+		window = 0
+	} else if window < 0 {
 		window = 0
 	}
 	if maxQueue < 0 {

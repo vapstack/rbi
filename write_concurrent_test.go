@@ -718,8 +718,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchMax:      32,
-		AutoBatchMaxQueue: 0, // unlimited to avoid queue backpressure in the test
+		AutoBatchMax: 32,
 	})
 
 	const (

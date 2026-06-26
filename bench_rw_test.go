@@ -710,7 +710,6 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 				DisableIndexStore: true,
 				AutoBatchWindow:   200 * time.Microsecond,
 				AutoBatchMax:      16,
-				AutoBatchMaxQueue: 1024,
 			},
 		},
 	} {

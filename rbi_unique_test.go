@@ -793,10 +793,9 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 
 func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		AnalyzeInterval:   -1,
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AnalyzeInterval: -1,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	type modelRec struct {

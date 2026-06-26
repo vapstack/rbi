@@ -190,8 +190,7 @@ type Options struct {
 	// AutoBatchWindow configures the coalescing window for parallel
 	// single-record Set/Patch/Delete operations.
 	//
-	// Negative value forces the batcher to process one API write request
-	// per Bolt transaction.
+	// Negative value disables coalescing waits.
 	//
 	// Default: 50us
 	//
@@ -216,17 +215,6 @@ type Options struct {
 	//
 	// Very high values can create commit-size spikes and tail-latency variance.
 	AutoBatchMax int
-
-	// AutoBatchMaxQueue limits pending batch write requests.
-	//
-	// Negative value disables queue cap.
-	//
-	// Default: 512
-	//
-	// Typical range: 128..8192
-	//
-	// Larger values can increase memory usage under sustained overload.
-	AutoBatchMaxQueue int
 
 	// EnableAutoBatchStats enables runtime collection of auto-batch stats.
 	//
@@ -265,7 +253,6 @@ const (
 	defaultSnapshotMatPredCacheMaxCardinality      = 128 << 10
 	defaultAutoBatchWindow                         = 50 * time.Microsecond
 	defaultAutoBatchMax                            = 64
-	defaultAutoBatchMaxQueue                       = 512
 	defaultNumericRangeBucketSize                  = 512
 	defaultNumericRangeBucketMinFieldKeys          = 8192
 	defaultNumericRangeBucketMinSpanKeys           = 1024
@@ -295,9 +282,6 @@ func (o *Options) setDefaults() {
 	}
 	if o.AutoBatchMax == 0 {
 		o.AutoBatchMax = defaultAutoBatchMax
-	}
-	if o.AutoBatchMaxQueue == 0 {
-		o.AutoBatchMaxQueue = defaultAutoBatchMaxQueue
 	}
 	if o.NumericRangeBucketSize == 0 {
 		o.NumericRangeBucketSize = defaultNumericRangeBucketSize
@@ -676,7 +660,7 @@ func (db *DB[K, V]) initBatcher() {
 	cfg := wexec.Config{
 		MaxOps:             db.options.AutoBatchMax,
 		Window:             db.options.AutoBatchWindow,
-		MaxQueue:           db.options.AutoBatchMaxQueue,
+		MaxQueue:           max(db.options.AutoBatchMax*8, 256),
 		StatsEnabled:       db.options.EnableAutoBatchStats,
 		Unavailable:        db.unavailableErr,
 		Bolt:               db.bolt,

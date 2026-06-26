@@ -106,9 +106,8 @@ func TestIndex_DeleteCleanState(t *testing.T) {
 
 func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   2 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 2048,
+		AutoBatchWindow: 2 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	countries := []string{"NL", "PL", "DE", "US"}

@@ -126,6 +126,21 @@ func TestNormalNotifyDoesNotInterruptMultiJobCoalesceWindow(t *testing.T) {
 	}
 }
 
+func TestSchedulerNegativeWindowKeepsOpportunisticBatching(t *testing.T) {
+	s := newScheduler(8, -1, 0, false)
+	s.enqueue(schedulerJob(schedulerReq(1, 0), false))
+	s.enqueue(schedulerJob(schedulerReq(2, 0), false))
+	s.enqueue(schedulerJob(schedulerReq(3, 0), false))
+
+	batch := s.popBatch(false)
+	if len(batch) != 3 {
+		t.Fatalf("batch len = %d, want 3", len(batch))
+	}
+	if s.maxOps != 8 || s.window != 0 {
+		t.Fatalf("scheduler config = maxOps:%d window:%s, want maxOps:8 window:0", s.maxOps, s.window)
+	}
+}
+
 func TestWakeWaitersInterruptsHotWindowCoalesce(t *testing.T) {
 	ex := NewBatcher(Config{
 		MaxOps:       8,

@@ -98,10 +98,9 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 
 func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:   -1,
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AnalyzeInterval: -1,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	cloneRec := func(src *Rec) Rec {
@@ -321,9 +320,8 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 
 func TestBatch_SequentialSet_DoesNotProduceMultiRequestBatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 64,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	before := db.AutoBatchStats()
@@ -441,11 +439,28 @@ func TestBatch_MaxOne_StillUsesBatcher(t *testing.T) {
 	}
 }
 
+func TestBatch_MaxQueueDerivedFromMaxBatch(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchMax:         16,
+		EnableAutoBatchStats: true,
+	})
+	if got := db.AutoBatchStats().MaxQueue; got != 256 {
+		t.Fatalf("MaxQueue for AutoBatchMax=16 = %d, want 256", got)
+	}
+
+	db, _ = openTempDBUint64(t, Options{
+		AutoBatchMax:         64,
+		EnableAutoBatchStats: true,
+	})
+	if got := db.AutoBatchStats().MaxQueue; got != 512 {
+		t.Fatalf("MaxQueue for AutoBatchMax=64 = %d, want 512", got)
+	}
+}
+
 func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 64,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	before := db.AutoBatchStats()
@@ -476,9 +491,8 @@ func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 
 func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
@@ -513,9 +527,8 @@ func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 
 func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 64,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
@@ -673,10 +686,9 @@ func TestAutoBatchExt_BatchAtomic_PatchStrictDuplicateSameID_RollsBackBothSteps(
 
 func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:   -1,
-		AutoBatchWindow:   200 * time.Microsecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AnalyzeInterval: -1,
+		AutoBatchWindow: 200 * time.Microsecond,
+		AutoBatchMax:    16,
 	})
 
 	for i := 1; i <= 4; i++ {
@@ -794,9 +806,8 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 
 func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		AutoBatchWindow:   200 * time.Microsecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AutoBatchWindow: 200 * time.Microsecond,
+		AutoBatchMax:    16,
 	})
 
 	for i := 1; i <= 8; i++ {
@@ -916,10 +927,9 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 
 func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:   -1,
-		AutoBatchWindow:   200 * time.Microsecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AnalyzeInterval: -1,
+		AutoBatchWindow: 200 * time.Microsecond,
+		AutoBatchMax:    16,
 	})
 
 	for i := 1; i <= 2; i++ {
@@ -1098,9 +1108,8 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 
 func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 64,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	before := db.AutoBatchStats()
@@ -1122,11 +1131,10 @@ func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
 	}
 }
 
-func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueuedGroupedJob(t *testing.T) {
+func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   5 * time.Millisecond,
-		AutoBatchMax:      1,
-		AutoBatchMaxQueue: 1,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    1,
 	})
 
 	before := db.AutoBatchStats()
@@ -1175,18 +1183,6 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 			st.QueueLen == 1
 	})
 
-	waitingDone := make(chan error, 1)
-	go func() {
-		waitingDone <- db.BatchDelete([]uint64{4, 5})
-	}()
-
-	waitAutoBatchExtraStats(t, db, "in-flight+queued+waiting state", func(st rbistats.AutoBatch) bool {
-		return st.Submitted == before.Submitted+3 &&
-			st.Enqueued == before.Enqueued+2 &&
-			st.Dequeued == before.Dequeued+1 &&
-			st.QueueLen == 1
-	})
-
 	closeDone := make(chan error, 1)
 	go func() {
 		closeDone <- db.Close()
@@ -1198,52 +1194,6 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 		default:
 			close(release)
 		}
-	}
-
-	select {
-	case err := <-waitingDone:
-		if !errors.Is(err, rbierrors.ErrClosed) {
-			t.Fatalf("waiting writer error = %v, want rbierrors.ErrClosed", err)
-		}
-	case <-time.After(2 * time.Second):
-		releaseCommit()
-
-		var (
-			waitingErr  error
-			inFlightErr error
-			queuedErr   error
-			closeErr    error
-		)
-
-		select {
-		case waitingErr = <-waitingDone:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("waiting writer stayed blocked even after releasing in-flight commit, stats=%+v", db.AutoBatchStats())
-		}
-		select {
-		case inFlightErr = <-inFlightDone:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("in-flight writer did not finish after releasing commit, stats=%+v", db.AutoBatchStats())
-		}
-		select {
-		case queuedErr = <-queuedDone:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("queued grouped job did not finish after releasing commit, stats=%+v", db.AutoBatchStats())
-		}
-		select {
-		case closeErr = <-closeDone:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("Close did not finish after releasing commit, stats=%+v", db.AutoBatchStats())
-		}
-
-		t.Fatalf(
-			"waiting writer did not unblock on Close while in-flight commit was blocked; after release waiting=%v inFlight=%v queued=%v close=%v stats=%+v",
-			waitingErr,
-			inFlightErr,
-			queuedErr,
-			closeErr,
-			db.AutoBatchStats(),
-		)
 	}
 
 	releaseCommit()
@@ -1276,11 +1226,11 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 	}
 
 	after := waitAutoBatchExtraStats(t, db, "mixed close outcomes settled", func(st rbistats.AutoBatch) bool {
-		return st.Submitted == before.Submitted+3 &&
+		return st.Submitted == before.Submitted+2 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+2 &&
 			st.ExecutedBatches == before.ExecutedBatches+1 &&
-			st.FallbackClosed == before.FallbackClosed+1 &&
+			st.FallbackClosed == before.FallbackClosed &&
 			st.QueueLen == 0 &&
 			!st.WorkerRunning
 	})
@@ -1291,7 +1241,7 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 	if got := readAutoBatchExtraRawValue(t, db, uint64(1)); got == nil || got.Name != "persisted" || got.Age != 11 {
 		t.Fatalf("id=1 must persist from in-flight writer, got=%#v", got)
 	}
-	for _, id := range []uint64{2, 3, 4, 5} {
+	for _, id := range []uint64{2, 3} {
 		if got := readAutoBatchExtraRawValue(t, db, id); got != nil {
 			t.Fatalf("id=%d must stay absent after close, got=%#v", id, got)
 		}
@@ -1300,10 +1250,9 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 
 func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		AnalyzeInterval:   -1,
-		AutoBatchWindow:   200 * time.Microsecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 256,
+		AnalyzeInterval: -1,
+		AutoBatchWindow: 200 * time.Microsecond,
+		AutoBatchMax:    16,
 	})
 
 	emails := []string{
@@ -1526,9 +1475,8 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 
 func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow:   10 * time.Millisecond,
-		AutoBatchMax:      16,
-		AutoBatchMaxQueue: 1024,
+		AutoBatchWindow: 10 * time.Millisecond,
+		AutoBatchMax:    16,
 	})
 
 	firstStarted := make(chan struct{})
