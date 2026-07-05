@@ -3,7 +3,6 @@ package rbi
 import (
 	"errors"
 	"fmt"
-	"github.com/vapstack/rbi/rbierrors"
 	"math/rand/v2"
 	"path/filepath"
 	"runtime"
@@ -13,13 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/rbierrors"
+
 	"github.com/vapstack/qx"
 	"go.etcd.io/bbolt"
 )
 
 func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 200)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 200)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -65,20 +66,20 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 						Tags:     []string{"go", "java", "ops"}[:1+r.IntN(3)],
 						FullName: "FN",
 					}
-					if err := db.Set(id, rec); err != nil {
+					if err := writeSet(c, id, rec); err != nil {
 						reportErr(fmt.Errorf("writer set error: %w", err))
 						return
 					}
 
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(50))}}
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
 					}
 
 				case 2:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						reportErr(fmt.Errorf("writer delete error: %w", err))
 						return
 					}
@@ -120,7 +121,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 
 				q := qs[r.IntN(len(qs))]
 
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					if errors.Is(err, rbierrors.ErrClosed) {
 						return
@@ -144,7 +145,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 					}
 				}
 
-				if _, err = db.Count(q.Filter); err != nil {
+				if _, err = readCount(c, q.Filter); err != nil {
 					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
@@ -166,8 +167,8 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 }
 
 func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 200)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 200)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -204,18 +205,18 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 						Tags:     []string{"go", "java", "ops"}[:1+r.IntN(3)],
 						FullName: "FN",
 					}
-					if err := db.Set(id, rec); err != nil {
+					if err := writeSet(c, id, rec); err != nil {
 						reportErr(fmt.Errorf("writer set error: %w", err))
 						return
 					}
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(50))}}
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
 					}
 				case 2:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						reportErr(fmt.Errorf("writer delete error: %w", err))
 						return
 					}
@@ -244,7 +245,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				}
 
 				q := qs[r.IntN(len(qs))]
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					if errors.Is(err, rbierrors.ErrClosed) {
 						return
@@ -267,7 +268,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 					}
 				}
 
-				ids, err := db.QueryKeys(q)
+				ids, err := readQueryKeys(c, q)
 				if err != nil {
 					if errors.Is(err, rbierrors.ErrClosed) {
 						return
@@ -277,7 +278,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				}
 				_ = ids
 
-				if _, err = db.Count(q.Filter); err != nil {
+				if _, err = readCount(c, q.Filter); err != nil {
 					if errors.Is(err, rbierrors.ErrClosed) {
 						return
 					}
@@ -286,7 +287,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				}
 
 				seen := 0
-				if err = db.ScanKeys(0, func(_ uint64) (bool, error) {
+				if err = readScanKeys(c, 0, func(_ uint64) (bool, error) {
 					seen++
 					return seen < 64, nil
 				}); err != nil {
@@ -311,8 +312,8 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 }
 
 func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 1_200)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 1_200)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -383,11 +384,11 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 				id := uint64(1 + r.IntN(16_000))
 				switch r.IntN(3) {
 				case 0:
-					reportErr(db.Set(id, randomRec(id)))
+					reportErr(writeSet(c, id, randomRec(id)))
 				case 1:
-					reportErr(db.Patch(id, randomPatch()))
+					reportErr(writePatch(c, id, randomPatch()))
 				default:
-					reportErr(db.Delete(id))
+					reportErr(writeDelete(c, id))
 				}
 				if loadErr() != nil {
 					return
@@ -455,7 +456,7 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		if _, err := db.QueryKeys(q); err != nil {
+		if _, err := readQueryKeys(c, q); err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
 		sawExec = true
@@ -478,8 +479,8 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 }
 
 func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 1_600)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 1_600)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -566,11 +567,11 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 				id := uint64(1 + r.IntN(24_000))
 				switch r.IntN(10) {
 				case 0, 1, 2, 3:
-					reportErr(db.Set(id, randomRec(id)))
+					reportErr(writeSet(c, id, randomRec(id)))
 				case 4, 5, 6, 7, 8:
-					reportErr(db.Patch(id, randomPatch()))
+					reportErr(writePatch(c, id, randomPatch()))
 				default:
-					reportErr(db.Delete(id))
+					reportErr(writeDelete(c, id))
 				}
 				if loadErr() != nil {
 					return
@@ -632,7 +633,7 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 		}
 
 		q := queries[r.IntN(len(queries))]
-		if _, err := db.QueryKeys(q); err != nil {
+		if _, err := readQueryKeys(c, q); err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
 		sawPlan = true
@@ -650,7 +651,7 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 }
 
 func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempStringCollection(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}
@@ -670,7 +671,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			Tags:     []string{tagPool[rSeed.IntN(len(tagPool))], tagPool[rSeed.IntN(len(tagPool))]},
 			FullName: fmt.Sprintf("FN-%05d", i),
 		}
-		if err := db.Set(fmt.Sprintf("dyn-%06d", i), rec); err != nil {
+		if err := writeSet(c, fmt.Sprintf("dyn-%06d", i), rec); err != nil {
 			t.Fatalf("seed Set(%d): %v", i, err)
 		}
 	}
@@ -744,7 +745,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 				switch r.IntN(10) {
 				case 0, 1, 2, 3, 4, 5:
 					key := nextKey()
-					reportErr(db.Set(key, makeRec(key)))
+					reportErr(writeSet(c, key, makeRec(key)))
 				case 6, 7, 8:
 					key := randomExistingKey(r)
 					patch := []Field{
@@ -752,10 +753,10 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
 						{Name: "active", Value: r.IntN(2) == 0},
 					}
-					reportErr(db.Patch(key, patch))
+					reportErr(writePatch(c, key, patch))
 				default:
 					key := randomExistingKey(r)
-					reportErr(db.Delete(key))
+					reportErr(writeDelete(c, key))
 				}
 
 				if loadErr() != nil {
@@ -811,7 +812,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		if _, err := db.QueryKeys(q); err != nil {
+		if _, err := readQueryKeys(c, q); err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
 		sawExec = true
@@ -851,34 +852,33 @@ type raceExtraRec struct {
 	Opt      *string  `db:"opt"       rbi:"index"`
 }
 
-func raceExtraOpenTempDBUint64(t *testing.T, opts Options) *DB[uint64, raceExtraRec] {
+func raceExtraOpenTempUint64Collection(t *testing.T, opts Options) *Collection[uint64, raceExtraRec] {
 	t.Helper()
+	enableStoreStatsForTest(t)
 
 	path := filepath.Join(t.TempDir(), "race_extra.db")
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
 	opts = testOptions(opts)
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
 
-	db, err := New[uint64, raceExtraRec](raw, opts)
+	c, err := Open[uint64, raceExtraRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db
+	return c
 }
 
-func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec], n int, gen func(i int) *raceExtraRec) {
+func raceExtraSeedGeneratedUint64Data(t *testing.T, db *Collection[uint64, raceExtraRec], n int, gen func(i int) *raceExtraRec) {
 	t.Helper()
 
 	db.disableSync()
@@ -896,8 +896,8 @@ func raceExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, raceExtraRec]
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		if err := writeSets(db, batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(seed batch=%d): %v", len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -935,19 +935,18 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 		t.Skip("race-only public DB workload")
 	}
 
-	db := raceExtraOpenTempDBUint64(t, Options{
-		AnalyzeInterval:                             -1,
-		AutoBatchWindow:                             25 * time.Microsecond,
-		AutoBatchMax:                                16,
-		SnapshotMaterializedPredCacheMaxEntries:     4,
-		SnapshotMaterializedPredCacheMaxCardinality: 96,
-		NumericRangeBucketSize:                      64,
-		NumericRangeBucketMinFieldKeys:              1,
-		NumericRangeBucketMinSpanKeys:               1,
+	c := raceExtraOpenTempUint64Collection(t, Options{
+		AnalyzeInterval:                          -1,
+		BatchSoftLimit:                           16,
+		MaterializedPredicateCacheMaxEntries:     4,
+		MaterializedPredicateCacheMaxCardinality: 96,
+		NumericRangeBucketSize:                   64,
+		NumericRangeBucketMinFieldKeys:           1,
+		NumericRangeBucketMinSpanKeys:            1,
 	})
 
 	const total = 4096
-	raceExtraSeedGeneratedUint64Data(t, db, total, func(i int) *raceExtraRec {
+	raceExtraSeedGeneratedUint64Data(t, c, total, func(i int) *raceExtraRec {
 		opt := fmt.Sprintf("opt-%d", i%17)
 		return &raceExtraRec{
 			raceExtraMeta: raceExtraMeta{Country: []string{"NL", "PL", "DE", "US"}[i&3]},
@@ -989,10 +988,10 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 		).Offset(8).Limit(80),
 	}
 	for i := range queries {
-		if _, err := db.QueryKeys(queries[i]); err != nil {
+		if _, err := readQueryKeys(c, queries[i]); err != nil {
 			t.Fatalf("warm QueryKeys(%d): %v", i, err)
 		}
-		if _, err := db.Count(queries[i].Filter); err != nil {
+		if _, err := readCount(c, queries[i].Filter); err != nil {
 			t.Fatalf("warm Count(%d): %v", i, err)
 		}
 	}
@@ -1060,7 +1059,7 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 				id := uint64(1 + r.IntN(total+512))
 				switch r.IntN(6) {
 				case 0:
-					if !checkErr("Set", db.Set(id, record(id, worker*10_000+i))) {
+					if !checkErr("Set", writeSet(c, id, record(id, worker*10_000+i))) {
 						return
 					}
 				case 1:
@@ -1068,7 +1067,7 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 						{Name: "age", Value: r.IntN(total + 768)},
 						{Name: "score", Value: float64(r.IntN(1200)) + float64(i&7)*0.25},
 					}
-					if !checkErr("Patch numeric", db.Patch(id, patch)) {
+					if !checkErr("Patch numeric", writePatch(c, id, patch)) {
 						return
 					}
 				case 2:
@@ -1077,7 +1076,7 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 						{Name: "country", Value: []string{"NL", "PL", "DE", "US", "FR"}[r.IntN(5)]},
 						{Name: "tags", Value: []string{[]string{"go", "db", "ops", "rust", "java", "qa"}[r.IntN(6)]}},
 					}
-					if !checkErr("Patch indexed", db.Patch(id, patch)) {
+					if !checkErr("Patch indexed", writePatch(c, id, patch)) {
 						return
 					}
 				case 3:
@@ -1089,7 +1088,7 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 						ids = append(ids, batchID)
 						vals = append(vals, record(batchID, worker*20_000+i*16+j))
 					}
-					if !checkErr("BatchSet", db.BatchSet(ids, vals)) {
+					if !checkErr("MultiSet", writeSets(c, ids, vals)) {
 						return
 					}
 				case 4:
@@ -1099,7 +1098,7 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 						ids = append(ids, uint64(1+r.IntN(total+512)))
 					}
 					patch := []Field{{Name: "full_name", Value: fmt.Sprintf("batch-%d-%d", worker, i)}}
-					if !checkErr("BatchPatch", db.BatchPatch(ids, patch)) {
+					if !checkErr("MultiPatch", writePatches(c, ids, patch)) {
 						return
 					}
 				default:
@@ -1109,10 +1108,10 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 						for j := 0; j < n; j++ {
 							ids = append(ids, uint64(1+r.IntN(total+512)))
 						}
-						if !checkErr("BatchDelete", db.BatchDelete(ids)) {
+						if !checkErr("MultiDelete", writeDeletes(c, ids)) {
 							return
 						}
-					} else if !checkErr("Delete", db.Delete(id)) {
+					} else if !checkErr("Delete", writeDelete(c, id)) {
 						return
 					}
 				}
@@ -1140,37 +1139,37 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 				q := queries[r.IntN(len(queries))]
 				switch r.IntN(8) {
 				case 0:
-					if _, err := db.QueryKeys(q); !checkErr("QueryKeys", err) {
+					if _, err := readQueryKeys(c, q); !checkErr("QueryKeys", err) {
 						return
 					}
 				case 1:
-					if _, err := db.Count(q.Filter); !checkErr("Count", err) {
+					if _, err := readCount(c, q.Filter); !checkErr("Count", err) {
 						return
 					}
 				case 2:
-					items, err := db.Query(q)
+					items, err := readQuery(c, q)
 					if !checkErr("Query", err) {
 						return
 					}
-					db.ReleaseRecords(items...)
+					c.ReleaseRecords(items...)
 				case 3:
-					rec, err := db.Get(uint64(1 + r.IntN(total+512)))
+					rec, err := readGet(c, uint64(1+r.IntN(total+512)))
 					if !checkErr("Get", err) {
 						return
 					}
-					db.ReleaseRecords(rec)
+					c.ReleaseRecords(rec)
 				case 4:
 					for j := range batch {
 						batch[j] = uint64(1 + r.IntN(total+512))
 					}
-					items, err := db.BatchGet(batch...)
-					if !checkErr("BatchGet", err) {
+					items, err := readValues(c, batch...)
+					if !checkErr("readValues", err) {
 						return
 					}
-					db.ReleaseRecords(items...)
+					c.ReleaseRecords(items...)
 				case 5:
 					seen := 0
-					err := db.ScanKeys(uint64(1+r.IntN(total)), func(uint64) (bool, error) {
+					err := readScanKeys(c, uint64(1+r.IntN(total)), func(uint64) (bool, error) {
 						seen++
 						return seen < 24, nil
 					})
@@ -1179,27 +1178,27 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 					}
 				case 6:
 					scanned = scanned[:0]
-					err := db.SeqScan(uint64(1+r.IntN(total)), func(_ uint64, rec *raceExtraRec) (bool, error) {
+					err := readSeqScan(c, uint64(1+r.IntN(total)), func(_ uint64, rec *raceExtraRec) (bool, error) {
 						scanned = append(scanned, rec)
 						return len(scanned) < 12, nil
 					})
 					if !checkErr("SeqScan", err) {
-						db.ReleaseRecords(scanned...)
+						c.ReleaseRecords(scanned...)
 						return
 					}
-					db.ReleaseRecords(scanned...)
+					c.ReleaseRecords(scanned...)
 				default:
 					if i&31 == 0 {
-						if !checkErr("RefreshPlannerStats", db.RefreshPlannerStats()) {
+						if !checkErr("RefreshPlannerStats", c.RefreshPlannerStats()) {
 							return
 						}
 					} else {
-						if _, err := db.Stats(); !checkErr("Stats", err) {
+						if _, err := c.Stats(); !checkErr("Stats", err) {
 							return
 						}
-						_ = db.IndexStats()
-						_ = db.AutoBatchStats()
-						_ = db.SnapshotStats()
+						_ = c.IndexStats()
+						_ = c.StoreStats()
+						_ = c.SnapshotStats()
 					}
 				}
 			}
@@ -1214,17 +1213,17 @@ func TestRaceExtra_DBPublicConcurrentWorkload(t *testing.T) {
 }
 
 func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(t *testing.T) {
-	db := raceExtraOpenTempDBUint64(t, Options{
-		AnalyzeInterval:                             -1,
-		SnapshotMaterializedPredCacheMaxEntries:     2,
-		SnapshotMaterializedPredCacheMaxCardinality: 64,
-		NumericRangeBucketSize:                      128,
-		NumericRangeBucketMinFieldKeys:              1,
-		NumericRangeBucketMinSpanKeys:               1,
+	c := raceExtraOpenTempUint64Collection(t, Options{
+		AnalyzeInterval:                          -1,
+		MaterializedPredicateCacheMaxEntries:     2,
+		MaterializedPredicateCacheMaxCardinality: 64,
+		NumericRangeBucketSize:                   128,
+		NumericRangeBucketMinFieldKeys:           1,
+		NumericRangeBucketMinSpanKeys:            1,
 	})
 
 	const total = 6_000
-	raceExtraSeedGeneratedUint64Data(t, db, total, func(i int) *raceExtraRec {
+	raceExtraSeedGeneratedUint64Data(t, c, total, func(i int) *raceExtraRec {
 		return &raceExtraRec{
 			raceExtraMeta: raceExtraMeta{Country: "NL"},
 			Name:          fmt.Sprintf("user-%d", i),
@@ -1252,7 +1251,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 	}
 
 	for i, tc := range cases {
-		got, err := db.QueryKeys(tc.q)
+		got, err := readQueryKeys(c, tc.q)
 		if err != nil {
 			t.Fatalf("warm QueryKeys(%d): %v", i, err)
 		}
@@ -1298,7 +1297,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 
 				tc := cases[r.IntN(len(cases))]
 
-				got, err := db.QueryKeys(tc.q)
+				got, err := readQueryKeys(c, tc.q)
 				if err != nil {
 					setFailed(fmt.Sprintf("QueryKeys failed: %v", err))
 					return
@@ -1308,7 +1307,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 					return
 				}
 
-				count, err := db.Count(tc.q.Filter)
+				count, err := readCount(c, tc.q.Filter)
 				if err != nil {
 					setFailed(fmt.Sprintf("Count failed: %v", err))
 					return
@@ -1319,7 +1318,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 				}
 
 				if i%4 == 0 {
-					values, err := db.Query(tc.q)
+					values, err := readQuery(c, tc.q)
 					if err != nil {
 						setFailed(fmt.Sprintf("Query failed: %v", err))
 						return
@@ -1346,14 +1345,14 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 }
 
 func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFieldPublishes(t *testing.T) {
-	db := raceExtraOpenTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		AutoBatchMax:                            1,
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+	c := raceExtraOpenTempUint64Collection(t, Options{
+		AnalyzeInterval:                      -1,
+		BatchSoftLimit:                       1,
+		MaterializedPredicateCacheMaxEntries: 64,
 	})
 
 	const total = 6_000
-	raceExtraSeedGeneratedUint64Data(t, db, total, func(i int) *raceExtraRec {
+	raceExtraSeedGeneratedUint64Data(t, c, total, func(i int) *raceExtraRec {
 		return &raceExtraRec{
 			raceExtraMeta: raceExtraMeta{Country: "NL"},
 			Name:          fmt.Sprintf("user-%d", i),
@@ -1385,7 +1384,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 	}
 
 	for i, q := range queries {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("warm QueryKeys(%d): %v", i, err)
 		}
@@ -1455,7 +1454,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 					}
 				}
 
-				if err := db.Patch(id, patch); err != nil {
+				if err := writePatch(c, id, patch); err != nil {
 					setFailed(fmt.Sprintf("writer patch failed: %v", err))
 					return
 				}
@@ -1478,7 +1477,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 				q := queries[idx]
 				want := wants[idx]
 
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					setFailed(fmt.Sprintf("QueryKeys(%d) failed: %v", idx, err))
 					return
@@ -1488,7 +1487,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 					return
 				}
 
-				count, err := db.Count(q.Filter)
+				count, err := readCount(c, q.Filter)
 				if err != nil {
 					setFailed(fmt.Sprintf("Count(%d) failed: %v", idx, err))
 					return
@@ -1516,7 +1515,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 				q := queries[idx]
 				want := wants[idx]
 
-				values, err := db.Query(q)
+				values, err := readQuery(c, q)
 				if err != nil {
 					setFailed(fmt.Sprintf("Query(%d) failed: %v", idx, err))
 					return

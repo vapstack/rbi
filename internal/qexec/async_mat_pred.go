@@ -14,9 +14,12 @@ import (
 const asyncMaterializedPredCancelProbeInterval = 2 * time.Millisecond
 
 type AsyncMaterializedPredSnapshotOps struct {
-	CurrentSeq func() uint64
-	PinBySeq   func(uint64) (*snapshot.View, *snapshot.Ref, bool)
-	Unpin      func(uint64, *snapshot.Ref)
+	CurrentSeq      func() uint64
+	PinCurrentBySeq func(uint64) (*snapshot.View, AsyncSnapshotPin, bool)
+}
+
+type AsyncSnapshotPin interface {
+	Unpin()
 }
 
 type AsyncMaterializedPredStats struct {
@@ -125,7 +128,7 @@ func (qv *View) scheduleAsyncMaterializedPredWarmup(plan asyncMaterializedPredPl
 
 func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMaterializedPredPlan) bool {
 	ops := s.ops
-	if ops.CurrentSeq == nil || ops.PinBySeq == nil || ops.Unpin == nil {
+	if ops.CurrentSeq == nil || ops.PinCurrentBySeq == nil {
 		return false
 	}
 	stats := s.statsEnabled
@@ -160,7 +163,7 @@ func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMater
 	}
 	s.mu.Unlock()
 
-	snap, ref, ok := ops.PinBySeq(plan.seq)
+	snap, pin, ok := ops.PinCurrentBySeq(plan.seq)
 	if !ok {
 		s.releaseTaskSlot(taskKey)
 		if stats {
@@ -169,7 +172,7 @@ func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMater
 		return false
 	}
 	if ops.CurrentSeq() != plan.seq {
-		ops.Unpin(plan.seq, ref)
+		pin.Unpin()
 		s.releaseTaskSlot(taskKey)
 		if stats {
 			s.canceled.Add(1)
@@ -180,15 +183,15 @@ func (s *asyncMaterializedPredScheduler) schedule(exec *Runtime, plan asyncMater
 	if stats {
 		s.scheduled.Add(1)
 	}
-	go s.run(exec, plan, snap, ref)
+	go s.run(exec, plan, snap, pin)
 	return true
 }
 
-func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializedPredPlan, snap *snapshot.View, ref *snapshot.Ref) {
+func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializedPredPlan, snap *snapshot.View, pin AsyncSnapshotPin) {
 	ops := s.ops
 	stats := s.statsEnabled
 	taskKey := asyncMaterializedPredTaskKey{seq: plan.seq, key: plan.key}
-	defer s.finish(ops, plan.seq, ref, taskKey)
+	defer s.finish(pin, taskKey)
 
 	if ops.CurrentSeq() != plan.seq {
 		if stats {
@@ -254,8 +257,8 @@ func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializ
 	}
 }
 
-func (s *asyncMaterializedPredScheduler) finish(ops AsyncMaterializedPredSnapshotOps, seq uint64, ref *snapshot.Ref, key asyncMaterializedPredTaskKey) {
-	ops.Unpin(seq, ref)
+func (s *asyncMaterializedPredScheduler) finish(pin AsyncSnapshotPin, key asyncMaterializedPredTaskKey) {
+	pin.Unpin()
 	s.releaseTaskSlot(key)
 }
 

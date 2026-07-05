@@ -7,14 +7,75 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"go.etcd.io/bbolt"
 )
 
+type Executor struct {
+	stats executorStatsCounters
+
+	dataBucket   []byte
+	strmapBucket []byte
+
+	bucketFillPercent  float64
+	rejectEmptyPayload bool
+
+	strKey      bool
+	indexed     bool
+	ops         *RecordOps
+	schema      *schema.Schema
+	unique      UniqueContext
+	snapshotOps SnapshotOps
+}
+
+type Config struct {
+	StatsEnabled bool
+
+	DataBucket   []byte
+	StrMapBucket []byte
+	StrKey       bool
+
+	BucketFillPercent  float64
+	RejectEmptyPayload bool
+
+	Indexed     bool
+	Ops         *RecordOps
+	Schema      *schema.Schema
+	Unique      UniqueContext
+	SnapshotOps SnapshotOps
+}
+
+func NewExecutor(cfg Config) *Executor {
+	ex := &Executor{
+		stats: executorStatsCounters{Enabled: cfg.StatsEnabled},
+
+		dataBucket:         cfg.DataBucket,
+		bucketFillPercent:  cfg.BucketFillPercent,
+		rejectEmptyPayload: cfg.RejectEmptyPayload,
+		strKey:             cfg.StrKey,
+		strmapBucket:       cfg.StrMapBucket,
+		indexed:            cfg.Indexed,
+		ops:                cfg.Ops,
+		schema:             cfg.Schema,
+		unique:             cfg.Unique,
+		snapshotOps:        cfg.SnapshotOps,
+	}
+	return ex
+}
+
+func (b *Executor) ExecutorStats() ExecutorStats {
+	if !b.stats.Enabled {
+		return ExecutorStats{}
+	}
+	return ExecutorStats{
+		CallbackOps:    b.stats.CallbackOps.Load(),
+		UniqueRejected: b.stats.UniqueRejected.Load(),
+		TxOpErrors:     b.stats.TxOpErrors.Load(),
+		CallbackErrors: b.stats.CallbackErrors.Load(),
+	}
+}
+
 type (
-	BeforeProcessHook func(keycodec.DataKey, unsafe.Pointer) error
-	BeforeStoreHook   func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
-	BeforeCommitHook  func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
-	CloneFunc         func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error)
+	OnChangeHook func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
+	CloneFunc    func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error)
 )
 
 type RecordOps struct {
@@ -25,7 +86,7 @@ type RecordOps struct {
 }
 
 type SnapshotOps struct {
-	Manager     *snapshot.Registry
+	Current     func() *snapshot.View
 	Schema      *schema.Schema
 	CacheConfig snapshot.CacheConfig
 	PatchFields map[string]*schema.Field

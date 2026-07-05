@@ -55,11 +55,12 @@ const ReservedKeyFieldName = "$key"
 //
 // A type that implements ValueIndexer is responsible for ensuring that
 // IndexingValue returns a valid and stable string for every value that may
-// appear in indexed data. Nil interface values and nil pointers to
-// value-receiver ValueIndexer values are indexed as null, including typed
-// nils held in ValueIndexer interfaces. Nil interface and nil pointer
-// elements in slices do not emit index keys. Other nil receivers are passed
-// to IndexingValue.
+// appear in indexed data. Indexed fields that use ValueIndexer must be
+// declared with concrete types, not interfaces.
+//
+// Nil pointers to value-receiver ValueIndexer values are indexed as null.
+// In slice indexes, nil pointers to value-receiver ValueIndexer values do not
+// emit index keys. Other nil receivers are passed to IndexingValue.
 //
 // IndexingValue must return a deterministic string: the same value must
 // always produce the same indexing key.
@@ -72,9 +73,10 @@ type ValueIndexer interface {
 }
 
 var (
-	viType           = reflect.TypeFor[ValueIndexer]()
-	ValueIndexerType = viType
-	nativeTimeType   = reflect.TypeFor[time.Time]()
+	viType            = reflect.TypeFor[ValueIndexer]()
+	ValueIndexerType  = viType
+	nativeTimeType    = reflect.TypeFor[time.Time]()
+	nativeTimePtrType = reflect.PointerTo(nativeTimeType)
 )
 
 func isNativeTimeScalarType(t reflect.Type) bool {
@@ -83,6 +85,11 @@ func isNativeTimeScalarType(t reflect.Type) bool {
 
 func isNativeTimePointerType(t reflect.Type) bool {
 	return t.Kind() == reflect.Pointer && isNativeTimeScalarType(t.Elem())
+}
+
+func isNativeTimeWrapperType(t reflect.Type) bool {
+	return (isNativeTimeScalarType(t) && t != nativeTimeType) ||
+		(isNativeTimePointerType(t) && t != nativeTimePtrType)
 }
 
 func isEmbeddedContainerType(t reflect.Type) bool {
@@ -108,7 +115,7 @@ func FieldUsesOrderedNumericKeys(f *Field) bool {
 // FieldUsesNilIndex reports whether writes maintain a physical nil posting
 // for the field. Slice fields store element postings and length only.
 func FieldUsesNilIndex(f *Field) bool {
-	return f != nil && (f.Ptr || (!f.Slice && f.UseVI && f.Kind == reflect.Interface))
+	return f != nil && f.Ptr
 }
 
 func FieldQueryCaps(f *Field) qir.FieldCaps {
@@ -205,7 +212,8 @@ type fieldCollector struct {
 }
 
 type Config struct {
-	Index map[string]IndexKind
+	Index       map[string]IndexKind
+	CustomCodec bool
 }
 
 type Schema struct {
@@ -662,7 +670,7 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 	if err := ValidateIndexKind(indexKind); err != nil {
 		return fmt.Errorf("field %v: %w", sf.Name, err)
 	}
-	f, err := buildFieldDefinition(sf, index, indexKind)
+	f, err := buildFieldDefinition(sf, index, indexKind, collector.config.CustomCodec)
 	if err != nil {
 		return err
 	}
@@ -689,7 +697,7 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 	return nil
 }
 
-func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind) (*Field, error) {
+func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind, customCodec bool) (*Field, error) {
 	dbname := sf.Name
 	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 		dbname = dbTag
@@ -708,8 +716,26 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	)
 
 	useVI = sf.Type.Implements(viType)
+	if !customCodec && isNativeTimeWrapperType(sf.Type) {
+		// ValueIndexer only defines index-key projection.
+		// Record snapshotting depends on the value codec,
+		// and msgpack supports only exact time.Time.
+		return nil, fmt.Errorf("field %v has unsupported named type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, sf.Type)
+	}
 	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
 	if useVI {
+		if kind == reflect.Interface {
+			return nil, fmt.Errorf("field %v has unsupported ValueIndexer interface type %v, use a concrete ValueIndexer type", sf.Name, sf.Type)
+		}
+		if !customCodec {
+			valueType := sf.Type
+			if valueType.Kind() == reflect.Pointer {
+				valueType = valueType.Elem()
+			}
+			if valueType.Kind() == reflect.Slice && isNativeTimeWrapperType(valueType.Elem()) {
+				return nil, fmt.Errorf("field %v has unsupported named element type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, valueType.Elem())
+			}
+		}
 		if kind == reflect.Pointer && sf.Type.Elem().Implements(viType) {
 			ptr = true
 			kind = sf.Type.Elem().Kind()
@@ -747,9 +773,19 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	if kind == reflect.Slice && !useVI {
 		slice = true
 		elem := sf.Type.Elem()
+
+		// ValueIndexer only defines index-key projection. Record snapshotting still
+		// depends on the value codec, and msgpack preserves only exact time.Time.
+		if !customCodec && isNativeTimeWrapperType(elem) {
+			return nil, fmt.Errorf("field %v has unsupported named element type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, elem)
+		}
+
 		kind = elem.Kind()
 		useVI = elem.Implements(viType)
 		if useVI {
+			if kind == reflect.Interface {
+				return nil, fmt.Errorf("field %v has unsupported ValueIndexer interface element type %v, use a slice of concrete ValueIndexer type", sf.Name, elem)
+			}
 			viTypeID = fieldTypeID(elem)
 		}
 		if !useVI {

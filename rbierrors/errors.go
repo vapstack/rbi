@@ -6,7 +6,7 @@ import (
 
 var (
 	ErrNotStructType              = errors.New("value is not a struct")
-	ErrClosed                     = errors.New("database closed")
+	ErrClosed                     = errors.New("collection closed")
 	ErrBroken                     = errors.New("index is broken")
 	ErrNoIndex                    = errors.New("index is disabled (transparent mode)")
 	ErrInvalidQuery               = errors.New("invalid query")
@@ -17,4 +17,10 @@ var (
 	ErrPersistedIndexStale        = errors.New("persisted index is stale")
 	ErrPersistedIndexInvalid      = errors.New("persisted index is invalid")
 	ErrCloneNil                   = errors.New("clone returned nil")
+	ErrNilTx                      = errors.New("nil transaction")
+	ErrStoreMismatch              = errors.New("transaction root store mismatch")
+	ErrWrongTx                    = errors.New("wrong transaction type")
+	ErrTxDone                     = errors.New("transaction is done")
+	ErrCollectionNotVisible       = errors.New("collection is not visible in transaction")
+	ErrGeneratedWriteDepth        = errors.New("generated write depth exceeded")
 )

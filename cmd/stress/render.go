@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vapstack/rbi/rbistats"
 )
 
 type uiRenderer struct {
@@ -68,9 +70,9 @@ func (r *uiRenderer) render(snapshot viewSnapshot, inputBuffer, status string) e
 	b.WriteByte('\n')
 	b.WriteString(formatMemoryLine(snapshot.Memory))
 	b.WriteByte('\n')
-	b.WriteString(formatSnapshotLine(snapshot.Snapshot))
+	b.WriteString(formatSnapshotLine(snapshot.Snapshot, snapshot.Write.Stats))
 	b.WriteByte('\n')
-	b.WriteString(formatBatchLine(snapshot.Batch))
+	b.WriteString(formatWriteLine(snapshot.Write))
 	b.WriteByte('\n')
 	b.WriteString(formatTraceLine(snapshot.Planner))
 	b.WriteByte('\n')
@@ -137,33 +139,32 @@ func formatMemoryLine(memory *MemorySnapshot) string {
 	)
 }
 
-func formatSnapshotLine(sample snapshotSample) string {
+func formatSnapshotLine(sample snapshotSample, root rbistats.Store) string {
 	stats := sample.Stats
 	return fmt.Sprintf(
 		"snap    seq=%d pin=%d reg=%d uni=%d",
 		stats.Sequence,
-		stats.PinnedRefs,
-		stats.RegistrySize,
+		root.PinnedRefs,
+		root.RegistrySize,
 		stats.UniverseCard,
 	)
 }
 
-func formatBatchLine(sample batchSample) string {
+func formatWriteLine(sample writeSample) string {
 	stats := sample.Stats
 	delta := sample.Delta
 	return fmt.Sprintf(
-		"batch   q=%d/%d exec=%s multi=%s dist=%d/%d/%d/%d avg=%.1f hot=%t err=%d",
+		"write   q=%d/%d exec=%s multi=%s dist=%d/%d/%d/%d avg=%.1f err=%d",
 		stats.QueueLen,
-		stats.MaxQueue,
+		stats.QueueCap,
 		formatOps(float64(delta.ExecutedBatches)),
-		formatOps(float64(delta.MultiRequestOps)),
+		formatOps(float64(delta.MultiUnitOps)),
 		delta.BatchSize1,
 		delta.BatchSize2To4,
 		delta.BatchSize5To8,
 		delta.BatchSize9Plus,
 		stats.AvgBatchSize,
-		stats.HotWindowActive,
-		delta.TxCommitErrors+delta.TxOpErrors+delta.TxBeginErrors+delta.CallbackErrors,
+		delta.RejectedClosed+delta.UniqueRejected+delta.TxCommitErrors+delta.TxOpErrors+delta.TxBeginErrors+delta.CallbackErrors,
 	)
 }
 

@@ -23,15 +23,15 @@ type statsShapeRec struct {
 }
 
 func TestAPI_Stats_ZeroAfterClose(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30})
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30})
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	var zero rbistats.DB[uint64]
-	got, err := db.Stats()
+	var zero rbistats.Collection[uint64]
+	got, err := c.Stats()
 	if !errors.Is(err, rbierrors.ErrClosed) {
 		t.Fatalf("expected rbierrors.ErrClosed after Close, got %v", err)
 	}
@@ -41,47 +41,154 @@ func TestAPI_Stats_ZeroAfterClose(t *testing.T) {
 }
 
 func TestAPI_IndexStats_ZeroAfterClose(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30})
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30})
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if got := db.IndexStats(); !reflect.DeepEqual(got, rbistats.Index{}) {
+	if got := c.IndexStats(); !reflect.DeepEqual(got, rbistats.Index{}) {
 		t.Fatalf("expected zero IndexStats after Close, got %+v", got)
 	}
 }
 
 func TestAPI_SnapshotStats_ZeroAfterClose(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30})
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30})
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	var zero rbistats.Snapshot
-	if got := db.SnapshotStats(); got != zero {
+	if got := c.SnapshotStats(); got != zero {
 		t.Fatalf("expected zero SnapshotStats after Close, got %+v", got)
+	}
+}
+
+func TestAPI_StoreStats_DisabledByDefault(t *testing.T) {
+	old := EnableStoreStats
+	EnableStoreStats = false
+	t.Cleanup(func() { EnableStoreStats = old })
+
+	c, _ := openTempUint64Collection(t)
+	if got := c.StoreStats(); got != (rbistats.Store{}) {
+		t.Fatalf("StoreStats with disabled flag=%+v want zero", got)
+	}
+}
+
+func TestAPI_StoreStats_ReportsRootRegistryState(t *testing.T) {
+	old := EnableStoreStats
+	EnableStoreStats = true
+	t.Cleanup(func() { EnableStoreStats = old })
+
+	raw, _ := openRawBolt(t)
+	recDB, err := Open[uint64, Rec](raw, testOptions(Options{}))
+	if err != nil {
+		t.Fatalf("New Rec: %v", err)
+	}
+	productDB, err := Open[string, Product](raw, testOptions(Options{}))
+	if err != nil {
+		t.Fatalf("New Product: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = recDB.Close()
+		_ = productDB.Close()
+		_ = raw.Close()
+	})
+
+	st := recDB.StoreStats()
+	if st.OpenCollections != 2 {
+		t.Fatalf("OpenCollections=%d want 2: %+v", st.OpenCollections, st)
+	}
+	if st.CollectionHighWater != 2 {
+		t.Fatalf("CollectionHighWater=%d want 2: %+v", st.CollectionHighWater, st)
+	}
+	if st.RegistrySize == 0 || st.StagedGenerations != 0 || st.Reaped || st.Broken {
+		t.Fatalf("unexpected registry state: %+v", st)
+	}
+
+	tx := BeginIndexView()
+	if _, err = tx.collectionSnapshot(recDB.collection); err != nil {
+		t.Fatalf("collectionSnapshot: %v", err)
+	}
+	defer tx.Release()
+	pinned := recDB.StoreStats()
+	if pinned.PinnedRefs != 1 {
+		t.Fatalf("PinnedRefs=%d want 1: %+v", pinned.PinnedRefs, pinned)
+	}
+	if pinned.OldestPinnedEpoch != tx.epoch {
+		t.Fatalf("OldestPinnedEpoch=%d want %d: %+v", pinned.OldestPinnedEpoch, tx.epoch, pinned)
+	}
+	tx.Close()
+	after := recDB.StoreStats()
+	if after.PinnedRefs != 0 || after.OldestPinnedEpoch != 0 {
+		t.Fatalf("unexpected pins after close: %+v", after)
+	}
+}
+
+func TestAPI_StoreStats_ReportsWriteCounters(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	raw, _ := openRawBolt(t)
+	recDB, err := Open[uint64, Rec](raw, testOptions(Options{BatchSoftLimit: 1}))
+	if err != nil {
+		t.Fatalf("New Rec: %v", err)
+	}
+	productDB, err := Open[string, Product](raw, testOptions(Options{BatchSoftLimit: 1}))
+	if err != nil {
+		t.Fatalf("New Product: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = recDB.Close()
+		_ = productDB.Close()
+		_ = raw.Close()
+	})
+
+	if err = writeSet(recDB, 1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Rec.Set: %v", err)
+	}
+	if err = writeSet(productDB, "sku-1", &Product{SKU: "sku-1", Price: 10}); err != nil {
+		t.Fatalf("Product.Set: %v", err)
+	}
+
+	waitAutoBatchExtraStats(t, recDB.root, "root write counters settled", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == 2 &&
+			st.Enqueued == 2 &&
+			st.Dequeued == 2 &&
+			st.ExecutedBatches == 2 &&
+			st.BatchSize1 == 2 &&
+			st.MaxBatchSeen == 1 &&
+			st.AvgBatchSize == 1
+	})
+	st := recDB.StoreStats()
+	if st.LogicalUnitsSubmitted != 2 || st.LogicalUnitsEnqueued != 2 || st.LogicalUnitsDequeued != 2 {
+		t.Fatalf("root logical unit counters did not include both collections: %+v", st)
+	}
+	if st.ExecutedBatches != 2 || st.BatchSize1 != 2 || st.MaxBatchSeen != 1 || st.AvgBatchSize != 1 {
+		t.Fatalf("root batch counters were not populated: %+v", st)
+	}
+	if st.QueueHighWater == 0 || st.QueueCap == 0 {
+		t.Fatalf("root queue counters were not populated: %+v", st)
 	}
 }
 
 func TestAPI_Stats_ReportsCheapSchemaAndModeFacts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shape.db")
-	db, raw := openBoltAndNew[uint64, statsShapeRec](t, path)
+	c, bolt := openBoltAndCollection[uint64, statsShapeRec](t, path)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	if st.Mode != rbistats.ModeIndexed {
-		t.Fatalf("Mode=%d want indexed", st.Mode)
+	if !st.Indexed {
+		t.Fatalf("Indexed=%v want indexed", st.Indexed)
 	}
 	if st.StringKeys {
 		t.Fatalf("StringKeys=true for uint64 DB")
@@ -98,13 +205,13 @@ func TestAPI_Stats_ReportsCheapSchemaAndModeFacts(t *testing.T) {
 }
 
 func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "alice", Age: 30, Tags: []string{"go"}},
 		2: {Name: "bob", Age: 35, Tags: []string{"db"}},
 	})
 
-	s1 := db.IndexStats()
+	s1 := c.IndexStats()
 	if s1.FieldSize["age"] == 0 {
 		t.Fatalf("expected age field stats to exist: %+v", s1)
 	}
@@ -115,7 +222,7 @@ func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
 	delete(s1.FieldApproxStructBytes, "age")
 	delete(s1.FieldApproxHeapBytes, "age")
 
-	s2 := db.IndexStats()
+	s2 := c.IndexStats()
 	if s2.FieldSize["age"] == 0 {
 		t.Fatalf("caller mutation leaked into IndexStats.FieldSize")
 	}
@@ -134,12 +241,12 @@ func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
 }
 
 func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
 	})
 
 	for i := 1; i <= 16; i++ {
-		mustSetAPIRec(t, db, uint64(i), &Rec{
+		mustSetAPIRec(t, c, uint64(i), &Rec{
 			Name:   "seed",
 			Age:    20 + i,
 			Active: i%2 == 0,
@@ -163,11 +270,11 @@ func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 					Active: (w+i)%2 == 0,
 					Tags:   []string{"w", "api"},
 				}
-				if err := db.Set(id, rec); err != nil {
+				if err := writeSet(c, id, rec); err != nil {
 					errCh <- err
 					return
 				}
-				if err := db.Patch(id, []Field{{Name: "age", Value: 30 + ((w + i) % 20)}}); err != nil {
+				if err := writePatch(c, id, []Field{{Name: "age", Value: 30 + ((w + i) % 20)}}); err != nil {
 					errCh <- err
 					return
 				}
@@ -180,26 +287,26 @@ func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 80; i++ {
-				if _, err := db.Stats(); err != nil {
+				if _, err := c.Stats(); err != nil {
 					errCh <- err
 					return
 				}
-				_ = db.IndexStats()
-				_ = db.SnapshotStats()
-				_ = db.PlannerStats()
-				_ = db.AutoBatchStats()
-				_ = db.BucketName()
-				items, err := db.Query(qx.Query(qx.GTE("age", 18)).Limit(8))
+				_ = c.IndexStats()
+				_ = c.SnapshotStats()
+				_ = c.PlannerStats()
+				_ = c.StoreStats()
+				_ = c.dataBucket
+				items, err := readQuery(c, qx.Query(qx.GTE("age", 18)).Limit(8))
 				if err != nil {
 					errCh <- err
 					return
 				}
-				releaseUniqueRecords(db, items...)
-				if _, err := db.QueryKeys(qx.Query(qx.EQ("active", true)).Limit(8)); err != nil {
+				releaseUniqueRecords(c, items...)
+				if _, err := readQueryKeys(c, qx.Query(qx.EQ("active", true)).Limit(8)); err != nil {
 					errCh <- err
 					return
 				}
-				if _, err := db.Count(); err != nil {
+				if _, err := readCount(c); err != nil {
 					errCh <- err
 					return
 				}
@@ -215,18 +322,18 @@ func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 }
 
 func TestAPI_PlannerStats_ReturnMapsAreCallerOwned(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "alice", Age: 30, Tags: []string{"go"}},
 		2: {Name: "bob", Age: 35, Tags: []string{"db"}},
 		3: {Name: "carol", Age: 35, Tags: []string{"ops"}},
 	})
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
-	s1 := db.PlannerStats()
+	s1 := c.PlannerStats()
 	age, ok := s1.Fields["age"]
 	if !ok || age.DistinctKeys == 0 {
 		t.Fatalf("expected age planner stats to exist: %+v", s1)
@@ -235,7 +342,7 @@ func TestAPI_PlannerStats_ReturnMapsAreCallerOwned(t *testing.T) {
 	s1.Fields["age"] = rbistats.PlannerField{}
 	delete(s1.Fields, "name")
 
-	s2 := db.PlannerStats()
+	s2 := c.PlannerStats()
 	if got := s2.Fields["age"]; got.DistinctKeys == 0 {
 		t.Fatalf("caller mutation leaked into PlannerStats.Fields[age]: %+v", got)
 	}
@@ -245,18 +352,20 @@ func TestAPI_PlannerStats_ReturnMapsAreCallerOwned(t *testing.T) {
 }
 
 func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
 	})
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"db"}}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "bob", Age: 20, Tags: []string{"db"}}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
@@ -269,14 +378,11 @@ func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
 	if st.IndexFieldCount == 0 {
 		t.Fatalf("expected Stats.IndexFieldCount > 0")
 	}
-	if st.AutoBatchCount == 0 {
-		t.Fatalf("expected stats auto-batch count > 0")
-	}
 	if st.SnapshotSequence == 0 {
 		t.Fatalf("expected stats snapshot sequence > 0")
 	}
 
-	idx := db.IndexStats()
+	idx := c.IndexStats()
 	if idx.EntryCount == 0 {
 		t.Fatalf("expected index diagnostics entry_count > 0")
 	}
@@ -284,18 +390,15 @@ func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
 		t.Fatalf("expected approx heap bytes >= index size, got approx=%d index=%d", idx.ApproxHeapBytes, idx.Size)
 	}
 
-	snap := db.SnapshotStats()
+	snap := c.SnapshotStats()
 	if snap.Sequence == 0 {
 		t.Fatalf("expected snapshot sequence > 0")
-	}
-	if snap.RegistrySize == 0 {
-		t.Fatalf("expected snapshot registry to be non-empty")
 	}
 	if snap.UniverseCard == 0 {
 		t.Fatalf("expected snapshot universe cardinality > 0")
 	}
 
-	pl := db.PlannerStats()
+	pl := c.PlannerStats()
 	if pl.Version == 0 {
 		t.Fatalf("expected planner stats version > 0")
 	}
@@ -309,162 +412,162 @@ func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
 		t.Fatalf("expected disabled analyze interval (0), got %v", pl.AnalyzeInterval)
 	}
 
-	bs := db.AutoBatchStats()
-	if bs.Window <= 0 {
-		t.Fatalf("expected positive auto-batch window, got %v", bs.Window)
-	}
-	if bs.Enqueued == 0 {
-		t.Fatalf("expected auto-batch stats to observe enqueued writes")
+	waitAutoBatchExtraStats(t, c.root, "component accessor root counters settled", func(st rootSchedulerSnapshot) bool {
+		return st.BatchSize1 != 0
+	})
+	rootStats := c.StoreStats()
+	if rootStats.LogicalUnitsEnqueued == 0 || rootStats.ExecutedBatches == 0 {
+		t.Fatalf("expected root stats to observe writes: %+v", rootStats)
 	}
 }
 
 func TestStats_PreservesIndexTimingFields(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	db.stats.BuildTime = 123 * time.Millisecond
-	db.stats.BuildRPS = 456
-	db.stats.LoadTime = 789 * time.Millisecond
+	c.stats.BuildTime = 123 * time.Millisecond
+	c.stats.BuildRPS = 456
+	c.stats.LoadTime = 789 * time.Millisecond
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 
-	if st.BuildTime != db.stats.BuildTime {
-		t.Fatalf("expected BuildTime=%v, got %v", db.stats.BuildTime, st.BuildTime)
+	if st.BuildTime != c.stats.BuildTime {
+		t.Fatalf("expected BuildTime=%v, got %v", c.stats.BuildTime, st.BuildTime)
 	}
-	if st.BuildRPS != db.stats.BuildRPS {
-		t.Fatalf("expected BuildRPS=%d, got %d", db.stats.BuildRPS, st.BuildRPS)
+	if st.BuildRPS != c.stats.BuildRPS {
+		t.Fatalf("expected BuildRPS=%d, got %d", c.stats.BuildRPS, st.BuildRPS)
 	}
-	if st.LoadTime != db.stats.LoadTime {
-		t.Fatalf("expected LoadTime=%v, got %v", db.stats.LoadTime, st.LoadTime)
+	if st.LoadTime != c.stats.LoadTime {
+		t.Fatalf("expected LoadTime=%v, got %v", c.stats.LoadTime, st.LoadTime)
 	}
 }
 
 func TestStats_IndexedSnapshotFactsNumeric(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for _, id := range []uint64{7, 2, 4} {
-		mustSetAPIRec(t, db, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
+		mustSetAPIRec(t, c, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
 	}
-	if err := db.Delete(7); err != nil {
+	if err := writeDelete(c, 7); err != nil {
 		t.Fatalf("Delete(7): %v", err)
 	}
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 	if st.KeyCount != 2 || st.LastKey != 4 {
 		t.Fatalf("Stats=%+v want key_count=2 last_key=4", st)
 	}
-	if st.Mode != rbistats.ModeIndexed || st.StringKeys {
+	if !st.Indexed || st.StringKeys {
 		t.Fatalf("Stats mode/key kind=%+v want indexed uint64", st)
 	}
-	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+	if want := readBucketSequence(t, c.root.bolt, c.dataBucket); st.SnapshotSequence != want {
 		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
 	}
 
-	if err := db.Truncate(); err != nil {
+	if err = c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	st, err = db.Stats()
+	st, err = c.Stats()
 	if err != nil {
 		t.Fatalf("Stats after truncate: %v", err)
 	}
 	if st.KeyCount != 0 || st.LastKey != 0 {
 		t.Fatalf("Stats after truncate=%+v want empty key facts", st)
 	}
-	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+	if want := readBucketSequence(t, c.root.bolt, c.dataBucket); st.SnapshotSequence != want {
 		t.Fatalf("SnapshotSequence after truncate=%d want %d", st.SnapshotSequence, want)
 	}
 }
 
 func TestStats_TransparentNumericLeavesKeyCountZero(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{Index: map[string]IndexKind{}, AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{Index: map[string]IndexKind{}, BatchSoftLimit: 1})
 
 	for _, id := range []uint64{3, 9, 1} {
-		mustSetAPIRec(t, db, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
+		mustSetAPIRec(t, c, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)})
 	}
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 	if st.KeyCount != 0 || st.LastKey != 9 || st.IndexFieldCount != 0 {
 		t.Fatalf("Stats=%+v want key_count=0 last_key=9 index_field_count=0", st)
 	}
-	if st.Mode != rbistats.ModeTransparent || st.StringKeys {
+	if st.Indexed || st.StringKeys {
 		t.Fatalf("Stats mode/key kind=%+v want transparent uint64", st)
 	}
-	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+	if want := readBucketSequence(t, c.root.bolt, c.dataBucket); st.SnapshotSequence != want {
 		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
 	}
 }
 
 func TestStats_IndexedStringReportsCountWithoutLastKey(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	for _, id := range []string{"b", "aa", "c"} {
-		if err := db.Set(id, &Rec{Name: id}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: id}); err != nil {
 			t.Fatalf("Set(%q): %v", id, err)
 		}
 	}
-	if err := db.Delete("c"); err != nil {
+	if err := writeDelete(c, "c"); err != nil {
 		t.Fatalf("Delete(c): %v", err)
 	}
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 	if st.KeyCount != 2 || st.LastKey != "b" {
 		t.Fatalf("Stats=%+v want key_count=2 last_key=b", st)
 	}
-	if st.Mode != rbistats.ModeIndexed || !st.StringKeys {
+	if !st.Indexed || !st.StringKeys {
 		t.Fatalf("Stats mode/key kind=%+v want indexed string", st)
 	}
-	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+	if want := readBucketSequence(t, c.root.bolt, c.dataBucket); st.SnapshotSequence != want {
 		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
 	}
 }
 
 func TestStats_TransparentStringLeavesKeyCountZero(t *testing.T) {
-	db, _ := openTempDBString(t, Options{Index: map[string]IndexKind{}, AutoBatchMax: 1})
+	c, _ := openTempStringCollection(t, Options{Index: map[string]IndexKind{}, BatchSoftLimit: 1})
 
 	for _, id := range []string{"b", "aa", "c"} {
-		if err := db.Set(id, &Rec{Name: id}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: id}); err != nil {
 			t.Fatalf("Set(%q): %v", id, err)
 		}
 	}
 
-	st, err := db.Stats()
+	st, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 	if st.KeyCount != 0 || st.LastKey != "c" || st.IndexFieldCount != 0 {
 		t.Fatalf("Stats=%+v want key_count=0 last_key=c index_field_count=0", st)
 	}
-	if st.Mode != rbistats.ModeTransparent || !st.StringKeys {
+	if st.Indexed || !st.StringKeys {
 		t.Fatalf("Stats mode/key kind=%+v want transparent string", st)
 	}
-	if want := readBucketSequence(t, db.Bolt(), db.BucketName()); st.SnapshotSequence != want {
+	if want := readBucketSequence(t, c.root.bolt, c.dataBucket); st.SnapshotSequence != want {
 		t.Fatalf("SnapshotSequence=%d want %d", st.SnapshotSequence, want)
 	}
 }
 
 func TestStats_ErrorReturnsZeroValue(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30})
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30})
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		return tx.DeleteBucket(db.BucketName())
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.DeleteBucket(c.dataBucket)
 	}); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 
-	var zero rbistats.DB[uint64]
-	st, err := db.Stats()
+	var zero rbistats.Collection[uint64]
+	st, err := c.Stats()
 	if err == nil {
 		t.Fatal("expected Stats error")
 	}
@@ -479,22 +582,22 @@ func TestStats_BoltReadSetupFailureReturnsZeroValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	db, err := New[uint64, Rec](raw, testOptions(Options{
+	c, err := Open[uint64, Rec](raw, testOptions(Options{
 		BucketName:        "stats_bolt_closed",
 		DisableIndexStore: true,
 	}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err = raw.Close(); err != nil {
 		t.Fatalf("raw Close: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = db.Close()
+		_ = c.Close()
 	})
 
-	var zero rbistats.DB[uint64]
-	st, err := db.Stats()
+	var zero rbistats.Collection[uint64]
+	st, err := c.Stats()
 	if err == nil {
 		t.Fatal("expected Stats error")
 	}
@@ -503,58 +606,8 @@ func TestStats_BoltReadSetupFailureReturnsZeroValue(t *testing.T) {
 	}
 }
 
-func TestComponentAccessors(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval: -1,
-	})
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"db"}}); err != nil {
-		t.Fatalf("Set(2): %v", err)
-	}
-
-	st, err := db.Stats()
-	if err != nil {
-		t.Fatalf("Stats: %v", err)
-	}
-	if st.KeyCount != 2 {
-		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
-	}
-	if st.SnapshotSequence == 0 {
-		t.Fatalf("expected Stats.SnapshotSequence > 0")
-	}
-
-	idx := db.IndexStats()
-	if idx.Size == 0 {
-		t.Fatalf("expected IndexStats.Size > 0")
-	}
-	if len(idx.UniqueFieldKeys) == 0 {
-		t.Fatalf("expected IndexStats.UniqueFieldKeys to be populated")
-	}
-
-	pl := db.PlannerStats()
-	if pl.Version == 0 {
-		t.Fatalf("expected PlannerStats.Version > 0")
-	}
-	if pl.GeneratedAt.IsZero() {
-		t.Fatalf("expected PlannerStats.GeneratedAt to be set")
-	}
-
-	snap := db.SnapshotStats()
-	if snap.Sequence == 0 {
-		t.Fatalf("expected SnapshotStats.Sequence > 0")
-	}
-
-	bs := db.AutoBatchStats()
-	if bs.Window <= 0 {
-		t.Fatalf("expected AutoBatchStats.Window > 0")
-	}
-}
-
 func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
-	db := openTempDBUint64IndexStats(t)
+	c := openTempDBUint64IndexStats(t)
 
 	const total = 96
 	rankNil := 0
@@ -568,7 +621,7 @@ func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
 		} else {
 			rankNil++
 		}
-		if err := db.Set(uint64(i+1), &indexStatsTestRec{
+		if err := writeSet(c, uint64(i+1), &indexStatsTestRec{
 			Name: fmt.Sprintf("user_%04d", i),
 			Rank: rank,
 		}); err != nil {
@@ -583,7 +636,7 @@ func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
 	}
 	rankEntries := rankUnique + 1
 
-	got := db.IndexStats()
+	got := c.IndexStats()
 	if got.UniqueFieldKeys["name"] != total {
 		t.Fatalf("name unique keys=%d, want %d", got.UniqueFieldKeys["name"], total)
 	}

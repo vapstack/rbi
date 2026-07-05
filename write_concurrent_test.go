@@ -12,13 +12,13 @@ import (
 )
 
 func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	db.disableSync()
-	defer db.enableSync()
+	c, _ := openTempUint64Collection(t)
+	c.disableSync()
+	defer c.enableSync()
 
 	const keys = 8
 	for i := 1; i <= keys; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{
+		ioExtMustSetRec(t, c, uint64(i), &Rec{
 			Name: fmt.Sprintf("seed-%d", i),
 			Age:  i,
 			Tags: []string{fmt.Sprintf("t%d", i%3)},
@@ -49,7 +49,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 				id := uint64((i+w)%keys + 1)
 				switch i % 3 {
 				case 0:
-					if err := db.Set(id, &Rec{
+					if err := writeSet(c, id, &Rec{
 						Name: fmt.Sprintf("w%d-set-%d", w, i),
 						Age:  i,
 						Tags: []string{fmt.Sprintf("set-%d", i%5)},
@@ -59,7 +59,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 						return
 					}
 				case 1:
-					if err := db.Patch(id, []Field{
+					if err := writePatch(c, id, []Field{
 						{Name: "age", Value: 1000 + i},
 						{Name: "country", Value: "DE"},
 					}); err != nil {
@@ -67,7 +67,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(%d): %w", w, id, err)
 						return
 					}
@@ -88,7 +88,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 			}()
 			for i := 0; i < 120; i++ {
 				id := uint64((i+r)%keys + 1)
-				v, err := db.Get(id)
+				v, err := readGet(c, id)
 				if err != nil {
 					errCh <- fmt.Errorf("reader=%d Get(%d): %w", r, id, err)
 					return
@@ -98,19 +98,19 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				vals, err := db.BatchGet(ids...)
+				vals, err := readValues(c, ids...)
 				if err != nil {
-					errCh <- fmt.Errorf("reader=%d BatchGet: %w", r, err)
+					errCh <- fmt.Errorf("reader=%d readValues: %w", r, err)
 					return
 				}
 				for i, v := range vals {
 					if v != nil && v.Name == "" {
-						errCh <- fmt.Errorf("reader=%d BatchGet[%d]: empty name", r, i)
+						errCh <- fmt.Errorf("reader=%d readValues[%d]: empty name", r, i)
 						return
 					}
 				}
 
-				if err := db.SeqScan(0, func(id uint64, v *Rec) (bool, error) {
+				if err := readSeqScan(c, 0, func(id uint64, v *Rec) (bool, error) {
 					if v.Name == "" {
 						return false, fmt.Errorf("SeqScan id=%d empty name", id)
 					}
@@ -120,13 +120,13 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				if err := scanRawBolt(t, db, 0, func(id uint64, raw []byte) (bool, error) {
+				if err := scanRawBolt(t, c, 0, func(id uint64, raw []byte) (bool, error) {
 					cp := append([]byte(nil), raw...)
-					v, err := db.decode(cp)
+					v, err := c.decode(cp)
 					if err != nil {
 						return false, fmt.Errorf("decode raw id=%d: %w", id, err)
 					}
-					defer db.ReleaseRecords(v)
+					defer c.ReleaseRecords(v)
 					if v.Name == "" {
 						return false, fmt.Errorf("raw id=%d empty name", id)
 					}
@@ -136,7 +136,7 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				if err := db.ScanKeys(0, func(id uint64) (bool, error) {
+				if err := readScanKeys(c, 0, func(id uint64) (bool, error) {
 					if id == 0 {
 						return false, fmt.Errorf("zero key")
 					}
@@ -159,19 +159,19 @@ func TestIOExt_ConcurrentUint64ReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 	if t.Failed() {
 		t.FailNow()
 	}
-	if _, err := db.BatchGet(ids...); err != nil {
-		t.Fatalf("final BatchGet: %v", err)
+	if _, err := readValues(c, ids...); err != nil {
+		t.Fatalf("final readValues: %v", err)
 	}
 }
 
 func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
-	db.disableSync()
-	defer db.enableSync()
+	c, _ := openTempCollectionStringProduct(t)
+	c.disableSync()
+	defer c.enableSync()
 
 	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6"}
 	for i, key := range keys {
-		ioExtMustSetProduct(t, db, key, &Product{
+		ioExtMustSetProduct(t, c, key, &Product{
 			SKU:   key,
 			Price: float64(i + 1),
 			Tags:  []string{fmt.Sprintf("t%d", i%3)},
@@ -196,7 +196,7 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 				key := keys[(i+w)%len(keys)]
 				switch i % 3 {
 				case 0:
-					if err := db.Set(key, &Product{
+					if err := writeSet(c, key, &Product{
 						SKU:   key,
 						Price: float64(i + 1),
 						Tags:  []string{fmt.Sprintf("set-%d", i%5)},
@@ -205,7 +205,7 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 						return
 					}
 				case 1:
-					if err := db.Patch(key, []Field{
+					if err := writePatch(c, key, []Field{
 						{Name: "price", Value: float64(1000 + i)},
 						{Name: "tags", Value: []string{fmt.Sprintf("patch-%d", i%5)}},
 					}); err != nil {
@@ -213,7 +213,7 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 						return
 					}
 				default:
-					if err := db.Delete(key); err != nil {
+					if err := writeDelete(c, key); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(%q): %w", w, key, err)
 						return
 					}
@@ -234,7 +234,7 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 			}()
 			for i := 0; i < 120; i++ {
 				key := keys[(i+r)%len(keys)]
-				v, err := db.Get(key)
+				v, err := readGet(c, key)
 				if err != nil {
 					errCh <- fmt.Errorf("reader=%d Get(%q): %w", r, key, err)
 					return
@@ -244,19 +244,19 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				vals, err := db.BatchGet(keys...)
+				vals, err := readValues(c, keys...)
 				if err != nil {
-					errCh <- fmt.Errorf("reader=%d BatchGet: %w", r, err)
+					errCh <- fmt.Errorf("reader=%d readValues: %w", r, err)
 					return
 				}
 				for i, v := range vals {
 					if v != nil && v.SKU == "" {
-						errCh <- fmt.Errorf("reader=%d BatchGet[%d]: empty sku", r, i)
+						errCh <- fmt.Errorf("reader=%d readValues[%d]: empty sku", r, i)
 						return
 					}
 				}
 
-				if err := db.SeqScan("", func(id string, v *Product) (bool, error) {
+				if err := readSeqScan(c, "", func(id string, v *Product) (bool, error) {
 					if id == "" || v.SKU == "" {
 						return false, fmt.Errorf("SeqScan empty id/sku")
 					}
@@ -266,17 +266,17 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				if err := scanRawBolt(t, db, "", func(id string, raw []byte) (bool, error) {
-					payload, err := rawPayloadForTest(db, raw)
+				if err := scanRawBolt(t, c, "", func(id string, raw []byte) (bool, error) {
+					payload, err := rawPayloadForTest(c, raw)
 					if err != nil {
 						return false, fmt.Errorf("parse raw id=%q: %w", id, err)
 					}
 					cp := append([]byte(nil), payload...)
-					v, err := db.decode(cp)
+					v, err := c.decode(cp)
 					if err != nil {
 						return false, fmt.Errorf("decode raw id=%q: %w", id, err)
 					}
-					defer db.ReleaseRecords(v)
+					defer c.ReleaseRecords(v)
 					if id == "" || v.SKU == "" {
 						return false, fmt.Errorf("raw empty id/sku")
 					}
@@ -286,7 +286,7 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 					return
 				}
 
-				ids, err := db.QueryKeys(qx.Query())
+				ids, err := readQueryKeys(c, qx.Query())
 				if err != nil {
 					errCh <- fmt.Errorf("reader=%d QueryKeys(all): %w", r, err)
 					return
@@ -312,30 +312,30 @@ func TestIOExt_ConcurrentStringReadersWriters_NoPanicsOrDecodeErrors(t *testing.
 		t.FailNow()
 	}
 
-	scanned := ioExtCollectSeqScanProduct(t, db, "")
+	scanned := ioExtCollectSeqScanProduct(t, c, "")
 	for key, v := range scanned {
 		if key == "" || v.SKU == "" {
 			t.Fatalf("invalid final scanned product: key=%q value=%#v", key, v)
 		}
-		raw := ioExtMustReadStringRaw(t, db, key)
-		payload, err := rawPayloadForTest(db, raw)
+		raw := ioExtMustReadStringRaw(t, c, key)
+		payload, err := rawPayloadForTest(c, raw)
 		if err != nil {
 			t.Fatalf("final raw payload(%q): %v", key, err)
 		}
-		decoded, err := db.decode(payload)
+		decoded, err := c.decode(payload)
 		if err != nil {
 			t.Fatalf("final decode(%q): %v", key, err)
 		}
 		if decoded.SKU == "" {
-			db.ReleaseRecords(decoded)
+			c.ReleaseRecords(decoded)
 			t.Fatalf("final decoded product has empty sku for key=%q", key)
 		}
-		db.ReleaseRecords(decoded)
+		c.ReleaseRecords(decoded)
 	}
 }
 
 func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	const (
 		writers    = 8
@@ -371,15 +371,15 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 				}
 				q := readQueries[(readerID+i)%len(readQueries)]
 				i++
-				if _, err := db.QueryKeys(q); err != nil {
+				if _, err := readQueryKeys(c, q); err != nil {
 					errCh <- fmt.Errorf("reader QueryKeys error: %w", err)
 					return
 				}
-				if _, err := db.Query(q); err != nil {
+				if _, err := readQuery(c, q); err != nil {
 					errCh <- fmt.Errorf("reader Query error: %w", err)
 					return
 				}
-				if _, err := db.Count(q.Filter); err != nil {
+				if _, err := readCount(c, q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader Count error: %w", err)
 					return
 				}
@@ -396,7 +396,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 			for i := 0; i < opsPerW; i++ {
 				id := uint64((w*131+i*17)%idSpace + 1)
 				if (w+i)%5 == 0 {
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(%d): %w", w, id, err)
 						return
 					}
@@ -416,7 +416,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 					},
 					Meta: Meta{Country: "NL"},
 				}
-				if err := db.Set(id, rec); err != nil {
+				if err := writeSet(c, id, rec); err != nil {
 					errCh <- fmt.Errorf("writer=%d Set(%d): %w", w, id, err)
 					return
 				}
@@ -442,7 +442,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		age  int
 	}
 	live := make(map[uint64]liveRec, idSpace)
-	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		if rec == nil {
 			return false, fmt.Errorf("nil record for id=%d", id)
 		}
@@ -456,7 +456,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	total, err := db.Count()
+	total, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count(): %v", err)
 	}
@@ -466,7 +466,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 
 	liveNames := make(map[string]uint64, len(live))
 	for id, rec := range live {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", rec.name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", rec.name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(name=%q): %v", rec.name, err)
 		}
@@ -488,7 +488,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		if _, stillLive := liveNames[name]; stillLive {
 			return true
 		}
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(stale name=%q): %v", name, err)
 		}
@@ -501,7 +501,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 }
 
 func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	const (
 		writers    = 6
@@ -553,15 +553,15 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 				}
 				q := readQueries[(readerID+i)%len(readQueries)]
 				i++
-				if _, err := db.QueryKeys(q); err != nil {
+				if _, err := readQueryKeys(c, q); err != nil {
 					errCh <- fmt.Errorf("reader QueryKeys error: %w", err)
 					return
 				}
-				if _, err := db.Query(q); err != nil {
+				if _, err := readQuery(c, q); err != nil {
 					errCh <- fmt.Errorf("reader Query error: %w", err)
 					return
 				}
-				if _, err := db.Count(q.Filter); err != nil {
+				if _, err := readCount(c, q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader Count error: %w", err)
 					return
 				}
@@ -578,7 +578,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 			for i := 0; i < opsPerW; i++ {
 				opType := (w*37 + i*13) % 3
 				switch opType {
-				case 0: // BatchSet
+				case 0: // MultiSet
 					size := 2 + ((w + i) % 4)
 					ids := makeBatchIDs(w, i, size)
 					vals := make([]*Rec, 0, len(ids))
@@ -598,12 +598,12 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 							Meta: Meta{Country: "NL"},
 						})
 					}
-					if err := db.BatchSet(ids, vals); err != nil {
-						errCh <- fmt.Errorf("writer=%d BatchSet: %w", w, err)
+					if err := writeSets(c, ids, vals); err != nil {
+						errCh <- fmt.Errorf("writer=%d MultiSet: %w", w, err)
 						return
 					}
 
-				case 1: // BatchPatch
+				case 1: // MultiPatch
 					size := 2 + ((w + i + 1) % 4)
 					ids := makeBatchIDs(w+19, i+7, size)
 					patchAge := 900_000 + w*1000 + i
@@ -612,16 +612,16 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 						{Name: "age", Value: patchAge},
 						{Name: "active", Value: patchActive},
 					}
-					if err := db.BatchPatch(ids, patch); err != nil {
-						errCh <- fmt.Errorf("writer=%d BatchPatch: %w", w, err)
+					if err := writePatches(c, ids, patch); err != nil {
+						errCh <- fmt.Errorf("writer=%d MultiPatch: %w", w, err)
 						return
 					}
 
-				default: // BatchDelete
+				default: // MultiDelete
 					size := 1 + ((w + i + 2) % 4)
 					ids := makeBatchIDs(w+41, i+3, size)
-					if err := db.BatchDelete(ids); err != nil {
-						errCh <- fmt.Errorf("writer=%d BatchDelete: %w", w, err)
+					if err := writeDeletes(c, ids); err != nil {
+						errCh <- fmt.Errorf("writer=%d MultiDelete: %w", w, err)
 						return
 					}
 				}
@@ -647,7 +647,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		active bool
 	}
 	live := make(map[uint64]liveRec, idSpace)
-	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		if rec == nil {
 			return false, fmt.Errorf("nil record for id=%d", id)
 		}
@@ -658,7 +658,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	total, err := db.Count()
+	total, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count(): %v", err)
 	}
@@ -668,7 +668,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 
 	liveNames := make(map[string]uint64, len(live))
 	for id, exp := range live {
-		v, err := db.Get(id)
+		v, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
@@ -682,7 +682,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 			)
 		}
 
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", exp.name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", exp.name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(name=%q): %v", exp.name, err)
 		}
@@ -704,7 +704,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		if _, stillLive := liveNames[name]; stillLive {
 			return true
 		}
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(stale name=%q): %v", name, err)
 		}
@@ -717,8 +717,10 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 }
 
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchMax: 32,
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 32,
 	})
 
 	const (
@@ -797,7 +799,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 						Tags:     randTags(),
 						FullName: fmt.Sprintf("ID-%03d", id),
 					}
-					if err := db.Set(id, rec); err != nil {
+					if err := writeSet(c, id, rec); err != nil {
 						errCh <- fmt.Errorf("writer=%d set id=%d: %w", w, id, err)
 						return
 					}
@@ -825,7 +827,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 					default:
 						patch = []Field{{Name: "tags", Value: randTags()}}
 					}
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						errCh <- fmt.Errorf("writer=%d patch id=%d patch=%v: %w", w, id, patch, err)
 						return
 					}
@@ -838,7 +840,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 					logMu.Unlock()
 
 				default: // Delete
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						errCh <- fmt.Errorf("writer=%d delete id=%d: %w", w, id, err)
 						return
 					}
@@ -862,11 +864,14 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		t.FailNow()
 	}
 
-	bs := db.AutoBatchStats()
-	if bs.FallbackClosed != 0 {
-		t.Fatalf("unexpected auto-batcher fallback stats: %+v", bs)
+	waitAutoBatchExtraStats(t, c.root, "concurrent multi-unit accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.MultiUnitBatches != 0
+	})
+	bs := c.StoreStats()
+	if bs.RejectedClosed != 0 {
+		t.Fatalf("unexpected root scheduler rejected stats: %+v", bs)
 	}
-	if bs.MultiRequestBatches == 0 {
+	if bs.MultiUnitBatches == 0 {
 		t.Fatalf("expected at least one multi-request batch, stats=%+v", bs)
 	}
 
@@ -943,7 +948,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	}
 
 	live := make(map[uint64]*Rec, idSpace)
-	scanErr := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	scanErr := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		if rec == nil {
 			return false, fmt.Errorf("nil record for id=%d", id)
 		}
@@ -954,7 +959,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", scanErr)
 	}
 
-	count, err := db.Count()
+	count, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count(): %v", err)
 	}
@@ -963,7 +968,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	}
 
 	queryContainsID := func(q *qx.QX, id uint64) bool {
-		ids, qerr := db.QueryKeys(q)
+		ids, qerr := readQueryKeys(c, q)
 		if qerr != nil {
 			t.Fatalf("QueryKeys(%v): %v", q, qerr)
 		}
@@ -981,7 +986,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	}
 
 	for id := uint64(1); id <= idSpace; id++ {
-		got, err := db.Get(id)
+		got, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}

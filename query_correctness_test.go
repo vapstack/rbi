@@ -12,11 +12,11 @@ import (
 )
 
 func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
 
-	items, err := db.Query(qx.Query(qx.EQ("age", 30)))
+	items, err := readQuery(c, qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -26,25 +26,25 @@ func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
 
 	items[0].Name = "mutated"
 	items[0].Tags[0] = "changed"
-	db.ReleaseRecords(items...)
+	c.ReleaseRecords(items...)
 
-	again, err := db.Get(1)
+	again, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
-	defer releaseUniqueRecords(db, again)
+	defer releaseUniqueRecords(c, again)
 	if again == nil || again.Name != "alice" || again.Tags[0] != "go" {
 		t.Fatalf("stored value changed after Query result mutation: %#v", again)
 	}
 
-	keys, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	keys, err := readQueryKeys(c, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys(alice): %v", err)
 	}
 	if !slices.Equal(keys, []uint64{1}) {
 		t.Fatalf("query index changed after Query result release: %v", keys)
 	}
-	keys, err = db.QueryKeys(qx.Query(qx.EQ("name", "mutated")))
+	keys, err = readQueryKeys(c, qx.Query(qx.EQ("name", "mutated")))
 	if err != nil {
 		t.Fatalf("QueryKeys(mutated): %v", err)
 	}
@@ -54,9 +54,9 @@ func TestAPI_Query_ReturnedRecordsDetachedFromStore(t *testing.T) {
 }
 
 func TestAPI_Query_ReturnOrderMatchesQueryKeys(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "id-1", Age: 20},
 		2: {Name: "id-2", Age: 40},
 		3: {Name: "id-3", Age: 30},
@@ -64,15 +64,15 @@ func TestAPI_Query_ReturnOrderMatchesQueryKeys(t *testing.T) {
 
 	q := qx.Query(qx.GTE("age", 20)).Sort("age", qx.DESC)
 
-	keys, err := db.QueryKeys(q)
+	keys, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	items, err := db.Query(q)
+	items, err := readQuery(c, q)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	defer releaseUniqueRecords(db, items...)
+	defer releaseUniqueRecords(c, items...)
 
 	if len(keys) != len(items) {
 		t.Fatalf("Query/QueryKeys length mismatch: keys=%v items=%d", keys, len(items))
@@ -91,16 +91,16 @@ func TestAPI_Query_ReturnOrderMatchesQueryKeys(t *testing.T) {
 }
 
 func TestAPI_Count_IgnoresOrderOffsetLimit(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "a", Age: 18},
 		2: {Name: "b", Age: 25},
 		3: {Name: "c", Age: 30},
 		4: {Name: "d", Age: 35},
 	})
 
-	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("age", qx.ASC).Offset(2).Limit(1).Filter)
+	got, err := readCount(c, qx.Query(qx.GTE("age", 25)).Sort("age", qx.ASC).Offset(2).Limit(1).Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -110,14 +110,14 @@ func TestAPI_Count_IgnoresOrderOffsetLimit(t *testing.T) {
 }
 
 func TestAPI_Count_IgnoresInvalidOrderField(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "a", Age: 25},
 		2: {Name: "b", Age: 30},
 	})
 
-	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("does_not_exist", qx.ASC).Offset(1).Limit(1).Filter)
+	got, err := readCount(c, qx.Query(qx.GTE("age", 25)).Sort("does_not_exist", qx.ASC).Offset(1).Limit(1).Filter)
 	if err != nil {
 		t.Fatalf("Count should ignore order fields entirely, got err=%v", err)
 	}
@@ -127,16 +127,16 @@ func TestAPI_Count_IgnoresInvalidOrderField(t *testing.T) {
 }
 
 func TestAPI_QueryKeys_POSNilPriorityDoesNotPanic(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "a", Tags: []string{"go"}},
 		2: {Name: "b", Tags: []string{"db"}},
 		3: {Name: "c", Tags: []string{"go", "db"}},
 		4: {Name: "d", Tags: []string{"ops"}},
 	})
 
-	got, err := db.QueryKeys(qx.Query(
+	got, err := readQueryKeys(c, qx.Query(
 		qx.HASANY("tags", []string{"go", "db"}),
 	).SortBy(qx.POS("tags", nil), qx.ASC))
 	if err != nil {
@@ -149,28 +149,28 @@ func TestAPI_QueryKeys_POSNilPriorityDoesNotPanic(t *testing.T) {
 }
 
 func TestQuery_MissingBucket_EmptyIndexResultStillRequiresSequenceTx(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c, _ := openTempUint64Collection(t)
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		if tx.Bucket(db.BucketName()) == nil {
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		if tx.Bucket(c.dataBucket) == nil {
 			return nil
 		}
-		return tx.DeleteBucket(db.BucketName())
+		return tx.DeleteBucket(c.dataBucket)
 	}); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 
-	items, err := db.Query(qx.Query(qx.EQ("age", 999_999)))
+	items, err := readQuery(c, qx.Query(qx.EQ("age", 999_999)))
 	if err == nil {
 		t.Fatalf("expected missing bucket error, got items=%#v", items)
 	}
 }
 
 func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
-	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempStringCollection(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
@@ -198,7 +198,7 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 			s := fmt.Sprintf("opt-%d", i)
 			rec.Opt = &s
 		}
-		if err := db.Set(fmt.Sprintf("id-%05d", i), rec); err != nil {
+		if err := writeSet(c, fmt.Sprintf("id-%05d", i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
@@ -281,7 +281,7 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 			q.Order = randomOrder()
 		}
 
-		gotKeys, err := db.QueryKeys(q)
+		gotKeys, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("step=%d QueryKeys(%+v): %v", step, q, err)
 		}
@@ -292,14 +292,14 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 			fullQ.Window.Offset = 0
 			fullQ.Window.Limit = 0
 			var err error
-			wantFull, err = expectedKeysString(t, db, fullQ)
+			wantFull, err = expectedKeysString(t, c, fullQ)
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(full %+v): %v", step, q, err)
 			}
 			assertNoOrderWindowSubsetString(t, q, gotKeys, wantFull, fmt.Sprintf("step=%d QueryKeys", step))
 		} else {
 			var err error
-			wantPage, err = expectedKeysString(t, db, q)
+			wantPage, err = expectedKeysString(t, c, q)
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(page %+v): %v", step, q, err)
 			}
@@ -308,13 +308,13 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 			}
 		}
 
-		gotItems, err := db.Query(q)
+		gotItems, err := readQuery(c, q)
 		if err != nil {
 			t.Fatalf("step=%d Query(%+v): %v", step, q, err)
 		}
-		wantItems, err := db.BatchGet(gotKeys...)
+		wantItems, err := readValues(c, gotKeys...)
 		if err != nil {
-			t.Fatalf("step=%d BatchGet(got): %v", step, err)
+			t.Fatalf("step=%d readValues(got): %v", step, err)
 		}
 		if len(gotItems) != len(wantItems) {
 			t.Fatalf("step=%d items len mismatch: got=%d want=%d q=%+v", step, len(gotItems), len(wantItems), q)
@@ -339,13 +339,13 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 		case wantFull != nil:
 			wantCount = len(wantFull)
 		default:
-			wantAll, err := expectedKeysString(t, db, countQ)
+			wantAll, err := expectedKeysString(t, c, countQ)
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(all %+v): %v", step, q, err)
 			}
 			wantCount = len(wantAll)
 		}
-		cnt, err := db.Count(q.Filter)
+		cnt, err := readCount(c, q.Filter)
 		if err != nil {
 			t.Fatalf("step=%d Count(%+v): %v", step, q, err)
 		}
@@ -356,7 +356,7 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 }
 
 func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T) {
-	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempStringCollection(t, Options{AnalyzeInterval: -1})
 	r := newRand(20260303)
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
@@ -379,7 +379,7 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 			Tags:     tags,
 			FullName: fmt.Sprintf("FN-%05d", i),
 		}
-		if err := db.Set(fmt.Sprintf("id-%05d", i), rec); err != nil {
+		if err := writeSet(c, fmt.Sprintf("id-%05d", i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
@@ -429,11 +429,11 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 	for i := range queries {
 		q := queries[i]
 
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("q%d QueryKeys: %v", i, err)
 		}
-		want, err := expectedKeysString(t, db, q)
+		want, err := expectedKeysString(t, c, q)
 		if err != nil {
 			t.Fatalf("q%d expectedKeysString: %v", i, err)
 		}
@@ -441,7 +441,7 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 			fullQ := cloneQuery(q)
 			fullQ.Window.Offset = 0
 			fullQ.Window.Limit = 0
-			fullWant, err := expectedKeysString(t, db, fullQ)
+			fullWant, err := expectedKeysString(t, c, fullQ)
 			if err != nil {
 				t.Fatalf("q%d expectedKeysString(full): %v", i, err)
 			}
@@ -455,8 +455,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 }
 
 func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 80)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 80)
 
 	queries := []*qx.QX{
 		qx.Query(qx.EQ("name", "alice")),
@@ -496,18 +496,18 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 	for i, q := range queries {
 		q := q
 		t.Run(fmt.Sprintf("q%d_%v", i, plannerExtExprOp(q.Filter)), func(t *testing.T) {
-			gotKeys, err := db.QueryKeys(q)
+			gotKeys, err := readQueryKeys(c, q)
 			if err != nil {
 				t.Fatalf("QueryKeys: %v", err)
 			}
 
-			wantPageKeys, err := expectedKeysUint64(t, db, q)
+			wantPageKeys, err := expectedKeysUint64(t, c, q)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(page): %v", err)
 			}
 			assertQueryIDsEqual(t, q, gotKeys, wantPageKeys)
 
-			gotItems, err := db.Query(q)
+			gotItems, err := readQuery(c, q)
 			if err != nil {
 				t.Fatalf("Query: %v", err)
 			}
@@ -519,12 +519,12 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 			qNoPage.Window.Offset = 0
 			qNoPage.Window.Limit = 0
 
-			wantAllKeys, err := expectedKeysUint64(t, db, &qNoPage)
+			wantAllKeys, err := expectedKeysUint64(t, c, &qNoPage)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(all): %v", err)
 			}
 
-			cnt, err := db.Count(q.Filter)
+			cnt, err := readCount(c, q.Filter)
 			if err != nil {
 				t.Fatalf("Count: %v", err)
 			}
@@ -536,7 +536,7 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 }
 
 func TestQuerySetEquivalence_StringKeys(t *testing.T) {
-	db, path := openTempDBString(t)
+	c, path := openTempStringCollection(t)
 
 	for i := 1; i <= 20; i++ {
 		id := fmt.Sprintf("id-%02d", i)
@@ -549,20 +549,20 @@ func TestQuerySetEquivalence_StringKeys(t *testing.T) {
 			Tags:     []string{"go"},
 			FullName: "X",
 		}
-		if err := db.Set(id, r); err != nil {
+		if err := writeSet(c, id, r); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	q := qx.Query(qx.GT("age", 10))
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
 	wantSet := map[string]struct{}{}
-	err = db.SeqScan("", func(id string, v *Rec) (bool, error) {
+	err = readSeqScan(c, "", func(id string, v *Rec) (bool, error) {
 		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
@@ -592,21 +592,21 @@ func TestQuerySetEquivalence_StringKeys(t *testing.T) {
 }
 
 func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 220)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 220)
 
 	q := qx.Query(
 		qx.NOT(qx.EQ("name", "alice")),
 	).Offset(10).Limit(40)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
 	fullQ := cloneQuery(q)
 	clearQueryOrderWindowForTest(fullQ)
-	full, err := expectedKeysUint64(t, db, fullQ)
+	full, err := expectedKeysUint64(t, c, fullQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full): %v", err)
 	}
@@ -614,8 +614,8 @@ func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
 }
 
 func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 240)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 240)
 
 	r := newRand(20260326)
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
@@ -726,7 +726,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 		switch x := r.IntN(100); {
 		case x < 22:
 			rec := randomRec(id)
-			if err := db.Set(id, rec); err != nil {
+			if err := writeSet(c, id, rec); err != nil {
 				t.Fatalf("step=%d Set(id=%d): %v", step, id, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d set id=%d tags=%v country=%s age=%d active=%v", step, id, rec.Tags, rec.Country, rec.Age, rec.Active))
@@ -741,13 +741,13 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 				vals[i] = randomRec(cid)
 				pairs[i] = fmt.Sprintf("%d:%v", cid, vals[i].Tags)
 			}
-			if err := db.BatchSet(ids, vals); err != nil {
-				t.Fatalf("step=%d BatchSet(ids=%v): %v", step, ids, err)
+			if err := writeSets(c, ids, vals); err != nil {
+				t.Fatalf("step=%d MultiSet(ids=%v): %v", step, ids, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d set_many %s", step, strings.Join(pairs, " | ")))
 		case x < 58:
 			patch := randomPatch()
-			if err := db.Patch(id, patch); err != nil {
+			if err := writePatch(c, id, patch); err != nil {
 				t.Fatalf("step=%d Patch(id=%d): %v", step, id, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d patch id=%d patch=%v", step, id, patch))
@@ -758,12 +758,12 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 				ids[i] = uint64(1 + r.IntN(360))
 			}
 			patch := randomPatch()
-			if err := db.BatchPatch(ids, patch); err != nil {
-				t.Fatalf("step=%d BatchPatch(ids=%v,patch=%v): %v", step, ids, patch, err)
+			if err := writePatches(c, ids, patch); err != nil {
+				t.Fatalf("step=%d MultiPatch(ids=%v,patch=%v): %v", step, ids, patch, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d patch_many ids=%v patch=%v", step, ids, patch))
 		case x < 88:
-			if err := db.Delete(id); err != nil {
+			if err := writeDelete(c, id); err != nil {
 				t.Fatalf("step=%d Delete(id=%d): %v", step, id, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d delete id=%d", step, id))
@@ -773,8 +773,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 			for i := 0; i < n; i++ {
 				ids[i] = uint64(1 + r.IntN(360))
 			}
-			if err := db.BatchDelete(ids); err != nil {
-				t.Fatalf("step=%d BatchDelete(ids=%v): %v", step, ids, err)
+			if err := writeDeletes(c, ids); err != nil {
+				t.Fatalf("step=%d MultiDelete(ids=%v): %v", step, ids, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d delete_many ids=%v", step, ids))
 		}
@@ -782,11 +782,11 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 		for qi := 0; qi < 3; qi++ {
 			q := randomQuery()
 
-			gotKeys, err := db.QueryKeys(q)
+			gotKeys, err := readQueryKeys(c, q)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d QueryKeys: %v q=%+v", step, qi, err, q)
 			}
-			wantKeys, err := expectedKeysUint64(t, db, q)
+			wantKeys, err := expectedKeysUint64(t, c, q)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d expectedKeys: %v q=%+v", step, qi, err, q)
 			}
@@ -810,8 +810,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 				if first >= 0 && first < len(gotKeys) && first < len(wantKeys) {
 					gid := gotKeys[first]
 					wid := wantKeys[first]
-					gv, _ := db.Get(gid)
-					wv, _ := db.Get(wid)
+					gv, _ := readGet(c, gid)
+					wv, _ := readGet(c, wid)
 					if queryTestOrderIsArrayPosOnField(q, "country") {
 						vals := queryTestOrderValues(q)
 						var gm, wm []string
@@ -826,8 +826,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 								qx.EQ("active", true),
 								qx.EQ("country", country),
 							))
-							gotIDs, gerr := db.QueryKeys(qSimple)
-							wantIDs, werr := expectedKeysUint64(t, db, qSimple)
+							gotIDs, gerr := readQueryKeys(c, qSimple)
+							wantIDs, werr := expectedKeysUint64(t, c, qSimple)
 							if gerr != nil || werr != nil {
 								return fmt.Sprintf("%s: gotErr=%v wantErr=%v", country, gerr, werr)
 							}
@@ -875,13 +875,13 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 				t.Fatalf("step=%d qi=%d keys mismatch q=%+v got=%v want=%v%s\nops:\n%s", step, qi, q, gotKeys, wantKeys, extra, strings.Join(opsLog, "\n"))
 			}
 
-			gotItems, err := db.Query(q)
+			gotItems, err := readQuery(c, q)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d Query: %v q=%+v", step, qi, err, q)
 			}
-			wantItems, err := db.BatchGet(wantKeys...)
+			wantItems, err := readValues(c, wantKeys...)
 			if err != nil {
-				t.Fatalf("step=%d qi=%d BatchGet(wantKeys): %v", step, qi, err)
+				t.Fatalf("step=%d qi=%d readValues(wantKeys): %v", step, qi, err)
 			}
 			if len(gotItems) != len(wantItems) {
 				t.Fatalf("step=%d qi=%d items len mismatch q=%+v got=%d want=%d", step, qi, q, len(gotItems), len(wantItems))
@@ -898,11 +898,11 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 			qNoPage := *q
 			qNoPage.Window.Offset = 0
 			qNoPage.Window.Limit = 0
-			wantAllKeys, err := expectedKeysUint64(t, db, &qNoPage)
+			wantAllKeys, err := expectedKeysUint64(t, c, &qNoPage)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d expectedKeys(all): %v q=%+v", step, qi, err, q)
 			}
-			cnt, err := db.Count(q.Filter)
+			cnt, err := readCount(c, q.Filter)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d Count: %v q=%+v", step, qi, err, q)
 			}
@@ -914,8 +914,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 }
 
 func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 20_000)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 20_000)
 
 	tests := []struct {
 		name string
@@ -971,13 +971,13 @@ func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			base := runQueryKeysChecked(t, db, tc.q)
+			base := runQueryKeysChecked(t, c, tc.q)
 			normalizedQ := normalizeQueryForTest(tc.q)
-			normalized := runQueryKeysChecked(t, db, normalizedQ)
+			normalized := runQueryKeysChecked(t, c, normalizedQ)
 			assertQueryIDsEqual(t, tc.q, base, normalized)
 
 			noisyQ := withNoisyEquivalentQuery(tc.q, len(tc.name))
-			noisy := runQueryKeysChecked(t, db, noisyQ)
+			noisy := runQueryKeysChecked(t, c, noisyQ)
 			assertQueryIDsEqual(t, tc.q, base, noisy)
 		})
 	}
@@ -1020,8 +1020,8 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 		t.Run(p.name, func(t *testing.T) {
 			t.Parallel()
 
-			db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-			seedMetamorphicDataProfile(t, db, 8_000, p)
+			c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+			seedMetamorphicDataProfile(t, c, 8_000, p)
 
 			r := newRand(777 + int64(pi)*1000)
 			const queryCount = 70
@@ -1034,7 +1034,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 				countQ.Window.Offset = 0
 				countQ.Window.Limit = 0
 
-				wantCountKeys, err := expectedKeysUint64(t, db, countQ)
+				wantCountKeys, err := expectedKeysUint64(t, c, countQ)
 				if err != nil {
 					t.Fatalf(
 						"expectedKeysUint64(count profile=%s i=%d): %v\nq=%+v",
@@ -1042,10 +1042,10 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					)
 				}
 
-				base := runQueryKeysChecked(t, db, q)
+				base := runQueryKeysChecked(t, c, q)
 
 				nq := normalizeQueryForTest(q)
-				normalized := runQueryKeysChecked(t, db, nq)
+				normalized := runQueryKeysChecked(t, c, nq)
 				if queryContractNoOrderWindow(q) {
 					assertNoOrderWindowSubset(t, q, base, wantCountKeys, fmt.Sprintf("base profile=%s i=%d", p.name, i))
 					assertNoOrderWindowSubset(t, nq, normalized, wantCountKeys, fmt.Sprintf("normalize profile=%s i=%d", p.name, i))
@@ -1054,7 +1054,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 				}
 
 				noisyQ := withNoisyEquivalentQuery(q, i)
-				noisy := runQueryKeysChecked(t, db, noisyQ)
+				noisy := runQueryKeysChecked(t, c, noisyQ)
 				if queryContractNoOrderWindow(q) {
 					assertNoOrderWindowSubset(t, noisyQ, noisy, wantCountKeys, fmt.Sprintf("noisy profile=%s i=%d", p.name, i))
 				} else {
@@ -1063,7 +1063,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 
 				wantCount := uint64(len(wantCountKeys))
 
-				gotCount, err := db.Count(q.Filter)
+				gotCount, err := readCount(c, q.Filter)
 				if err != nil {
 					t.Fatalf("Count(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
 				}
@@ -1080,8 +1080,8 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 }
 
 func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 8_000)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 8_000)
 
 	queries := []*qx.QX{
 		qx.Query(
@@ -1136,12 +1136,12 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 		for i := range queries {
 			q := queries[i]
 
-			got, err := db.QueryKeys(q)
+			got, err := readQueryKeys(c, q)
 			if err != nil {
 				t.Fatalf("%s q%d QueryKeys: %v", label, i, err)
 			}
 
-			want, err := expectedKeysUint64(t, db, q)
+			want, err := expectedKeysUint64(t, c, q)
 			if err != nil {
 				t.Fatalf("%s q%d expectedKeysUint64: %v", label, i, err)
 			}
@@ -1150,7 +1150,7 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 				fullQ := cloneQuery(q)
 				fullQ.Window.Offset = 0
 				fullQ.Window.Limit = 0
-				fullWant, err := expectedKeysUint64(t, db, fullQ)
+				fullWant, err := expectedKeysUint64(t, c, fullQ)
 				if err != nil {
 					t.Fatalf("%s q%d expectedKeysUint64(full): %v", label, i, err)
 				}
@@ -1183,16 +1183,16 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 				Tags:     []string{tagPool[r.IntN(len(tagPool))], tagPool[r.IntN(len(tagPool))]},
 				FullName: fmt.Sprintf("FN-%05d", 1+r.IntN(15_000)),
 			}
-			if err := db.Set(id, rec); err != nil {
+			if err := writeSet(c, id, rec); err != nil {
 				t.Fatalf("mutated Set(id=%d): %v", id, err)
 			}
 		case 1:
 			patch := []Field{{Name: "age", Value: float64(18 + r.IntN(65))}}
-			if err := db.Patch(id, patch); err != nil {
+			if err := writePatch(c, id, patch); err != nil {
 				t.Fatalf("mutated Patch(id=%d): %v", id, err)
 			}
 		default:
-			if err := db.Delete(id); err != nil {
+			if err := writeDelete(c, id); err != nil {
 				t.Fatalf("mutated Delete(id=%d): %v", id, err)
 			}
 		}
@@ -1202,8 +1202,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 }
 
 func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 10_000)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 10_000)
 
 	direct := qx.Query(
 		qx.GTE("age", 18),
@@ -1219,11 +1219,11 @@ func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
 		Window: direct.Window,
 	}
 
-	gotDirect, err := db.QueryKeys(direct)
+	gotDirect, err := readQueryKeys(c, direct)
 	if err != nil {
 		t.Fatalf("QueryKeys(direct): %v", err)
 	}
-	gotWrapped, err := db.QueryKeys(wrapped)
+	gotWrapped, err := readQueryKeys(c, wrapped)
 	if err != nil {
 		t.Fatalf("QueryKeys(wrapped): %v", err)
 	}
@@ -1245,7 +1245,7 @@ type queryMetamorphicCase struct {
 
 type queryMetamorphicSource struct {
 	name  string
-	open  func(*testing.T) *DB[uint64, Rec]
+	open  func(*testing.T) *Collection[uint64, Rec]
 	cases func() []queryMetamorphicCase
 }
 
@@ -1591,30 +1591,30 @@ func queryMetamorphicCuratedSources() []queryMetamorphicSource {
 	return []queryMetamorphicSource{
 		{
 			name: "Seeded",
-			open: func(t *testing.T) *DB[uint64, Rec] {
-				db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-				_ = seedData(t, db, 8_000)
-				return db
+			open: func(t *testing.T) *Collection[uint64, Rec] {
+				c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+				_ = seedData(t, c, 8_000)
+				return c
 			},
 			cases: queryMetamorphicSeededCases,
 		},
 		{
 			name:  "SkewedNotIn",
-			open:  openSkewedNotInRegressionDB,
+			open:  openSkewedNotInRegressionCollection,
 			cases: queryMetamorphicSkewedNotInCases,
 		},
 		{
 			name: "UniformProfile",
-			open: func(t *testing.T) *DB[uint64, Rec] {
-				db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-				seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
+			open: func(t *testing.T) *Collection[uint64, Rec] {
+				c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+				seedMetamorphicDataProfile(t, c, 8_000, metamorphicDataProfile{
 					name:        "Uniform",
 					scoreLevels: 50_000,
 					activeTrue:  0.50,
 					hotCountryP: 0.15,
 					hotTagP:     0.30,
 				})
-				return db
+				return c
 			},
 			cases: queryMetamorphicUniformProfileCases,
 		},
@@ -1623,12 +1623,12 @@ func queryMetamorphicCuratedSources() []queryMetamorphicSource {
 
 func runQueryMetamorphicTransforms(
 	t *testing.T,
-	db *DB[uint64, Rec],
+	c *Collection[uint64, Rec],
 	tc queryMetamorphicCase,
 ) {
 	t.Helper()
 	baseQ := cloneQuery(tc.q)
-	contract := newUint64QueryContract(t, db)
+	contract := newUint64QueryContract(t, c)
 	baseline := newQueryMetamorphicBaseline(contract, baseQ)
 	for _, transform := range queryMetamorphicTransforms() {
 		derived, ok := transform.apply(baseQ)
@@ -1645,17 +1645,17 @@ func runQueryMetamorphicTransforms(
 
 func runQueryMetamorphicExecutionRounds(
 	t *testing.T,
-	db *DB[uint64, Rec],
+	c *Collection[uint64, Rec],
 	tc queryMetamorphicCase,
 ) {
 	t.Helper()
 	baseQ := cloneQuery(tc.q)
-	contract := newUint64QueryContract(t, db)
+	contract := newUint64QueryContract(t, c)
 	baseline := newQueryMetamorphicBaseline(contract, baseQ)
 
 	contract.AssertMetamorphicEquivalent(baseline, tc.name+"/WarmCacheRoundTrip", baseQ)
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats(%s): %v", tc.name, err)
 	}
 	contract.AssertMetamorphicEquivalent(baseline, tc.name+"/RefreshPlannerStatsRoundTrip", baseQ)
@@ -1666,10 +1666,10 @@ func TestQueryMetamorphic_SmallWorldTransforms(t *testing.T) {
 		t.Run(world.name, func(t *testing.T) {
 			t.Parallel()
 
-			db := openSmallWorldDB(t, world)
+			c := openSmallWorldCollection(t, world)
 			for _, tc := range queryMetamorphicSmallWorldCases() {
 				t.Run(tc.name, func(t *testing.T) {
-					runQueryMetamorphicTransforms(t, db, tc)
+					runQueryMetamorphicTransforms(t, c, tc)
 				})
 			}
 		})
@@ -1681,10 +1681,10 @@ func TestQueryMetamorphic_CuratedCorpusTransforms(t *testing.T) {
 		t.Run(source.name, func(t *testing.T) {
 			t.Parallel()
 
-			db := source.open(t)
+			c := source.open(t)
 			for _, tc := range source.cases() {
 				t.Run(tc.name, func(t *testing.T) {
-					runQueryMetamorphicTransforms(t, db, tc)
+					runQueryMetamorphicTransforms(t, c, tc)
 				})
 			}
 		})
@@ -1696,10 +1696,10 @@ func TestQueryMetamorphic_CuratedExecutionRounds(t *testing.T) {
 		t.Run(source.name, func(t *testing.T) {
 			t.Parallel()
 
-			db := source.open(t)
+			c := source.open(t)
 			for _, tc := range source.cases() {
 				t.Run(tc.name, func(t *testing.T) {
-					runQueryMetamorphicExecutionRounds(t, db, tc)
+					runQueryMetamorphicExecutionRounds(t, c, tc)
 				})
 			}
 		})
@@ -1966,18 +1966,18 @@ func smallWorldWindowCases() []smallWorldWindowCase {
 	}
 }
 
-func openSmallWorldDB(t *testing.T, world smallWorldCase) *DB[uint64, Rec] {
+func openSmallWorldCollection(t *testing.T, world smallWorldCase) *Collection[uint64, Rec] {
 	t.Helper()
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 	for _, row := range world.rows {
-		if err := db.Set(row.id, row.rec); err != nil {
+		if err := writeSet(c, row.id, row.rec); err != nil {
 			t.Fatalf("Set(%d): %v", row.id, err)
 		}
 	}
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
-	return db
+	return c
 }
 
 func buildSmallWorldQuery(exprCase smallWorldExprCase, orderCase smallWorldOrderCase, windowCase smallWorldWindowCase) *qx.QX {
@@ -2005,14 +2005,14 @@ func TestQuerySmallWorld_BoundedExhaustiveContract(t *testing.T) {
 		t.Run(world.name, func(t *testing.T) {
 			t.Parallel()
 
-			db := openSmallWorldDB(t, world)
+			c := openSmallWorldCollection(t, world)
 
 			for _, exprCase := range exprs {
 				t.Run(exprCase.name, func(t *testing.T) {
 					for _, orderCase := range orders {
 						for _, windowCase := range windows {
 							q := buildSmallWorldQuery(exprCase, orderCase, windowCase)
-							contract := newUint64QueryContract(t, db)
+							contract := newUint64QueryContract(t, c)
 							contract.assertAllReadPathsMatchReference(q)
 						}
 					}

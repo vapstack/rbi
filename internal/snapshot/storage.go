@@ -154,4 +154,11 @@ func (v *View) releaseStorage() {
 	v.LenIndex = nil
 	v.Measure = nil
 	v.LenZeroComplement = nil
+	v.Universe = posting.List{}
+	v.universeOwner = nil
+}
+
+func (v *View) Release() {
+	v.releaseStorage()
+	v.releaseRuntimeCaches()
 }

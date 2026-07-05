@@ -337,7 +337,7 @@ func buildQexecBenchDBWithOptionsAndRows(b *testing.B, opts testOptions, rows in
 func qexecBenchPublicOptions(opts testOptions) Options {
 	return Options{
 		AnalyzeInterval:                             -1,
-		SnapshotMaterializedPredCacheMaxEntries:     opts.MatPredCacheMaxEntries,
+		MaterializedPredCacheMaxEntries:             opts.MatPredCacheMaxEntries,
 		SnapshotMaterializedPredCacheMaxCardinality: int(opts.MatPredCacheMaxCard),
 		NumericRangeBucketSize:                      opts.NumericRangeBucketSize,
 		NumericRangeBucketMinFieldKeys:              opts.NumericRangeBucketMinFieldKeys,
@@ -412,8 +412,8 @@ func newQexecBenchPublicDB(b *testing.B, rows int, options Options) *DB[uint64, 
 			}
 			ptrs[i] = &vals[i]
 		}
-		if err := db.BatchSet(ids, ptrs); err != nil {
-			b.Fatalf("BatchSet: %v", err)
+		if err := db.MultiSet(ids, ptrs); err != nil {
+			b.Fatalf("MultiSet: %v", err)
 		}
 	}
 	return db
@@ -1167,8 +1167,8 @@ func newQexecBenchUniqueDB(b *testing.B) *DB[uint64, qexecBenchUniqueRec] {
 		}
 		vals[i] = &rows[i]
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		b.Fatalf("BatchSet: %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		b.Fatalf("MultiSet: %v", err)
 	}
 	return db
 }

@@ -2,12 +2,9 @@ package engine
 
 import (
 	"errors"
-	"io"
-	"log"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"unsafe"
@@ -17,10 +14,10 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
-	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -121,14 +118,38 @@ func createRuntimeStringMap(t *testing.T, db *bbolt.DB, bucket []byte) []byte {
 	return mapBucket
 }
 
-func newRuntimeTestRuntime(t *testing.T, strKey bool, snapshotStats bool) *Index {
+func runtimeTestBucketState(t *testing.T, db *bbolt.DB, bucket []byte, strKey bool) (uint64, bool, keycodec.DataKey) {
+	t.Helper()
+
+	var seq uint64
+	var hasLast bool
+	var last keycodec.DataKey
+	if err := db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucket)
+		if b == nil {
+			return errors.New("bucket does not exist")
+		}
+		seq = b.Sequence()
+		key, _ := b.Cursor().Last()
+		if key != nil {
+			hasLast = true
+			last = keycodec.DataKeyFromBytes(key, strKey)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("bucket state: %v", err)
+	}
+	return seq, hasLast, last
+}
+
+func newRuntimeTestRuntime(t *testing.T, strKey bool) *Index {
 	t.Helper()
 
 	rt, err := schema.Compile(reflect.TypeOf(runtimeTestRec{}), schema.Config{})
 	if err != nil {
 		t.Fatalf("schema.Compile: %v", err)
 	}
-	r, err := NewIndex(Config{Schema: rt, StrKey: strKey, SnapshotStats: snapshotStats})
+	r, err := NewIndex(Config{Schema: rt, StrKey: strKey})
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
 	}
@@ -222,8 +243,9 @@ func newRuntimeStringKeyIndexRuntime(t *testing.T) *Index {
 func runtimeTestQueryKeys(t *testing.T, r *Index, q *qx.QX) []uint64 {
 	t.Helper()
 
+	snap := r.CurrentSnapshot()
 	var got []uint64
-	if err := r.QueryKeys(q, func(ids []uint64) error {
+	if err := r.QueryKeysOnSnapshot(snap, q, func(ids []uint64) error {
 		got = append(got, ids...)
 		return nil
 	}); err != nil {
@@ -232,19 +254,28 @@ func runtimeTestQueryKeys(t *testing.T, r *Index, q *qx.QX) []uint64 {
 	return got
 }
 
+func (index *Index) QueryKeysOnSnapshot(snap *snapshot.View, q *qx.QX, fn func([]uint64) error) error {
+	ids, err := index.QueryIDsOnSnapshot(snap, q, false)
+	if err != nil {
+		return err
+	}
+	return fn(ids)
+}
+
 func TestRuntimeScanStringKeysUsesKeyIndexSnapshot(t *testing.T) {
 	r := newRuntimeStringKeyIndexRuntime(t)
 
-	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+	r.installStorageSnapshot(3, snapshot.Storage{
 		KeyIndex: runtimeTestStringKeyStorage([]string{"a", "b", "c"}, []uint64{11, 12, 13}),
 		Universe: posting.BuildFromSorted([]uint64{
 			11, 12, 13,
 		}),
 	})
 
+	snap := r.CurrentSnapshot()
 	var got []string
 	var saved string
-	if err := r.ScanStringKeys("b", func(key string) (bool, error) {
+	if err := r.ScanStringKeysOnSnapshot(snap, "b", func(key string) (bool, error) {
 		got = append(got, key)
 		if key == "b" {
 			saved = key
@@ -258,7 +289,7 @@ func TestRuntimeScanStringKeysUsesKeyIndexSnapshot(t *testing.T) {
 	}
 
 	got = got[:0]
-	if err := r.ScanStringKeys("a", func(key string) (bool, error) {
+	if err := r.ScanStringKeysOnSnapshot(snap, "a", func(key string) (bool, error) {
 		got = append(got, key)
 		return false, nil
 	}); err != nil {
@@ -269,14 +300,14 @@ func TestRuntimeScanStringKeysUsesKeyIndexSnapshot(t *testing.T) {
 	}
 
 	scanErr := errors.New("scan error")
-	err := r.ScanStringKeys("a", func(string) (bool, error) {
+	err := r.ScanStringKeysOnSnapshot(snap, "a", func(string) (bool, error) {
 		return true, scanErr
 	})
 	if !errors.Is(err, scanErr) {
 		t.Fatalf("ScanStringKeys error=%v want %v", err, scanErr)
 	}
 
-	r.publishStorageSnapshotNoLock(4, snapshot.Storage{
+	r.installStorageSnapshot(4, snapshot.Storage{
 		KeyIndex: runtimeTestStringKeyStorage([]string{"z"}, []uint64{99}),
 		Universe: posting.BuildFromSorted([]uint64{
 			99,
@@ -289,14 +320,14 @@ func TestRuntimeScanStringKeysUsesKeyIndexSnapshot(t *testing.T) {
 
 func TestRuntimeStringKeyPredicatesUseKeyIndex(t *testing.T) {
 	r := newRuntimeStringKeyIndexRuntime(t)
-	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+	r.installStorageSnapshot(3, snapshot.Storage{
 		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha", "beta", "bravo", "carrot"}, []uint64{40, 10, 30, 20}),
 		Universe: posting.BuildFromSorted([]uint64{
 			10, 20, 30, 40,
 		}),
 	})
 
-	stats := r.IndexStats()
+	stats := r.IndexStatsOnSnapshot(r.CurrentSnapshot())
 	if stats.StringKeyIndex == nil {
 		t.Fatal("StringKeyIndex stats nil")
 	}
@@ -330,7 +361,7 @@ func TestRuntimeStringKeyPredicatesUseKeyIndex(t *testing.T) {
 
 func TestRuntimeStringKeyOrderUsesKeyIndex(t *testing.T) {
 	r := newRuntimeStringKeyIndexRuntime(t)
-	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+	r.installStorageSnapshot(3, snapshot.Storage{
 		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha", "beta", "bravo", "carrot"}, []uint64{40, 10, 30, 20}),
 		Universe: posting.BuildFromSorted([]uint64{
 			10, 20, 30, 40,
@@ -353,7 +384,7 @@ func TestRuntimeStringKeyOrderUsesKeyIndex(t *testing.T) {
 
 func TestRuntimeStringKeyRejectsNonStringValues(t *testing.T) {
 	r := newRuntimeStringKeyIndexRuntime(t)
-	r.publishStorageSnapshotNoLock(3, snapshot.Storage{
+	r.installStorageSnapshot(3, snapshot.Storage{
 		KeyIndex: runtimeTestStringKeyStorage([]string{"alpha"}, []uint64{1}),
 		Universe: posting.BuildFromSorted([]uint64{1}),
 	})
@@ -367,7 +398,7 @@ func TestRuntimeStringKeyRejectsNonStringValues(t *testing.T) {
 		qx.Query(qx.CONTAINS(schema.ReservedKeyFieldName, true)),
 	}
 	for i, q := range cases {
-		err := r.QueryKeys(q, func([]uint64) error { return nil })
+		err := r.QueryKeysOnSnapshot(r.CurrentSnapshot(), q, func([]uint64) error { return nil })
 		if err == nil {
 			t.Fatalf("case %d QueryKeys succeeded, want error", i)
 		}
@@ -386,6 +417,111 @@ func buildRuntimeTestIndex(t *testing.T, r *Index, db *bbolt.DB, bucket []byte) 
 	}
 }
 
+func TestRuntimeInstallCurrentSnapshotDoesNotRepublishExistingCurrent(t *testing.T) {
+	bucket := []byte("runtime_install_existing_current")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	setRuntimeTestSequence(t, db, bucket, 1)
+
+	r := newRuntimeTestRuntime(t, false)
+	buildRuntimeTestIndex(t, r, db, bucket)
+	current := r.CurrentSnapshot()
+	if current == nil {
+		t.Fatal("BuildIndex did not install current snapshot")
+	}
+
+	if err := r.InstallCurrentSnapshot(db, bucket); err != nil {
+		t.Fatalf("InstallCurrentSnapshot: %v", err)
+	}
+	if got := r.CurrentSnapshot(); got != current {
+		t.Fatalf("InstallCurrentSnapshot replaced existing current snapshot: got=%p want=%p", got, current)
+	}
+}
+
+func TestRuntimeInitialSnapshotCacheHasRuntimeContext(t *testing.T) {
+	bucket := []byte("runtime_initial_snapshot_cache_context")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	setRuntimeTestSequence(t, db, bucket, 1)
+
+	rt, err := schema.Compile(reflect.TypeOf(runtimeTestRec{}), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	var dirty atomic.Bool
+	var epoch atomic.Uint64
+	epoch.Store(7)
+	r, err := NewIndex(Config{
+		Schema:                          rt,
+		MaterializedPredCacheMaxEntries: 1,
+		RuntimeCachesDirtyOwner:         &dirty,
+		RuntimeCachesRetireEpoch:        &epoch,
+	})
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	buildRuntimeTestIndex(t, r, db, bucket)
+	snap := r.CurrentSnapshot()
+	if snap == nil {
+		t.Fatal("initial build did not install current snapshot")
+	}
+	defer r.ReleaseUnpublishedSnapshot()
+
+	snap.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("a"), (posting.List{}).BuildAdded(1))
+	snap.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("b"), (posting.List{}).BuildAdded(2))
+	if !dirty.Load() {
+		t.Fatal("initial snapshot runtime cache eviction did not mark dirty owner")
+	}
+	retained := snap.TakeRetiredRuntimeCachesBefore(7)
+	if !retained.Empty() {
+		retained.Release()
+		t.Fatal("retired runtime cache payload was detached before its retire epoch became safe")
+	}
+	retained.Release()
+	if !snap.RuntimeCachesDirty() {
+		t.Fatal("runtime cache dirty flag was cleared while retired payload was still epoch-protected")
+	}
+	retired := snap.TakeRetiredRuntimeCachesBefore(8)
+	if retired.Empty() {
+		t.Fatal("retired runtime cache payload was not detached after safe epoch advanced")
+	}
+	retired.Release()
+}
+
+func TestRuntimeReleaseUnpublishedSnapshotReleasesCurrentView(t *testing.T) {
+	bucket := []byte("runtime_release_unpublished_current")
+	db := openRuntimeTestBolt(t, bucket)
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
+	setRuntimeTestSequence(t, db, bucket, 1)
+
+	r := newRuntimeTestRuntime(t, false)
+	buildRuntimeTestIndex(t, r, db, bucket)
+	snap := r.CurrentSnapshot()
+	if snap == nil || snap.Index == nil || snap.NilIndex == nil || snap.LenIndex == nil || snap.Measure == nil {
+		t.Fatalf("current snapshot not installed: %v", snap)
+	}
+
+	r.ReleaseUnpublishedSnapshot()
+	if got := r.CurrentSnapshot(); got != nil {
+		t.Fatalf("current snapshot after release=%v want nil", got)
+	}
+	if snap.Index != nil || snap.NilIndex != nil || snap.LenIndex != nil || snap.Measure != nil {
+		t.Fatalf("released snapshot kept storage: index=%v nil=%v len=%v measure=%v", snap.Index, snap.NilIndex, snap.LenIndex, snap.Measure)
+	}
+}
+
+func TestRuntimeReleaseUnpublishedSnapshotReleasesInitialStorage(t *testing.T) {
+	r := newRuntimeTestRuntime(t, false)
+	if r.index == nil || r.nilIndex == nil || r.lenIndex == nil || r.measure == nil {
+		t.Fatalf("initial storage missing: index=%v nil=%v len=%v measure=%v", r.index, r.nilIndex, r.lenIndex, r.measure)
+	}
+
+	r.ReleaseUnpublishedSnapshot()
+	if r.index != nil || r.nilIndex != nil || r.lenIndex != nil || r.lenZeroComplement != nil || r.measure != nil {
+		t.Fatalf("initial storage after release: index=%v nil=%v len=%v lenZero=%v measure=%v", r.index, r.nilIndex, r.lenIndex, r.lenZeroComplement, r.measure)
+	}
+}
+
 func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	bucket := []byte("runtime_dispatch")
 	db := openRuntimeTestBolt(t, bucket)
@@ -394,11 +530,12 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 3, runtimeTestRec{Name: "alice", Tags: []string{"go", "db"}, Score: 7, Active: true})
 	setRuntimeTestSequence(t, db, bucket, 3)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
+	snap := r.CurrentSnapshot()
 
 	var keys []uint64
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+	if err := r.QueryKeysOnSnapshot(snap, qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
@@ -408,7 +545,7 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatalf("QueryKeys IDs=%v want [1 3]", keys)
 	}
 
-	count, err := r.Count(qx.EQ("active", true))
+	count, err := r.CountOnSnapshot(snap, qx.EQ("active", true))
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -416,7 +553,7 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatalf("Count=%d want 2", count)
 	}
 
-	agg, err := r.Aggregate(qx.Query(qx.EQ("active", true)).Metrics(qx.ROWCOUNT().AS("rows")))
+	agg, err := r.AggregateOnSnapshot(snap, qx.Query(qx.EQ("active", true)).Metrics(qx.ROWCOUNT().AS("rows")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -428,41 +565,29 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatalf("Aggregate rowcount=%d ok=%v want 2/true", rows, ok)
 	}
 
-	called := false
-	unavailableErr := errors.New("unavailable")
-	err = r.Query(qx.Query(qx.EQ("name", "alice")), db, bucket, func() error {
-		return unavailableErr
-	}, func(tx *bbolt.Tx, ids []uint64) error {
-		called = true
-		if !slices.Equal(ids, []uint64{1, 3}) {
-			t.Fatalf("Query callback IDs=%v want [1 3]", ids)
-		}
+	ids, err := r.QueryIDsOnSnapshot(snap, qx.Query(qx.EQ("name", "alice")), true)
+	if err != nil {
+		t.Fatalf("QueryIDsOnSnapshot: %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1, 3}) {
+		t.Fatalf("QueryIDsOnSnapshot IDs=%v want [1 3]", ids)
+	}
+	if err = db.View(func(tx *bbolt.Tx) error {
 		var key [8]byte
 		raw := tx.Bucket(bucket).Get(keycodec.U64BytesWithBuf(ids[0], &key))
 		if raw == nil {
 			t.Fatal("Query callback did not receive sequence-aligned bolt tx")
 		}
 		return nil
-	})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if !called {
-		t.Fatal("Query callback was not called")
+	}); err != nil {
+		t.Fatalf("View: %v", err)
 	}
 
-	dbStats, err := r.DBStats(db, bucket, nil)
-	if err != nil {
-		t.Fatalf("DBStats: %v", err)
+	seq, hasLast, last := runtimeTestBucketState(t, db, bucket, false)
+	if seq != 3 || snap.UniverseCardinality() != 3 || !hasLast || keycodec.UserKeyFromDataKey[uint64](last, false) != 3 {
+		t.Fatalf("bucket/snapshot state seq=%d card=%d hasLast=%v last=%v", seq, snap.UniverseCardinality(), hasLast, last)
 	}
-	if dbStats.Sequence != 3 || dbStats.KeyCount != 3 || !dbStats.HasLast || keycodec.UserKeyFromDataKey[uint64](dbStats.LastKey, false) != 3 {
-		t.Fatalf("DBStats=%+v", dbStats)
-	}
-	snapshotStats := r.SnapshotStats()
-	if snapshotStats.Sequence != 3 || snapshotStats.UniverseCard != 3 || snapshotStats.RegistrySize != 1 {
-		t.Fatalf("SnapshotStats=%+v", snapshotStats)
-	}
-	indexStats := r.IndexStats()
+	indexStats := r.IndexStatsOnSnapshot(snap)
 	if indexStats.FieldTotalCardinality["name"] != 3 || indexStats.FieldTotalCardinality["active"] != 3 {
 		t.Fatalf("IndexStats.FieldTotalCardinality=%v", indexStats.FieldTotalCardinality)
 	}
@@ -470,7 +595,7 @@ func TestRuntimeBuildQueryCountAggregatePlannerAndStats(t *testing.T) {
 		t.Fatalf("IndexStats.StringKeyIndex=%+v, want nil", indexStats.StringKeyIndex)
 	}
 
-	if err = r.RefreshPlannerStats(func() error { return nil }); err != nil {
+	if err = r.RefreshPlannerStatsOnSnapshot(snap, func() error { return nil }); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 	plannerStats := r.PlannerStats()
@@ -488,7 +613,7 @@ func TestRuntimeStringQueryKeysReturnIDs(t *testing.T) {
 	putRuntimeTestStringRec(t, db, bucket, mapBucket, "c", runtimeTestRec{Name: "alice", Active: true})
 	setRuntimeTestSequence(t, db, bucket, 3)
 
-	r := newRuntimeTestRuntime(t, true, true)
+	r := newRuntimeTestRuntime(t, true)
 	result, err := r.BuildIndex(db, bucket, mapBucket, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec)
 	if err != nil {
 		t.Fatalf("BuildIndex: %v", err)
@@ -498,7 +623,8 @@ func TestRuntimeStringQueryKeysReturnIDs(t *testing.T) {
 	}
 
 	var got []uint64
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(ids []uint64) error {
+	snap := r.CurrentSnapshot()
+	if err := r.QueryKeysOnSnapshot(snap, qx.Query(qx.EQ("name", "alice")), func(ids []uint64) error {
 		got = ids
 		return nil
 	}); err != nil {
@@ -508,12 +634,9 @@ func TestRuntimeStringQueryKeysReturnIDs(t *testing.T) {
 		t.Fatalf("QueryKeys IDs=%v want [1 3]", got)
 	}
 
-	st, err := r.DBStats(db, bucket, nil)
-	if err != nil {
-		t.Fatalf("DBStats: %v", err)
-	}
-	if st.Sequence != 3 || st.KeyCount != 3 || !st.HasLast || keycodec.UserKeyFromDataKey[string](st.LastKey, true) != "c" {
-		t.Fatalf("string DBStats=%+v", st)
+	seq, hasLast, last := runtimeTestBucketState(t, db, bucket, true)
+	if seq != 3 || snap.UniverseCardinality() != 3 || !hasLast || keycodec.UserKeyFromDataKey[string](last, true) != "c" {
+		t.Fatalf("string bucket/snapshot state seq=%d card=%d hasLast=%v last=%v", seq, snap.UniverseCardinality(), hasLast, last)
 	}
 }
 
@@ -524,20 +647,15 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob"})
 	setRuntimeTestSequence(t, db, bucket, 2)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	staged := r.StageTruncate(4)
 	if staged.view == nil {
 		t.Fatal("StageTruncate returned empty staged snapshot")
 	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 2 {
+	if got := r.CurrentSnapshot(); got == nil || got.Seq != 2 {
 		t.Fatalf("current snapshot before publish=%v", got)
-	}
-	if snap, seq, ref := r.snapshot.PinCurrent(); snap == nil || seq != 2 || ref == nil {
-		t.Fatalf("PinCurrent before publish snap=%v seq=%d ref=%v", snap, seq, ref)
-	} else {
-		r.snapshot.Unpin(seq, ref)
 	}
 
 	if err := db.Update(func(tx *bbolt.Tx) error {
@@ -553,17 +671,17 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 		t.Fatalf("truncate bucket: %v", err)
 	}
 
-	var broken atomic.Bool
-	err := r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), 4, "truncate", staged)
+	err := r.InstallCommittedSnapshot(staged.view)
 	if err != nil {
-		t.Fatalf("PublishCommittedStaged: %v", err)
+		t.Fatalf("InstallCommittedStaged: %v", err)
 	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
+	if got := r.CurrentSnapshot(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
 		t.Fatalf("current snapshot after truncate=%v", got)
 	}
 
 	var keys []uint64
-	if err := r.QueryKeys(qx.Query(), func(k []uint64) error {
+	current := r.CurrentSnapshot()
+	if err := r.QueryKeysOnSnapshot(current, qx.Query(), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
@@ -572,12 +690,9 @@ func TestRuntimeStageTruncatePublishesEmptySnapshot(t *testing.T) {
 	if len(keys) != 0 {
 		t.Fatalf("QueryKeys after truncate=%v want empty", keys)
 	}
-	stats, err := r.DBStats(db, bucket, nil)
-	if err != nil {
-		t.Fatalf("DBStats after truncate: %v", err)
-	}
-	if stats.Sequence != 4 || stats.KeyCount != 0 || stats.HasLast {
-		t.Fatalf("DBStats after truncate=%+v", stats)
+	seq, hasLast, _ := runtimeTestBucketState(t, db, bucket, false)
+	if seq != 4 || current.UniverseCardinality() != 0 || hasLast {
+		t.Fatalf("bucket/snapshot state after truncate seq=%d card=%d hasLast=%v", seq, current.UniverseCardinality(), hasLast)
 	}
 }
 
@@ -588,7 +703,7 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob"})
 	setRuntimeTestSequence(t, db, bucket, 2)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	prepared, shape, err := r.prepareQuery(qx.Query(qx.EQ("name", "alice")))
@@ -597,25 +712,23 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	old, seq, ref := r.snapshot.PinCurrent()
-	if old == nil || seq != 2 || ref == nil {
-		t.Fatalf("PinCurrent old snap=%v seq=%d ref=%v", old, seq, ref)
+	old := r.CurrentSnapshot()
+	if old == nil || old.Seq != 2 {
+		t.Fatalf("old snapshot=%v", old)
 	}
-	defer r.snapshot.Unpin(seq, ref)
 
 	staged := r.StageTruncate(4)
 	if staged.view == nil {
 		t.Fatal("StageTruncate returned empty staged snapshot")
 	}
-	var broken atomic.Bool
-	if err = r.PublishCommittedStaged(&broken, log.New(io.Discard, "", 0), 4, "truncate", staged); err != nil {
-		t.Fatalf("PublishCommittedStaged: %v", err)
+	if err = r.InstallCommittedSnapshot(staged.view); err != nil {
+		t.Fatalf("InstallCommittedStaged: %v", err)
 	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
+	if got := r.CurrentSnapshot(); got == nil || got.Seq != 4 || got.UniverseCardinality() != 0 {
 		t.Fatalf("current snapshot after truncate=%v", got)
 	}
 
-	keys, err := r.queryKeysOnSnapshot(old, &shape, false)
+	keys, err := r.QueryShapeOnSnapshot(old, &shape, false)
 	if err != nil {
 		t.Fatalf("query old snapshot: %v", err)
 	}
@@ -624,7 +737,7 @@ func TestRuntimePinnedCurrentSurvivesPublishedTruncate(t *testing.T) {
 	}
 
 	var currentKeys []uint64
-	if err = r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+	if err = r.QueryKeysOnSnapshot(r.CurrentSnapshot(), qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		currentKeys = k
 		return nil
 	}); err != nil {
@@ -642,11 +755,15 @@ func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob"})
 	setRuntimeTestSequence(t, db, bucket, 2)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	file := filepath.Join(t.TempDir(), "runtime.rbi")
-	if err := r.StoreIndex(file, db, bucket, [persist.UIDLen]byte{}); err != nil {
+	old := r.CurrentSnapshot()
+	if old == nil || old.Seq != 2 {
+		t.Fatalf("old snapshot=%v", old)
+	}
+	if err := r.StoreIndexSnapshot(file, old.Seq, [persist.UIDLen]byte{}, old); err != nil {
 		t.Fatalf("StoreIndex: %v", err)
 	}
 
@@ -656,20 +773,14 @@ func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	old, seq, ref := r.snapshot.PinCurrent()
-	if old == nil || seq != 2 || ref == nil {
-		t.Fatalf("PinCurrent old snap=%v seq=%d ref=%v", old, seq, ref)
-	}
-	defer r.snapshot.Unpin(seq, ref)
-
-	if _, err = r.LoadIndex(file, db.Path(), bucket, seq, [persist.UIDLen]byte{}); err != nil {
+	if _, err = r.LoadIndex(file, db.Path(), bucket, old.Seq, [persist.UIDLen]byte{}); err != nil {
 		t.Fatalf("LoadIndex: %v", err)
 	}
-	if got := r.snapshot.Current(); got == nil || got == old || got.Seq != 2 {
+	if got := r.CurrentSnapshot(); got == nil || got == old || got.Seq != 2 {
 		t.Fatalf("current snapshot after LoadIndex=%v old=%v", got, old)
 	}
 
-	keys, err := r.queryKeysOnSnapshot(old, &shape, false)
+	keys, err := r.QueryShapeOnSnapshot(old, &shape, false)
 	if err != nil {
 		t.Fatalf("query old snapshot: %v", err)
 	}
@@ -678,54 +789,88 @@ func TestRuntimePinnedCurrentSurvivesLoadIndex(t *testing.T) {
 	}
 }
 
-func TestRuntimeDBStatsMissingSnapshotReturnsUnavailable(t *testing.T) {
-	bucket := []byte("runtime_stats_missing_snapshot")
+func TestRuntimeBuildReleasesLoadedSnapshotWhenRebuilding(t *testing.T) {
+	bucket := []byte("runtime_loaded_snapshot_rebuild_release")
 	db := openRuntimeTestBolt(t, bucket)
-	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice"})
+	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Tags: []string{"go"}, Score: 10, Active: true})
+	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob", Tags: []string{"db"}, Score: 20})
 	setRuntimeTestSequence(t, db, bucket, 2)
 
-	r := newRuntimeTestRuntime(t, false, true)
-	errUnavailable := errors.New("unavailable")
-	_, err := r.DBStats(db, bucket, func() error {
-		return errUnavailable
-	})
-	if !errors.Is(err, errUnavailable) {
-		t.Fatalf("DBStats err=%v want %v", err, errUnavailable)
+	r := newRuntimeTestRuntime(t, false)
+	buildRuntimeTestIndex(t, r, db, bucket)
+	snap := r.CurrentSnapshot()
+
+	file := filepath.Join(t.TempDir(), "runtime.rbi")
+	if err := r.StoreIndexSnapshot(file, snap.Seq, [persist.UIDLen]byte{}, snap); err != nil {
+		t.Fatalf("StoreIndex: %v", err)
+	}
+
+	loaded := newRuntimeTestRuntime(t, false)
+	if _, err := loaded.LoadIndex(file, db.Path(), bucket, snap.Seq, [persist.UIDLen]byte{}); err != nil {
+		t.Fatalf("LoadIndex: %v", err)
+	}
+	loadedSnap := loaded.CurrentSnapshot()
+	if loadedSnap == nil || loadedSnap.Index == nil {
+		t.Fatalf("loaded snapshot=%v", loadedSnap)
+	}
+
+	if _, err := loaded.BuildIndex(
+		db,
+		bucket,
+		nil,
+		map[string]struct{}{"name": {}},
+		nil,
+		decodeRuntimeTestRec,
+		releaseRuntimeTestRec,
+	); err != nil {
+		t.Fatalf("BuildIndex partial: %v", err)
+	}
+	if got := loaded.CurrentSnapshot(); got == nil || got == loadedSnap || got.Seq != loadedSnap.Seq {
+		t.Fatalf("current after rebuild=%v loaded=%v", got, loadedSnap)
+	}
+	if loadedSnap.Index != nil || loadedSnap.NilIndex != nil || loadedSnap.LenIndex != nil || loadedSnap.Measure != nil {
+		t.Fatalf("loaded snapshot storage was not released: index=%v nil=%v len=%v measure=%v", loadedSnap.Index, loadedSnap.NilIndex, loadedSnap.LenIndex, loadedSnap.Measure)
+	}
+
+	var keys []uint64
+	if err := loaded.QueryKeysOnSnapshot(loaded.CurrentSnapshot(), qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+		keys = k
+		return nil
+	}); err != nil {
+		t.Fatalf("QueryKeys rebuilt current: %v", err)
+	}
+	if !slices.Equal(keys, []uint64{1}) {
+		t.Fatalf("rebuilt current IDs=%v want [1]", keys)
 	}
 }
 
-func TestRuntimeDropStagedKeepsCurrentSnapshotQueryable(t *testing.T) {
+func TestRuntimeStageTruncateKeepsCurrentSnapshotQueryable(t *testing.T) {
 	bucket := []byte("runtime_drop_staged")
 	db := openRuntimeTestBolt(t, bucket)
 	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
 	setRuntimeTestSequence(t, db, bucket, 1)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	staged := r.StageTruncate(2)
 	if staged.view == nil {
 		t.Fatal("StageTruncate returned empty staged snapshot")
 	}
-	r.DropStaged(2)
 
-	if snap, ref, ok := r.snapshot.PinBySeq(2); ok {
-		r.snapshot.Unpin(2, ref)
-		t.Fatalf("staged snapshot survived DropStaged: %v", snap)
-	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
-		t.Fatalf("current snapshot after DropStaged=%v", got)
+	if got := r.CurrentSnapshot(); got == nil || got == staged.view || got.Seq != 1 || got.UniverseCardinality() != 1 {
+		t.Fatalf("current snapshot after StageTruncate=%v", got)
 	}
 
 	var keys []uint64
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+	if err := r.QueryKeysOnSnapshot(r.CurrentSnapshot(), qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
-		t.Fatalf("QueryKeys after DropStaged: %v", err)
+		t.Fatalf("QueryKeys after StageTruncate: %v", err)
 	}
 	if !slices.Equal(keys, []uint64{1}) {
-		t.Fatalf("QueryKeys after DropStaged IDs=%v want [1]", keys)
+		t.Fatalf("QueryKeys after StageTruncate IDs=%v want [1]", keys)
 	}
 }
 
@@ -735,7 +880,7 @@ func TestRuntimeFailedBuildIndexKeepsCurrentSnapshotQueryable(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 1, runtimeTestRec{Name: "alice", Active: true})
 	setRuntimeTestSequence(t, db, bucket, 1)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 
 	if err := db.Update(func(tx *bbolt.Tx) error {
@@ -749,12 +894,12 @@ func TestRuntimeFailedBuildIndexKeepsCurrentSnapshotQueryable(t *testing.T) {
 	if _, err := r.BuildIndex(db, bucket, nil, nil, nil, decodeRuntimeTestRec, releaseRuntimeTestRec); err == nil {
 		t.Fatal("BuildIndex succeeded with corrupt record")
 	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
+	if got := r.CurrentSnapshot(); got == nil || got.Seq != 1 || got.UniverseCardinality() != 1 {
 		t.Fatalf("current snapshot after failed BuildIndex=%v", got)
 	}
 
 	var keys []uint64
-	if err := r.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+	if err := r.QueryKeysOnSnapshot(r.CurrentSnapshot(), qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
@@ -765,110 +910,46 @@ func TestRuntimeFailedBuildIndexKeepsCurrentSnapshotQueryable(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigureWriteWiresSnapshotPublish(t *testing.T) {
-	r := newRuntimeTestRuntime(t, false, true)
+func TestRuntimeConfigureWriteWiresSnapshotOps(t *testing.T) {
+	r := newRuntimeTestRuntime(t, false)
 	var cfg wexec.Config
-	var broken atomic.Bool
 
-	r.ConfigureWrite(&cfg, &broken, log.New(io.Discard, "", 0))
+	r.ConfigureWrite(&cfg)
 	if !cfg.Indexed {
 		t.Fatal("ConfigureWrite did not enable indexed writes")
 	}
 	if cfg.Unique.Schema != r.schema || cfg.Unique.Current == nil {
 		t.Fatalf("Unique wiring=%+v", cfg.Unique)
 	}
-	if cfg.SnapshotOps.Manager != r.snapshot || cfg.SnapshotOps.Schema != r.schema {
+	if cfg.SnapshotOps.Current == nil || cfg.SnapshotOps.Schema != r.schema {
 		t.Fatalf("SnapshotOps wiring=%+v", cfg.SnapshotOps)
 	}
 	if cfg.SnapshotOps.CacheConfig != r.SnapshotCacheConfig() {
 		t.Fatalf("SnapshotOps CacheConfig=%+v want %+v", cfg.SnapshotOps.CacheConfig, r.SnapshotCacheConfig())
 	}
-	if cfg.PublishCommitted == nil {
-		t.Fatal("ConfigureWrite did not install publish callback")
-	}
-
-	staged := r.StageTruncate(11)
-	if err := cfg.PublishCommitted(11, "set", staged.view); err != nil {
-		t.Fatalf("PublishCommitted callback: %v", err)
-	}
-	if got := r.snapshot.Current(); got == nil || got.Seq != 11 {
-		t.Fatalf("current snapshot after callback=%v", got)
-	}
-	if cfg.Unique.Current() != r.snapshot.Current() {
+	if cfg.Unique.Current() != r.CurrentSnapshot() {
 		t.Fatal("Unique.Current is not wired to runtime snapshot manager")
 	}
 }
 
-func TestRuntimeCommittedPublishPanicBreaksAndDropsStaged(t *testing.T) {
-	r := newRuntimeTestRuntime(t, false, true)
+func TestRuntimeCommittedInstallPanicPropagates(t *testing.T) {
+	r := newRuntimeTestRuntime(t, false)
 	staged := r.StageTruncate(7)
 	if staged.view == nil {
 		t.Fatal("StageTruncate returned empty staged snapshot")
 	}
-	if snap, ref, ok := r.snapshot.PinBySeq(7); !ok || snap != staged.view || ref == nil {
-		t.Fatalf("staged snapshot was not pinnable before panic")
-	} else {
-		r.snapshot.Unpin(7, ref)
-	}
+	staged.view.Release()
 
-	var broken atomic.Bool
-	err := func() (err error) {
-		defer r.recoverCommittedPublishPanic(&broken, log.New(io.Discard, "", 0), 7, "truncate", &err)
-		panic("failpoint: publish truncate")
-	}()
-	if !errors.Is(err, rbierrors.ErrBroken) {
-		t.Fatalf("recover err=%v want broken", err)
-	}
-	if !broken.Load() {
-		t.Fatal("broken flag was not set")
-	}
-	if snap, ref, ok := r.snapshot.PinBySeq(7); ok {
-		r.snapshot.Unpin(7, ref)
-		t.Fatalf("staged snapshot survived recovery: %v", snap)
-	}
-	if got := r.snapshot.Current(); got != nil {
-		t.Fatalf("current snapshot=%v want nil", got)
-	}
-}
-
-func TestRuntimeAnalyzeStopSignalConcurrentWithStop(t *testing.T) {
-	r := newRuntimeTestRuntime(t, false, false)
-
-	for i := 0; i < 1000; i++ {
-		stop := make(chan struct{})
-		done := make(chan struct{})
-		r.exec.Analyzer.Lock()
-		r.exec.Analyzer.Stop = stop
-		r.exec.Analyzer.Done = done
-		r.exec.Analyzer.Unlock()
-
-		var doneWG sync.WaitGroup
-		doneWG.Add(1)
-		go func() {
-			defer doneWG.Done()
-			<-stop
-			close(done)
-		}()
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			r.stopAnalyzerSignal()
-		}()
-		go func() {
-			defer wg.Done()
-			r.StopAnalyzeLoop()
-		}()
-		wg.Wait()
-		doneWG.Wait()
-
-		r.exec.Analyzer.Lock()
-		if r.exec.Analyzer.Stop != nil || r.exec.Analyzer.Done != nil {
-			t.Fatalf("iteration %d analyzer state stop=%v done=%v", i, r.exec.Analyzer.Stop, r.exec.Analyzer.Done)
+	defer func() {
+		if v := recover(); v == nil {
+			t.Fatal("InstallCommittedSnapshot did not propagate panic")
 		}
-		r.exec.Analyzer.Unlock()
-	}
+		if got := r.CurrentSnapshot(); got != nil {
+			t.Fatalf("current snapshot=%v want nil", got)
+		}
+	}()
+
+	_ = r.InstallCommittedSnapshot(nil)
 }
 
 func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
@@ -878,16 +959,17 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	putRuntimeTestRec(t, db, bucket, 2, runtimeTestRec{Name: "bob", Score: 20})
 	setRuntimeTestSequence(t, db, bucket, 5)
 
-	r := newRuntimeTestRuntime(t, false, true)
+	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
-	r.RefreshPlannerStatsLocked()
+	snap := r.CurrentSnapshot()
+	r.RefreshPlannerStatsOnSnapshot(snap, func() error { return nil })
 
 	file := filepath.Join(t.TempDir(), "runtime.rbi")
-	if err := r.StoreIndex(file, db, bucket, [persist.UIDLen]byte{}); err != nil {
+	if err := r.StoreIndexSnapshot(file, snap.Seq, [persist.UIDLen]byte{}, snap); err != nil {
 		t.Fatalf("StoreIndex: %v", err)
 	}
 
-	loaded := newRuntimeTestRuntime(t, false, true)
+	loaded := newRuntimeTestRuntime(t, false)
 	seq, err := currentBucketSequence(db, bucket)
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
@@ -899,7 +981,8 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	loaded.PublishLoadedPlannerStats(result.PlannerStats)
 
 	var keys []uint64
-	if err := loaded.QueryKeys(qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
+	loadedSnap := loaded.CurrentSnapshot()
+	if err := loaded.QueryKeysOnSnapshot(loadedSnap, qx.Query(qx.EQ("name", "alice")), func(k []uint64) error {
 		keys = k
 		return nil
 	}); err != nil {
@@ -908,7 +991,7 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	if !slices.Equal(keys, []uint64{1}) {
 		t.Fatalf("loaded QueryKeys IDs=%v want [1]", keys)
 	}
-	count, err := loaded.Count(qx.EQ("active", true))
+	count, err := loaded.CountOnSnapshot(loadedSnap, qx.EQ("active", true))
 	if err != nil {
 		t.Fatalf("loaded Count: %v", err)
 	}

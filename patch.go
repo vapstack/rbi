@@ -49,14 +49,14 @@ const (
 // and copy safety is provided on a best-effort basis.
 //
 // If newVal is nil, it returns an empty slice.
-func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, error) {
+func (c *Collection[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, error) {
 	useJSON := false
 	for _, opt := range opts {
 		if opt == PatchJSON {
 			useJSON = true
 		}
 	}
-	return db.makePatch(oldVal, newVal, nil, useJSON)
+	return c.makePatch(oldVal, newVal, nil, useJSON)
 }
 
 // MakePatchInto is like MakePatch, but writes the result into the provided
@@ -68,14 +68,14 @@ func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, 
 //
 // If newVal is nil, it returns an empty slice.
 // On error, returned slice is reset to length 0.
-func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) ([]Field, error) {
+func (c *Collection[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) ([]Field, error) {
 	useJSON := false
 	for _, opt := range opts {
 		if opt == PatchJSON {
 			useJSON = true
 		}
 	}
-	return db.makePatch(oldVal, newVal, dst, useJSON)
+	return c.makePatch(oldVal, newVal, dst, useJSON)
 }
 
 type patchScratch struct {
@@ -89,7 +89,7 @@ var patchScratchPool = pooled.Pointers[patchScratch]{
 	},
 }
 
-func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) ([]Field, error) {
+func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) ([]Field, error) {
 	target = target[:0]
 
 	if newVal == nil {
@@ -103,7 +103,7 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 	rvNew = reflect.ValueOf(newVal).Elem()
 
 	scratch := patchScratchPool.Get()
-	patchAccess := db.schema.Patch.Access
+	patchAccess := c.schema.Patch.Access
 	scratch.seen = slices.Grow(scratch.seen[:0], len(patchAccess))[:len(patchAccess)]
 	defer patchScratchPool.Put(scratch)
 
@@ -113,41 +113,39 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) (
 		oldPtr = unsafe.Pointer(oldVal)
 	}
 
-	var patchErr error
-	db.forEachModifiedIndexedField(oldVal, newVal, func(acc schema.IndexedFieldAccessor) bool {
-		if acc.PatchOrdinal < 0 {
-			return true
-		}
-		ordinal := patchCoverOrdinal(patchAccess, acc.PatchOrdinal, useJSON)
-		if scratch.seen[ordinal] {
-			return true
-		}
-		patchAcc := patchAccess[ordinal]
-		name := patchFieldName(patchAcc.Field, useJSON)
-		if useJSON {
-			if name == "" {
-				patchErr = fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
-				return false
+	if c.index != nil {
+		for _, acc := range c.schema.Indexed {
+			if oldVal != nil && !acc.Modified(oldPtr, newPtr) {
+				continue
 			}
-		} else if name == "" {
-			patchErr = fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
-			return false
+			if acc.PatchOrdinal < 0 {
+				continue
+			}
+			ordinal := patchCoverOrdinal(patchAccess, acc.PatchOrdinal, useJSON)
+			if scratch.seen[ordinal] {
+				continue
+			}
+			patchAcc := patchAccess[ordinal]
+			name := patchFieldName(patchAcc.Field, useJSON)
+			if useJSON {
+				if name == "" {
+					return target[:0], fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
+				}
+			} else if name == "" {
+				return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
+			}
+			var value any
+			if patchAcc.CopyValue != nil {
+				value = patchAcc.CopyValue(newPtr)
+			} else {
+				value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
+			}
+			markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
+			target = append(target, Field{
+				Name:  name,
+				Value: value,
+			})
 		}
-		var value any
-		if patchAcc.CopyValue != nil {
-			value = patchAcc.CopyValue(newPtr)
-		} else {
-			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
-		}
-		markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
-		target = append(target, Field{
-			Name:  name,
-			Value: value,
-		})
-		return true
-	})
-	if patchErr != nil {
-		return target[:0], patchErr
 	}
 
 	for ordinal, patchAcc := range patchAccess {
@@ -239,41 +237,26 @@ func markPatchSubtreeSeen(seen []bool, access []schema.PatchFieldAccessor, ordin
 	}
 }
 
+// patchItemsForWrite returns request-owned storage; callers must transfer it to
+// wexec or release it with schema.ReleasePatchItemSlice.
 func patchItemsForWrite(fields []Field) []schema.PatchItem {
-	// Field and schema.PatchItem are layout-identical; wexec copies this view
-	// into request-owned storage immediately.
-	return unsafe.Slice((*schema.PatchItem)(unsafe.SliceData(fields)), len(fields))
-}
-
-func (db *DB[K, V]) forEachModifiedAccessor(accessors []schema.IndexedFieldAccessor, v1 *V, v2 *V, fn func(schema.IndexedFieldAccessor) bool) {
-	if fn == nil {
-		return
-	}
-	if len(accessors) == 0 {
-		return
-	}
-	if v1 == nil || v2 == nil {
-		for _, acc := range accessors {
-			if !fn(acc) {
-				return
-			}
-		}
-		return
-	}
-	ptr1 := unsafe.Pointer(v1)
-	ptr2 := unsafe.Pointer(v2)
-	for _, acc := range accessors {
-		if acc.Modified(ptr1, ptr2) && !fn(acc) {
-			return
+	items := schema.GetPatchItemSlice(len(fields))[:len(fields)]
+	for i := range fields {
+		items[i] = schema.PatchItem{
+			Name:  fields[i].Name,
+			Value: deepCopyValue(fields[i].Value),
 		}
 	}
+	return items
 }
 
-func (db *DB[K, V]) forEachModifiedIndexedField(v1 *V, v2 *V, fn func(schema.IndexedFieldAccessor) bool) {
-	if db.index == nil {
-		return
+func (c *Collection[K, V]) validatePatchFieldNames(fields []Field) error {
+	for i := range fields {
+		if _, ok := c.schema.Patch.Fields[fields[i].Name]; !ok {
+			return fmt.Errorf("cannot patch field %v: field information is missing", fields[i].Name)
+		}
 	}
-	db.forEachModifiedAccessor(db.schema.Indexed, v1, v2, fn)
+	return nil
 }
 
 func deepCopyValue(src any) any {
@@ -317,7 +300,6 @@ type sliceCopyKey struct {
 	ptr uintptr
 	typ reflect.Type
 	len int
-	cap int
 }
 
 var timeTimeType = reflect.TypeFor[time.Time]()
@@ -363,7 +345,7 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 	}
 	if kind == reflect.Slice {
 		if origin.Len() != 0 && state.slices != nil {
-			key := sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len(), cap: origin.Cap()}
+			key := sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len()}
 			if clone, ok := state.slices[key]; ok {
 				return clone
 			}
@@ -410,12 +392,12 @@ func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
 		return ptr
 
 	case reflect.Slice:
-		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Cap())
+		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Len())
 		if origin.Len() != 0 {
 			if state.slices == nil {
 				state.slices = make(map[sliceCopyKey]reflect.Value)
 			}
-			state.slices[sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len(), cap: origin.Cap()}] = s
+			state.slices[sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len()}] = s
 		}
 		for i := 0; i < origin.Len(); i++ {
 			clone := deepCopy(origin.Index(i), state)

@@ -2,7 +2,6 @@ package wexec
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"math/bits"
 	"slices"
@@ -17,7 +16,6 @@ import (
 type prepared struct {
 	req *request
 
-	key      []byte
 	payload  []byte
 	physical []byte
 	idx      uint64
@@ -27,7 +25,52 @@ type prepared struct {
 	newVal   unsafe.Pointer
 }
 
+type AppliedBatch struct {
+	Seq      uint64
+	Snapshot *snapshot.View
+	cleanup  *appliedBatchCleanup
+}
+
 var snapshotOldValueExists byte
+
+type appliedBatchCleanup struct {
+	att     *attemptState
+	ex      *Executor
+	reqs    []request
+	batches []Batch
+}
+
+func (applied *AppliedBatch) Release() {
+	cleanup := applied.cleanup
+	if cleanup == nil {
+		return
+	}
+	applied.cleanup = nil
+	cleanup.release()
+}
+
+func (cleanup *appliedBatchCleanup) release() {
+	if cleanup.att != nil {
+		attemptStatePool.Put(cleanup.att)
+		cleanup.att = nil
+	}
+	if cleanup.ex != nil {
+		for i := range cleanup.reqs {
+			cleanup.ex.releaseRequest(&cleanup.reqs[i])
+		}
+		requestScratchPool.Put(cleanup.reqs)
+		cleanup.ex = nil
+		cleanup.reqs = nil
+	}
+	if cleanup.batches != nil {
+		for i := range cleanup.batches {
+			cleanup.batches[i].Cancel()
+		}
+		batchSlicePool.Put(cleanup.batches)
+		cleanup.batches = nil
+	}
+	appliedBatchCleanupPool.Put(cleanup)
+}
 
 func assignPreparedErr(ops []prepared, err error) {
 	for _, op := range ops {
@@ -56,6 +99,7 @@ type recordState struct {
 type attemptState struct {
 	dataBucket   *bbolt.Bucket
 	strmapBucket *bbolt.Bucket
+	base         *attemptState
 	statsEnabled bool
 	release      func(unsafe.Pointer)
 	singleState  bool
@@ -76,39 +120,41 @@ type attemptState struct {
 
 	ownedPayloads []*bytes.Buffer
 	releaseValues []unsafe.Pointer
-
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
 	uniqueNewVals []unsafe.Pointer
 	uniqueState   uniqueBatchCheckState
 }
 
-func (b *Batcher) prepareActive(att *attemptState, active []*request) {
+func (b *Executor) prepareActive(att *attemptState, active []request, hookTx unsafe.Pointer) {
 	for i := 0; i < len(active); i++ {
-		req := active[i]
+		req := &active[i]
 		if req.Err != nil {
 			continue
 		}
-
-		switch req.op {
-		case opSet:
-			b.prepareSet(att, req)
-		case opPatch:
-			b.preparePatch(att, req)
-		case opDelete:
-			b.prepareDelete(att, req)
-		}
+		b.prepareRequest(att, req, hookTx)
 	}
 }
 
-func (b *Batcher) ensureIdx(att *attemptState, state *recordState, id keycodec.DataKey, create bool) error {
+func (b *Executor) prepareRequest(att *attemptState, req *request, hookTx unsafe.Pointer) {
+	switch req.op {
+	case opSet:
+		b.prepareSet(att, req, hookTx)
+	case opPatch:
+		b.preparePatch(att, req, hookTx)
+	case opDelete:
+		b.prepareDelete(att, req, hookTx)
+	}
+}
+
+func (b *Executor) ensureIdx(att *attemptState, state *recordState, id keycodec.DataKey, create bool) error {
 	if state.idxKnown {
 		return nil
 	}
 	if b.strKey {
 		idx, err := att.strmapBucket.NextSequence()
 		if err != nil {
-			return fmt.Errorf("advance string map sequence: %w", err)
+			return fmt.Errorf("%w: %w", ErrAdvanceStringMapSequence, err)
 		}
 		state.idx = idx
 		if create {
@@ -121,9 +167,10 @@ func (b *Batcher) ensureIdx(att *attemptState, state *recordState, id keycodec.D
 	return nil
 }
 
-func (b *Batcher) prepareSet(att *attemptState, req *request) {
-	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.beforeStore) > 0 || len(req.beforeCommit) > 0
-	state, err := b.loadState(att, req, b.strKey || needOldValue, needOldValue)
+func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Pointer) {
+	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.onChange) > 0
+	readState := b.strKey || needOldValue
+	state, pos, err := b.loadState(att, req, readState, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -134,23 +181,32 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 
 	// key-only indexed snapshots exist only for string keys
 	//
-	// numeric key DB without indexed fields runs in transparent mode,
+	// numeric key collection without indexed fields runs in transparent mode,
 	// so wexec is not configured as indexed there
 	if snapOld == nil && state.exists && b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() {
 		snapOld = unsafe.Pointer(&snapshotOldValueExists)
 	}
-	newVal := req.setValue
+
 	payload := req.payloadBytes()
 	physical := payload
 	if req.setPayload != nil {
 		physical = req.setPayload.Bytes()
 	}
-	var ownedPayload *bytes.Buffer
+
+	var (
+		newVal       unsafe.Pointer
+		ownedPayload *bytes.Buffer
+	)
 	payloadOff := req.payloadOff
 
-	if len(req.beforeStore) > 0 {
+	if len(state.key) > bbolt.MaxKeySize {
+		req.Err = formatBoltWriteErr(berrors.ErrKeyTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
+
+	if len(req.onChange) > 0 {
 		if att.statsEnabled {
-			b.sched.stats.CallbackOps.Add(1)
+			b.stats.CallbackOps.Add(1)
 		}
 		if req.cloneValue != nil {
 			newVal, err = req.cloneValue(req.id, req.setBaseline)
@@ -167,10 +223,10 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 			}
 			att.releaseValues = append(att.releaseValues, newVal)
 		}
-		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
+		if err = runOnChangeHooks(hookTx, req.generationDepth, req.id, oldVal, newVal, req.onChange); err != nil {
 			req.Err = err
 			if att.statsEnabled {
-				b.sched.stats.CallbackErrors.Add(1)
+				b.stats.CallbackErrors.Add(1)
 			}
 			return
 		}
@@ -193,14 +249,42 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		payload = physical[payloadOff:]
 	}
 
-	if len(req.beforeStore) == 0 {
-		if err = b.ops.ValidateIndex(newVal); err != nil {
-			req.Err = err
-			return
+	if len(req.onChange) == 0 {
+		needPreparedValue := b.indexed && b.schema.HasQueryFields()
+		if !needPreparedValue && b.unique.Schema != nil && len(b.unique.Schema.Unique) != 0 {
+			needPreparedValue = true
+		}
+		if needPreparedValue {
+			if b.rejectEmptyPayload && len(payload) == 0 {
+				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, errEmptyPayload)
+				return
+			}
+			newVal, err = b.ops.Decode(payload)
+			if err != nil {
+				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, err)
+				return
+			}
+			att.releaseValues = append(att.releaseValues, newVal)
+		}
+		if newVal != nil {
+			if err = b.ops.ValidateIndex(newVal); err != nil {
+				req.Err = err
+				return
+			}
 		}
 	}
 
+	if b.rejectEmptyPayload && len(payload) == 0 {
+		req.Err = formatBoltWriteErr(errEmptyPayload, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
+	if int64(len(physical)) > bbolt.MaxValueSize {
+		req.Err = formatBoltWriteErr(berrors.ErrValueTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
 	if b.strKey && !state.exists {
+		// A key deleted earlier in this attempt no longer has a string-map row;
+		// force a fresh idx so applyAccepted recreates the reverse mapping.
 		state.idxKnown = false
 		state.idxNew = false
 	}
@@ -211,10 +295,13 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		}
 	}
 	idxNew := state.idxNew
+	snapNew := newVal
+	if snapNew == nil && b.strKey && b.snapshotOps.StrKeyIndex && !b.schema.HasQueryFields() {
+		snapNew = unsafe.Pointer(&snapshotOldValueExists)
+	}
 
 	att.prepared = append(att.prepared, prepared{
 		req:      req,
-		key:      state.key,
 		payload:  payload,
 		physical: physical,
 		idx:      state.idx,
@@ -223,24 +310,35 @@ func (b *Batcher) prepareSet(att *attemptState, req *request) {
 		snapOld:  snapOld,
 		newVal:   newVal,
 	})
+
 	if b.indexed {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
 			ID:  state.idx,
 			Old: snapOld,
-			New: newVal,
+			New: snapNew,
 		})
 	}
+
 	state.value = newVal
 	state.exists = true
+
 	if ownedPayload != nil {
 		state.setOwnedPayload(ownedPayload, payloadOff)
 	} else {
 		state.setBorrowedPayload(payload)
 	}
+
+	if pos < 0 && !att.singleState {
+		pos = len(att.states)
+		att.states = append(att.states, *state)
+		state = &att.states[pos]
+		state.key = req.id.Bytes(b.strKey, &state.keyBuf)
+		att.setStatePos(b.strKey, req.id, pos)
+	}
 }
 
-func (b *Batcher) preparePatch(att *attemptState, req *request) {
-	state, err := b.loadState(att, req, true, true)
+func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.Pointer) {
+	state, _, err := b.loadState(att, req, true, true)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecodeExistingValue, err)
 		return
@@ -265,20 +363,14 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 		req.Err = formatPrepareErr(prepareErrApplyPatch, err)
 		return
 	}
-	if len(req.beforeProcess) > 0 {
-		if err = runBeforeProcessHooks(req.id, newVal, req.beforeProcess); err != nil {
-			req.Err = err
-			return
-		}
-	}
-	if len(req.beforeStore) > 0 {
+	if len(req.onChange) > 0 {
 		if att.statsEnabled {
-			b.sched.stats.CallbackOps.Add(1)
+			b.stats.CallbackOps.Add(1)
 		}
-		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
+		if err = runOnChangeHooks(hookTx, req.generationDepth, req.id, oldVal, newVal, req.onChange); err != nil {
 			req.Err = err
 			if att.statsEnabled {
-				b.sched.stats.CallbackErrors.Add(1)
+				b.stats.CallbackErrors.Add(1)
 			}
 			return
 		}
@@ -298,6 +390,20 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	}
 	att.ownedPayloads = append(att.ownedPayloads, buf)
 
+	payload := buf.Bytes()[payloadOff:]
+	physical := buf.Bytes()
+	if len(state.key) > bbolt.MaxKeySize {
+		req.Err = formatBoltWriteErr(berrors.ErrKeyTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
+	if b.rejectEmptyPayload && len(payload) == 0 {
+		req.Err = formatBoltWriteErr(errEmptyPayload, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
+	if int64(len(physical)) > bbolt.MaxValueSize {
+		req.Err = formatBoltWriteErr(berrors.ErrValueTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
+		return
+	}
 	if b.strKey || b.indexed {
 		if err = b.ensureIdx(att, state, req.id, false); err != nil {
 			req.Err = err
@@ -307,9 +413,8 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 
 	att.prepared = append(att.prepared, prepared{
 		req:      req,
-		key:      state.key,
-		payload:  buf.Bytes()[payloadOff:],
-		physical: buf.Bytes(),
+		payload:  payload,
+		physical: physical,
 		idx:      state.idx,
 		idxNew:   state.idxNew,
 		oldVal:   oldVal,
@@ -322,7 +427,7 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 			Old:       snapOld,
 			New:       newVal,
 			Patch:     req.patch,
-			PatchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
+			PatchOnly: len(req.onChange) == 0,
 		})
 	}
 	state.value = newVal
@@ -330,9 +435,9 @@ func (b *Batcher) preparePatch(att *attemptState, req *request) {
 	state.setOwnedPayload(buf, payloadOff)
 }
 
-func (b *Batcher) prepareDelete(att *attemptState, req *request) {
-	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.beforeCommit) > 0
-	state, err := b.loadState(att, req, true, needOldValue)
+func (b *Executor) prepareDelete(att *attemptState, req *request, hookTx unsafe.Pointer) {
+	needOldValue := (b.indexed && b.schema.HasQueryFields()) || len(req.onChange) > 0
+	state, _, err := b.loadState(att, req, true, needOldValue)
 	if err != nil {
 		req.Err = formatPrepareErr(prepareErrDecode, err)
 		return
@@ -352,10 +457,21 @@ func (b *Batcher) prepareDelete(att *attemptState, req *request) {
 			return
 		}
 	}
+	if len(req.onChange) > 0 {
+		if att.statsEnabled {
+			b.stats.CallbackOps.Add(1)
+		}
+		if err = runOnChangeHooks(hookTx, req.generationDepth, req.id, oldVal, nil, req.onChange); err != nil {
+			req.Err = err
+			if att.statsEnabled {
+				b.stats.CallbackErrors.Add(1)
+			}
+			return
+		}
+	}
 
 	att.prepared = append(att.prepared, prepared{
 		req:     req,
-		key:     state.key,
 		idx:     state.idx,
 		idxNew:  state.idxNew,
 		oldVal:  oldVal,
@@ -415,7 +531,7 @@ func (st *attemptState) setStatePos(strKey bool, key keycodec.DataKey, pos int) 
 	st.stateByUintID[key.Uint()] = pos
 }
 
-func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld bool) (*recordState, error) {
+func (b *Executor) loadState(st *attemptState, req *request, read bool, decodeOld bool) (*recordState, int, error) {
 	if st.singleState {
 		state := &st.state
 		state.key = req.id.Bytes(b.strKey, &state.keyBuf)
@@ -425,11 +541,11 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 				payload := prev
 				if b.strKey {
 					if len(prev) < stringValuePrefixLen {
-						return nil, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
+						return nil, -1, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
 					}
 					idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
 					if idx == 0 {
-						return nil, fmt.Errorf("string storage format: zero string id")
+						return nil, -1, fmt.Errorf("string storage format: zero string id")
 					}
 					state.idx = idx
 					state.idxKnown = true
@@ -438,7 +554,7 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 				if decodeOld {
 					oldVal, err := b.ops.Decode(payload)
 					if err != nil {
-						return nil, err
+						return nil, -1, err
 					}
 					state.value = oldVal
 					st.releaseValues = append(st.releaseValues, oldVal)
@@ -446,310 +562,313 @@ func (b *Batcher) loadState(st *attemptState, req *request, read bool, decodeOld
 				state.setBorrowedPayload(payload)
 			}
 		}
-		return state, nil
+
+		if decodeOld && state.exists && state.value == nil && state.payloadKnown {
+			oldVal, err := b.ops.Decode(state.payloadBytes())
+			if err != nil {
+				return nil, -1, err
+			}
+			state.value = oldVal
+			st.releaseValues = append(st.releaseValues, oldVal)
+		}
+		return state, -1, nil
 	}
 
 	if pos, ok := st.statePos(b.strKey, req.id); ok {
-		return &st.states[pos], nil
+		state := &st.states[pos]
+		if decodeOld && state.exists && state.value == nil && state.payloadKnown {
+			oldVal, err := b.ops.Decode(state.payloadBytes())
+			if err != nil {
+				return nil, -1, err
+			}
+			state.value = oldVal
+			st.releaseValues = append(st.releaseValues, oldVal)
+		}
+		return state, pos, nil
+	}
+
+	if st.base != nil {
+		if basePos, ok := st.base.statePos(b.strKey, req.id); ok {
+			// Frame current state copies accepted state lazily; failed current
+			// work can then be discarded without rewriting the base attempt.
+			pos := len(st.states)
+			st.states = append(st.states, recordState{})
+			state := &st.states[pos]
+			*state = st.base.states[basePos]
+			state.key = req.id.Bytes(b.strKey, &state.keyBuf)
+			if decodeOld && state.exists && state.value == nil && state.payloadKnown {
+				oldVal, err := b.ops.Decode(state.payloadBytes())
+				if err != nil {
+					*state = recordState{}
+					st.states = st.states[:pos]
+					return nil, -1, err
+				}
+				state.value = oldVal
+				st.releaseValues = append(st.releaseValues, oldVal)
+			}
+			st.setStatePos(b.strKey, req.id, pos)
+			return state, pos, nil
+		}
+	}
+	if !read {
+		state := &st.state
+		*state = recordState{}
+		state.key = req.id.Bytes(b.strKey, &state.keyBuf)
+		return state, -1, nil
 	}
 
 	pos := len(st.states)
 	st.states = append(st.states, recordState{})
 	state := &st.states[pos]
 	state.key = req.id.Bytes(b.strKey, &state.keyBuf)
-	if read {
-		if prev := st.dataBucket.Get(state.key); prev != nil {
-			state.exists = true
-			payload := prev
-			if b.strKey {
-				if len(prev) < stringValuePrefixLen {
-					*state = recordState{}
-					st.states = st.states[:pos]
-					return nil, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
-				}
-				idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
-				if idx == 0 {
-					*state = recordState{}
-					st.states = st.states[:pos]
-					return nil, fmt.Errorf("string storage format: zero string id")
-				}
-				state.idx = idx
-				state.idxKnown = true
-				payload = prev[stringValuePrefixLen:]
+	if prev := st.dataBucket.Get(state.key); prev != nil {
+		state.exists = true
+		payload := prev
+		if b.strKey {
+			if len(prev) < stringValuePrefixLen {
+				*state = recordState{}
+				st.states = st.states[:pos]
+				return nil, -1, fmt.Errorf("string storage format: value shorter than %d bytes", stringValuePrefixLen)
 			}
-			if decodeOld {
-				oldVal, err := b.ops.Decode(payload)
-				if err != nil {
-					*state = recordState{}
-					st.states = st.states[:pos]
-					return nil, err
-				}
-				state.value = oldVal
-				st.releaseValues = append(st.releaseValues, oldVal)
+			idx := keycodec.U64FromBytes(prev[:stringValuePrefixLen])
+			if idx == 0 {
+				*state = recordState{}
+				st.states = st.states[:pos]
+				return nil, -1, fmt.Errorf("string storage format: zero string id")
 			}
-			state.setBorrowedPayload(payload)
+			state.idx = idx
+			state.idxKnown = true
+			payload = prev[stringValuePrefixLen:]
 		}
+		if decodeOld {
+			oldVal, err := b.ops.Decode(payload)
+			if err != nil {
+				*state = recordState{}
+				st.states = st.states[:pos]
+				return nil, -1, err
+			}
+			state.value = oldVal
+			st.releaseValues = append(st.releaseValues, oldVal)
+		}
+		state.setBorrowedPayload(payload)
 	}
 
 	st.setStatePos(b.strKey, req.id, pos)
-	return state, nil
+	return state, pos, nil
 }
 
-func (b *Batcher) applyAccepted(tx *bbolt.Tx, bucket *bbolt.Bucket, att *attemptState, accepted []prepared, atomicAll bool, rejectEmptyPayload bool) (*request, error) {
-	stats := b.sched.stats.Enabled
-	var callbackFailedReq *request
+func (b *Executor) applyAccepted(att *attemptState) error {
+	stats := b.stats.Enabled
 
-	for _, op := range accepted {
-		var err error
+	for _, op := range att.accepted {
+		var (
+			err    error
+			keyBuf [8]byte
+		)
+		key := op.req.id.Bytes(b.strKey, &keyBuf)
+
 		switch op.req.op {
+
 		case opSet, opPatch:
-			if rejectEmptyPayload && len(op.payload) == 0 {
-				err = errEmptyPayload
-			} else if b.strKey {
+			if b.strKey {
 				if op.idxNew {
 					var mapKey [8]byte
-					err = att.strmapBucket.Put(keycodec.U64BytesWithBuf(op.idx, &mapKey), op.key)
+					err = att.strmapBucket.Put(keycodec.U64BytesWithBuf(op.idx, &mapKey), key)
 				}
 				if err == nil {
 					var idxBuf [8]byte
+					// The encoded value reserved this prefix; fill it only after
+					// filtering accepts the final string id.
 					copy(op.physical, keycodec.U64BytesWithBuf(op.idx, &idxBuf))
-					err = bucket.Put(op.key, op.physical)
+					err = att.dataBucket.Put(key, op.physical)
 				}
 			} else {
-				err = bucket.Put(op.key, op.physical)
+				err = att.dataBucket.Put(key, op.physical)
 			}
+
 		case opDelete:
-			err = bucket.Delete(op.key)
+			err = att.dataBucket.Delete(key)
 			if err == nil && b.strKey {
 				var mapKey [8]byte
 				err = att.strmapBucket.Delete(keycodec.U64BytesWithBuf(op.idx, &mapKey))
 			}
-		default:
-			err = errUnknownOp
 		}
+
 		if err != nil {
-			rawErr := err
-			err = formatBoltWriteErr(err, op.req.op, op.req.id.Format(b.strKey), op.idx, op.key, op.payload)
-			requestErr := errors.Is(rawErr, errEmptyPayload)
-			if !requestErr && !atomicAll {
-				requestErr = errors.Is(rawErr, berrors.ErrKeyTooLarge) || errors.Is(rawErr, berrors.ErrValueTooLarge)
-			}
-			if requestErr {
-				op.req.Err = err
-			}
+			err = formatBoltWriteErr(err, op.req.op, op.req.id.Format(b.strKey), op.idx, key, op.payload)
 			if stats {
-				b.sched.stats.TxOpErrors.Add(1)
+				b.stats.TxOpErrors.Add(1)
 			}
-			if requestErr && !atomicAll {
-				callbackFailedReq = op.req
-				break
-			}
-			return nil, err
-		}
-
-		if len(op.req.beforeCommit) > 0 {
-			if stats && len(op.req.beforeStore) == 0 {
-				b.sched.stats.CallbackOps.Add(1)
-			}
-			if err = runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); err != nil {
-				err = fmt.Errorf(
-					"before_commit op=%s id=%s idx=%d key_len=%d payload_len=%d: %w",
-					op.req.op.String(),
-					op.req.id.Format(b.strKey),
-					op.idx,
-					len(op.key),
-					len(op.payload),
-					err,
-				)
-				op.req.Err = err
-				if stats {
-					b.sched.stats.CallbackErrors.Add(1)
-					b.sched.stats.TxOpErrors.Add(1)
-				}
-				if !atomicAll {
-					callbackFailedReq = op.req
-					break
-				}
-				return nil, err
-			}
+			return err
 		}
 	}
 
-	if callbackFailedReq != nil {
-		return callbackFailedReq, nil
-	}
-	return nil, nil
+	return nil
 }
 
-func (b *Batcher) attempt(active []*request, atomicAll bool) (*request, bool, error) {
-	tx, err := b.bolt.Begin(true)
-	if err != nil {
-		if b.sched.stats.Enabled {
-			b.sched.stats.TxBeginErrors.Add(1)
-		}
-		return nil, true, fmt.Errorf("tx error: %w", err)
+func (batch *Batch) ApplyAtomic(tx *bbolt.Tx) (AppliedBatch, error) {
+	reqs := batch.reqs
+	batch.reqs = nil
+	batch.hooks = false
+
+	if len(reqs) == 0 {
+		requestScratchPool.Put(reqs)
+		return AppliedBatch{}, nil
 	}
+
+	applied, err := batch.ex.applyAtomic(tx, reqs)
+	if err != nil || applied.Seq == 0 {
+		for i := 0; i < len(reqs); i++ {
+			batch.ex.releaseRequest(&reqs[i])
+		}
+		requestScratchPool.Put(reqs)
+		return applied, err
+	}
+	applied.cleanup.ex = batch.ex
+	applied.cleanup.reqs = reqs
+	return applied, err
+}
+
+func (b *Executor) applyAtomic(tx *bbolt.Tx, active []request) (AppliedBatch, error) {
 	bucket := tx.Bucket(b.dataBucket)
 	if bucket == nil {
-		if b.sched.stats.Enabled {
-			b.sched.stats.TxOpErrors.Add(1)
+		if b.stats.Enabled {
+			b.stats.TxOpErrors.Add(1)
 		}
-		_ = tx.Rollback()
-		return nil, true, fmt.Errorf("bucket does not exist")
+		return AppliedBatch{}, ErrBucketMissing
 	}
+
 	bucket.FillPercent = b.bucketFillPercent
+
 	var stringMap *bbolt.Bucket
 	if b.strKey {
 		stringMap = tx.Bucket(b.strmapBucket)
 		if stringMap == nil {
-			if b.sched.stats.Enabled {
-				b.sched.stats.TxOpErrors.Add(1)
+			if b.stats.Enabled {
+				b.stats.TxOpErrors.Add(1)
 			}
-			_ = tx.Rollback()
-			return nil, true, fmt.Errorf("string map bucket does not exist")
-		}
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	capHint := len(active)
-	singleState := capHint == 1
-	if capHint == 0 {
-		capHint = 1
-	} else if capHint <= 8 {
-		capHint = 8
-	} else {
-		capHint = 1 << bits.Len(uint(capHint-1))
-	}
-	att := attemptStatePool.Get()
-	uniqueFields := 0
-	if b.unique.Schema != nil {
-		uniqueFields = len(b.unique.Schema.Unique)
-	}
-	withSnapshots := b.indexed && b.snapshotOps.Manager != nil
-	att.prepare(bucket, b.sched.stats.Enabled, b.ops.Release, capHint, singleState, withSnapshots, uniqueFields)
-	att.strmapBucket = stringMap
-	if cap(att.prepared) < capHint {
-		att.prepared = slices.Grow(att.prepared, capHint)
-	}
-	if !singleState && cap(att.states) < capHint {
-		att.states = slices.Grow(att.states, capHint)
-	}
-
-	if !singleState {
-		att.prepareStateMap(b.strKey, capHint)
-	}
-	defer attemptStatePool.Put(att)
-
-	b.prepareActive(att, active)
-
-	if atomicAll {
-		if reqErr := firstRequestErr(active); reqErr != nil {
-			return nil, true, reqErr
+			return AppliedBatch{}, ErrStringMapBucketMissing
 		}
 	}
 
+	att, withSnapshots := b.newAttemptState(bucket, stringMap, len(active), len(active) == 1)
+	var hookTx unsafe.Pointer
+
+	b.prepareActive(att, active, hookTx)
+
+	if reqErr := firstRequestErr(active); reqErr != nil {
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, reqErr
+	}
 	if len(att.prepared) == 0 {
-		return nil, true, nil
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, nil
 	}
-
-	b.publishMu.Lock()
-	defer b.publishMu.Unlock()
-
-	if err = b.unavailable(); err != nil {
-		assignPreparedErr(att.prepared, err)
-		return nil, true, nil
+	if err := b.filterAccepted(att); err != nil {
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, err
 	}
-
-	if err = b.filterAccepted(att, atomicAll); err != nil {
-		return nil, true, err
-	}
-
 	if len(att.accepted) == 0 {
-		return nil, true, nil
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, nil
 	}
-
-	retryWithoutReq, err := b.applyAccepted(tx, bucket, att, att.accepted, atomicAll, b.rejectEmptyPayload)
-	if err != nil {
-		return nil, true, err
-	}
-	if retryWithoutReq != nil {
-		return retryWithoutReq, false, nil
-	}
-
-	if !withSnapshots {
-		if _, err = bucket.NextSequence(); err != nil {
-			if b.sched.stats.Enabled {
-				b.sched.stats.TxOpErrors.Add(1)
-			}
-			return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
-		}
-		if err = b.commit(tx); err != nil {
-			if b.sched.stats.Enabled {
-				b.sched.stats.TxCommitErrors.Add(1)
-			}
-			assignPreparedErr(att.accepted, err)
-		}
-		return nil, true, nil
+	if err := b.applyAccepted(att); err != nil {
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, err
 	}
 
 	seq, err := bucket.NextSequence()
 	if err != nil {
-		if b.sched.stats.Enabled {
-			b.sched.stats.TxOpErrors.Add(1)
+		if b.stats.Enabled {
+			b.stats.TxOpErrors.Add(1)
 		}
-		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
+		attemptStatePool.Put(att)
+		return AppliedBatch{}, fmt.Errorf("%w: %w", ErrAdvanceBucketSequence, err)
 	}
 
-	var keyDeltas []snapshot.KeyDelta
-	if b.strKey && b.snapshotOps.StrKeyIndex {
-		if cap(att.acceptedKeyDeltas) < len(att.accepted) {
-			att.acceptedKeyDeltas = slices.Grow(att.acceptedKeyDeltas, len(att.accepted))
-		}
-		keyDeltas = att.acceptedKeyDeltas[:0]
-		for i := range att.accepted {
-			op := att.accepted[i]
-			switch op.req.op {
-			case opSet:
-				if op.idxNew && op.newVal != nil {
-					keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String(), Add: true})
-				}
-			case opDelete:
-				if op.snapOld != nil {
-					keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String()})
-				}
-			}
-		}
-		att.acceptedKeyDeltas = keyDeltas
+	cleanup := appliedBatchCleanupPool.Get()
+	cleanup.att = att
+	applied := AppliedBatch{Seq: seq, cleanup: cleanup}
+	if !withSnapshots {
+		return applied, nil
 	}
 
-	snap := snapshot.BuildInPlaceWithKeyDeltas(
+	applied.Snapshot = b.buildAcceptedSnapshot(seq, att)
+	return applied, nil
+}
+
+func (b *Executor) newAttemptState(bucket *bbolt.Bucket, stringMap *bbolt.Bucket, capHint int, singleState bool) (*attemptState, bool) {
+	capHint = normalizeAttemptCapHint(capHint)
+	uniqueFields := 0
+	if b.unique.Schema != nil {
+		uniqueFields = len(b.unique.Schema.Unique)
+	}
+	withSnapshots := b.snapshotsEnabled()
+	att := attemptStatePool.Get()
+	att.prepare(bucket, b.stats.Enabled, b.ops.Release, capHint, singleState, withSnapshots, uniqueFields)
+	att.strmapBucket = stringMap
+	if cap(att.prepared) < capHint {
+		att.prepared = slices.Grow(att.prepared, capHint)
+	}
+	if !singleState {
+		if cap(att.states) < capHint {
+			att.states = slices.Grow(att.states, capHint)
+		}
+		att.prepareStateMap(b.strKey, capHint)
+	}
+	return att, withSnapshots
+}
+
+func normalizeAttemptCapHint(capHint int) int {
+	if capHint == 0 {
+		return 1
+	}
+	if capHint <= 8 {
+		return 8
+	}
+	return 1 << bits.Len(uint(capHint-1))
+}
+
+func (b *Executor) snapshotsEnabled() bool {
+	return b.indexed && b.snapshotOps.Current != nil
+}
+
+func (b *Executor) buildAcceptedSnapshot(seq uint64, att *attemptState) *snapshot.View {
+	keyDeltas := b.acceptedKeyDeltas(att)
+	return snapshot.BuildInPlaceWithKeyDeltas(
 		seq,
-		b.snapshotOps.Manager.Current(),
+		b.snapshotOps.Current(),
 		b.snapshotOps.Schema,
 		b.snapshotOps.CacheConfig,
 		b.snapshotOps.PatchFields,
 		att.acceptedSnapshots,
 		keyDeltas,
 	)
-	b.snapshotOps.Manager.Stage(snap)
+}
 
-	if err = b.commit(tx); err != nil {
-		if b.sched.stats.Enabled {
-			b.sched.stats.TxCommitErrors.Add(1)
+func (b *Executor) acceptedKeyDeltas(att *attemptState) []snapshot.KeyDelta {
+	if !b.strKey || !b.snapshotOps.StrKeyIndex {
+		return nil
+	}
+	if cap(att.acceptedKeyDeltas) < len(att.accepted) {
+		att.acceptedKeyDeltas = slices.Grow(att.acceptedKeyDeltas, len(att.accepted))
+	}
+	keyDeltas := att.acceptedKeyDeltas[:0]
+	for i := range att.accepted {
+		op := att.accepted[i]
+		switch op.req.op {
+		case opSet:
+			if op.idxNew {
+				keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String(), Add: true})
+			}
+		case opDelete:
+			if op.snapOld != nil {
+				keyDeltas = append(keyDeltas, snapshot.KeyDelta{ID: op.idx, Key: op.req.id.String()})
+			}
 		}
-		b.snapshotOps.Manager.DropStaged(seq)
-		assignPreparedErr(att.accepted, err)
-		return nil, true, nil
 	}
-
-	name := opName(active[0].op, len(active), atomicAll, b.sched.maxOps)
-	err = b.publishCommitted(seq, name, snap)
-	if err != nil {
-		b.snapshotOps.Manager.DropStaged(seq)
-		assignPreparedErr(att.accepted, err)
-	}
-
-	return nil, true, nil
+	att.acceptedKeyDeltas = keyDeltas
+	return keyDeltas
 }
 
 func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release func(unsafe.Pointer), capHint int, singleState bool, withSnapshots bool, uniqueFields int) {
@@ -820,6 +939,7 @@ func (st *attemptState) cleanup() {
 
 	st.dataBucket = nil
 	st.strmapBucket = nil
+	st.base = nil
 	st.statsEnabled = false
 	st.release = nil
 	st.singleState = false

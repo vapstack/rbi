@@ -47,8 +47,8 @@ func newCorrectnessDB(t *testing.T, options ...Options) *DB[uint64, Rec] {
 		{Meta: Meta{Country: "DE"}, Name: "n11", Email: "n11@test", Age: 42, Score: 5, Active: true, Tags: []string{"tag_tiny"}, FullName: "FN-11"},
 		{Meta: Meta{Country: "IN"}, Name: "n12", Email: "n12@test", Age: 52, Score: 60, Active: false, Tags: []string{"java"}, FullName: "FN-12", Opt: &optG},
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 	return db
 }
@@ -66,8 +66,8 @@ func TestQueryCorrectness_MergedNumericRangeImpossibleEQIsEmpty(t *testing.T) {
 		{Signed: 2, Unsigned: 2},
 		{Signed: 3, Unsigned: 3},
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 
 	cases := []struct {
@@ -414,8 +414,8 @@ func TestCountScalarInSplit_BroadSingleValueIN(t *testing.T) {
 			want++
 		}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 
 	expr := qx.AND(
@@ -878,8 +878,8 @@ func TestQueryCorrectness_PreparedPinnedSnapshotStableDuringConcurrentPublish(t 
 		ids[i] = id
 		vals[i] = &Rec{Name: name, Age: int(id)}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
 	snap := db.engine.snapshot.Current()
@@ -969,8 +969,8 @@ func TestQueryCorrectness_PreparedPinnedNumericRangeSnapshotStableDuringConcurre
 		ids[i] = id
 		vals[i] = &Rec{Name: fmt.Sprintf("user-%04d", id), Age: int(id)}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 	setNumericBucketKnobs(t, db, 64, 1, 1)
 
@@ -1074,22 +1074,22 @@ func TestQueryCorrectness_PreparedQueryConcurrentPublishKeepsWholeSnapshot(t *te
 	}
 	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
 
-	if err := db.BatchSet(ids, stateA); err != nil {
-		t.Fatalf("BatchSet(stateA): %v", err)
+	if err := db.MultiSet(ids, stateA); err != nil {
+		t.Fatalf("MultiSet(stateA): %v", err)
 	}
 	wantA, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys(stateA): %v", err)
 	}
-	if err = db.BatchSet(ids, stateB); err != nil {
-		t.Fatalf("BatchSet(stateB): %v", err)
+	if err = db.MultiSet(ids, stateB); err != nil {
+		t.Fatalf("MultiSet(stateB): %v", err)
 	}
 	wantB, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys(stateB): %v", err)
 	}
-	if err = db.BatchSet(ids, stateA); err != nil {
-		t.Fatalf("BatchSet(stateA reset): %v", err)
+	if err = db.MultiSet(ids, stateA); err != nil {
+		t.Fatalf("MultiSet(stateA reset): %v", err)
 	}
 
 	start := make(chan struct{})
@@ -1105,9 +1105,9 @@ func TestQueryCorrectness_PreparedQueryConcurrentPublishKeepsWholeSnapshot(t *te
 			if i&1 == 1 {
 				vals = stateA
 			}
-			if err := db.BatchSet(ids, vals); err != nil {
+			if err := db.MultiSet(ids, vals); err != nil {
 				select {
-				case errCh <- "BatchSet: " + err.Error():
+				case errCh <- "MultiSet: " + err.Error():
 				default:
 				}
 				return
@@ -1178,22 +1178,22 @@ func TestQueryCorrectness_PreparedOrderedORConcurrentPublishKeepsWholeSnapshot(t
 		qx.AND(qx.EQ("country", "DE"), qx.GTE("age", 25)),
 	)).Sort("score", qx.DESC).Offset(1).Limit(5)
 
-	if err := db.BatchSet(ids, stateA); err != nil {
-		t.Fatalf("BatchSet(stateA): %v", err)
+	if err := db.MultiSet(ids, stateA); err != nil {
+		t.Fatalf("MultiSet(stateA): %v", err)
 	}
 	wantA, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys(stateA): %v", err)
 	}
-	if err = db.BatchSet(ids, stateB); err != nil {
-		t.Fatalf("BatchSet(stateB): %v", err)
+	if err = db.MultiSet(ids, stateB); err != nil {
+		t.Fatalf("MultiSet(stateB): %v", err)
 	}
 	wantB, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys(stateB): %v", err)
 	}
-	if err = db.BatchSet(ids, stateA); err != nil {
-		t.Fatalf("BatchSet(stateA reset): %v", err)
+	if err = db.MultiSet(ids, stateA); err != nil {
+		t.Fatalf("MultiSet(stateA reset): %v", err)
 	}
 
 	start := make(chan struct{})
@@ -1209,9 +1209,9 @@ func TestQueryCorrectness_PreparedOrderedORConcurrentPublishKeepsWholeSnapshot(t
 			if i&1 == 1 {
 				vals = stateA
 			}
-			if err := db.BatchSet(ids, vals); err != nil {
+			if err := db.MultiSet(ids, vals); err != nil {
 				select {
-				case errCh <- "BatchSet: " + err.Error():
+				case errCh <- "MultiSet: " + err.Error():
 				default:
 				}
 				return
@@ -1272,7 +1272,7 @@ func TestQueryCorrectness_StringPreparedOrderedORConcurrentPublishKeepsWholeSnap
 		MatPredMaxCard:    testMatPredCacheMaxCard,
 	}
 	qe := &queryEngine{
-		snapshot: snapshot.NewRegistry(false),
+		snapshot: newTestSnapshotSource(),
 		schema:   rt,
 		exec:     exec,
 		cfg:      cfg,
@@ -1434,8 +1434,8 @@ func TestQueryCorrectness_PublicWrappersAndCacheModes(t *testing.T) {
 	}
 
 	opts := []Options{
-		{SnapshotMaterializedPredCacheMaxEntries: -1},
-		{SnapshotMaterializedPredCacheMaxEntries: 1, SnapshotMaterializedPredCacheMaxCardinality: 2},
+		{MaterializedPredCacheMaxEntries: -1},
+		{MaterializedPredCacheMaxEntries: 1, SnapshotMaterializedPredCacheMaxCardinality: 2},
 	}
 	for i := range opts {
 		db = newCorrectnessDB(t, opts[i])

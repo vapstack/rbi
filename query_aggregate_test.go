@@ -117,19 +117,19 @@ type aggregateByIDGateRec struct {
 	Score int    `db:"score" rbi:"index"`
 }
 
-func openTempAggregateDB(t *testing.T) *DB[uint64, aggregateTestRec] {
+func openTempAggregateDB(t *testing.T) *Collection[uint64, aggregateTestRec] {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate.db")
-	db, raw := openBoltAndNew[uint64, aggregateTestRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateTestRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db
+	return c
 }
 
-func seedAggregateTestData(t *testing.T, db *DB[uint64, aggregateTestRec]) {
+func seedAggregateTestData(t *testing.T, c *Collection[uint64, aggregateTestRec]) {
 	t.Helper()
 	score10 := int64(10)
 	score20 := int64(20)
@@ -143,23 +143,23 @@ func seedAggregateTestData(t *testing.T, db *DB[uint64, aggregateTestRec]) {
 		{Country: "DE", Status: "inactive", Name: "eric", Age: 17, Score: &score40},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 }
 
 func TestAggregateOrdinaryMetricsAndRowCount(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Aggregate(qx.ROWCOUNT().AS("rows")))
+	result, err := readAggregate(c, qx.Aggregate(qx.ROWCOUNT().AS("rows")))
 	if err != nil {
 		t.Fatalf("Aggregate rowcount: %v", err)
 	}
 	requireAggregateUint(t, result.Rows[0][0], 5)
 
-	result, err = db.Aggregate(qx.Query(qx.GTE("age", 30)).Metrics(
+	result, err = readAggregate(c, qx.Query(qx.GTE("age", 30)).Metrics(
 		qx.ROWCOUNT().AS("rows"),
 		qx.COUNT("age").AS("age_count"),
 		qx.SUM("age").AS("age_sum"),
@@ -192,7 +192,7 @@ func TestAggregateOrdinaryMetricsAndRowCount(t *testing.T) {
 	requireAggregateString(t, row[6], "alice")
 	requireAggregateString(t, row[7], "dora")
 
-	result, err = db.Aggregate(qx.Query(qx.EQ("name", "missing")).Metrics(
+	result, err = readAggregate(c, qx.Query(qx.EQ("name", "missing")).Metrics(
 		qx.ROWCOUNT().AS("rows"),
 		qx.COUNT("age").AS("age_count"),
 		qx.AVG("age").AS("age_avg"),
@@ -212,10 +212,10 @@ func TestAggregateOrdinaryMetricsAndRowCount(t *testing.T) {
 
 func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 	dir := t.TempDir()
-	db, raw := openBoltAndNew[uint64, aggregateByIDGateRec](t, filepath.Join(dir, "aggregate_by_id_gate.db"), Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateByIDGateRec](t, filepath.Join(dir, "aggregate_by_id_gate.db"), Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	ids := make([]uint64, 0, 20)
@@ -228,11 +228,11 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 		ids = append(ids, uint64(i))
 		vals = append(vals, &aggregateByIDGateRec{Group: group, Score: i})
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 
-	full, err := db.Aggregate(qx.Group("group").Metrics(
+	full, err := readAggregate(c, qx.Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
@@ -255,7 +255,7 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 	requireAggregateInt(t, fullRows["b"][2], 110)
 	requireAggregateInt(t, fullRows["b"][3], 2)
 
-	selective, err := db.Aggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
+	selective, err := readAggregate(c, qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
@@ -274,10 +274,10 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 }
 
 func TestAggregateUngroupedMeasureAndOrdinaryMetrics(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 30)).Metrics(
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 30)).Metrics(
 		qx.ROWCOUNT().AS("rows"),
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
@@ -315,10 +315,10 @@ func TestAggregateUngroupedMeasureAndOrdinaryMetrics(t *testing.T) {
 }
 
 func TestAggregateGroupByMultipleFieldsUsesInvertedIndexes(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country", "status").
 		Metrics(
 			qx.ROWCOUNT().AS("rows"),
@@ -353,10 +353,10 @@ func TestAggregateGroupByMultipleFieldsUsesInvertedIndexes(t *testing.T) {
 func TestAggregateNullGroupAndNullableMeasure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_null_group.db")
-	db, raw := openBoltAndNew[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	segmentA := "a"
@@ -370,12 +370,12 @@ func TestAggregateNullGroupAndNullableMeasure(t *testing.T) {
 		{Segment: &segmentB},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Group("segment").Metrics(
+	result, err := readAggregate(c, qx.Group("segment").Metrics(
 		qx.ROWCOUNT().AS("rows"),
 		qx.COUNT("amount").AS("amount_count"),
 		qx.SUM("amount").AS("amount_sum"),
@@ -415,26 +415,26 @@ func TestAggregateNullGroupAndNullableMeasure(t *testing.T) {
 }
 
 func TestAggregateGroupByAliasControlsLayoutAndCollisions(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.GroupBy(qx.REF("country").AS("c")).Metrics(qx.ROWCOUNT().AS("rows")))
+	result, err := readAggregate(c, qx.GroupBy(qx.REF("country").AS("c")).Metrics(qx.ROWCOUNT().AS("rows")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
 	requireAggregateLayout(t, result.Layout, []string{"c", "rows"})
 
-	_, err = db.Aggregate(qx.GroupBy(qx.REF("country").AS("rows")).Metrics(qx.ROWCOUNT().AS("rows")))
+	_, err = readAggregate(c, qx.GroupBy(qx.REF("country").AS("rows")).Metrics(qx.ROWCOUNT().AS("rows")))
 	if err == nil || !strings.Contains(err.Error(), `duplicate aggregate output "rows"`) {
 		t.Fatalf("duplicate group/metric alias err=%v", err)
 	}
 }
 
 func TestAggregateWindowAppliesToResultRows(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Group("country").Metrics(qx.ROWCOUNT().AS("rows")).Offset(1).Limit(1))
+	result, err := readAggregate(c, qx.Group("country").Metrics(qx.ROWCOUNT().AS("rows")).Offset(1).Limit(1))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestAggregateWindowAppliesToResultRows(t *testing.T) {
 	requireAggregateString(t, result.Rows[0][0], "US")
 	requireAggregateUint(t, result.Rows[0][1], 3)
 
-	result, err = db.Aggregate(qx.Group("country").Metrics(qx.ROWCOUNT().AS("rows")).Offset(10))
+	result, err = readAggregate(c, qx.Group("country").Metrics(qx.ROWCOUNT().AS("rows")).Offset(10))
 	if err != nil {
 		t.Fatalf("Aggregate offset beyond end: %v", err)
 	}
@@ -455,10 +455,10 @@ func TestAggregateWindowAppliesToResultRows(t *testing.T) {
 }
 
 func TestAggregateHavingFiltersRows(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country", "status").
 		Metrics(
 			qx.ROWCOUNT().AS("rows"),
@@ -487,7 +487,7 @@ func TestAggregateHavingFiltersRows(t *testing.T) {
 	requireAggregateUint(t, got["US|inactive"][2], 1)
 	requireAggregateInt(t, got["US|inactive"][3], 30)
 
-	result, err = db.Aggregate(qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), 10)))
+	result, err = readAggregate(c, qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), 10)))
 	if err != nil {
 		t.Fatalf("Aggregate ungrouped having: %v", err)
 	}
@@ -497,12 +497,12 @@ func TestAggregateHavingFiltersRows(t *testing.T) {
 }
 
 func TestAggregateHavingPointerLiterals(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
 	limit := uint64(1)
 	countryUS := "US"
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country", "status").
 		Metrics(qx.ROWCOUNT().AS("rows")).
 		Having(
@@ -520,7 +520,7 @@ func TestAggregateHavingPointerLiterals(t *testing.T) {
 	requireAggregateUint(t, result.Rows[0][2], 2)
 
 	countries := []string{"US"}
-	result, err = db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err = readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country").
 		Metrics(qx.ROWCOUNT().AS("rows")).
 		Having(qx.OP(qx.OpIN, qx.OUT("country"), qx.LIT(&countries))))
@@ -537,10 +537,10 @@ func TestAggregateHavingPointerLiterals(t *testing.T) {
 func TestAggregateHavingNullPredicates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_having_null.db")
-	db, raw := openBoltAndNew[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	segmentA := "a"
@@ -552,12 +552,12 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 		{},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+	result, err := readAggregate(c, qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.ISNULL(qx.OUT("avg_amount"))).
 		SortOut("segment"))
 	if err != nil {
@@ -573,7 +573,7 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	requireAggregateNone(t, result.Rows[1][1])
 
 	var nilFloat *float64
-	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+	result, err = readAggregate(c, qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.EQ(qx.OUT("avg_amount"), nilFloat)).
 		SortOut("segment"))
 	if err != nil {
@@ -585,7 +585,7 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	requireAggregateString(t, result.Rows[0][0], "b")
 	requireAggregateNone(t, result.Rows[1][0])
 
-	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+	result, err = readAggregate(c, qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.IN(qx.OUT("avg_amount"), []*float64{nilFloat})).
 		SortOut("segment"))
 	if err != nil {
@@ -597,7 +597,7 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 	requireAggregateString(t, result.Rows[0][0], "b")
 	requireAggregateNone(t, result.Rows[1][0])
 
-	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+	result, err = readAggregate(c, qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.GTE(qx.OUT("avg_amount"), nil)))
 	if err != nil {
 		t.Fatalf("Aggregate GTE nil: %v", err)
@@ -606,7 +606,7 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 		t.Fatalf("GTE nil having rows len=%d, want 0; rows=%#v", len(result.Rows), result.Rows)
 	}
 
-	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+	result, err = readAggregate(c, qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
 		Having(qx.LTE(qx.OUT("avg_amount"), nil)))
 	if err != nil {
 		t.Fatalf("Aggregate LTE nil: %v", err)
@@ -617,10 +617,10 @@ func TestAggregateHavingNullPredicates(t *testing.T) {
 }
 
 func TestAggregateOrderByMultipleOutputsBeforeWindow(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country", "status").
 		Metrics(
 			qx.ROWCOUNT().AS("rows"),
@@ -643,7 +643,7 @@ func TestAggregateOrderByMultipleOutputsBeforeWindow(t *testing.T) {
 	requireAggregateString(t, result.Rows[2][0], "DE")
 	requireAggregateString(t, result.Rows[2][1], "active")
 
-	result, err = db.Aggregate(qx.Query(qx.GTE("age", 18)).
+	result, err = readAggregate(c, qx.Query(qx.GTE("age", 18)).
 		Group("country", "status").
 		Metrics(
 			qx.ROWCOUNT().AS("rows"),
@@ -667,10 +667,10 @@ func TestAggregateOrderByMultipleOutputsBeforeWindow(t *testing.T) {
 func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_having_precision.db")
-	db, raw := openBoltAndNew[uint64, aggregateHavingPrecisionRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateHavingPrecisionRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	const exactFloatBoundary = uint64(1 << 53)
@@ -681,12 +681,12 @@ func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing
 		{Group: "int_low", Signed: -int64(exactFloatBoundary) - 1},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+	result, err := readAggregate(c, qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
 		Having(qx.GT(qx.OUT("sum"), float64(exactFloatBoundary))).
 		SortOut("group"))
 	if err != nil {
@@ -698,7 +698,7 @@ func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing
 	requireAggregateString(t, result.Rows[0][0], "uint_hi")
 	requireAggregateUint(t, result.Rows[0][1], exactFloatBoundary+1)
 
-	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+	result, err = readAggregate(c, qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
 		Having(qx.EQ(qx.OUT("sum"), float64(exactFloatBoundary))).
 		SortOut("group"))
 	if err != nil {
@@ -709,7 +709,7 @@ func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing
 	}
 	requireAggregateString(t, result.Rows[0][0], "uint_eq")
 
-	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+	result, err = readAggregate(c, qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
 		Having(qx.IN(qx.OUT("sum"), []float64{float64(exactFloatBoundary)})).
 		SortOut("group"))
 	if err != nil {
@@ -720,7 +720,7 @@ func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing
 	}
 	requireAggregateString(t, result.Rows[0][0], "uint_eq")
 
-	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("signed").AS("sum")).
+	result, err = readAggregate(c, qx.Group("group").Metrics(qx.SUM("signed").AS("sum")).
 		Having(qx.LT(qx.OUT("sum"), -float64(exactFloatBoundary))).
 		SortOut("group"))
 	if err != nil {
@@ -736,20 +736,20 @@ func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing
 func TestAggregateValueIndexerFieldsUseStringIndexKeys(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_vi.db")
-	db, raw := openBoltAndNew[uint64, aggregateVIRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateVIRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	if err := db.Set(1, &aggregateVIRec{Code: 10, Flag: true}); err != nil {
+	if err := writeSet(c, 1, &aggregateVIRec{Code: 10, Flag: true}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &aggregateVIRec{Code: 2, Flag: false}); err != nil {
+	if err := writeSet(c, 2, &aggregateVIRec{Code: 2, Flag: false}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Query().Metrics(
+	result, err := readAggregate(c, qx.Query().Metrics(
 		qx.MIN("code").AS("min_code"),
 		qx.MAX("code").AS("max_code"),
 	))
@@ -762,7 +762,7 @@ func TestAggregateValueIndexerFieldsUseStringIndexKeys(t *testing.T) {
 	requireAggregateString(t, result.Rows[0][0], "002")
 	requireAggregateString(t, result.Rows[0][1], "010")
 
-	result, err = db.Aggregate(qx.Query().Metrics(qx.DISTINCT("flag").AS("flag")))
+	result, err = readAggregate(c, qx.Query().Metrics(qx.DISTINCT("flag").AS("flag")))
 	if err != nil {
 		t.Fatalf("Aggregate DISTINCT flag: %v", err)
 	}
@@ -772,21 +772,21 @@ func TestAggregateValueIndexerFieldsUseStringIndexKeys(t *testing.T) {
 	requireAggregateString(t, result.Rows[0][0], "N")
 	requireAggregateString(t, result.Rows[1][0], "Y")
 
-	_, err = db.Aggregate(qx.Query().Metrics(qx.SUM("code").AS("sum_code")))
+	_, err = readAggregate(c, qx.Query().Metrics(qx.SUM("code").AS("sum_code")))
 	if err == nil || !strings.Contains(err.Error(), `SUM requires numeric field "code"`) {
 		t.Fatalf("SUM over ValueIndexer err=%v", err)
 	}
-	_, err = db.Aggregate(qx.Query().Metrics(qx.AVG("code").AS("avg_code")))
+	_, err = readAggregate(c, qx.Query().Metrics(qx.AVG("code").AS("avg_code")))
 	if err == nil || !strings.Contains(err.Error(), `AVG requires numeric field "code"`) {
 		t.Fatalf("AVG over ValueIndexer err=%v", err)
 	}
 }
 
 func TestAggregateDistinctField(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).Metrics(qx.DISTINCT("country").AS("country")))
+	result, err := readAggregate(c, qx.Query(qx.GTE("age", 18)).Metrics(qx.DISTINCT("country").AS("country")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -799,10 +799,10 @@ func TestAggregateDistinctField(t *testing.T) {
 }
 
 func TestAggregateCountDistinctField(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.COUNT(qx.DISTINCT("country")).AS("country_count"),
 		qx.ROWCOUNT().AS("rows"),
 	))
@@ -816,7 +816,7 @@ func TestAggregateCountDistinctField(t *testing.T) {
 	requireAggregateUint(t, result.Rows[0][0], 2)
 	requireAggregateUint(t, result.Rows[0][1], 5)
 
-	result, err = db.Aggregate(qx.Group("status").Metrics(
+	result, err = readAggregate(c, qx.Group("status").Metrics(
 		qx.COUNT(qx.DISTINCT("country")).AS("country_count"),
 		qx.ROWCOUNT().AS("rows"),
 	).SortOut("status"))
@@ -838,10 +838,10 @@ func TestAggregateCountDistinctField(t *testing.T) {
 func TestAggregateCountDistinctIgnoresNullValues(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_count_distinct_null.db")
-	db, raw := openBoltAndNew[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	segmentA := "a"
@@ -853,12 +853,12 @@ func TestAggregateCountDistinctIgnoresNullValues(t *testing.T) {
 		{},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.COUNT(qx.DISTINCT("segment")).AS("segment_count"),
 		qx.DISTINCT("segment").AS("segment"),
 	))
@@ -866,14 +866,14 @@ func TestAggregateCountDistinctIgnoresNullValues(t *testing.T) {
 		t.Fatalf("mixed rowset DISTINCT err=%v", err)
 	}
 
-	result, err = db.Aggregate(qx.Aggregate(qx.COUNT(qx.DISTINCT("segment")).AS("segment_count")))
+	result, err = readAggregate(c, qx.Aggregate(qx.COUNT(qx.DISTINCT("segment")).AS("segment_count")))
 	if err != nil {
 		t.Fatalf("Aggregate count distinct: %v", err)
 	}
 	requireAggregateLayout(t, result.Layout, []string{"segment_count"})
 	requireAggregateUint(t, result.Rows[0][0], 2)
 
-	result, err = db.Aggregate(qx.Aggregate(qx.DISTINCT("segment").AS("segment")))
+	result, err = readAggregate(c, qx.Aggregate(qx.DISTINCT("segment").AS("segment")))
 	if err != nil {
 		t.Fatalf("Aggregate distinct: %v", err)
 	}
@@ -883,10 +883,10 @@ func TestAggregateCountDistinctIgnoresNullValues(t *testing.T) {
 }
 
 func TestAggregateEmptyMatchesReturnShapeWithoutRowsForGroupedAndDistinct(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
-	result, err := db.Aggregate(qx.Query(qx.EQ("name", "missing")).Metrics(qx.DISTINCT("country").AS("country")))
+	result, err := readAggregate(c, qx.Query(qx.EQ("name", "missing")).Metrics(qx.DISTINCT("country").AS("country")))
 	if err != nil {
 		t.Fatalf("Aggregate DISTINCT empty: %v", err)
 	}
@@ -895,7 +895,7 @@ func TestAggregateEmptyMatchesReturnShapeWithoutRowsForGroupedAndDistinct(t *tes
 		t.Fatalf("distinct empty rows len=%d, want 0", len(result.Rows))
 	}
 
-	result, err = db.Aggregate(qx.Query(qx.EQ("name", "missing")).
+	result, err = readAggregate(c, qx.Query(qx.EQ("name", "missing")).
 		Group("country").
 		Metrics(qx.ROWCOUNT().AS("rows"), qx.SUM("age").AS("age_sum")))
 	if err != nil {
@@ -910,17 +910,17 @@ func TestAggregateEmptyMatchesReturnShapeWithoutRowsForGroupedAndDistinct(t *tes
 func TestAggregateSUMEmptyPreservesFieldKind(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_sum_type.db")
-	db, raw := openBoltAndNew[uint64, aggregateSumTypeRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateSumTypeRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	if err := db.Set(1, &aggregateSumTypeRec{Group: "nil-only"}); err != nil {
+	if err := writeSet(c, 1, &aggregateSumTypeRec{Group: "nil-only"}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Query(qx.EQ("group", "missing")).Metrics(
+	result, err := readAggregate(c, qx.Query(qx.EQ("group", "missing")).Metrics(
 		qx.SUM("ordinary_u").AS("ordinary_u"),
 		qx.SUM("ordinary_f").AS("ordinary_f"),
 		qx.SUM("measure_u").AS("measure_u"),
@@ -937,7 +937,7 @@ func TestAggregateSUMEmptyPreservesFieldKind(t *testing.T) {
 	requireAggregateUint(t, result.Rows[0][2], 0)
 	requireAggregateFloat(t, result.Rows[0][3], 0)
 
-	result, err = db.Aggregate(qx.Query(qx.EQ("group", "nil-only")).Metrics(
+	result, err = readAggregate(c, qx.Query(qx.EQ("group", "nil-only")).Metrics(
 		qx.SUM("measure_u").AS("measure_u"),
 		qx.SUM("measure_f").AS("measure_f"),
 	))
@@ -954,20 +954,20 @@ func TestAggregateSUMEmptyPreservesFieldKind(t *testing.T) {
 func TestAggregateMeasureOnlyDB(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "measure_only.db")
-	db, raw := openBoltAndNew[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	if err := db.Set(1, &measureOnlyRec{Amount: 10}); err != nil {
+	if err := writeSet(c, 1, &measureOnlyRec{Amount: 10}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &measureOnlyRec{Amount: 20}); err != nil {
+	if err := writeSet(c, 2, &measureOnlyRec{Amount: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.ROWCOUNT().AS("rows"),
 		qx.SUM("amount").AS("sum"),
 		qx.AVG("amount").AS("avg"),
@@ -987,10 +987,10 @@ func TestAggregateMeasureOnlyDB(t *testing.T) {
 func TestAggregateFloatValuesIncludeNegativeAndZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_float.db")
-	db, raw := openBoltAndNew[uint64, aggregateFloatRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateFloatRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	rows := []aggregateFloatRec{
@@ -999,12 +999,12 @@ func TestAggregateFloatValuesIncludeNegativeAndZero(t *testing.T) {
 		{Group: "all", Ordinary: 4.5, Measure: 4.5},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Query(qx.EQ("group", "all")).Metrics(
+	result, err := readAggregate(c, qx.Query(qx.EQ("group", "all")).Metrics(
 		qx.SUM("ordinary").AS("ordinary_sum"),
 		qx.AVG("ordinary").AS("ordinary_avg"),
 		qx.MIN("ordinary").AS("ordinary_min"),
@@ -1031,10 +1031,10 @@ func TestAggregateFloatValuesIncludeNegativeAndZero(t *testing.T) {
 func TestAggregateSUMIntegerOverflowReturnsError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_overflow.db")
-	db, raw := openBoltAndNew[uint64, aggregateOverflowRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateOverflowRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	rows := []aggregateOverflowRec{
@@ -1042,7 +1042,7 @@ func TestAggregateSUMIntegerOverflowReturnsError(t *testing.T) {
 		{Ordinary: 1, Signed: 1, Unsigned: 1},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
@@ -1057,30 +1057,30 @@ func TestAggregateSUMIntegerOverflowReturnsError(t *testing.T) {
 		{name: "measure_unsigned", q: qx.Aggregate(qx.SUM("unsigned")), want: "unsigned SUM overflow"},
 	}
 	for i := range cases {
-		_, err := db.Aggregate(cases[i].q)
+		_, err := readAggregate(c, cases[i].q)
 		if err == nil || !strings.Contains(err.Error(), cases[i].want) {
 			t.Fatalf("%s: err=%v, want %q", cases[i].name, err, cases[i].want)
 		}
 	}
 }
 
-func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T) {
+func TestAggregateMeasureEmptyBaseMultiSetDuplicateIDsUsesLastValue(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "measure_duplicate_batch.db")
-	db, raw := openBoltAndNew[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 1},
 		[]*measureOnlyRec{{Amount: 10}, {Amount: 20}},
 	); err != nil {
-		t.Fatalf("BatchSet duplicate ids: %v", err)
+		t.Fatalf("MultiSet duplicate ids: %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.COUNT("amount").AS("count"),
 		qx.SUM("amount").AS("sum"),
 		qx.AVG("amount").AS("avg"),
@@ -1100,10 +1100,10 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wide_measure.db")
-	db, raw := openBoltAndNew[uint64, aggregateWideMeasureRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateWideMeasureRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	const total = 700
@@ -1113,12 +1113,12 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 		if id <= keep {
 			status = "keep"
 		}
-		if err := db.Set(uint64(id), &aggregateWideMeasureRec{Status: status, Amount: int64(id)}); err != nil {
+		if err := writeSet(c, uint64(id), &aggregateWideMeasureRec{Status: status, Amount: int64(id)}); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.COUNT("amount").AS("count"),
 		qx.SUM("amount").AS("sum"),
 		qx.MIN("amount").AS("min"),
@@ -1132,7 +1132,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	requireAggregateInt(t, result.Rows[0][2], 1)
 	requireAggregateInt(t, result.Rows[0][3], total)
 
-	result, err = db.Aggregate(qx.Query(qx.EQ("status", "keep")).Metrics(
+	result, err = readAggregate(c, qx.Query(qx.EQ("status", "keep")).Metrics(
 		qx.COUNT("amount").AS("count"),
 		qx.SUM("amount").AS("sum"),
 		qx.AVG("amount").AS("avg"),
@@ -1152,29 +1152,29 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 func TestAggregateStartupBuildKeepsMultipleMeasureFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "two_measure_rebuild.db")
-	db, raw := openBoltAndNew[uint64, aggregateTwoMeasureRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateTwoMeasureRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	for id := 1; id <= 3; id++ {
-		if err := db.Set(uint64(id), &aggregateTwoMeasureRec{Left: int64(id), Right: int64(id * 10)}); err != nil {
+		if err := writeSet(c, uint64(id), &aggregateTwoMeasureRec{Left: int64(id), Right: int64(id * 10)}); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw.Close: %v", err)
 	}
-	db, raw = openBoltAndNew[uint64, aggregateTwoMeasureRec](t, path, Options{
+	c, bolt = openBoltAndCollection[uint64, aggregateTwoMeasureRec](t, path, Options{
 		AnalyzeInterval:  -1,
 		DisableIndexLoad: true,
 	})
 
-	result, err := db.Aggregate(qx.Aggregate(
+	result, err := readAggregate(c, qx.Aggregate(
 		qx.COUNT("left").AS("left_count"),
 		qx.SUM("left").AS("left_sum"),
 		qx.COUNT("right").AS("right_count"),
@@ -1192,10 +1192,10 @@ func TestAggregateStartupBuildKeepsMultipleMeasureFields(t *testing.T) {
 func TestAggregateMeasureAppendAfterLargeSeed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "measure_tail_fill.db")
-	db, raw := openBoltAndNew[uint64, aggregateWideMeasureRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateWideMeasureRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	const seed = 600
@@ -1206,8 +1206,8 @@ func TestAggregateMeasureAppendAfterLargeSeed(t *testing.T) {
 		ids[i] = id
 		vals[i] = &aggregateWideMeasureRec{Status: "keep", Amount: int64(id)}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet seed: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet seed: %v", err)
 	}
 
 	const appendCount = 10
@@ -1218,11 +1218,11 @@ func TestAggregateMeasureAppendAfterLargeSeed(t *testing.T) {
 		appendIDs[i] = id
 		appendVals[i] = &aggregateWideMeasureRec{Status: "keep", Amount: int64(id)}
 	}
-	if err := db.BatchSet(appendIDs, appendVals); err != nil {
-		t.Fatalf("BatchSet append: %v", err)
+	if err := writeSets(c, appendIDs, appendVals); err != nil {
+		t.Fatalf("MultiSet append: %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Aggregate(qx.COUNT("amount").AS("count"), qx.SUM("amount").AS("sum")))
+	result, err := readAggregate(c, qx.Aggregate(qx.COUNT("amount").AS("count"), qx.SUM("amount").AS("sum")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -1237,22 +1237,22 @@ func TestAggregateMeasureStorageLoadsFromPersistedIndex(t *testing.T) {
 	var logs bytes.Buffer
 	opts := Options{AnalyzeInterval: -1, Logger: log.New(&logs, "", 0)}
 
-	db, raw := openBoltAndNew[uint64, measureOnlyRec](t, path, opts)
-	if err := db.Set(1, &measureOnlyRec{Amount: 10}); err != nil {
+	c, bolt := openBoltAndCollection[uint64, measureOnlyRec](t, path, opts)
+	if err := writeSet(c, 1, &measureOnlyRec{Amount: 10}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &measureOnlyRec{Amount: 20}); err != nil {
+	if err := writeSet(c, 2, &measureOnlyRec{Amount: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw Close: %v", err)
 	}
 
 	logs.Reset()
-	db2, raw2 := openBoltAndNew[uint64, measureOnlyRec](t, path, opts)
+	db2, raw2 := openBoltAndCollection[uint64, measureOnlyRec](t, path, opts)
 	t.Cleanup(func() {
 		_ = db2.Close()
 		_ = raw2.Close()
@@ -1261,7 +1261,7 @@ func TestAggregateMeasureStorageLoadsFromPersistedIndex(t *testing.T) {
 		t.Fatalf("measure storage was rebuilt instead of loaded: %s", logs.String())
 	}
 
-	result, err := db2.Aggregate(qx.Aggregate(qx.SUM("amount").AS("sum")))
+	result, err := readAggregate(db2, qx.Aggregate(qx.SUM("amount").AS("sum")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -1276,21 +1276,21 @@ func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 	path := filepath.Join(dir, "measure_planner_stats.db")
 	opts := Options{AnalyzeInterval: -1, BucketName: "aggregate_planner_stats"}
 
-	db, raw := openBoltAndNew[uint64, aggregatePlannerStatsBaseRec](t, path, opts)
-	if err := db.Set(1, &aggregatePlannerStatsBaseRec{Category: "a", Amount: 10}); err != nil {
+	c, bolt := openBoltAndCollection[uint64, aggregatePlannerStatsBaseRec](t, path, opts)
+	if err := writeSet(c, 1, &aggregatePlannerStatsBaseRec{Category: "a", Amount: 10}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &aggregatePlannerStatsBaseRec{Category: "b", Amount: 20}); err != nil {
+	if err := writeSet(c, 2, &aggregatePlannerStatsBaseRec{Category: "b", Amount: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw Close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, aggregatePlannerStatsNextRec](t, path, opts)
+	db2, raw2 := openBoltAndCollection[uint64, aggregatePlannerStatsNextRec](t, path, opts)
 	t.Cleanup(func() {
 		_ = db2.Close()
 		_ = raw2.Close()
@@ -1309,10 +1309,10 @@ func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 func TestAggregateMatchesSlowReferenceModel(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_model.db")
-	db, raw := openBoltAndNew[uint64, aggregateModelRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateModelRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	amount10 := int64(10)
@@ -1328,12 +1328,12 @@ func TestAggregateMatchesSlowReferenceModel(t *testing.T) {
 		{Country: "FR", Status: "active", Age: 18},
 	}
 	for i := range rows {
-		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+		if err := writeSet(c, uint64(i+1), &rows[i]); err != nil {
 			t.Fatalf("Set(%d): %v", i+1, err)
 		}
 	}
 
-	result, err := db.Aggregate(qx.Query(qx.OR(qx.EQ("status", "active"), qx.GTE("age", 50))).
+	result, err := readAggregate(c, qx.Query(qx.OR(qx.EQ("status", "active"), qx.GTE("age", 50))).
 		Group("country", "status").
 		Metrics(
 			qx.ROWCOUNT().AS("rows"),
@@ -1400,8 +1400,8 @@ func TestAggregateMatchesSlowReferenceModel(t *testing.T) {
 }
 
 func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
-	db := openTempAggregateDB(t)
-	seedAggregateTestData(t, db)
+	c := openTempAggregateDB(t)
+	seedAggregateTestData(t, c)
 
 	cases := []struct {
 		name string
@@ -1501,7 +1501,7 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 	}
 
 	for i := range cases {
-		_, err := db.Aggregate(cases[i].q)
+		_, err := readAggregate(c, cases[i].q)
 		if err == nil || !strings.Contains(err.Error(), cases[i].want) {
 			t.Fatalf("%s: err=%v, want %q", cases[i].name, err, cases[i].want)
 		}
@@ -1511,13 +1511,13 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 func TestAggregateRejectsCountDistinctSliceField(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aggregate_count_distinct_slice.db")
-	db, raw := openBoltAndNew[uint64, aggregateSliceRec](t, path, Options{AnalyzeInterval: -1})
+	c, bolt := openBoltAndCollection[uint64, aggregateSliceRec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	_, err := db.Aggregate(qx.Aggregate(qx.COUNT(qx.DISTINCT("tags")).AS("tag_count")))
+	_, err := readAggregate(c, qx.Aggregate(qx.COUNT(qx.DISTINCT("tags")).AS("tag_count")))
 	if err == nil || !strings.Contains(err.Error(), `aggregate over slice field "tags" is not supported`) {
 		t.Fatalf("COUNT(DISTINCT slice) err=%v", err)
 	}
@@ -1674,18 +1674,18 @@ func copySeededFile(t *testing.T, src, dst string) {
 	}
 }
 
-func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
+func countByExprBitmap(t *testing.T, c *Collection[uint64, Rec], expr qx.Expr) uint64 {
 	t.Helper()
-	ids, err := db.QueryKeys(qx.Query(expr))
+	ids, err := readQueryKeys(c, qx.Query(expr))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	return uint64(len(ids))
 }
 
-func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
+func countByExprBitmapCountORBench(t *testing.T, c *Collection[uint64, countORBenchRec], expr qx.Expr) uint64 {
 	t.Helper()
-	ids, err := db.QueryKeys(qx.Query(expr))
+	ids, err := readQueryKeys(c, qx.Query(expr))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1700,16 +1700,16 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 		},
 		TraceSampleEvery: 1,
 	}
-	db, _ := openTempDBUint64(t, opts)
+	c, _ := openTempUint64Collection(t, opts)
 
-	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	got, err := db.Count(qx.Query(qx.EQ("country", "NL")).Filter)
+	got, err := readCount(c, qx.Query(qx.EQ("country", "NL")).Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1726,8 +1726,8 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 }
 
 func TestCount_SignedIntFloatUpperEdgeBounds(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	mustSetAPIRecs(t, c, map[uint64]*Rec{
 		1: {Name: "a", Age: -10},
 		2: {Name: "b", Age: 0},
 		3: {Name: "c", Age: 42},
@@ -1750,7 +1750,7 @@ func TestCount_SignedIntFloatUpperEdgeBounds(t *testing.T) {
 	for i := range cases {
 		tc := cases[i]
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := db.Count(tc.expr)
+			got, err := readCount(c, tc.expr)
 			if err != nil {
 				t.Fatalf("Count: %v", err)
 			}
@@ -1769,16 +1769,16 @@ func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
 		},
 		TraceSampleEvery: 1,
 	}
-	db, _ := openTempDBUint64(t, opts)
+	c, _ := openTempUint64Collection(t, opts)
 
-	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	result, err := db.Aggregate(qx.Query(qx.EQ("country", "NL")).Metrics(qx.ROWCOUNT().AS("rows")))
+	result, err := readAggregate(c, qx.Query(qx.EQ("country", "NL")).Metrics(qx.ROWCOUNT().AS("rows")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -1808,9 +1808,9 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 		},
 		TraceSampleEvery: 1,
 	}
-	db, _ := openTempDBUint64(t, opts)
+	c, _ := openTempUint64Collection(t, opts)
 
-	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, c, 20_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%06d@example.com", i),
@@ -1825,9 +1825,9 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 		qx.AND(qx.PREFIX("email", "user03"), qx.EQ("active", true)),
 		qx.AND(qx.PREFIX("email", "user04"), qx.EQ("active", true)),
 	)
-	want := countByExprBitmap(t, db, expr)
+	want := countByExprBitmap(t, c, expr)
 
-	result, err := db.Aggregate(qx.Query(expr).Metrics(qx.ROWCOUNT().AS("rows")))
+	result, err := readAggregate(c, qx.Query(expr).Metrics(qx.ROWCOUNT().AS("rows")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -1850,7 +1850,7 @@ func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
 
 func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
 	var events []rbitrace.Event
-	db := countOpenORBenchSharedDB(t, "test_count_and_set_range_materialized.db", Options{
+	c := countOpenORBenchSharedCollection(t, "test_count_and_set_range_materialized.db", Options{
 		AnalyzeInterval: -1,
 		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
@@ -1865,7 +1865,7 @@ func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
 		qx.HASANY("tags", []string{"go", "security", "ops"}),
 	)
 
-	got, err := db.Count(expr)
+	got, err := readCount(c, expr)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1873,7 +1873,7 @@ func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	last := events[len(events)-1]
-	want := countByExprBitmapCountORBench(t, db, expr)
+	want := countByExprBitmapCountORBench(t, c, expr)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -1884,7 +1884,7 @@ func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
 
 func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 	var events []rbitrace.Event
-	db := countOpenORBenchSharedDB(t, "test_count_or_materialized_promotes.db", Options{
+	c := countOpenORBenchSharedCollection(t, "test_count_or_materialized_promotes.db", Options{
 		AnalyzeInterval: -1,
 		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
@@ -1910,7 +1910,7 @@ func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 		),
 	)
 
-	first, err := db.Count(expr)
+	first, err := readCount(c, expr)
 	if err != nil {
 		t.Fatalf("first Count: %v", err)
 	}
@@ -1921,7 +1921,7 @@ func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 		t.Fatalf("expected first plan %q, got %q", rbitrace.PlanCountORPredicates, plan)
 	}
 
-	second, err := db.Count(expr)
+	second, err := readCount(c, expr)
 	if err != nil {
 		t.Fatalf("second Count: %v", err)
 	}
@@ -1932,7 +1932,7 @@ func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
 		t.Fatalf("expected second plan %q, got %q", rbitrace.PlanCountMaterialized, plan)
 	}
 
-	want := countByExprBitmapCountORBench(t, db, expr)
+	want := countByExprBitmapCountORBench(t, c, expr)
 	if second != want {
 		t.Fatalf("count mismatch: got=%d want=%d", second, want)
 	}
@@ -1943,13 +1943,13 @@ func TestAggregateRowCount_MatchesCountForRepresentativeFilters(t *testing.T) {
 	opts.AnalyzeInterval = -1
 
 	path := filepath.Join(t.TempDir(), "rowcount_equiv.db")
-	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	c, bolt := openBoltAndCollection[uint64, UserBench](t, path, opts)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	seedBenchData(t, db, 150_000)
+	seedBenchData(t, c, 150_000)
 
 	cases := []struct {
 		name string
@@ -2008,16 +2008,16 @@ func TestAggregateRowCount_MatchesCountForRepresentativeFilters(t *testing.T) {
 				aggQ  *qx.QX
 			)
 			if tc.all {
-				count, err = db.Count()
+				count, err = readCount(c)
 				aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
 			} else {
-				count, err = db.Count(tc.q.Filter)
+				count, err = readCount(c, tc.q.Filter)
 				aggQ = qx.Query(tc.q.Filter).Metrics(qx.ROWCOUNT().AS("rows"))
 			}
 			if err != nil {
 				t.Fatalf("Count: %v", err)
 			}
-			result, err := db.Aggregate(aggQ)
+			result, err := readAggregate(c, aggQ)
 			if err != nil {
 				t.Fatalf("Aggregate: %v", err)
 			}
@@ -2035,7 +2035,7 @@ func TestAggregateRowCount_MatchesCountForSmallWorldFilters(t *testing.T) {
 
 	for _, world := range smallWorldCases() {
 		t.Run(world.name, func(t *testing.T) {
-			db := openSmallWorldDB(t, world)
+			c := openSmallWorldCollection(t, world)
 
 			for _, exprCase := range exprs {
 				t.Run(exprCase.name, func(t *testing.T) {
@@ -2045,16 +2045,16 @@ func TestAggregateRowCount_MatchesCountForSmallWorldFilters(t *testing.T) {
 						aggQ  *qx.QX
 					)
 					if exprCase.noFilter {
-						count, err = db.Count()
+						count, err = readCount(c)
 						aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
 					} else {
-						count, err = db.Count(exprCase.expr)
+						count, err = readCount(c, exprCase.expr)
 						aggQ = qx.Query(exprCase.expr).Metrics(qx.ROWCOUNT().AS("rows"))
 					}
 					if err != nil {
 						t.Fatalf("Count: %v", err)
 					}
-					result, err := db.Aggregate(aggQ)
+					result, err := readAggregate(c, aggQ)
 					if err != nil {
 						t.Fatalf("Aggregate: %v", err)
 					}
@@ -2078,13 +2078,13 @@ func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	opts.AnalyzeInterval = -1
 
 	path := filepath.Join(t.TempDir(), "count_public_allocs.db")
-	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	c, bolt := openBoltAndCollection[uint64, UserBench](t, path, opts)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	seedBenchData(t, db, 150_000)
+	seedBenchData(t, c, 150_000)
 
 	cases := []struct {
 		name string
@@ -2104,7 +2104,7 @@ func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			run := func() {
-				if _, err := db.Count(tc.q.Filter); err != nil {
+				if _, err := readCount(c, tc.q.Filter); err != nil {
 					t.Fatalf("Count: %v", err)
 				}
 			}
@@ -2116,7 +2116,7 @@ func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 		})
 	}
 
-	orDB, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	orDB, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, orDB, 20_000)
 	orQ := qx.Query(qx.OR(
 		qx.AND(
@@ -2138,7 +2138,7 @@ func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	))
 	t.Run("ORHybrid", func(t *testing.T) {
 		run := func() {
-			if _, err := orDB.Count(orQ.Filter); err != nil {
+			if _, err := readCount(orDB, orQ.Filter); err != nil {
 				t.Fatalf("Count: %v", err)
 			}
 		}
@@ -2169,7 +2169,7 @@ type seededDBFixture struct {
 
 var countORBenchSharedSeeded seededDBFixture
 
-func seedCountORBenchData(t *testing.T, db *DB[uint64, countORBenchRec], n int) {
+func seedCountORBenchData(t *testing.T, c *Collection[uint64, countORBenchRec], n int) {
 	t.Helper()
 
 	countries := []string{"US", "DE", "NL", "FR"}
@@ -2203,8 +2203,8 @@ func seedCountORBenchData(t *testing.T, db *DB[uint64, countORBenchRec], n int) 
 			Roles:   append([]string(nil), rolesPool[(i/5)%len(rolesPool)]...),
 		}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 }
 
@@ -2219,14 +2219,14 @@ func countORBenchSharedSeedPath(t *testing.T) string {
 		}
 
 		path := filepath.Join(dir, "seed.db")
-		db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, Options{AnalyzeInterval: -1})
-		seedCountORBenchData(t, db, 128_000)
-		if err = db.Close(); err != nil {
+		c, bolt := openBoltAndCollection[uint64, countORBenchRec](t, path, Options{AnalyzeInterval: -1})
+		seedCountORBenchData(t, c, 128_000)
+		if err = c.Close(); err != nil {
 			countORBenchSharedSeeded.err = err
-			_ = raw.Close()
+			_ = bolt.Close()
 			return
 		}
-		if err = raw.Close(); err != nil {
+		if err = bolt.Close(); err != nil {
 			countORBenchSharedSeeded.err = err
 			return
 		}
@@ -2239,16 +2239,16 @@ func countORBenchSharedSeedPath(t *testing.T) string {
 	return countORBenchSharedSeeded.path
 }
 
-func countOpenORBenchSharedDB(t *testing.T, name string, opts Options) *DB[uint64, countORBenchRec] {
+func countOpenORBenchSharedCollection(t *testing.T, name string, opts Options) *Collection[uint64, countORBenchRec] {
 	t.Helper()
 
 	path := copySeededDBWithSidecars(t, countORBenchSharedSeedPath(t), name)
-	db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, opts)
+	c, bolt := openBoltAndCollection[uint64, countORBenchRec](t, path, opts)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db
+	return c
 }
 
 func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
@@ -2263,7 +2263,7 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db := countOpenORBenchSharedDB(t, "test_count_scalar_in_split_mixed.db", Options{
+	c := countOpenORBenchSharedCollection(t, "test_count_scalar_in_split_mixed.db", Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -2277,7 +2277,7 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 		qx.GTE("score", 60.0),
 	)
 
-	got, err := db.Count(q.Filter)
+	got, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -2288,7 +2288,7 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 	mu.Unlock()
-	want := countByExprBitmapCountORBench(t, db, q.Filter)
+	want := countByExprBitmapCountORBench(t, c, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -2310,17 +2310,17 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_cohort.db"), Options{
+	c, bolt := openBoltAndCollection[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_cohort.db"), Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
 	})
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	countries := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB", "US"}
 	statuses := []string{"active", "trial", "paused", "banned"}
@@ -2346,8 +2346,8 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
 		}
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 
 	q := qx.Query(
@@ -2359,7 +2359,7 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 		qx.GTE("score", 80.0),
 	)
 
-	got, err := db.Count(q.Filter)
+	got, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -2370,7 +2370,7 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 	mu.Unlock()
-	want := countByExprBitmapCountORBench(t, db, q.Filter)
+	want := countByExprBitmapCountORBench(t, c, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}

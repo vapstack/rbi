@@ -599,7 +599,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 
 func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: -1,
+		MaterializedPredCacheMaxEntries: -1,
 	})
 
 	for i := 0; i < 700; i++ {
@@ -651,11 +651,11 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 
 func TestBuildPredRange_NumericBucketsRunWhenPredicateCacheDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: -1,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: -1,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1030,11 +1030,11 @@ func TestIndexViewRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 
 func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPostingFilterWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1069,11 +1069,11 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 
 func TestBuildPredicates_DefaultBuildKeepsColdNumericRangesLazy(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1119,8 +1119,8 @@ func TestBuildPredicates_DefaultBuildKeepsColdNumericRangesLazy(t *testing.T) {
 func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCacheLocal(t *testing.T) {
 	t.Run("FieldIndexRangeState", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{
-			AnalyzeInterval:                         -1,
-			SnapshotMaterializedPredCacheMaxEntries: 16,
+			AnalyzeInterval:                 -1,
+			MaterializedPredCacheMaxEntries: 16,
 		})
 		seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 			return &Rec{
@@ -1169,8 +1169,8 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 
 	t.Run("BaseState", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{
-			AnalyzeInterval:                         -1,
-			SnapshotMaterializedPredCacheMaxEntries: 16,
+			AnalyzeInterval:                 -1,
+			MaterializedPredCacheMaxEntries: 16,
 		})
 		seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 			return &Rec{
@@ -1210,8 +1210,8 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 
 func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1272,8 +1272,8 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 
 func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1332,8 +1332,8 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 
 func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1392,8 +1392,8 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 
 func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1446,8 +1446,8 @@ func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEager
 
 func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1500,8 +1500,8 @@ func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsW
 
 func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateStaysLazy(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1640,8 +1640,8 @@ func TestBuildPredicatesOrdered_MergedStringPrefixPreservesTightenedBounds(t *te
 
 func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredicateStaysLazy(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1706,8 +1706,8 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 
 func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1754,8 +1754,8 @@ func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMate
 
 func TestBuildPredicatesOrdered_BroadNullableComplementMaterializesWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 4; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1806,8 +1806,8 @@ func TestBuildPredicatesOrdered_BroadNullableComplementMaterializesWhenOrderedEa
 
 func TestBuildPredicatesOrdered_NonBroadNullableComplementMaterializesWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1872,8 +1872,8 @@ func TestBuildPredicatesOrdered_NonBroadNullableComplementMaterializesWhenOrdere
 
 func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -1931,8 +1931,8 @@ func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testin
 
 func TestOrderedORMaterializedRangeLeafCosts_NullableComplementPrefersPositiveCacheKey(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1987,8 +1987,8 @@ func TestOrderedORMaterializedRangeLeafCosts_NullableComplementPrefersPositiveCa
 
 func TestOrderedORMaterializedExactRangePredicateCosts_NullableComplementPrefersPositiveCacheKey(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -2050,8 +2050,8 @@ func TestOrderedORMaterializedExactRangePredicateCosts_NullableComplementPrefers
 
 func TestMaterializeOrderedORPredicate_PreservesMergedExactRangeBounds(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2109,8 +2109,8 @@ func TestMaterializeOrderedORPredicate_PreservesMergedExactRangeBounds(t *testin
 
 func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2200,8 +2200,8 @@ func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrdere
 
 func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 40; i++ {
 		v := 0
@@ -2276,8 +2276,8 @@ func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWh
 
 func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2350,8 +2350,8 @@ func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHit
 
 func TestOrderedORMaterializedPrefixLeafBuildWork_RejectsBroadComplementPrefix(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		email := fmt.Sprintf("user%05d@example.com", i)
@@ -2391,8 +2391,8 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		seed func(*DB[uint64, Rec]),
 	) {
 		db, _ := openTempDBUint64(t, Options{
-			AnalyzeInterval:                         -1,
-			SnapshotMaterializedPredCacheMaxEntries: 16,
+			AnalyzeInterval:                 -1,
+			MaterializedPredCacheMaxEntries: 16,
 		})
 		seed(db)
 
@@ -2566,8 +2566,8 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 
 func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -2668,8 +2668,8 @@ func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrde
 
 func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{

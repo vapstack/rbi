@@ -15,10 +15,10 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
+func mustCurrentBucketSequence(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 	t.Helper()
 
-	seq, err := currentBucketSequence(db.bolt, db.dataBucket)
+	seq, err := currentBucketSequence(c.root.bolt, c.dataBucket)
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}
@@ -26,68 +26,66 @@ func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
 }
 
 func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	before := db.SnapshotStats().Sequence
+	before := c.SnapshotStats().Sequence
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	after := db.SnapshotStats().Sequence
+	after := c.SnapshotStats().Sequence
 	if after <= before {
 		t.Fatalf("snapshot sequence did not advance: before=%d after=%d", before, after)
 	}
 
-	cur := mustCurrentBucketSequence(t, db)
+	cur := mustCurrentBucketSequence(t, c)
 	if after != cur {
 		t.Fatalf("snapshot sequence mismatch with bolt Seq: snapshot=%d bolt=%d", after, cur)
 	}
 }
 
 func TestSnapshotSequence_PreviousSnapshotIsRetiredAfterPublishWithoutPins(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	oldSequence := db.SnapshotStats().Sequence
+	oldSequence := c.SnapshotStats().Sequence
 
-	if err := db.Set(2, &Rec{Name: "new", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "new", Age: 20}); err != nil {
 		t.Fatalf("concurrent Set: %v", err)
 	}
 
-	latest := db.SnapshotStats()
+	latest := c.SnapshotStats()
 	if latest.Sequence <= oldSequence {
 		t.Fatalf("latest sequence did not advance: old=%d latest=%d", oldSequence, latest.Sequence)
 	}
-	if latest.RegistrySize != 1 {
-		t.Fatalf("previous snapshot unexpectedly remained tracked: stats=%+v", latest)
-	}
+	assertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotSequence_AdvancesOnWrite(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	before := db.SnapshotStats().Sequence
-	if err := db.Set(1, &Rec{Name: "x", Age: 1}); err != nil {
+	before := c.SnapshotStats().Sequence
+	if err := writeSet(c, 1, &Rec{Name: "x", Age: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	after := db.SnapshotStats().Sequence
+	after := c.SnapshotStats().Sequence
 	if after <= before {
 		t.Fatalf("snapshot sequence did not advance on write: before=%d after=%d", before, after)
 	}
 }
 
 func TestSnapshot_PublishedAsFullState(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go", "db"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Tags: []string{"go", "db"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	got, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	got, err := readQueryKeys(c, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name): %v", err)
 	}
@@ -95,7 +93,7 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 		t.Fatalf("name query mismatch: got=%v want=[1]", got)
 	}
 
-	got, err = db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"go"})))
+	got, err = readQueryKeys(c, qx.Query(qx.HASANY("tags", []string{"go"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(tags): %v", err)
 	}
@@ -104,7 +102,7 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 	}
 
 	orderQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
-	got, err = db.QueryKeys(orderQ)
+	got, err = readQueryKeys(c, orderQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(array count): %v", err)
 	}
@@ -114,22 +112,22 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 }
 
 func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	want := []string{"k1"}
-	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+	if err := writeSet(c, "k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
 
 	for i := 2; i <= 12; i++ {
 		key := fmt.Sprintf("k%d", i)
 		want = append(want, key)
-		if err := db.Set(key, &Rec{Name: key}); err != nil {
+		if err := writeSet(c, key, &Rec{Name: key}); err != nil {
 			t.Fatalf("Set(%s): %v", key, err)
 		}
 	}
 
-	got, err := db.QueryKeys(qx.Query())
+	got, err := readQueryKeys(c, qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -138,8 +136,8 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 	}
 }
 
-func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+func TestSnapshot_EmptyBaseMultiSetBuildsDistinctLenIndex(t *testing.T) {
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
 	ids := []uint64{1, 2, 3, 4}
 	vals := []*Rec{
@@ -148,12 +146,12 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 		{Name: "u3", Tags: []string{"go", "go"}},
 		{Name: "u4", Tags: []string{"go", "db", "db"}},
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
-	gotEmpty, err := db.QueryKeys(emptyQ)
+	gotEmpty, err := readQueryKeys(c, emptyQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
@@ -162,11 +160,11 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 	}
 
 	orderQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
-	gotOrder, err := db.QueryKeys(orderQ)
+	gotOrder, err := readQueryKeys(c, orderQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(array count): %v", err)
 	}
-	wantOrder, err := expectedKeysUint64(t, db, orderQ)
+	wantOrder, err := expectedKeysUint64(t, c, orderQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(array count): %v", err)
 	}
@@ -176,9 +174,9 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 }
 
 func TestSnapshotFromEmptyBase_StringScanKeysReadsDataBucket(t *testing.T) {
-	db, _ := openTempDBString(t, Options{
+	c, _ := openTempStringCollection(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchMax:    1,
+		BatchSoftLimit:  1,
 	})
 
 	const seedN = 256
@@ -199,12 +197,12 @@ func TestSnapshotFromEmptyBase_StringScanKeysReadsDataBucket(t *testing.T) {
 		})
 	}
 
-	if err := db.BatchSet(keys, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+	if err := writeSets(c, keys, vals); err != nil {
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
 	var got []string
-	if err := db.ScanKeys("k0254", func(id string) (bool, error) {
+	if err := readScanKeys(c, "k0254", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	}); err != nil {
@@ -220,29 +218,30 @@ func TestSnapshotFromEmptyBase_StringScanKeysReadsDataBucket(t *testing.T) {
 
 func snapshotExtOptions() Options {
 	return Options{
-		AutoBatchMax:    1,
+		BatchSoftLimit:  1,
 		AnalyzeInterval: -1,
 	}
 }
 
 func TestSnapshotExt_ScanKeysPinsRuntimeSnapshotDuringScan(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	enableStoreStatsForTest(t)
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	before := db.SnapshotStats()
+	before := c.StoreStats()
 	if before.RegistrySize != 1 || before.PinnedRefs != 0 {
 		t.Fatalf("unexpected stats before ScanKeys: %+v", before)
 	}
 
 	var got []uint64
-	if err := db.ScanKeys(0, func(id uint64) (bool, error) {
-		during := db.SnapshotStats()
+	if err := readScanKeys(c, 0, func(id uint64) (bool, error) {
+		during := c.StoreStats()
 		if during.PinnedRefs != 1 {
 			t.Fatalf("expected ScanKeys runtime snapshot pin during callback, stats=%+v", during)
 		}
@@ -255,16 +254,16 @@ func TestSnapshotExt_ScanKeysPinsRuntimeSnapshotDuringScan(t *testing.T) {
 		t.Fatalf("ScanKeys=%v want [1 2]", got)
 	}
 
-	after := db.SnapshotStats()
+	after := c.StoreStats()
 	if after.RegistrySize != 1 || after.PinnedRefs != 0 {
 		t.Fatalf("unexpected stats after ScanKeys: %+v", after)
 	}
 }
 
 func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
@@ -277,16 +276,16 @@ func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) 
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[Rec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeUint64[Rec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Set(2, &Rec{Name: "bob", Age: 20}, blockCommit)
+		done <- writeSet(c, 2, &Rec{Name: "bob", Age: 20}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "staged set commit hook")
+	snapshotExtraWait(t, entered, "staged set change hook")
 
-	oldItems, err := db.Query(qx.Query(qx.EQ("name", "bob")))
+	oldItems, err := readQuery(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("Query(bob before publish): %v", err)
 	}
@@ -294,7 +293,7 @@ func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) 
 		t.Fatalf("public query unexpectedly sees future write: %#v", oldItems)
 	}
 
-	oldItems, err = db.Query(qx.Query(qx.EQ("name", "alice")))
+	oldItems, err = readQuery(c, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("Query(alice before publish): %v", err)
 	}
@@ -307,7 +306,7 @@ func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) 
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	currentItems, err := db.Query(qx.Query(qx.EQ("name", "bob")))
+	currentItems, err := readQuery(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("Query(current snapshot): %v", err)
 	}
@@ -317,25 +316,25 @@ func TestSnapshotExt_QuerySeesPublishedStateWhileSetCommitBlocked(t *testing.T) 
 }
 
 func TestSnapshotExt_TruncatePublishesEmptySnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	oldStats := db.SnapshotStats()
-	if err := db.Truncate(); err != nil {
+	oldStats := c.SnapshotStats()
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	mid := db.SnapshotStats()
+	mid := c.SnapshotStats()
 	if mid.Sequence <= oldStats.Sequence {
 		t.Fatalf("expected truncate to publish newer snapshot: old=%d new=%d", oldStats.Sequence, mid.Sequence)
 	}
 
-	keys, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	keys, err := readQueryKeys(c, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys(after truncate): %v", err)
 	}
@@ -343,24 +342,25 @@ func TestSnapshotExt_TruncatePublishesEmptySnapshot(t *testing.T) {
 		t.Fatalf("expected current snapshot to be empty after truncate, got=%v", keys)
 	}
 
-	stats := db.SnapshotStats()
-	if stats.RegistrySize != 1 || stats.PinnedRefs != 0 {
-		t.Fatalf("unexpected snapshot stats after truncate: %+v", stats)
+	stats := c.SnapshotStats()
+	if stats.Sequence == 0 {
+		t.Fatalf("unexpected zero snapshot stats after truncate: %+v", stats)
 	}
+	assertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExt_StringScanKeysAcrossTruncate(t *testing.T) {
-	db, _ := openTempDBString(t, snapshotExtOptions())
+	c, _ := openTempStringCollection(t, snapshotExtOptions())
 
-	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+	if err := writeSet(c, "k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+	if err := writeSet(c, "k2", &Rec{Name: "two"}); err != nil {
 		t.Fatalf("Set(k2): %v", err)
 	}
 
 	var got []string
-	err := db.ScanKeys("", func(id string) (bool, error) {
+	err := readScanKeys(c, "", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -370,11 +370,11 @@ func TestSnapshotExt_StringScanKeysAcrossTruncate(t *testing.T) {
 	if !slices.Equal(got, []string{"k1", "k2"}) {
 		t.Fatalf("ScanKeys=%v want [k1 k2]", got)
 	}
-	if err := db.Truncate(); err != nil {
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 	got = got[:0]
-	err = db.ScanKeys("", func(id string) (bool, error) {
+	err = readScanKeys(c, "", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -387,26 +387,26 @@ func TestSnapshotExt_StringScanKeysAcrossTruncate(t *testing.T) {
 }
 
 func TestSnapshotExt_StringScanKeysAfterTruncateReuse(t *testing.T) {
-	db, _ := openTempDBString(t, snapshotExtOptions())
+	c, _ := openTempStringCollection(t, snapshotExtOptions())
 
-	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+	if err := writeSet(c, "k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+	if err := writeSet(c, "k2", &Rec{Name: "two"}); err != nil {
 		t.Fatalf("Set(k2): %v", err)
 	}
-	if err := db.Truncate(); err != nil {
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	if err := db.Set("a", &Rec{Name: "a"}); err != nil {
+	if err := writeSet(c, "a", &Rec{Name: "a"}); err != nil {
 		t.Fatalf("Set(a): %v", err)
 	}
-	if err := db.Set("z", &Rec{Name: "z"}); err != nil {
+	if err := writeSet(c, "z", &Rec{Name: "z"}); err != nil {
 		t.Fatalf("Set(z): %v", err)
 	}
 
 	var got []string
-	err := db.ScanKeys("b", func(id string) (bool, error) {
+	err := readScanKeys(c, "b", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -419,16 +419,17 @@ func TestSnapshotExt_StringScanKeysAfterTruncateReuse(t *testing.T) {
 }
 
 func TestSnapshotExt_QueryKeysReleasesCurrentSnapshotPinOnError(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	enableStoreStatsForTest(t)
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	if _, err := db.QueryKeys(qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
+	if _, err := readQueryKeys(c, qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
 		t.Fatalf("expected QueryKeys to fail for unknown field")
 	}
-	stats := db.SnapshotStats()
+	stats := c.StoreStats()
 	if stats.RegistrySize != 1 {
 		t.Fatalf("expected QueryKeys snapshot ref to remain registered")
 	}
@@ -438,16 +439,17 @@ func TestSnapshotExt_QueryKeysReleasesCurrentSnapshotPinOnError(t *testing.T) {
 }
 
 func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	enableStoreStatsForTest(t)
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	if _, err := db.Count(qx.EQ("does_not_exist", 1)); err == nil {
+	if _, err := readCount(c, qx.EQ("does_not_exist", 1)); err == nil {
 		t.Fatalf("expected Count to fail for unknown field")
 	}
-	stats := db.SnapshotStats()
+	stats := c.StoreStats()
 	if stats.RegistrySize != 1 {
 		t.Fatalf("expected Count snapshot ref to remain registered")
 	}
@@ -457,15 +459,16 @@ func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
 }
 
 func TestSnapshotExt_ScanKeysCallbackErrorReleasesRuntimeSnapshotPin(t *testing.T) {
-	db, _ := openTempDBUint64(t, snapshotExtOptions())
+	enableStoreStatsForTest(t)
+	c, _ := openTempUint64Collection(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
 	wantErr := errors.New("stop")
-	err := db.ScanKeys(0, func(uint64) (bool, error) {
-		stats := db.SnapshotStats()
+	err := readScanKeys(c, 0, func(uint64) (bool, error) {
+		stats := c.StoreStats()
 		if stats.PinnedRefs != 1 {
 			t.Fatalf("expected ScanKeys runtime snapshot pin during callback, stats=%+v", stats)
 		}
@@ -474,7 +477,7 @@ func TestSnapshotExt_ScanKeysCallbackErrorReleasesRuntimeSnapshotPin(t *testing.
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("ScanKeys err=%v want %v", err, wantErr)
 	}
-	stats := db.SnapshotStats()
+	stats := c.StoreStats()
 	if stats.RegistrySize != 1 {
 		t.Fatalf("expected current snapshot ref to remain registered")
 	}
@@ -493,65 +496,61 @@ type snapshotExtraRec struct {
 
 func snapshotExtraOptions() Options {
 	return testOptions(Options{
-		AutoBatchMax:    1,
+		BatchSoftLimit:  1,
 		AnalyzeInterval: -1,
 	})
 }
 
-func snapshotExtraOpenTempDBUint64(t *testing.T, opts Options) (*DB[uint64, snapshotExtraRec], string) {
+func snapshotExtraOpenTempUint64Collection(t *testing.T, opts Options) (*Collection[uint64, snapshotExtraRec], string) {
 	t.Helper()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot_extra_uint64.db")
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
 	opts = testOptions(opts)
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
 
-	db, err := New[uint64, snapshotExtraRec](raw, opts)
+	c, err := Open[uint64, snapshotExtraRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db, path
+	return c, path
 }
 
-func snapshotExtraOpenTempDBString(t *testing.T, opts Options) (*DB[string, snapshotExtraRec], string) {
+func snapshotExtraOpenTempStringCollection(t *testing.T, opts Options) (*Collection[string, snapshotExtraRec], string) {
 	t.Helper()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot_extra_string.db")
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
 	opts = testOptions(opts)
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
 
-	db, err := New[string, snapshotExtraRec](raw, opts)
+	c, err := Open[string, snapshotExtraRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db, path
+	return c, path
 }
 
 func snapshotExtraOpenRawBolt(t *testing.T) (*bbolt.DB, string) {
@@ -566,11 +565,11 @@ func snapshotExtraOpenRawBolt(t *testing.T) (*bbolt.DB, string) {
 	return raw, path
 }
 
-func snapshotExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, snapshotExtraRec], n int, gen func(i int) *snapshotExtraRec) {
+func snapshotExtraSeedGeneratedUint64Data(t *testing.T, c *Collection[uint64, snapshotExtraRec], n int, gen func(i int) *snapshotExtraRec) {
 	t.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
@@ -583,8 +582,8 @@ func snapshotExtraSeedGeneratedUint64Data(t *testing.T, db *DB[uint64, snapshotE
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		if err := writeSets(c, batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(seed batch=%d): %v", len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -610,9 +609,9 @@ func snapshotExtraWait(t *testing.T, ch <-chan struct{}, label string) {
 	}
 }
 
-func snapshotExtraBlockBeforeCommitUint64[V any](entered, release chan struct{}, err error) ExecOption[uint64, V] {
+func snapshotExtraBlockOnChangeUint64[V any](entered, release chan struct{}, err error) ExecOption[uint64, V] {
 	var once sync.Once
-	return BeforeCommit(func(*bbolt.Tx, uint64, *V, *V) error {
+	return OnChange(func(*Tx, uint64, *V, *V) error {
 		once.Do(func() {
 			close(entered)
 			<-release
@@ -621,9 +620,9 @@ func snapshotExtraBlockBeforeCommitUint64[V any](entered, release chan struct{},
 	})
 }
 
-func snapshotExtraBlockBeforeCommitString[V any](entered, release chan struct{}, err error) ExecOption[string, V] {
+func snapshotExtraBlockOnChangeString[V any](entered, release chan struct{}, err error) ExecOption[string, V] {
 	var once sync.Once
-	return BeforeCommit(func(*bbolt.Tx, string, *V, *V) error {
+	return OnChange(func(*Tx, string, *V, *V) error {
 		once.Do(func() {
 			close(entered)
 			<-release
@@ -632,26 +631,23 @@ func snapshotExtraBlockBeforeCommitString[V any](entered, release chan struct{},
 	})
 }
 
-func snapshotExtraAssertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *DB[K, V]) {
+func snapshotExtraAssertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, c *Collection[K, V]) {
 	tb.Helper()
 
-	stats := db.SnapshotStats()
-	if stats.RegistrySize != 1 {
-		tb.Fatalf("snapshot registry contains staged or retired refs: stats=%+v", stats)
-	}
+	assertNoFutureSnapshotRefs(tb, c)
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetBeforeCommit(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetOnChange(t *testing.T) {
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.Set(1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -662,26 +658,26 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetBeforeCommit(t *testing.T) 
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Set(2, &snapshotExtraRec{Name: "charlie", Age: 20}, blockCommit)
+		done <- writeSet(c, 2, &snapshotExtraRec{Name: "charlie", Age: 20}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "set before commit hook")
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	snapshotExtraWait(t, entered, "set before change hook")
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("current snapshot changed before commit publish: got=%d want=%d", got, oldSeq)
 	}
 
-	beforeBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	beforeBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob before publish): %v", err)
 	}
 	if !slices.Equal(beforeBob, []uint64{2}) {
 		t.Fatalf("public query lost committed row before publish: got=%v want=[2]", beforeBob)
 	}
-	beforeCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	beforeCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie before publish): %v", err)
 	}
@@ -694,7 +690,7 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetBeforeCommit(t *testing.T) 
 		t.Fatalf("Set(update): %v", err)
 	}
 
-	currentCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	currentCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie): %v", err)
 	}
@@ -702,7 +698,7 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetBeforeCommit(t *testing.T) 
 		t.Fatalf("current snapshot missed committed update: got=%v want=[2]", currentCharlie)
 	}
 
-	currentBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	currentBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob): %v", err)
 	}
@@ -710,20 +706,20 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetBeforeCommit(t *testing.T) 
 		t.Fatalf("current snapshot kept stale pre-update row: %v", currentBob)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetRollback(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.Set(1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -734,23 +730,23 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetRollback(t *testing.T) {
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback set"))
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback set"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Set(2, &snapshotExtraRec{Name: "charlie", Age: 20}, blockCommit)
+		done <- writeSet(c, 2, &snapshotExtraRec{Name: "charlie", Age: 20}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "rollback set before commit hook")
+	snapshotExtraWait(t, entered, "rollback set before change hook")
 
-	beforeBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	beforeBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob before rollback): %v", err)
 	}
 	if !slices.Equal(beforeBob, []uint64{2}) {
 		t.Fatalf("public query lost committed row before rollback: got=%v want=[2]", beforeBob)
 	}
-	beforeCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	beforeCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie before rollback): %v", err)
 	}
@@ -764,11 +760,11 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetRollback(t *testing.T) {
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
 
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("rollback replaced published snapshot: got=%d want=%d", got, oldSeq)
 	}
 
-	currentBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	currentBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob): %v", err)
 	}
@@ -776,7 +772,7 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetRollback(t *testing.T) {
 		t.Fatalf("current snapshot lost pre-rollback row: got=%v want=[2]", currentBob)
 	}
 
-	currentCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	currentCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie): %v", err)
 	}
@@ -784,20 +780,20 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightSetRollback(t *testing.T) {
 		t.Fatalf("current snapshot observed rolled-back row: %v", currentCharlie)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchSetBeforeCommit(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightMultiSetOnChange(t *testing.T) {
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.Set(1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -808,40 +804,40 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchSetBeforeCommit(t *testin
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.BatchSet(
+		done <- writeSets(c,
 			[]uint64{2, 3},
 			[]*snapshotExtraRec{
 				{Name: "charlie", Age: 20},
 				{Name: "dave", Age: 40},
 			},
-			blockCommit,
+			blockChange,
 		)
 	}()
 
-	snapshotExtraWait(t, entered, "batch_set before commit hook")
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	snapshotExtraWait(t, entered, "batch_set before change hook")
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("current snapshot changed before batch_set publish: got=%d want=%d", got, oldSeq)
 	}
 
-	beforeBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	beforeBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob before batch publish): %v", err)
 	}
 	if !slices.Equal(beforeBob, []uint64{2}) {
 		t.Fatalf("public query lost committed batch row before publish: got=%v want=[2]", beforeBob)
 	}
-	beforeCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	beforeCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie before batch publish): %v", err)
 	}
 	if len(beforeCharlie) != 0 {
 		t.Fatalf("public query observed staged future batch row: %v", beforeCharlie)
 	}
-	beforeDave, err := db.QueryKeys(qx.Query(qx.EQ("name", "dave")))
+	beforeDave, err := readQueryKeys(c, qx.Query(qx.EQ("name", "dave")))
 	if err != nil {
 		t.Fatalf("QueryKeys(dave before batch publish): %v", err)
 	}
@@ -851,17 +847,17 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchSetBeforeCommit(t *testin
 
 	close(release)
 	if err := <-done; err != nil {
-		t.Fatalf("BatchSet(update+insert): %v", err)
+		t.Fatalf("MultiSet(update+insert): %v", err)
 	}
 
-	currentCharlie, err := db.QueryKeys(qx.Query(qx.EQ("name", "charlie")))
+	currentCharlie, err := readQueryKeys(c, qx.Query(qx.EQ("name", "charlie")))
 	if err != nil {
 		t.Fatalf("QueryKeys(charlie): %v", err)
 	}
 	if !slices.Equal(currentCharlie, []uint64{2}) {
 		t.Fatalf("current snapshot missed committed batch update: got=%v want=[2]", currentCharlie)
 	}
-	currentDave, err := db.QueryKeys(qx.Query(qx.EQ("name", "dave")))
+	currentDave, err := readQueryKeys(c, qx.Query(qx.EQ("name", "dave")))
 	if err != nil {
 		t.Fatalf("QueryKeys(dave): %v", err)
 	}
@@ -869,20 +865,20 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchSetBeforeCommit(t *testin
 		t.Fatalf("current snapshot missed committed batch insert: got=%v want=[3]", currentDave)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightStringSetBeforeCommit(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBString(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightStringSetOnChange(t *testing.T) {
+	c, _ := snapshotExtraOpenTempStringCollection(t, snapshotExtraOptions())
 
-	if err := db.Set("k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
+	if err := writeSet(c, "k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	if err := db.Set("k2", &snapshotExtraRec{Name: "two", Age: 20}); err != nil {
+	if err := writeSet(c, "k2", &snapshotExtraRec{Name: "two", Age: 20}); err != nil {
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -893,19 +889,19 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightStringSetBeforeCommit(t *testi
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitString[snapshotExtraRec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeString[snapshotExtraRec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Set("future", &snapshotExtraRec{Name: "future", Age: 99}, blockCommit)
+		done <- writeSet(c, "future", &snapshotExtraRec{Name: "future", Age: 99}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "string set before commit hook")
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	snapshotExtraWait(t, entered, "string set before change hook")
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("current string snapshot changed before publish: got=%d want=%d", got, oldSeq)
 	}
 
-	beforeFuture, err := db.QueryKeys(qx.Query(qx.EQ("name", "future")))
+	beforeFuture, err := readQueryKeys(c, qx.Query(qx.EQ("name", "future")))
 	if err != nil {
 		t.Fatalf("QueryKeys(future before publish): %v", err)
 	}
@@ -918,7 +914,7 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightStringSetBeforeCommit(t *testi
 		t.Fatalf("Set(future): %v", err)
 	}
 
-	currentFuture, err := db.QueryKeys(qx.Query(qx.EQ("name", "future")))
+	currentFuture, err := readQueryKeys(c, qx.Query(qx.EQ("name", "future")))
 	if err != nil {
 		t.Fatalf("QueryKeys(future): %v", err)
 	}
@@ -926,20 +922,20 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightStringSetBeforeCommit(t *testi
 		t.Fatalf("current string snapshot missed committed future key: got=%v want=[future]", currentFuture)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_StringKeyRollbackLeavesPublicStateCleanAndRecovers(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBString(t, snapshotExtraOptions())
+	c, _ := snapshotExtraOpenTempStringCollection(t, snapshotExtraOptions())
 
-	if err := db.Set("k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
+	if err := writeSet(c, "k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	if err := db.Set("k2", &snapshotExtraRec{Name: "two", Age: 20}); err != nil {
+	if err := writeSet(c, "k2", &snapshotExtraRec{Name: "two", Age: 20}); err != nil {
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -950,16 +946,16 @@ func TestSnapshotExtra_StringKeyRollbackLeavesPublicStateCleanAndRecovers(t *tes
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitString[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback string set"))
+	blockChange := snapshotExtraBlockOnChangeString[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback string set"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Set("ghost", &snapshotExtraRec{Name: "ghost", Age: 99}, blockCommit)
+		done <- writeSet(c, "ghost", &snapshotExtraRec{Name: "ghost", Age: 99}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "string rollback set before commit hook")
+	snapshotExtraWait(t, entered, "string rollback set before change hook")
 
-	beforeGhost, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghost")))
+	beforeGhost, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghost")))
 	if err != nil {
 		t.Fatalf("QueryKeys(ghost before rollback): %v", err)
 	}
@@ -973,15 +969,15 @@ func TestSnapshotExtra_StringKeyRollbackLeavesPublicStateCleanAndRecovers(t *tes
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
 
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("rollback replaced published string snapshot: got=%d want=%d", got, oldSeq)
 	}
-	if got, err := db.Get("ghost"); err != nil {
+	if got, err := readGet(c, "ghost"); err != nil {
 		t.Fatalf("Get(ghost): %v", err)
 	} else if got != nil {
 		t.Fatalf("rolled-back ghost key became readable: %#v", got)
 	}
-	ghostKeys, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghost")))
+	ghostKeys, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghost")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghost): %v", err)
 	}
@@ -989,17 +985,17 @@ func TestSnapshotExtra_StringKeyRollbackLeavesPublicStateCleanAndRecovers(t *tes
 		t.Fatalf("rolled-back ghost key remained queryable: %v", ghostKeys)
 	}
 
-	if err := db.Set("later", &snapshotExtraRec{Name: "later", Age: 50}); err != nil {
+	if err := writeSet(c, "later", &snapshotExtraRec{Name: "later", Age: 50}); err != nil {
 		t.Fatalf("Set(later): %v", err)
 	}
-	queryLater, err := db.QueryKeys(qx.Query(qx.EQ("name", "later")))
+	queryLater, err := readQueryKeys(c, qx.Query(qx.EQ("name", "later")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=later): %v", err)
 	}
 	if !slices.Equal(queryLater, []string{"later"}) {
 		t.Fatalf("query path missed later key after rollback recovery: got=%v want=[later]", queryLater)
 	}
-	ghostKeys, err = db.QueryKeys(qx.Query(qx.EQ("name", "ghost")))
+	ghostKeys, err = readQueryKeys(c, qx.Query(qx.EQ("name", "ghost")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghost after recovery): %v", err)
 	}
@@ -1007,17 +1003,17 @@ func TestSnapshotExtra_StringKeyRollbackLeavesPublicStateCleanAndRecovers(t *tes
 		t.Fatalf("rolled-back ghost key became queryable after recovery: %v", ghostKeys)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_StringKeyBatchRollbackLeavesPublicStateCleanAndRecovers(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBString(t, snapshotExtraOptions())
+	c, _ := snapshotExtraOpenTempStringCollection(t, snapshotExtraOptions())
 
-	if err := db.Set("k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
+	if err := writeSet(c, "k1", &snapshotExtraRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1028,30 +1024,30 @@ func TestSnapshotExtra_StringKeyBatchRollbackLeavesPublicStateCleanAndRecovers(t
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitString[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback string batch_set"))
+	blockChange := snapshotExtraBlockOnChangeString[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback string batch_set"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.BatchSet(
+		done <- writeSets(c,
 			[]string{"ghostA", "ghostB"},
 			[]*snapshotExtraRec{
 				{Name: "ghostA", Age: 11},
 				{Name: "ghostB", Age: 12},
 			},
-			blockCommit,
+			blockChange,
 		)
 	}()
 
-	snapshotExtraWait(t, entered, "string rollback batch_set before commit hook")
+	snapshotExtraWait(t, entered, "string rollback batch_set before change hook")
 
-	beforeGhostA, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghostA")))
+	beforeGhostA, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghostA")))
 	if err != nil {
 		t.Fatalf("QueryKeys(ghostA before rollback): %v", err)
 	}
 	if len(beforeGhostA) != 0 {
 		t.Fatalf("public query observed ghostA row before rollback: %v", beforeGhostA)
 	}
-	beforeGhostB, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghostB")))
+	beforeGhostB, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghostB")))
 	if err != nil {
 		t.Fatalf("QueryKeys(ghostB before rollback): %v", err)
 	}
@@ -1065,27 +1061,27 @@ func TestSnapshotExtra_StringKeyBatchRollbackLeavesPublicStateCleanAndRecovers(t
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
 
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("rollback replaced published string snapshot: got=%d want=%d", got, oldSeq)
 	}
-	if got, err := db.Get("ghostA"); err != nil {
+	if got, err := readGet(c, "ghostA"); err != nil {
 		t.Fatalf("Get(ghostA): %v", err)
 	} else if got != nil {
 		t.Fatalf("rolled-back ghostA key became readable: %#v", got)
 	}
-	if got, err := db.Get("ghostB"); err != nil {
+	if got, err := readGet(c, "ghostB"); err != nil {
 		t.Fatalf("Get(ghostB): %v", err)
 	} else if got != nil {
 		t.Fatalf("rolled-back ghostB key became readable: %#v", got)
 	}
-	ghostAKeys, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghostA")))
+	ghostAKeys, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghostA")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghostA): %v", err)
 	}
 	if len(ghostAKeys) != 0 {
 		t.Fatalf("rolled-back ghostA key remained queryable: %v", ghostAKeys)
 	}
-	ghostBKeys, err := db.QueryKeys(qx.Query(qx.EQ("name", "ghostB")))
+	ghostBKeys, err := readQueryKeys(c, qx.Query(qx.EQ("name", "ghostB")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghostB): %v", err)
 	}
@@ -1093,30 +1089,30 @@ func TestSnapshotExtra_StringKeyBatchRollbackLeavesPublicStateCleanAndRecovers(t
 		t.Fatalf("rolled-back ghostB key remained queryable: %v", ghostBKeys)
 	}
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]string{"realA", "realB"},
 		[]*snapshotExtraRec{
 			{Name: "realA", Age: 21},
 			{Name: "realB", Age: 22},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(realA,realB): %v", err)
+		t.Fatalf("MultiSet(realA,realB): %v", err)
 	}
-	queryReal, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	queryReal, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(real recovery): %v", err)
 	}
 	if !slices.Equal(queryReal, []string{"k1", "realA", "realB"}) {
 		t.Fatalf("query path drift after batch rollback recovery: got=%v want=[k1 realA realB]", queryReal)
 	}
-	ghostAKeys, err = db.QueryKeys(qx.Query(qx.EQ("name", "ghostA")))
+	ghostAKeys, err = readQueryKeys(c, qx.Query(qx.EQ("name", "ghostA")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghostA after recovery): %v", err)
 	}
 	if len(ghostAKeys) != 0 {
 		t.Fatalf("rolled-back ghostA key became queryable after recovery: %v", ghostAKeys)
 	}
-	ghostBKeys, err = db.QueryKeys(qx.Query(qx.EQ("name", "ghostB")))
+	ghostBKeys, err = readQueryKeys(c, qx.Query(qx.EQ("name", "ghostB")))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=ghostB after recovery): %v", err)
 	}
@@ -1124,45 +1120,45 @@ func TestSnapshotExtra_StringKeyBatchRollbackLeavesPublicStateCleanAndRecovers(t
 		t.Fatalf("rolled-back ghostB key became queryable after recovery: %v", ghostBKeys)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_MaterializedPredCacheDoesNotLeakAcrossTouchedSnapshot(t *testing.T) {
 	opts := snapshotExtraOptions()
-	opts.SnapshotMaterializedPredCacheMaxEntries = 64
-	db, _ := snapshotExtraOpenTempDBUint64(t, opts)
+	opts.MaterializedPredicateCacheMaxEntries = 64
+	c, _ := snapshotExtraOpenTempUint64Collection(t, opts)
 
-	if err := db.Set(1, &snapshotExtraRec{Name: "alice", Email: "alpha@example.com"}); err != nil {
+	if err := writeSet(c, 1, &snapshotExtraRec{Name: "alice", Email: "alpha@example.com"}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &snapshotExtraRec{Name: "bob", Email: "beta@example.com"}); err != nil {
+	if err := writeSet(c, 2, &snapshotExtraRec{Name: "bob", Email: "beta@example.com"}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
 	alphaQ := qx.Query(qx.PREFIX("email", "alpha"))
 	futureQ := qx.Query(qx.PREFIX("email", "future"))
-	oldAlpha, err := db.QueryKeys(alphaQ)
+	oldAlpha, err := readQueryKeys(c, alphaQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(alpha warm): %v", err)
 	}
 	if !slices.Equal(oldAlpha, []uint64{1}) {
 		t.Fatalf("unexpected warm alpha result: got=%v want=[1]", oldAlpha)
 	}
-	oldFuture, err := db.QueryKeys(futureQ)
+	oldFuture, err := readQueryKeys(c, futureQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(future warm): %v", err)
 	}
 	if len(oldFuture) != 0 {
 		t.Fatalf("unexpected warm future result: %v", oldFuture)
 	}
-	if err = db.Patch(1, []Field{{Name: "email", Value: "gamma@example.com"}}); err != nil {
+	if err = writePatch(c, 1, []Field{{Name: "email", Value: "gamma@example.com"}}); err != nil {
 		t.Fatalf("Patch(email): %v", err)
 	}
-	if err := db.Set(3, &snapshotExtraRec{Name: "carol", Email: "future@example.com"}); err != nil {
+	if err := writeSet(c, 3, &snapshotExtraRec{Name: "carol", Email: "future@example.com"}); err != nil {
 		t.Fatalf("Set(3): %v", err)
 	}
 
-	currentAlpha, err := db.QueryKeys(alphaQ)
+	currentAlpha, err := readQueryKeys(c, alphaQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(alpha): %v", err)
 	}
@@ -1170,7 +1166,7 @@ func TestSnapshotExtra_MaterializedPredCacheDoesNotLeakAcrossTouchedSnapshot(t *
 		t.Fatalf("current snapshot kept stale alpha match: %v", currentAlpha)
 	}
 
-	currentFuture, err := db.QueryKeys(futureQ)
+	currentFuture, err := readQueryKeys(c, futureQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(future): %v", err)
 	}
@@ -1184,26 +1180,24 @@ func TestSnapshotExtra_PublicQueriesUnaffectedByOtherBucketWrites(t *testing.T) 
 	defer func() { _ = raw.Close() }()
 
 	opts := snapshotExtraOptions()
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
 
-	dbA, err := New[uint64, snapshotExtraRec](raw, opts)
+	dbA, err := Open[uint64, snapshotExtraRec](raw, opts)
 	if err != nil {
 		t.Fatalf("New(bucket A): %v", err)
 	}
 	defer func() { _ = dbA.Close() }()
 
 	opts.BucketName = "snapshot_extra_b"
-	dbB, err := New[uint64, snapshotExtraRec](raw, opts)
+	dbB, err := Open[uint64, snapshotExtraRec](raw, opts)
 	if err != nil {
 		t.Fatalf("New(bucket B): %v", err)
 	}
 	defer func() { _ = dbB.Close() }()
 
-	if err := dbA.Set(1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(dbA, 1, &snapshotExtraRec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("dbA Set(1): %v", err)
 	}
-	if err := dbA.Set(2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
+	if err := writeSet(dbA, 2, &snapshotExtraRec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("dbA Set(2): %v", err)
 	}
 
@@ -1212,7 +1206,7 @@ func TestSnapshotExtra_PublicQueriesUnaffectedByOtherBucketWrites(t *testing.T) 
 	writerDone := make(chan error, 1)
 	go func() {
 		for i := 0; i < 64; i++ {
-			if err := dbB.Set(uint64(i+1), &snapshotExtraRec{
+			if err := writeSet(dbB, uint64(i+1), &snapshotExtraRec{
 				Name: fmt.Sprintf("other-%02d", i),
 				Age:  100 + i,
 			}); err != nil {
@@ -1224,7 +1218,7 @@ func TestSnapshotExtra_PublicQueriesUnaffectedByOtherBucketWrites(t *testing.T) 
 	}()
 
 	for i := 0; i < 64; i++ {
-		items, err := dbA.QueryKeys(qx.Query().Sort("name", qx.ASC))
+		items, err := readQueryKeys(dbA, qx.Query().Sort("name", qx.ASC))
 		if err != nil {
 			t.Fatalf("dbA QueryKeys(iter=%d): %v", i, err)
 		}
@@ -1242,7 +1236,7 @@ func TestSnapshotExtra_PublicQueriesUnaffectedByOtherBucketWrites(t *testing.T) 
 		t.Fatalf("dbA snapshot sequence changed due to other bucket writes: before=%d after=%d", beforeSeq, afterSeq)
 	}
 
-	keys, err := dbA.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	keys, err := readQueryKeys(dbA, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("dbA QueryKeys(final): %v", err)
 	}
@@ -1251,10 +1245,10 @@ func TestSnapshotExtra_PublicQueriesUnaffectedByOtherBucketWrites(t *testing.T) 
 	}
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteBeforeCommit(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteOnChange(t *testing.T) {
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3},
 		[]*snapshotExtraRec{
 			{Name: "alice", Age: 30},
@@ -1262,10 +1256,10 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteBeforeCommit(t *testing.
 			{Name: "carol", Age: 40},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1276,26 +1270,26 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteBeforeCommit(t *testing.
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Delete(2, blockCommit)
+		done <- writeDelete(c, 2, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "delete before commit hook")
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	snapshotExtraWait(t, entered, "delete before change hook")
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("current snapshot changed before delete publish: got=%d want=%d", got, oldSeq)
 	}
 
-	beforeAll, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	beforeAll, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(all before delete publish): %v", err)
 	}
 	if !slices.Equal(beforeAll, []uint64{1, 2, 3}) {
 		t.Fatalf("public query drifted before delete publish: got=%v want=[1 2 3]", beforeAll)
 	}
-	beforeBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	beforeBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob before delete publish): %v", err)
 	}
@@ -1308,14 +1302,14 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteBeforeCommit(t *testing.
 		t.Fatalf("Delete(2): %v", err)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	currentKeys, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after delete): %v", err)
 	}
 	if !slices.Equal(currentKeys, []uint64{1, 3}) {
 		t.Fatalf("current snapshot missed committed delete: got=%v want=[1 3]", currentKeys)
 	}
-	currentBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	currentBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob after delete): %v", err)
 	}
@@ -1323,13 +1317,13 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteBeforeCommit(t *testing.
 		t.Fatalf("current snapshot retained deleted row: %v", currentBob)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteRollback(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3},
 		[]*snapshotExtraRec{
 			{Name: "alice", Age: 30},
@@ -1337,10 +1331,10 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteRollback(t *testing.T) {
 			{Name: "carol", Age: 40},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1351,16 +1345,16 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteRollback(t *testing.T) {
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback delete"))
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback delete"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Delete(2, blockCommit)
+		done <- writeDelete(c, 2, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "rollback delete before commit hook")
+	snapshotExtraWait(t, entered, "rollback delete before change hook")
 
-	beforeAll, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	beforeAll, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(all before delete rollback): %v", err)
 	}
@@ -1374,18 +1368,18 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteRollback(t *testing.T) {
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
 
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("rollback replaced published snapshot: got=%d want=%d", got, oldSeq)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	currentKeys, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after rollback): %v", err)
 	}
 	if !slices.Equal(currentKeys, []uint64{1, 2, 3}) {
 		t.Fatalf("current snapshot changed after rolled-back delete: got=%v want=[1 2 3]", currentKeys)
 	}
-	currentBob, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	currentBob, err := readQueryKeys(c, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
 		t.Fatalf("QueryKeys(bob after rollback): %v", err)
 	}
@@ -1393,13 +1387,13 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightDeleteRollback(t *testing.T) {
 		t.Fatalf("current snapshot lost rolled-back row: got=%v want=[2]", currentBob)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteBeforeCommit(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightMultiDeleteOnChange(t *testing.T) {
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3, 4},
 		[]*snapshotExtraRec{
 			{Name: "alice", Age: 30},
@@ -1408,10 +1402,10 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteBeforeCommit(t *tes
 			{Name: "dave", Age: 50},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1422,19 +1416,19 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteBeforeCommit(t *tes
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, nil)
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, nil)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.BatchDelete([]uint64{2, 2, 3, 3}, blockCommit)
+		done <- writeDeletes(c, []uint64{2, 2, 3, 3}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "batch_delete before commit hook")
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	snapshotExtraWait(t, entered, "batch_delete before change hook")
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("current snapshot changed before batch_delete publish: got=%d want=%d", got, oldSeq)
 	}
 
-	beforeAll, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	beforeAll, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(all before batch_delete publish): %v", err)
 	}
@@ -1444,17 +1438,17 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteBeforeCommit(t *tes
 
 	close(release)
 	if err := <-done; err != nil {
-		t.Fatalf("BatchDelete(2,2,3,3): %v", err)
+		t.Fatalf("MultiDelete(2,2,3,3): %v", err)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	currentKeys, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after batch_delete): %v", err)
 	}
 	if !slices.Equal(currentKeys, []uint64{1, 4}) {
 		t.Fatalf("current snapshot missed committed batch_delete: got=%v want=[1 4]", currentKeys)
 	}
-	currentDeleted, err := db.QueryKeys(qx.Query(qx.IN("name", []string{"bob", "carol"})))
+	currentDeleted, err := readQueryKeys(c, qx.Query(qx.IN("name", []string{"bob", "carol"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(deleted names after batch_delete): %v", err)
 	}
@@ -1462,13 +1456,13 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteBeforeCommit(t *tes
 		t.Fatalf("current snapshot retained batch-deleted rows: %v", currentDeleted)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
-func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteRollback(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBUint64(t, snapshotExtraOptions())
+func TestSnapshotExtra_PublicQueriesIgnoreInFlightMultiDeleteRollback(t *testing.T) {
+	c, _ := snapshotExtraOpenTempUint64Collection(t, snapshotExtraOptions())
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3, 4},
 		[]*snapshotExtraRec{
 			{Name: "alice", Age: 30},
@@ -1477,10 +1471,10 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteRollback(t *testing
 			{Name: "dave", Age: 50},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
-	oldSeq := db.SnapshotStats().Sequence
+	oldSeq := c.SnapshotStats().Sequence
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1491,16 +1485,16 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteRollback(t *testing
 			close(release)
 		}
 	})
-	blockCommit := snapshotExtraBlockBeforeCommitUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback batch_delete"))
+	blockChange := snapshotExtraBlockOnChangeUint64[snapshotExtraRec](entered, release, fmt.Errorf("failpoint: rollback batch_delete"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- db.BatchDelete([]uint64{2, 2, 3, 3}, blockCommit)
+		done <- writeDeletes(c, []uint64{2, 2, 3, 3}, blockChange)
 	}()
 
-	snapshotExtraWait(t, entered, "rollback batch_delete before commit hook")
+	snapshotExtraWait(t, entered, "rollback batch_delete before change hook")
 
-	beforeAll, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	beforeAll, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(all before batch_delete rollback): %v", err)
 	}
@@ -1514,11 +1508,11 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteRollback(t *testing
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
 
-	if got := db.SnapshotStats().Sequence; got != oldSeq {
+	if got := c.SnapshotStats().Sequence; got != oldSeq {
 		t.Fatalf("rollback replaced published snapshot: got=%d want=%d", got, oldSeq)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
+	currentKeys, err := readQueryKeys(c, qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after rollback): %v", err)
 	}
@@ -1526,15 +1520,15 @@ func TestSnapshotExtra_PublicQueriesIgnoreInFlightBatchDeleteRollback(t *testing
 		t.Fatalf("current snapshot changed after rolled-back batch_delete: got=%v want=[1 2 3 4]", currentKeys)
 	}
 
-	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
+	snapshotExtraAssertNoFutureSnapshotRefs(t, c)
 }
 
 func TestSnapshotExtra_PrefixQueriesAfterTruncateRebuild(t *testing.T) {
 	opts := snapshotExtraOptions()
-	opts.SnapshotMaterializedPredCacheMaxEntries = 64
-	db, _ := snapshotExtraOpenTempDBUint64(t, opts)
+	opts.MaterializedPredicateCacheMaxEntries = 64
+	c, _ := snapshotExtraOpenTempUint64Collection(t, opts)
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3},
 		[]*snapshotExtraRec{
 			{Name: "alice", Email: "alpha-one@example.com"},
@@ -1542,20 +1536,20 @@ func TestSnapshotExtra_PrefixQueriesAfterTruncateRebuild(t *testing.T) {
 			{Name: "carol", Email: "alpha-two@example.com"},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
 	alphaQ := qx.Query(qx.PREFIX("email", "alpha"))
 	futureQ := qx.Query(qx.PREFIX("email", "future"))
 
-	oldAlpha, err := db.QueryKeys(alphaQ)
+	oldAlpha, err := readQueryKeys(c, alphaQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(alpha warm): %v", err)
 	}
 	if !queryIDsEqual(alphaQ, oldAlpha, []uint64{1, 3}) {
 		t.Fatalf("unexpected alpha warm result: got=%v want=[1 3]", oldAlpha)
 	}
-	oldFuture, err := db.QueryKeys(futureQ)
+	oldFuture, err := readQueryKeys(c, futureQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(future warm): %v", err)
 	}
@@ -1563,27 +1557,27 @@ func TestSnapshotExtra_PrefixQueriesAfterTruncateRebuild(t *testing.T) {
 		t.Fatalf("unexpected future warm result: %v", oldFuture)
 	}
 
-	if err := db.Truncate(); err != nil {
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2},
 		[]*snapshotExtraRec{
 			{Name: "new-future", Email: "future@example.com"},
 			{Name: "new-gamma", Email: "gamma@example.com"},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet(rebuild): %v", err)
+		t.Fatalf("MultiSet(rebuild): %v", err)
 	}
 
-	currentAlpha, err := db.QueryKeys(alphaQ)
+	currentAlpha, err := readQueryKeys(c, alphaQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(current alpha): %v", err)
 	}
 	if len(currentAlpha) != 0 {
 		t.Fatalf("current snapshot retained stale alpha match after truncate rebuild: %v", currentAlpha)
 	}
-	currentFuture, err := db.QueryKeys(futureQ)
+	currentFuture, err := readQueryKeys(c, futureQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(current future): %v", err)
 	}
@@ -1597,9 +1591,9 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 	opts.NumericRangeBucketSize = 64
 	opts.NumericRangeBucketMinFieldKeys = 1
 	opts.NumericRangeBucketMinSpanKeys = 1
-	db, _ := snapshotExtraOpenTempDBUint64(t, opts)
+	c, _ := snapshotExtraOpenTempUint64Collection(t, opts)
 
-	snapshotExtraSeedGeneratedUint64Data(t, db, 512, func(i int) *snapshotExtraRec {
+	snapshotExtraSeedGeneratedUint64Data(t, c, 512, func(i int) *snapshotExtraRec {
 		return &snapshotExtraRec{
 			Name: fmt.Sprintf("user-%04d", i),
 			Age:  i,
@@ -1607,7 +1601,7 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 	})
 
 	oldHighQ := qx.Query(qx.GTE("age", 400))
-	oldHigh, err := db.QueryKeys(oldHighQ)
+	oldHigh, err := readQueryKeys(c, oldHighQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(old high warm): %v", err)
 	}
@@ -1615,17 +1609,17 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 		t.Fatalf("unexpected old high range result: len=%d ids=%v", len(oldHigh), oldHigh)
 	}
 
-	if err := db.Truncate(); err != nil {
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	snapshotExtraSeedGeneratedUint64Data(t, db, 128, func(i int) *snapshotExtraRec {
+	snapshotExtraSeedGeneratedUint64Data(t, c, 128, func(i int) *snapshotExtraRec {
 		return &snapshotExtraRec{
 			Name: fmt.Sprintf("rebuild-%03d", i),
 			Age:  i,
 		}
 	})
 
-	currentHigh, err := db.QueryKeys(oldHighQ)
+	currentHigh, err := readQueryKeys(c, oldHighQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(current high): %v", err)
 	}
@@ -1634,7 +1628,7 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 	}
 
 	currentMidQ := qx.Query(qx.GTE("age", 64))
-	currentMid, err := db.QueryKeys(currentMidQ)
+	currentMid, err := readQueryKeys(c, currentMidQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(current mid): %v", err)
 	}
@@ -1644,7 +1638,7 @@ func TestSnapshotExtra_NumericRangeQueriesAfterTruncateRebuild(t *testing.T) {
 }
 
 func TestSnapshotExtra_StringQueryKeysStaySingleSnapshotAcrossConcurrentTruncateRebuilds(t *testing.T) {
-	db, _ := snapshotExtraOpenTempDBString(t, snapshotExtraOptions())
+	c, _ := snapshotExtraOpenTempStringCollection(t, snapshotExtraOptions())
 
 	const seedN = 128
 	keys := make([]string, 0, seedN)
@@ -1658,13 +1652,13 @@ func TestSnapshotExtra_StringQueryKeysStaySingleSnapshotAcrossConcurrentTruncate
 			Age:   i,
 		})
 	}
-	if err := db.BatchSet(keys, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
+	if err := writeSets(c, keys, vals); err != nil {
+		t.Fatalf("MultiSet(seed): %v", err)
 	}
 
 	wantOld := slices.Clone(keys)
 	queryKeys := func() ([]string, error) {
-		return db.QueryKeys(qx.Query())
+		return readQueryKeys(c, qx.Query())
 	}
 	validKeys := func(got []string) bool {
 		if len(got) == 0 || slices.Equal(got, wantOld) {
@@ -1708,7 +1702,7 @@ func TestSnapshotExtra_StringQueryKeysStaySingleSnapshotAcrossConcurrentTruncate
 			if failed.Load() != nil {
 				return
 			}
-			if err := db.Truncate(); err != nil {
+			if err := c.Truncate(); err != nil {
 				setFailed(fmt.Sprintf("Truncate failed: %v", err))
 				return
 			}
@@ -1723,8 +1717,8 @@ func TestSnapshotExtra_StringQueryKeysStaySingleSnapshotAcrossConcurrentTruncate
 					Age:   round*100 + i,
 				})
 			}
-			if err := db.BatchSet(rebuildKeys, rebuildVals); err != nil {
-				setFailed(fmt.Sprintf("BatchSet(rebuild) failed: %v", err))
+			if err := writeSets(c, rebuildKeys, rebuildVals); err != nil {
+				setFailed(fmt.Sprintf("MultiSet(rebuild) failed: %v", err))
 				return
 			}
 		}

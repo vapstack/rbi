@@ -52,26 +52,26 @@ func TestParseWorkerCommand(t *testing.T) {
 	}
 }
 
-func TestMakeBatchSampleDelta(t *testing.T) {
-	baseline := rbistats.AutoBatch{
-		Submitted:        10,
-		ExecutedBatches:  5,
-		CoalesceWaitTime: 2 * time.Millisecond,
+func TestMakeWriteSampleDelta(t *testing.T) {
+	baseline := rbistats.Store{
+		LogicalUnitsSubmitted: 10,
+		ExecutedBatches:       5,
+		RejectedClosed:        2,
 	}
-	current := rbistats.AutoBatch{
-		Submitted:        19,
-		ExecutedBatches:  8,
-		CoalesceWaitTime: 7 * time.Millisecond,
+	current := rbistats.Store{
+		LogicalUnitsSubmitted: 19,
+		ExecutedBatches:       8,
+		RejectedClosed:        7,
 	}
-	sample := makeBatchSample(time.Unix(0, 0), baseline, current)
-	if sample.Delta.Submitted != 9 {
-		t.Fatalf("Submitted delta = %d, want 9", sample.Delta.Submitted)
+	sample := makeWriteSample(time.Unix(0, 0), baseline, current)
+	if sample.Delta.LogicalUnitsSubmitted != 9 {
+		t.Fatalf("LogicalUnitsSubmitted delta = %d, want 9", sample.Delta.LogicalUnitsSubmitted)
 	}
 	if sample.Delta.ExecutedBatches != 3 {
 		t.Fatalf("ExecutedBatches delta = %d, want 3", sample.Delta.ExecutedBatches)
 	}
-	if sample.Delta.CoalesceWaitTime != 5*time.Millisecond {
-		t.Fatalf("CoalesceWaitTime delta = %s, want 5ms", sample.Delta.CoalesceWaitTime)
+	if sample.Delta.RejectedClosed != 5 {
+		t.Fatalf("RejectedClosed delta = %d, want 5", sample.Delta.RejectedClosed)
 	}
 }
 
@@ -186,7 +186,7 @@ func TestParseOptionsGroupWorkerFlags(t *testing.T) {
 
 func TestPhaseReportsTrackManualCommandBoundaries(t *testing.T) {
 	app := newApp(
-		&DBHandle{},
+		&CollectionHandle{},
 		[]*classDescriptor{
 			{
 				Info: StressClassInfo{
@@ -249,7 +249,7 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 		}
 	})
 
-	if err := handle.DB.Set(1, generateUser(mathutil.NewRand(1), 1)); err != nil {
+	if err := stressWriteSet(handle.Collection, 1, generateUser(mathutil.NewRand(1), 1)); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
@@ -269,7 +269,7 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 	)
 
 	report := app.buildReport(false)
-	want := handle.DB.IndexStats()
+	want := handle.Collection.IndexStats()
 	if !reflect.DeepEqual(report.IndexStats, want) {
 		t.Fatalf("report.IndexStats = %+v, want %+v", report.IndexStats, want)
 	}
@@ -281,11 +281,30 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 	if got := bytes.Count(data, []byte(`"index_stats"`)); got != 1 {
 		t.Fatalf("expected final report JSON to contain exactly one index_stats section, got %d", got)
 	}
+
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal(report): %v", err)
+	}
+	var snapshot map[string]json.RawMessage
+	if err = json.Unmarshal(raw["snapshot_baseline"], &snapshot); err != nil {
+		t.Fatalf("Unmarshal(snapshot_baseline): %v", err)
+	}
+	if _, ok := snapshot["root"]; ok {
+		t.Fatalf("snapshot_baseline contains duplicated root store stats")
+	}
+	var write map[string]json.RawMessage
+	if err = json.Unmarshal(raw["write_baseline"], &write); err != nil {
+		t.Fatalf("Unmarshal(write_baseline): %v", err)
+	}
+	if _, ok := write["stats"]; !ok {
+		t.Fatalf("write_baseline missing store stats")
+	}
 }
 
 func TestRunHeadlessStopsOnWorkerError(t *testing.T) {
 	app := newApp(
-		&DBHandle{},
+		&CollectionHandle{},
 		[]*classDescriptor{
 			{
 				Info: StressClassInfo{
@@ -360,7 +379,7 @@ func TestRunHeadlessStopsOnWorkerError(t *testing.T) {
 
 func TestPrintWorkerErrorsIncludesExecutionContext(t *testing.T) {
 	app := newApp(
-		&DBHandle{},
+		&CollectionHandle{},
 		[]*classDescriptor{
 			{
 				Info: StressClassInfo{

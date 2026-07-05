@@ -8,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -20,23 +19,23 @@ type indexStatsTestRec struct {
 	Rank *int   `db:"rank" rbi:"index"`
 }
 
-func openTempDBUint64IndexStats(t *testing.T, options ...Options) *DB[uint64, indexStatsTestRec] {
+func openTempDBUint64IndexStats(t *testing.T, options ...Options) *Collection[uint64, indexStatsTestRec] {
 	t.Helper()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "index_stats.db")
-	db, raw := openBoltAndNew[uint64, indexStatsTestRec](t, path, options...)
+	c, bolt := openBoltAndCollection[uint64, indexStatsTestRec](t, path, options...)
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db
+	return c
 }
 
 func TestLenIndex_ZeroComplementClearsStaleFlagsAfterPatch(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 90; i++ {
 		rec := &Rec{
@@ -47,7 +46,7 @@ func TestLenIndex_ZeroComplementClearsStaleFlagsAfterPatch(t *testing.T) {
 		if i%5 == 0 {
 			rec.Tags = []string{"go"}
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
@@ -56,12 +55,12 @@ func TestLenIndex_ZeroComplementClearsStaleFlagsAfterPatch(t *testing.T) {
 		if i%5 == 0 {
 			continue
 		}
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string{"go"}}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: []string{"go"}}}); err != nil {
 			t.Fatalf("Patch(%d): %v", i, err)
 		}
 	}
 
-	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	got, err := readQueryKeys(c, qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
@@ -71,21 +70,21 @@ func TestLenIndex_ZeroComplementClearsStaleFlagsAfterPatch(t *testing.T) {
 }
 
 func TestIndex_DeleteCleanState(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 30}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "bob", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Set(3, &Rec{Name: "charlie", Age: 30}); err != nil {
+	if err := writeSet(c, 3, &Rec{Name: "charlie", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Delete(2); err != nil {
+	if err := writeDelete(c, 2); err != nil {
 		t.Fatal(err)
 	}
-	cnt, err := db.Count(qx.EQ("age", 30))
+	cnt, err := readCount(c, qx.EQ("age", 30))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +92,7 @@ func TestIndex_DeleteCleanState(t *testing.T) {
 		t.Fatalf("expected count 2, got %d", cnt)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 30)))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,15 +104,14 @@ func TestIndex_DeleteCleanState(t *testing.T) {
 }
 
 func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 2 * time.Millisecond,
-		AutoBatchMax:    16,
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 16,
 	})
 
 	countries := []string{"NL", "PL", "DE", "US"}
 	for i := 1; i <= 220; i++ {
 		id := uint64(i)
-		if err := db.Set(id, &Rec{
+		if err := writeSet(c, id, &Rec{
 			Meta:     Meta{Country: countries[i%len(countries)]},
 			Name:     fmt.Sprintf("seed-%03d", i),
 			Age:      18 + (i % 60),
@@ -162,7 +160,7 @@ func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 						Tags:     []string{fmt.Sprintf("w%d", w%4), fmt.Sprintf("grp-%d", i%7)},
 						FullName: fmt.Sprintf("FN-%05d", id),
 					}
-					if err := db.Set(id, rec); err != nil {
+					if err := writeSet(c, id, rec); err != nil {
 						errCh <- fmt.Errorf("writer=%d Set(id=%d): %w", w, id, err)
 						return
 					}
@@ -172,12 +170,12 @@ func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 						{Name: "active", Value: i%2 == 0},
 						{Name: "country", Value: countries[(w+i)%len(countries)]},
 					}
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						errCh <- fmt.Errorf("writer=%d Patch(id=%d): %w", w, id, err)
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(id=%d): %w", w, id, err)
 						return
 					}
@@ -193,15 +191,15 @@ func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < readerOps; i++ {
 				q := queries[(r+i)%len(queries)]
-				if _, err := db.QueryKeys(q); err != nil {
+				if _, err := readQueryKeys(c, q); err != nil {
 					errCh <- fmt.Errorf("reader=%d QueryKeys(i=%d): %w", r, i, err)
 					return
 				}
-				if _, err := db.Query(q); err != nil {
+				if _, err := readQuery(c, q); err != nil {
 					errCh <- fmt.Errorf("reader=%d Query(i=%d): %w", r, i, err)
 					return
 				}
-				if _, err := db.Count(q.Filter); err != nil {
+				if _, err := readCount(c, q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader=%d Count(i=%d): %w", r, i, err)
 					return
 				}
@@ -225,11 +223,11 @@ func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 		qx.Query(qx.NOT(qx.EQ("active", false))).SortBy(qx.POS("tags", []string{"w0", "w1", "seed", "grp-1"}), qx.DESC).Offset(2).Limit(85),
 	}
 	for i, q := range checkQueries {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("check QueryKeys(%d): %v", i, err)
 		}
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("check expectedKeysUint64(%d): %v", i, err)
 		}
@@ -239,13 +237,13 @@ func TestIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	}
 
 	var seqCount uint64
-	if err := db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
+	if err := readSeqScan(c, 0, func(_ uint64, _ *Rec) (bool, error) {
 		seqCount++
 		return true, nil
 	}); err != nil {
 		t.Fatalf("SeqScan(final): %v", err)
 	}
-	cnt, err := db.Count()
+	cnt, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count(): %v", err)
 	}
@@ -268,18 +266,18 @@ func strPtr(v string) *string {
 	return &v
 }
 
-func openTempDBUint64PtrInt(t *testing.T, options ...Options) (*DB[uint64, PtrIntRec], string) {
+func openTempDBUint64PtrInt(t *testing.T, options ...Options) (*Collection[uint64, PtrIntRec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_uint64_ptrint.db")
-	db, raw := openBoltAndNew[uint64, PtrIntRec](t, path, options...)
+	c, bolt := openBoltAndCollection[uint64, PtrIntRec](t, path, options...)
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db, path
+	return c, path
 }
 
 func sortedIDsCopy(ids []uint64) []uint64 {
@@ -294,7 +292,7 @@ func assertSameSet(t *testing.T, got, want []uint64) {
 }
 
 func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil", Opt: nil, Active: true},
@@ -304,42 +302,42 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
 
-	gotNil, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)))
+	gotNil, err := readQueryKeys(c, qx.Query(qx.EQ("opt", nil)))
 	if err != nil {
 		t.Fatalf("QueryKeys(EQ nil): %v", err)
 	}
 	assertSameSlice(t, gotNil, []uint64{1})
 
-	gotIn, err := db.QueryKeys(qx.Query(qx.IN("opt", []any{nil, "alpha"})))
+	gotIn, err := readQueryKeys(c, qx.Query(qx.IN("opt", []any{nil, "alpha"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(IN nil,alpha): %v", err)
 	}
 	assertSameSet(t, gotIn, []uint64{1, 3})
 
-	gotNE, err := db.QueryKeys(qx.Query(qx.NE("opt", nil)))
+	gotNE, err := readQueryKeys(c, qx.Query(qx.NE("opt", nil)))
 	if err != nil {
 		t.Fatalf("QueryKeys(NE nil): %v", err)
 	}
 	assertSameSet(t, gotNE, []uint64{2, 3, 4, 5})
 
-	gotPrefix, err := db.QueryKeys(qx.Query(qx.PREFIX("opt", "")))
+	gotPrefix, err := readQueryKeys(c, qx.Query(qx.PREFIX("opt", "")))
 	if err != nil {
 		t.Fatalf("QueryKeys(PREFIX empty): %v", err)
 	}
 	assertSameSet(t, gotPrefix, []uint64{2, 3, 4, 5})
 
-	gotSuffix, err := db.QueryKeys(qx.Query(qx.SUFFIX("opt", "ha")))
+	gotSuffix, err := readQueryKeys(c, qx.Query(qx.SUFFIX("opt", "ha")))
 	if err != nil {
 		t.Fatalf("QueryKeys(SUFFIX ha): %v", err)
 	}
 	assertSameSlice(t, gotSuffix, []uint64{3})
 
-	gotContains, err := db.QueryKeys(qx.Query(qx.CONTAINS("opt", "il")))
+	gotContains, err := readQueryKeys(c, qx.Query(qx.CONTAINS("opt", "il")))
 	if err != nil {
 		t.Fatalf("QueryKeys(CONTAINS il): %v", err)
 	}
@@ -351,11 +349,11 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 		qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2),
 		qx.Query(qx.EQ("active", true)).Sort("opt", qx.DESC).Offset(1).Limit(2),
 	} {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("QueryKeys(%+v): %v", q, err)
 		}
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 		}
@@ -364,11 +362,8 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 }
 
 func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
-	db, path := openTempDBUint64PtrInt(t)
-	opts := testOptions(Options{
-		EnableAutoBatchStats: true,
-		EnableSnapshotStats:  true,
-	})
+	c, path := openTempDBUint64PtrInt(t)
+	opts := testOptions(Options{})
 
 	rows := map[uint64]*PtrIntRec{
 		1: {Name: "nil", Rank: nil, Active: true},
@@ -377,7 +372,7 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 		4: {Name: "twenty", Rank: intPtr(20), Active: true},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -385,43 +380,43 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 	check := func(stage string, wantAsc, wantDesc, wantNil, wantIn, wantGT []uint64, wantCountNil, wantCountIn uint64) {
 		t.Helper()
 
-		gotNil, err := db.QueryKeys(qx.Query(qx.EQ("rank", nil)))
+		gotNil, err := readQueryKeys(c, qx.Query(qx.EQ("rank", nil)))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(EQ nil): %v", stage, err)
 		}
 		assertSameSlice(t, gotNil, wantNil)
 
-		gotIn, err := db.QueryKeys(qx.Query(qx.IN("rank", []any{nil, 10})))
+		gotIn, err := readQueryKeys(c, qx.Query(qx.IN("rank", []any{nil, 10})))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(IN nil,10): %v", stage, err)
 		}
 		assertSameSet(t, gotIn, wantIn)
 
-		gotGT, err := db.QueryKeys(qx.Query(qx.GT("rank", 0)))
+		gotGT, err := readQueryKeys(c, qx.Query(qx.GT("rank", 0)))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(GT 0): %v", stage, err)
 		}
 		assertSameSet(t, gotGT, wantGT)
 
-		gotAsc, err := db.QueryKeys(qx.Query().Sort("rank", qx.ASC))
+		gotAsc, err := readQueryKeys(c, qx.Query().Sort("rank", qx.ASC))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank ASC): %v", stage, err)
 		}
 		assertSameSlice(t, gotAsc, wantAsc)
 
-		gotDesc, err := db.QueryKeys(qx.Query().Sort("rank", qx.DESC))
+		gotDesc, err := readQueryKeys(c, qx.Query().Sort("rank", qx.DESC))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank DESC): %v", stage, err)
 		}
 		assertSameSlice(t, gotDesc, wantDesc)
 
-		gotAscPage, err := db.QueryKeys(qx.Query().Sort("rank", qx.ASC).Offset(1).Limit(3))
+		gotAscPage, err := readQueryKeys(c, qx.Query().Sort("rank", qx.ASC).Offset(1).Limit(3))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank ASC page): %v", stage, err)
 		}
 		assertSameSlice(t, gotAscPage, wantAsc[1:])
 
-		cntNil, err := db.Count(qx.Query(qx.EQ("rank", nil)).Filter)
+		cntNil, err := readCount(c, qx.Query(qx.EQ("rank", nil)).Filter)
 		if err != nil {
 			t.Fatalf("%s Count(EQ nil): %v", stage, err)
 		}
@@ -429,7 +424,7 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 			t.Fatalf("%s Count(EQ nil) mismatch: got=%d want=%d", stage, cntNil, wantCountNil)
 		}
 
-		cntIn, err := db.Count(qx.Query(qx.IN("rank", []any{nil, 10})).Filter)
+		cntIn, err := readCount(c, qx.Query(qx.IN("rank", []any{nil, 10})).Filter)
 		if err != nil {
 			t.Fatalf("%s Count(IN nil,10): %v", stage, err)
 		}
@@ -440,23 +435,23 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 
 	check("base", []uint64{2, 3, 4, 1}, []uint64{4, 3, 2, 1}, []uint64{1}, []uint64{1, 3}, []uint64{3, 4}, 1, 2)
 
-	if err := db.Patch(1, []Field{{Name: "rank", Value: 15}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "rank", Value: 15}}); err != nil {
 		t.Fatalf("Patch(1 rank=15): %v", err)
 	}
-	if err := db.Patch(2, []Field{{Name: "rank", Value: (*int)(nil)}}); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "rank", Value: (*int)(nil)}}); err != nil {
 		t.Fatalf("Patch(2 rank=nil): %v", err)
 	}
-	if err := db.Patch(4, []Field{{Name: "rank", Value: 5}}); err != nil {
+	if err := writePatch(c, 4, []Field{{Name: "rank", Value: 5}}); err != nil {
 		t.Fatalf("Patch(4 rank=5): %v", err)
 	}
 
 	check("delta", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
-	plannerStats := db.PlannerStats()
+	plannerStats := c.PlannerStats()
 	fs, ok := plannerStats.Fields["rank"]
 	if !ok {
 		t.Fatalf("planner stats missing rank field")
@@ -465,7 +460,7 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 		t.Fatalf("planner stats distinct keys mismatch: got=%d want=3", fs.DistinctKeys)
 	}
 
-	indexStats := db.IndexStats()
+	indexStats := c.IndexStats()
 	if got := indexStats.UniqueFieldKeys["rank"]; got != 3 {
 		t.Fatalf("index stats unique keys mismatch: got=%d want=3", got)
 	}
@@ -476,13 +471,13 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 		t.Fatalf("index stats field size should include nil family")
 	}
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := db.bolt.Close(); err != nil {
+	if err := c.root.bolt.Close(); err != nil {
 		t.Fatalf("bolt.Close: %v", err)
 	}
-	db = nil
+	c = nil
 
 	raw, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
@@ -495,7 +490,7 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 	}()
 
 	opts.DisableIndexLoad = true
-	reopened, err := New[uint64, PtrIntRec](raw, opts)
+	reopened, err := Open[uint64, PtrIntRec](raw, opts)
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
 	}
@@ -504,25 +499,25 @@ func TestPointerNil_IntQueriesCountStartupBuildAndReopen(t *testing.T) {
 			t.Fatalf("reopened.Close: %v", err)
 		}
 	}()
-	db = reopened
+	c = reopened
 
 	check("reopen", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 }
 
 func TestPointerNil_PatchClearsStaleNilState(t *testing.T) {
-	db, _ := openTempDBUint64PtrInt(t)
+	c, _ := openTempDBUint64PtrInt(t)
 
-	if err := db.Set(1, &PtrIntRec{Name: "nil", Rank: nil}); err != nil {
+	if err := writeSet(c, 1, &PtrIntRec{Name: "nil", Rank: nil}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &PtrIntRec{Name: "ten", Rank: intPtr(10)}); err != nil {
+	if err := writeSet(c, 2, &PtrIntRec{Name: "ten", Rank: intPtr(10)}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.Patch(1, []Field{{Name: "rank", Value: 20}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "rank", Value: 20}}); err != nil {
 		t.Fatalf("Patch(1 rank=20): %v", err)
 	}
 
-	gotNil, err := db.QueryKeys(qx.Query(qx.EQ("rank", nil)))
+	gotNil, err := readQueryKeys(c, qx.Query(qx.EQ("rank", nil)))
 	if err != nil {
 		t.Fatalf("QueryKeys(EQ nil): %v", err)
 	}
@@ -530,7 +525,7 @@ func TestPointerNil_PatchClearsStaleNilState(t *testing.T) {
 		t.Fatalf("expected no nil rows after patch, got %v", gotNil)
 	}
 
-	gotIn, err := db.QueryKeys(qx.Query(qx.IN("rank", []any{nil, 20})))
+	gotIn, err := readQueryKeys(c, qx.Query(qx.IN("rank", []any{nil, 20})))
 	if err != nil {
 		t.Fatalf("QueryKeys(IN nil,20): %v", err)
 	}
@@ -538,7 +533,7 @@ func TestPointerNil_PatchClearsStaleNilState(t *testing.T) {
 }
 
 func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	rows := map[uint64]*Rec{
 		1: {Meta: Meta{Country: "NL"}, Name: "a", Opt: nil, Active: true},
@@ -547,7 +542,7 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 		4: {Meta: Meta{Country: "NL"}, Name: "d", Opt: strPtr("gamma"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -557,17 +552,17 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 		qx.NOT(qx.EQ("country", "PL")),
 	).Sort("opt", qx.ASC).Limit(10)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
 
-	got, err = db.QueryKeys(q)
+	got, err = readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(second): %v", err)
 	}
@@ -575,7 +570,7 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 }
 
 func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil", Opt: nil, Active: true},
@@ -585,7 +580,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -598,11 +593,11 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.DESC).Offset(1).Limit(2),
 	}
 	for i, q := range queries {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("q%d QueryKeys: %v", i, err)
 		}
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("q%d expectedKeysUint64: %v", i, err)
 		}
@@ -611,16 +606,16 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 }
 
 func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
-	db, _ := openTempDBUint64PtrInt(t)
+	c, _ := openTempDBUint64PtrInt(t)
 
-	if err := db.Set(1, &PtrIntRec{Name: "a", Rank: nil}); err != nil {
+	if err := writeSet(c, 1, &PtrIntRec{Name: "a", Rank: nil}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &PtrIntRec{Name: "b", Rank: nil}); err != nil {
+	if err := writeSet(c, 2, &PtrIntRec{Name: "b", Rank: nil}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 	q := qx.Query().Sort("rank", qx.ASC).Limit(2)
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -628,7 +623,7 @@ func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
 }
 
 func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil", Opt: nil, Active: true},
@@ -638,7 +633,7 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -646,11 +641,11 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.ASC).Offset(1).Limit(3))
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -658,7 +653,7 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 }
 
 func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
 	})
 
@@ -670,14 +665,14 @@ func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
 		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	if err := db.Patch(1, []Field{{Name: "opt", Value: "zeta"}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "opt", Value: "zeta"}}); err != nil {
 		t.Fatalf("Patch(1 opt=zeta): %v", err)
 	}
-	if err := db.Patch(2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(2 opt=nil): %v", err)
 	}
 
@@ -685,11 +680,11 @@ func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.DESC).Offset(1).Limit(2))
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -698,7 +693,7 @@ func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
 
 /**/
 
-func indexExtBatchSetGenerated(t *testing.T, db *DB[uint64, Rec], start, end int, gen func(i int) *Rec) {
+func indexExtMultiSetGenerated(t *testing.T, db *Collection[uint64, Rec], start, end int, gen func(i int) *Rec) {
 	t.Helper()
 	if start > end {
 		return
@@ -710,8 +705,8 @@ func indexExtBatchSetGenerated(t *testing.T, db *DB[uint64, Rec], start, end int
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(start=%d,end=%d,size=%d): %v", start, end, len(batchIDs), err)
+		if err := writeSets(db, batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(start=%d,end=%d,size=%d): %v", start, end, len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -727,9 +722,9 @@ func indexExtBatchSetGenerated(t *testing.T, db *DB[uint64, Rec], start, end int
 	flush()
 }
 
-func indexExtAssertQueryKeysExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
+func indexExtAssertQueryKeysExpected(t *testing.T, db *Collection[uint64, Rec], q *qx.QX) []uint64 {
 	t.Helper()
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(db, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -741,13 +736,13 @@ func indexExtAssertQueryKeysExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX
 	return want
 }
 
-func indexExtAssertCountExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func indexExtAssertCountExpected(t *testing.T, db *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
 	want, err := expectedKeysUint64(t, db, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	got, err := db.Count(q.Filter)
+	got, err := readCount(db, q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -756,11 +751,11 @@ func indexExtAssertCountExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	}
 }
 
-func indexExtFloatSignedZeroDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtFloatSignedZeroCollection(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
 
-	db, _ := openTempDBUint64(t)
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
+	c, _ := openTempUint64Collection(t)
+	indexExtMultiSetGenerated(t, c, 1, 420, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("fzero/%03d", i),
 			Age:    i,
@@ -778,19 +773,19 @@ func indexExtFloatSignedZeroDB(t *testing.T) *DB[uint64, Rec] {
 		{id: 3, score: -1.0},
 		{id: 4, score: 1.0},
 	} {
-		if err := db.Patch(tc.id, []Field{{Name: "score", Value: tc.score}}); err != nil {
+		if err := writePatch(c, tc.id, []Field{{Name: "score", Value: tc.score}}); err != nil {
 			t.Fatalf("Patch(score %d): %v", tc.id, err)
 		}
 	}
 
-	return db
+	return c
 }
 
-func indexExtFloatNaNDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtFloatNaNCollection(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
 
-	db, _ := openTempDBUint64(t)
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
+	c, _ := openTempUint64Collection(t)
+	indexExtMultiSetGenerated(t, c, 1, 420, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("fnan/%03d", i),
 			Age:    i,
@@ -810,19 +805,19 @@ func indexExtFloatNaNDB(t *testing.T) *DB[uint64, Rec] {
 		{id: 5, score: 1.0},
 		{id: 6, score: math.Inf(1)},
 	} {
-		if err := db.Patch(tc.id, []Field{{Name: "score", Value: tc.score}}); err != nil {
+		if err := writePatch(c, tc.id, []Field{{Name: "score", Value: tc.score}}); err != nil {
 			t.Fatalf("Patch(score %d): %v", tc.id, err)
 		}
 	}
 
-	return db
+	return c
 }
 
-func indexExtNumericCoercionDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtNumericCoercionDB(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
 
-	db, _ := openTempDBUint64(t)
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
+	c, _ := openTempUint64Collection(t)
+	indexExtMultiSetGenerated(t, c, 1, 420, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("num/%03d", i),
 			Age:    i,
@@ -831,43 +826,43 @@ func indexExtNumericCoercionDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	})
 
-	return db
+	return c
 }
 
 func TestIndexExt_DBQueryAfterDistinctGrowthMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 300, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 300, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 
-	indexExtBatchSetGenerated(t, db, 301, 420, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 301, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 }
 
 func TestIndexExt_DBQueryAfterDistinctCollapseMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("dem/%03d", i), Age: i}
 	})
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 
 	for i := 1; i <= 50; i++ {
-		if err := db.Delete(uint64(i)); err != nil {
+		if err := writeDelete(c, uint64(i)); err != nil {
 			t.Fatalf("Delete(%d): %v", i, err)
 		}
 	}
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 }
 
 func TestIndexExt_DBPrefixQueryAfterSetPatchDeleteMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 450, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 450, func(i int) *Rec {
 		name := fmt.Sprintf("b/%03d", i)
 		switch {
 		case i <= 170:
@@ -879,27 +874,27 @@ func TestIndexExt_DBPrefixQueryAfterSetPatchDeleteMatchesExpected(t *testing.T) 
 	})
 
 	for _, id := range []uint64{171, 172, 173, 331, 332, 333} {
-		if err := db.Patch(id, []Field{{Name: "name", Value: fmt.Sprintf("aa/mut/%03d", id)}}); err != nil {
+		if err := writePatch(c, id, []Field{{Name: "name", Value: fmt.Sprintf("aa/mut/%03d", id)}}); err != nil {
 			t.Fatalf("Patch(%d): %v", id, err)
 		}
 	}
 	for _, id := range []uint64{10, 11, 12, 13, 14, 15} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
-	indexExtBatchSetGenerated(t, db, 451, 470, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 451, 470, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("aa/new/%03d", i), Age: i}
 	})
 
 	q := qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBRangeQueryAfterBoundaryPatchesMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 500, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 500, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("rng/%03d", i), Age: i}
 	})
 
@@ -914,19 +909,19 @@ func TestIndexExt_DBRangeQueryAfterBoundaryPatchesMatchesExpected(t *testing.T) 
 		{id: 54, age: 200},
 		{id: 55, age: 349},
 	} {
-		if err := db.Patch(tc.id, []Field{{Name: "age", Value: tc.age}}); err != nil {
+		if err := writePatch(c, tc.id, []Field{{Name: "age", Value: tc.age}}); err != nil {
 			t.Fatalf("Patch(%d): %v", tc.id, err)
 		}
 	}
 
 	q := qx.Query(qx.GTE("age", 200), qx.LT("age", 350)).Sort("age", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBCountAfterBoundaryPatchesAndDeletesMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 500, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 500, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("cnt/%03d", i),
 			Age:    1000 + i,
@@ -935,7 +930,7 @@ func TestIndexExt_DBCountAfterBoundaryPatchesAndDeletesMatchesExpected(t *testin
 	})
 
 	for _, id := range []uint64{110, 111, 112, 113, 114, 115} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
@@ -950,7 +945,7 @@ func TestIndexExt_DBCountAfterBoundaryPatchesAndDeletesMatchesExpected(t *testin
 		{id: 33, age: 1259, active: false},
 		{id: 34, age: 1180, active: true},
 	} {
-		if err := db.Patch(tc.id, []Field{
+		if err := writePatch(c, tc.id, []Field{
 			{Name: "age", Value: tc.age},
 			{Name: "active", Value: tc.active},
 		}); err != nil {
@@ -959,14 +954,14 @@ func TestIndexExt_DBCountAfterBoundaryPatchesAndDeletesMatchesExpected(t *testin
 	}
 
 	q := qx.Query(qx.GTE("age", 1100), qx.LT("age", 1260), qx.EQ("active", true))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBOrderAscAfterChurnMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 500, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 500, func(i int) *Rec {
 		return &Rec{
 			Name: fmt.Sprintf("orda/%03d", i),
 			Age:  i % 40,
@@ -985,24 +980,24 @@ func TestIndexExt_DBOrderAscAfterChurnMatchesExpected(t *testing.T) {
 		{id: 192, age: 17},
 		{id: 193, age: 17},
 	} {
-		if err := db.Patch(tc.id, []Field{{Name: "age", Value: tc.age}}); err != nil {
+		if err := writePatch(c, tc.id, []Field{{Name: "age", Value: tc.age}}); err != nil {
 			t.Fatalf("Patch(%d): %v", tc.id, err)
 		}
 	}
 	for _, id := range []uint64{44, 45, 46, 47, 48} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
 
 	q := qx.Query(qx.PREFIX("name", "orda/")).Sort("age", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBOrderDescLimitOffsetAfterChurnMatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 520, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 520, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("ordd/%03d", i),
 			Age:    100 + i%70,
@@ -1022,7 +1017,7 @@ func TestIndexExt_DBOrderDescLimitOffsetAfterChurnMatchesExpected(t *testing.T) 
 		{id: 250, age: 450, active: true},
 		{id: 251, age: 450, active: true},
 	} {
-		if err := db.Patch(tc.id, []Field{
+		if err := writePatch(c, tc.id, []Field{
 			{Name: "age", Value: tc.age},
 			{Name: "active", Value: tc.active},
 		}); err != nil {
@@ -1030,19 +1025,19 @@ func TestIndexExt_DBOrderDescLimitOffsetAfterChurnMatchesExpected(t *testing.T) 
 		}
 	}
 	for _, id := range []uint64{60, 61, 62, 63, 64, 65, 66} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
 
 	q := qx.Query(qx.EQ("active", true)).Sort("age", qx.DESC).Offset(17).Limit(61)
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBNilPointerTransitionsPreserveIndexes(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 500, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 500, func(i int) *Rec {
 		var opt *string
 		if i%7 != 0 {
 			s := fmt.Sprintf("opt-%03d", i)
@@ -1056,24 +1051,24 @@ func TestIndexExt_DBNilPointerTransitionsPreserveIndexes(t *testing.T) {
 
 	for _, id := range []uint64{7, 14, 21, 28, 35, 42} {
 		v := fmt.Sprintf("opt-hot-%03d", id)
-		if err := db.Patch(id, []Field{{Name: "opt", Value: v}}); err != nil {
+		if err := writePatch(c, id, []Field{{Name: "opt", Value: v}}); err != nil {
 			t.Fatalf("Patch(%d nil->value): %v", id, err)
 		}
 	}
 	for _, id := range []uint64{1, 2, 3, 4, 5, 6} {
-		if err := db.Patch(id, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+		if err := writePatch(c, id, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 			t.Fatalf("Patch(%d value->nil): %v", id, err)
 		}
 	}
 
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("opt", "opt-hot-")).Sort("opt", qx.ASC))
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", nil)))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.PREFIX("opt", "opt-hot-")).Sort("opt", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("opt", nil)))
 }
 
 func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	indexExtBatchSetGenerated(t, db, 1, 450, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 450, func(i int) *Rec {
 		return &Rec{
 			Name: fmt.Sprintf("tag/%03d", i),
 			Tags: []string{"shared", fmt.Sprintf("tag-%03d", i)},
@@ -1081,45 +1076,45 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 	})
 
 	for i := 1; i <= 30; i++ {
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string{}}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: []string{}}}); err != nil {
 			t.Fatalf("Patch(empty %d): %v", i, err)
 		}
 	}
 	for i := 31; i <= 60; i++ {
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string{"hot", "shared", "hot"}}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: []string{"hot", "shared", "hot"}}}); err != nil {
 			t.Fatalf("Patch(hot %d): %v", i, err)
 		}
 	}
 	for i := 61; i <= 75; i++ {
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string{"solo"}}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: []string{"solo"}}}); err != nil {
 			t.Fatalf("Patch(solo %d): %v", i, err)
 		}
 	}
 	for _, id := range []uint64{76, 77, 78, 79, 80} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
 
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"hot"})))
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASALL("tags", []string{"shared", "hot"})))
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"tag-005"})))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{"hot"})))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASALL("tags", []string{"shared", "hot"})))
+	indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{"tag-005"})))
 
 	var wantZero []uint64
 	for i := 1; i <= 30; i++ {
 		wantZero = append(wantZero, uint64(i))
 	}
-	gotZero, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	gotZero, err := readQueryKeys(c, qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
 	assertSameSlice(t, gotZero, wantZero)
 }
 
-func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+func TestIndexExt_DuplicateIDMultiPatchNetDiffKeepsIndexesConsistent(t *testing.T) {
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
-	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
+	indexExtMultiSetGenerated(t, c, 1, 420, func(i int) *Rec {
 		opt := fmt.Sprintf("seed-opt/%03d", i)
 		return &Rec{
 			Name: fmt.Sprintf("seed/%03d", i),
@@ -1130,10 +1125,10 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 	})
 
 	var step atomic.Int32
-	err := db.BatchPatch(
+	err := writePatches(c,
 		[]uint64{77, 77, 77},
 		[]Field{{Name: "age", Value: 9_001}},
-		BeforeProcess(func(_ uint64, v *Rec) error {
+		OnChange(func(_ *Tx, _ uint64, _ *Rec, v *Rec) error {
 			switch step.Add(1) {
 			case 1:
 				v.Name = "dup/first"
@@ -1158,13 +1153,13 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 		}),
 	)
 	if err != nil {
-		t.Fatalf("BatchPatch duplicate ids: %v", err)
+		t.Fatalf("MultiPatch duplicate ids: %v", err)
 	}
 
 	assertState := func(stage string) {
 		t.Helper()
 
-		got, err := db.Get(77)
+		got, err := readGet(c, 77)
 		if err != nil {
 			t.Fatalf("%s Get(77): %v", stage, err)
 		}
@@ -1175,18 +1170,18 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 			t.Fatalf("%s unexpected final value: %#v", stage, got)
 		}
 
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/final")))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "seed/077")))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/first")))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/second")))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"final"})))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"seed-tag/077"})))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"first"})))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", nil)))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", "seed-opt/077")))
-		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", "dup-live")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("name", "dup/final")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("name", "seed/077")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("name", "dup/first")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("name", "dup/second")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{"final"})))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{"seed-tag/077"})))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{"first"})))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("opt", nil)))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("opt", "seed-opt/077")))
+		indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("opt", "dup-live")))
 
-		gotEmptyTags, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+		gotEmptyTags, err := readQueryKeys(c, qx.Query(qx.EQ("tags", []string{})))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(empty tags): %v", stage, err)
 		}
@@ -1197,176 +1192,176 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 }
 
 func TestIndexExt_DBFloatSignedZeroBetweenBoundsMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(
 		qx.GTE("score", 0.0),
 		qx.LTE("score", 0.0),
 	).Sort("score", qx.ASC)
 
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatSignedZeroOrderAscMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(
 		qx.GTE("score", -1.0),
 	).Sort("score", qx.ASC).Limit(8)
 
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatSignedZeroEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(qx.EQ("score", 0.0))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatSignedZeroINMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(qx.IN("score", []float64{0.0}))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNegativeZeroEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(qx.EQ("score", math.Copysign(0, -1)))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatSignedZeroNotEqualCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroDB(t)
+	c := indexExtFloatSignedZeroCollection(t)
 
 	q := qx.Query(qx.NOT(qx.EQ("score", 0.0)))
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.EQ("score", math.NaN()))
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.EQ("score", math.NaN()))
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNLessEqualMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.LTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
-	indexExtAssertQueryKeysExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNGreaterEqualMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.GTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNNotEqualCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.NOT(qx.EQ("score", math.NaN())))
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatNaNINMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNDB(t)
+	c := indexExtFloatNaNCollection(t)
 
 	q := qx.Query(qx.IN("score", []float64{math.NaN(), 1.0}))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBIntFieldFloatEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", 42.0))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBIntFieldFloatRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("age", 200.0), qx.LT("age", 205.0)).Sort("age", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatFieldIntEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("score", 42))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatFieldIntRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("score", 200), qx.LT("score", 205)).Sort("score", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBIntFieldUintEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", uint64(42)))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBIntFieldUintRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("age", uint64(200)), qx.LT("age", uint64(205))).Sort("age", qx.ASC)
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBIntFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", keycodec.Int64ByteString(42)))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionDB(t)
+	c := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("score", keycodec.Float64ByteString(42.0)))
-	indexExtAssertQueryKeysExpected(t, db, q)
-	indexExtAssertCountExpected(t, db, q)
+	indexExtAssertQueryKeysExpected(t, c, q)
+	indexExtAssertCountExpected(t, c, q)
 }
 
 func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 420)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 420)
 
-	old, err := db.Get(215)
+	old, err := readGet(c, 215)
 	if err != nil {
 		t.Fatalf("Get(before 215): %v", err)
 	}
 	oldTags := append([]string(nil), old.Tags...)
-	db.ReleaseRecords(old)
+	c.ReleaseRecords(old)
 
 	newTags := []string{"rust", "db", "ops"}
 	rec := &Rec{
@@ -1379,12 +1374,12 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		Tags:     newTags,
 		FullName: "FN-00215",
 	}
-	if err := db.Set(215, rec); err != nil {
+	if err := writeSet(c, 215, rec); err != nil {
 		t.Fatalf("Set(215): %v", err)
 	}
 
 	for i := range newTags {
-		ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{newTags[i]})))
+		ids := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{newTags[i]})))
 		if !slices.Contains(ids, uint64(215)) {
 			t.Fatalf("new tag %q query missing id=215: ids=%v", newTags[i], ids)
 		}
@@ -1393,7 +1388,7 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		if slices.Contains(newTags, oldTags[i]) {
 			continue
 		}
-		ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{oldTags[i]})))
+		ids := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.HASANY("tags", []string{oldTags[i]})))
 		if slices.Contains(ids, uint64(215)) {
 			t.Fatalf("old tag %q query still contains id=215: ids=%v", oldTags[i], ids)
 		}
@@ -1401,15 +1396,15 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 }
 
 func TestSet_ReindexesScalarString_OnReplace(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 420)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 420)
 
-	old, err := db.Get(215)
+	old, err := readGet(c, 215)
 	if err != nil {
 		t.Fatalf("Get(before 215): %v", err)
 	}
 	oldFullName := old.FullName
-	db.ReleaseRecords(old)
+	c.ReleaseRecords(old)
 
 	rec := &Rec{
 		Meta:     Meta{Country: "PL"},
@@ -1421,30 +1416,30 @@ func TestSet_ReindexesScalarString_OnReplace(t *testing.T) {
 		Tags:     []string{"rust", "db", "ops"},
 		FullName: "FN-99999",
 	}
-	if err := db.Set(215, rec); err != nil {
+	if err := writeSet(c, 215, rec); err != nil {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	oldIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	oldIDs := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", oldFullName)))
 	if slices.Contains(oldIDs, uint64(215)) {
 		t.Fatalf("old full_name query still contains id=215: ids=%v", oldIDs)
 	}
-	newIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", rec.FullName)))
+	newIDs := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", rec.FullName)))
 	if !slices.Contains(newIDs, uint64(215)) {
 		t.Fatalf("new full_name query missing id=215: ids=%v", newIDs)
 	}
 }
 
-func TestBatchSet_RepeatedIDReindexesScalarString(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 420)
+func TestMultiSet_RepeatedIDReindexesScalarString(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 420)
 
-	old, err := db.Get(215)
+	old, err := readGet(c, 215)
 	if err != nil {
 		t.Fatalf("Get(before 215): %v", err)
 	}
 	oldFullName := old.FullName
-	db.ReleaseRecords(old)
+	c.ReleaseRecords(old)
 
 	first := &Rec{
 		Meta:     Meta{Country: "PL"},
@@ -1459,47 +1454,47 @@ func TestBatchSet_RepeatedIDReindexesScalarString(t *testing.T) {
 	second := *first
 	second.Email = "alice-215-b@example.test"
 	second.FullName = "FN-99999"
-	if err := db.BatchSet([]uint64{215, 215}, []*Rec{first, &second}); err != nil {
-		t.Fatalf("BatchSet repeated id: %v", err)
+	if err := writeSets(c, []uint64{215, 215}, []*Rec{first, &second}); err != nil {
+		t.Fatalf("MultiSet repeated id: %v", err)
 	}
 
-	oldIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	oldIDs := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", oldFullName)))
 	if slices.Contains(oldIDs, uint64(215)) {
 		t.Fatalf("old full_name query still contains id=215: ids=%v", oldIDs)
 	}
-	firstIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", first.FullName)))
+	firstIDs := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", first.FullName)))
 	if slices.Contains(firstIDs, uint64(215)) {
 		t.Fatalf("intermediate full_name query contains id=215: ids=%v", firstIDs)
 	}
-	secondIDs := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", second.FullName)))
+	secondIDs := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", second.FullName)))
 	if !slices.Contains(secondIDs, uint64(215)) {
 		t.Fatalf("final full_name query missing id=215: ids=%v", secondIDs)
 	}
 }
 
 func TestDelete_ReindexesScalarString(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 420)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 420)
 
-	old, err := db.Get(215)
+	old, err := readGet(c, 215)
 	if err != nil {
 		t.Fatalf("Get(before 215): %v", err)
 	}
 	oldFullName := old.FullName
-	db.ReleaseRecords(old)
+	c.ReleaseRecords(old)
 
-	if err := db.Delete(215); err != nil {
+	if err := writeDelete(c, 215); err != nil {
 		t.Fatalf("Delete(215): %v", err)
 	}
-	ids := indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("full_name", oldFullName)))
+	ids := indexExtAssertQueryKeysExpected(t, c, qx.Query(qx.EQ("full_name", oldFullName)))
 	if slices.Contains(ids, uint64(215)) {
 		t.Fatalf("old full_name query still contains id=215 after delete: ids=%v", ids)
 	}
 }
 
 func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1, AutoBatchMax: 1})
-	_ = seedData(t, db, 1_600)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1, BatchSoftLimit: 1})
+	_ = seedData(t, c, 1_600)
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}
@@ -1515,7 +1510,7 @@ func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
 		tagA := tagPool[r.IntN(len(tagPool))]
 		tagB := tagPool[r.IntN(len(tagPool))]
 		fullName := fmt.Sprintf("FN-%05d", 1+r.IntN(30_000))
-		if err := db.Set(id, &Rec{
+		if err := writeSet(c, id, &Rec{
 			Meta:     Meta{Country: country},
 			Name:     name,
 			Email:    fmt.Sprintf("%s-%d@example.test", name, id),
@@ -1529,21 +1524,21 @@ func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
 		}
 	}
 
-	stats, err := db.Stats()
+	stats, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	indexStats := db.IndexStats()
+	indexStats := c.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
 		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)
 	}
 
 	q := qx.Query().Sort("full_name", qx.ASC)
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(full_name ASC): %v", err)
 	}
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full_name ASC): %v", err)
 	}
@@ -1553,8 +1548,8 @@ func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
 }
 
 func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 1_600)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 1_600)
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}
@@ -1623,11 +1618,11 @@ func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) 
 				switch r.IntN(10) {
 				case 0, 1, 2, 3:
 					rec := randomRec(id)
-					reportErr(db.Set(id, rec))
+					reportErr(writeSet(c, id, rec))
 				case 4, 5, 6, 7, 8:
-					reportErr(db.Patch(id, randomPatch()))
+					reportErr(writePatch(c, id, randomPatch()))
 				default:
-					reportErr(db.Delete(id))
+					reportErr(writeDelete(c, id))
 				}
 				if firstErr.Load() != nil {
 					return
@@ -1640,18 +1635,18 @@ func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) 
 		t.Fatalf("writer error: %v", *errPtr)
 	}
 
-	stats, err := db.Stats()
+	stats, err := c.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	indexStats := db.IndexStats()
+	indexStats := c.IndexStats()
 	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
 		t.Fatalf("full_name cardinality=%d key_count=%d", got, stats.KeyCount)
 	}
 }
 
 func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	// arrange deterministic values so the query result is known
 	for i := 1; i <= 50; i++ {
@@ -1664,7 +1659,7 @@ func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
 			Tags:     []string{"go"},
 			FullName: fmt.Sprintf("FN-%02d", i),
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
@@ -1675,7 +1670,7 @@ func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
 		qx.EQ("active", true),
 	)
 
-	got0, err := db.QueryKeys(q)
+	got0, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys baseline: %v", err)
 	}
@@ -1685,17 +1680,17 @@ func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
 
 	// delete a subset and verify indexes reflect it
 	for _, id := range []uint64{3, 7, 10, 25, 50} {
-		if err := db.Delete(id); err != nil {
+		if err := writeDelete(c, id); err != nil {
 			t.Fatalf("Delete(%d): %v", id, err)
 		}
 	}
 
-	got1, err := db.QueryKeys(q)
+	got1, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys after delete: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -1703,7 +1698,7 @@ func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
 }
 
 func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	// put some records with age=10, then patch some to age=40 and ensure range queries reflect changes
 	for i := 1; i <= 60; i++ {
@@ -1716,31 +1711,31 @@ func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
 			Tags:     []string{"go"},
 			FullName: fmt.Sprintf("FN-%02d", i),
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	for _, id := range []uint64{2, 5, 9, 11, 17, 31} {
-		if err := db.Patch(id, []Field{{Name: "age", Value: float64(40)}}); err != nil {
+		if err := writePatch(c, id, []Field{{Name: "age", Value: float64(40)}}); err != nil {
 			t.Fatalf("Patch(%d): %v", id, err)
 		}
 	}
 
 	q := qx.Query(qx.GTE("age", 35)).Sort("age", qx.ASC)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
 
-	cnt, err := db.Count(q.Filter)
+	cnt, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}

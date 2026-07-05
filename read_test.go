@@ -9,237 +9,134 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 )
 
 func TestAPI_Get_ReturnedRecordDetachedFromStore(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	opt := "keep"
-	mustSetAPIRec(t, db, 1, &Rec{
+	mustSetAPIRec(t, c, 1, &Rec{
 		Name: "alice", Age: 30, Tags: []string{"go", "db"}, Opt: &opt,
 	})
 
-	got, err := db.Get(1)
+	got, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
 	if got == nil {
 		t.Fatalf("Get(1): got nil")
 	}
-	defer releaseUniqueRecords(db, got)
+	defer releaseUniqueRecords(c, got)
 
 	got.Name = "mutated"
 	got.Tags[0] = "changed"
 	got.Opt = nil
 
-	again, err := db.Get(1)
+	again, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1) again: %v", err)
 	}
 	if again == nil {
 		t.Fatalf("Get(1) again: got nil")
 	}
-	defer releaseUniqueRecords(db, again)
+	defer releaseUniqueRecords(c, again)
 
 	if again.Name != "alice" || again.Tags[0] != "go" || again.Opt == nil || *again.Opt != "keep" {
 		t.Fatalf("stored record was mutated through Get result: %#v", again)
 	}
 }
 
-func TestAPI_BatchGet_PreservesOrderAndNilHolesWithDuplicates(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+func TestAPI_ReadTxReadsUseBoundTransaction(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRecs(t, db, map[uint64]*Rec{
-		1: {Name: "one", Age: 10},
-		3: {Name: "three", Age: 30},
-	})
-
-	got, err := db.BatchGet(3, 2, 1, 3, 99)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	defer releaseUniqueRecords(db, got...)
-
-	if len(got) != 5 {
-		t.Fatalf("expected len=5, got %d", len(got))
-	}
-	if got[0] == nil || got[0].Name != "three" {
-		t.Fatalf("slot 0 mismatch: %#v", got[0])
-	}
-	if got[1] != nil {
-		t.Fatalf("slot 1 must be nil, got %#v", got[1])
-	}
-	if got[2] == nil || got[2].Name != "one" {
-		t.Fatalf("slot 2 mismatch: %#v", got[2])
-	}
-	if got[3] == nil || got[3].Name != "three" {
-		t.Fatalf("slot 3 mismatch: %#v", got[3])
-	}
-	if got[4] != nil {
-		t.Fatalf("slot 4 must be nil, got %#v", got[4])
-	}
-}
-
-func TestAPI_BatchGet_DuplicateIDsReturnIndependentCopies(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
-
-	got, err := db.BatchGet(1, 1)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	defer releaseUniqueRecords(db, got...)
-
-	if len(got) != 2 || got[0] == nil || got[1] == nil {
-		t.Fatalf("unexpected BatchGet result: %#v", got)
-	}
-	if got[0] == got[1] {
-		t.Fatalf("duplicate BatchGet entries alias the same record pointer")
-	}
-
-	got[0].Name = "mutated"
-	got[0].Tags[0] = "changed"
-
-	if got[1].Name != "alice" || got[1].Tags[0] != "go" {
-		t.Fatalf("mutating one BatchGet result changed the duplicate copy: %#v", got[1])
-	}
-
-	again, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	defer releaseUniqueRecords(db, again)
-	if again == nil || again.Name != "alice" || again.Tags[0] != "go" {
-		t.Fatalf("stored value changed after BatchGet mutation: %#v", again)
-	}
-}
-
-func TestAPI_TxReadsUseCallerTransaction(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(7, &Rec{Name: "committed", Age: 42}); err != nil {
+	if err := writeSet(c, 7, &Rec{Name: "committed", Age: 42}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Bolt().View(func(tx *bbolt.Tx) error {
-		got, err := db.GetTx(tx, 7)
-		if err != nil {
-			return fmt.Errorf("GetTx: %w", err)
-		}
-		defer releaseUniqueRecords(db, got)
-		if got == nil || got.Name != "committed" || got.Age != 42 {
-			return fmt.Errorf("GetTx got %#v", got)
-		}
-		vals, err := db.BatchGetTx(tx, 7, 99)
-		if err != nil {
-			return fmt.Errorf("BatchGetTx: %w", err)
-		}
-		defer releaseUniqueRecords(db, vals...)
-		if len(vals) != 2 || vals[0] == nil || vals[0].Name != "committed" || vals[1] != nil {
-			return fmt.Errorf("BatchGetTx got %#v", vals)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("fresh tx reads: %v", err)
+	tx := BeginView()
+	got, err := c.Get(tx, 7)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer tx.Release()
+	defer releaseUniqueRecords(c, got)
+	if got == nil || got.Name != "committed" || got.Age != 42 {
+		t.Fatalf("Get got %#v", got)
+	}
+	missing, err := c.Get(tx, 99)
+	if err != nil {
+		t.Fatalf("Get missing: %v", err)
+	}
+	if missing != nil {
+		t.Fatalf("Get missing got %#v", missing)
+	}
+	tx.Close()
+}
+
+func TestAPI_ReadQueryMethodsRequireTx(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+
+	var nilRead *Tx
+	if _, err := c.Get(nilRead, 1); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("Get nil tx err=%v, want ErrNilTx", err)
+	}
+	if err := c.ScanKeys(nilRead, 0, func(uint64) (bool, error) { return true, nil }); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("ScanKeys nil tx err=%v, want ErrNilTx", err)
+	}
+	if err := c.SeqScan(nilRead, 0, func(uint64, *Rec) (bool, error) { return true, nil }); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("SeqScan nil tx err=%v, want ErrNilTx", err)
+	}
+	if _, err := c.Query(nilRead, qx.Query()); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("Query nil tx err=%v, want ErrNilTx", err)
+	}
+	if _, err := c.QueryKeys(nilRead, qx.Query()); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("QueryKeys nil tx err=%v, want ErrNilTx", err)
+	}
+
+	var nilIndex *Tx
+	if _, err := c.Count(nilIndex); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("Count nil tx err=%v, want ErrNilTx", err)
+	}
+	if _, err := c.Aggregate(nilIndex, qx.Aggregate(qx.ROWCOUNT().AS("rows"))); !errors.Is(err, rbierrors.ErrNilTx) {
+		t.Fatalf("Aggregate nil tx err=%v, want ErrNilTx", err)
 	}
 }
 
 func TestIOExt_Get_ReturnsDetachedCopy(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
 
-	got := ioExtMustGetRec(t, db, 1)
+	got := ioExtMustGetRec(t, c, 1)
 	got.Name = "mutated"
 	got.Tags[0] = "oops"
 	got.Country = "US"
 
-	again := ioExtMustGetRec(t, db, 1)
+	again := ioExtMustGetRec(t, c, 1)
 	if again.Name != "alice" || again.Tags[0] != "go" || again.Country != "NL" {
 		t.Fatalf("stored value changed after mutating Get result: %#v", again)
 	}
 }
 
-func TestIOExt_BatchGet_ReturnsDetachedCopies(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "bob", Age: 40, Tags: []string{"db"}})
-
-	vals, err := db.BatchGet(1, 2)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	if len(vals) != 2 || vals[0] == nil || vals[1] == nil {
-		t.Fatalf("unexpected BatchGet result: %#v", vals)
-	}
-
-	vals[0].Name = "mutated-1"
-	vals[1].Tags[0] = "mutated-2"
-
-	v1 := ioExtMustGetRec(t, db, 1)
-	if v1.Name != "alice" || v1.Tags[0] != "go" {
-		t.Fatalf("id=1 changed after mutating BatchGet result: %#v", v1)
-	}
-	v2 := ioExtMustGetRec(t, db, 2)
-	if v2.Name != "bob" || v2.Tags[0] != "db" {
-		t.Fatalf("id=2 changed after mutating BatchGet result: %#v", v2)
-	}
-}
-
-func TestIOExt_BatchGet_DuplicateIDsProduceIndependentCopies(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}})
-
-	vals, err := db.BatchGet(1, 1)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	if len(vals) != 2 || vals[0] == nil || vals[1] == nil {
-		t.Fatalf("unexpected BatchGet result: %#v", vals)
-	}
-	if vals[0] == vals[1] {
-		t.Fatal("duplicate BatchGet ids returned the same pointer")
-	}
-
-	vals[0].Name = "mutated"
-	vals[0].Tags[0] = "oops"
-	if vals[1].Name != "alice" || vals[1].Tags[0] != "go" {
-		t.Fatalf("duplicate BatchGet result aliased unexpectedly: %#v", vals[1])
-	}
-
-	again := ioExtMustGetRec(t, db, 1)
-	if again.Name != "alice" || again.Tags[0] != "go" {
-		t.Fatalf("stored value changed after mutating duplicate BatchGet result: %#v", again)
-	}
-}
-
 func TestReadPaths_MissingKeys_ReturnEmpty(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
+	c, _ := openTempCollectionStringProduct(t)
 
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10, Tags: []string{"a"}}); err != nil {
+	if err := writeSet(c, "p1", &Product{SKU: "p1", Price: 10, Tags: []string{"a"}}); err != nil {
 		t.Fatalf("Set(p1): %v", err)
 	}
-	if err := db.Set("p2", &Product{SKU: "p2", Price: 20, Tags: []string{"b"}}); err != nil {
+	if err := writeSet(c, "p2", &Product{SKU: "p2", Price: 20, Tags: []string{"b"}}); err != nil {
 		t.Fatalf("Set(p2): %v", err)
 	}
 
-	if v, err := db.Get("missing-get"); err != nil {
+	if v, err := readGet(c, "missing-get"); err != nil {
 		t.Fatalf("Get(missing): %v", err)
 	} else if v != nil {
 		t.Fatalf("Get(missing) expected nil, got %#v", v)
 	}
 
-	values, err := db.BatchGet("missing-1", "p1", "missing-2")
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	if len(values) != 3 || values[0] != nil || values[1] == nil || values[2] != nil {
-		t.Fatalf("unexpected BatchGet result: %#v", values)
-	}
-
 	scanCalls := 0
-	if err := db.ScanKeys("zzzz", func(_ string) (bool, error) {
+	if err := readScanKeys(c, "zzzz", func(_ string) (bool, error) {
 		scanCalls++
 		return true, nil
 	}); err != nil {
@@ -250,7 +147,7 @@ func TestReadPaths_MissingKeys_ReturnEmpty(t *testing.T) {
 	}
 
 	seenSeq := 0
-	if err := db.SeqScan("zzzz", func(_ string, _ *Product) (bool, error) {
+	if err := readSeqScan(c, "zzzz", func(_ string, _ *Product) (bool, error) {
 		seenSeq++
 		return true, nil
 	}); err != nil {
@@ -261,19 +158,19 @@ func TestReadPaths_MissingKeys_ReturnEmpty(t *testing.T) {
 	}
 
 	qMissing := qx.Query(qx.EQ("sku", "missing-sku"))
-	if ids, err := db.QueryKeys(qMissing); err != nil {
+	if ids, err := readQueryKeys(c, qMissing); err != nil {
 		t.Fatalf("QueryKeys(missing sku): %v", err)
 	} else if len(ids) != 0 {
 		t.Fatalf("QueryKeys(missing sku) expected empty, got %v", ids)
 	}
 
-	if items, err := db.Query(qMissing); err != nil {
+	if items, err := readQuery(c, qMissing); err != nil {
 		t.Fatalf("Query(missing sku): %v", err)
 	} else if len(items) != 0 {
 		t.Fatalf("Query(missing sku) expected empty, got %d", len(items))
 	}
 
-	if cnt, err := db.Count(qMissing.Filter); err != nil {
+	if cnt, err := readCount(c, qMissing.Filter); err != nil {
 		t.Fatalf("Count(missing sku): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(missing sku) expected 0, got %d", cnt)
@@ -281,16 +178,16 @@ func TestReadPaths_MissingKeys_ReturnEmpty(t *testing.T) {
 }
 
 func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c, _ := openTempUint64Collection(t)
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		if tx.Bucket(db.BucketName()) == nil {
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		if tx.Bucket(c.dataBucket) == nil {
 			return nil
 		}
-		return tx.DeleteBucket(db.BucketName())
+		return tx.DeleteBucket(c.dataBucket)
 	}); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
@@ -305,19 +202,16 @@ func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
 		}
 	}
 
-	_, err := db.Get(1)
+	_, err := readGet(c, 1)
 	expectBucketErr("Get", err)
 
-	_, err = db.BatchGet(1, 2)
-	expectBucketErr("BatchGet", err)
-
-	err = db.SeqScan(0, func(_ uint64, _ *Rec) (bool, error) {
+	err = readSeqScan(c, 0, func(_ uint64, _ *Rec) (bool, error) {
 		return true, nil
 	})
 	expectBucketErr("SeqScan", err)
 
 	var scanKeysGot []uint64
-	err = db.ScanKeys(0, func(id uint64) (bool, error) {
+	err = readScanKeys(c, 0, func(id uint64) (bool, error) {
 		scanKeysGot = append(scanKeysGot, id)
 		return true, nil
 	})
@@ -328,17 +222,17 @@ func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
 		t.Fatalf("ScanKeys=%v want indexed universe [1]", scanKeysGot)
 	}
 
-	_, err = db.Query(qx.Query())
+	_, err = readQuery(c, qx.Query())
 	expectBucketErr("Query", err)
 }
 
 func TestQuery_NumericIndexMissingDataRecordReturnsError(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	mustSetAPIRec(t, db, 1, &Rec{Name: "one", Age: 1})
-	mustSetAPIRec(t, db, 2, &Rec{Name: "two", Age: 2})
+	c, _ := openTempUint64Collection(t)
+	mustSetAPIRec(t, c, 1, &Rec{Name: "one", Age: 1})
+	mustSetAPIRec(t, c, 2, &Rec{Name: "two", Age: 2})
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -348,79 +242,54 @@ func TestQuery_NumericIndexMissingDataRecordReturnsError(t *testing.T) {
 		t.Fatalf("delete raw record: %v", err)
 	}
 
-	keys, err := db.QueryKeys(qx.Query())
+	keys, err := readQueryKeys(c, qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	if !slices.Equal(keys, []uint64{1, 2}) {
 		t.Fatalf("QueryKeys=%v want [1 2]", keys)
 	}
-	if count, err := db.Count(); err != nil {
+	if count, err := readCount(c); err != nil {
 		t.Fatalf("Count: %v", err)
 	} else if count != 2 {
 		t.Fatalf("Count=%d want 2", count)
 	}
 
-	items, err := db.Query(qx.Query())
+	items, err := readQuery(c, qx.Query())
 	if err == nil || !strings.Contains(err.Error(), "missing numeric data") {
-		releaseUniqueRecords(db, items...)
+		releaseUniqueRecords(c, items...)
 		t.Fatalf("Query err=%v want missing numeric data", err)
 	}
 	if len(items) != 0 {
-		releaseUniqueRecords(db, items...)
+		releaseUniqueRecords(c, items...)
 		t.Fatalf("Query returned %d items with error", len(items))
 	}
 }
 
 func TestIOExt_Get_CorruptPayloadReturnsDecodeError(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "good-1"})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "good-2"})
-	ioExtMustCorruptUint64Raw(t, db, 1, []byte{0xff, 0x00, 0x7f})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "good-1"})
+	ioExtMustSetRec(t, c, 2, &Rec{Name: "good-2"})
+	ioExtMustCorruptUint64Raw(t, c, 1, []byte{0xff, 0x00, 0x7f})
 
-	if _, err := db.Get(1); err == nil || !strings.Contains(err.Error(), "decode") {
+	if _, err := readGet(c, 1); err == nil || !strings.Contains(err.Error(), "decode") {
 		t.Fatalf("expected Get decode error, got %v", err)
 	}
-	v2 := ioExtMustGetRec(t, db, 2)
+	v2 := ioExtMustGetRec(t, c, 2)
 	if v2.Name != "good-2" {
 		t.Fatalf("unexpected unaffected record: %#v", v2)
 	}
 }
 
-func TestIOExt_BatchGet_CorruptPayloadReturnsDecodeErrorWithoutPoisoningOtherReads(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "two"})
-	ioExtMustSetRec(t, db, 3, &Rec{Name: "three"})
-	ioExtMustCorruptUint64Raw(t, db, 2, []byte{0xff, 0x00, 0x7f})
-
-	vals, err := db.BatchGet(1, 2, 3)
-	if err == nil || !strings.Contains(err.Error(), "decode") {
-		t.Fatalf("expected BatchGet decode error, got %v", err)
-	}
-	if len(vals) != 3 || vals[0] == nil || vals[0].Name != "one" || vals[1] != nil || vals[2] != nil {
-		t.Fatalf("unexpected partial BatchGet result: %#v", vals)
-	}
-
-	v1 := ioExtMustGetRec(t, db, 1)
-	if v1.Name != "one" {
-		t.Fatalf("unexpected id=1 after failed BatchGet: %#v", v1)
-	}
-	v3 := ioExtMustGetRec(t, db, 3)
-	if v3.Name != "three" {
-		t.Fatalf("unexpected id=3 after failed BatchGet: %#v", v3)
-	}
-}
-
 func TestIOExt_SeqScan_CorruptPayloadStopsAtBadRecord(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "two"})
-	ioExtMustSetRec(t, db, 3, &Rec{Name: "three"})
-	ioExtMustCorruptUint64Raw(t, db, 2, []byte{0xff, 0x00, 0x7f})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "one"})
+	ioExtMustSetRec(t, c, 2, &Rec{Name: "two"})
+	ioExtMustSetRec(t, c, 3, &Rec{Name: "three"})
+	ioExtMustCorruptUint64Raw(t, c, 2, []byte{0xff, 0x00, 0x7f})
 
 	var seen []uint64
-	err := db.SeqScan(0, func(id uint64, _ *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, _ *Rec) (bool, error) {
 		seen = append(seen, id)
 		return true, nil
 	})
@@ -431,19 +300,19 @@ func TestIOExt_SeqScan_CorruptPayloadStopsAtBadRecord(t *testing.T) {
 		t.Fatalf("unexpected rows seen before decode error: %v", seen)
 	}
 
-	v3 := ioExtMustGetRec(t, db, 3)
+	v3 := ioExtMustGetRec(t, c, 3)
 	if v3.Name != "three" {
 		t.Fatalf("unexpected id=3 after failed SeqScan: %#v", v3)
 	}
 }
 
 func TestIOExt_SeqScan_InvalidFirstNumericKeyLengthReturnsError(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	raw := ioExtMustReadUint64Raw(t, db, 1)
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "one"})
+	raw := ioExtMustReadUint64Raw(t, c, 1)
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -456,7 +325,7 @@ func TestIOExt_SeqScan_InvalidFirstNumericKeyLengthReturnsError(t *testing.T) {
 		t.Fatalf("corrupt key: %v", err)
 	}
 
-	err := db.SeqScan(0, func(uint64, *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(uint64, *Rec) (bool, error) {
 		t.Fatal("SeqScan callback called for invalid key")
 		return true, nil
 	})
@@ -466,12 +335,12 @@ func TestIOExt_SeqScan_InvalidFirstNumericKeyLengthReturnsError(t *testing.T) {
 }
 
 func TestIOExt_SeqScan_InvalidNextNumericKeyLengthReturnsError(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	raw := ioExtMustReadUint64Raw(t, db, 1)
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "one"})
+	raw := ioExtMustReadUint64Raw(t, c, 1)
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
@@ -481,7 +350,7 @@ func TestIOExt_SeqScan_InvalidNextNumericKeyLengthReturnsError(t *testing.T) {
 	}
 
 	var seen []uint64
-	err := db.SeqScan(0, func(id uint64, _ *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, _ *Rec) (bool, error) {
 		seen = append(seen, id)
 		return true, nil
 	})
@@ -494,15 +363,15 @@ func TestIOExt_SeqScan_InvalidNextNumericKeyLengthReturnsError(t *testing.T) {
 }
 
 func TestIOExt_RawBoltScan_CorruptPayloadStillReturnsRawBytes(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "one"})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "two"})
-	ioExtMustSetRec(t, db, 3, &Rec{Name: "three"})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "one"})
+	ioExtMustSetRec(t, c, 2, &Rec{Name: "two"})
+	ioExtMustSetRec(t, c, 3, &Rec{Name: "three"})
 	corrupt := []byte{0xff, 0x00, 0x7f, 0x42}
-	ioExtMustCorruptUint64Raw(t, db, 2, corrupt)
+	ioExtMustCorruptUint64Raw(t, c, 2, corrupt)
 
 	got := make(map[uint64][]byte)
-	if err := scanRawBolt(t, db, 0, func(id uint64, raw []byte) (bool, error) {
+	if err := scanRawBolt(t, c, 0, func(id uint64, raw []byte) (bool, error) {
 		got[id] = append([]byte(nil), raw...)
 		return true, nil
 	}); err != nil {
@@ -517,11 +386,11 @@ func TestIOExt_RawBoltScan_CorruptPayloadStillReturnsRawBytes(t *testing.T) {
 }
 
 func TestAPI_SeqScan_CallbackMutationDoesNotPersist(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	mustSetAPIRec(t, db, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
+	mustSetAPIRec(t, c, 1, &Rec{Name: "alice", Age: 30, Tags: []string{"go", "db"}})
 
-	if err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	if err := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		if id != 1 {
 			return true, nil
 		}
@@ -532,24 +401,24 @@ func TestAPI_SeqScan_CallbackMutationDoesNotPersist(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	again, err := db.Get(1)
+	again, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
-	defer releaseUniqueRecords(db, again)
+	defer releaseUniqueRecords(c, again)
 	if again == nil || again.Name != "alice" || again.Tags[0] != "go" {
 		t.Fatalf("stored value changed after SeqScan callback mutation: %#v", again)
 	}
 }
 
 func TestAPI_ScanKeys_StopOnFalse(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 	for i := 1; i <= 5; i++ {
-		mustSetAPIRec(t, db, uint64(i), &Rec{Name: "x", Age: i})
+		mustSetAPIRec(t, c, uint64(i), &Rec{Name: "x", Age: i})
 	}
 
 	var got []uint64
-	err := db.ScanKeys(2, func(id uint64) (bool, error) {
+	err := readScanKeys(c, 2, func(id uint64) (bool, error) {
 		got = append(got, id)
 		return len(got) < 2, nil
 	})
@@ -562,14 +431,14 @@ func TestAPI_ScanKeys_StopOnFalse(t *testing.T) {
 }
 
 func TestAPI_ScanKeys_PropagatesCallbackError(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 	for i := 1; i <= 5; i++ {
-		mustSetAPIRec(t, db, uint64(i), &Rec{Name: "x", Age: i})
+		mustSetAPIRec(t, c, uint64(i), &Rec{Name: "x", Age: i})
 	}
 
 	sentinel := errors.New("scan stop")
 	var calls int
-	err := db.ScanKeys(1, func(id uint64) (bool, error) {
+	err := readScanKeys(c, 1, func(id uint64) (bool, error) {
 		calls++
 		if id == 3 {
 			return false, sentinel
@@ -587,20 +456,20 @@ func TestAPI_ScanKeys_PropagatesCallbackError(t *testing.T) {
 type scanKeysNamedUint64 uint64
 
 func TestAPI_ScanKeys_NamedUint64KeyType(t *testing.T) {
-	db, raw := openBoltAndNew[scanKeysNamedUint64, Rec](t, t.TempDir()+"/named_uint64.db")
+	c, raw := openBoltAndCollection[scanKeysNamedUint64, Rec](t, t.TempDir()+"/named_uint64.db")
 	t.Cleanup(func() {
-		_ = db.Close()
+		_ = c.Close()
 		_ = raw.Close()
 	})
 
 	for i := 1; i <= 3; i++ {
-		if err := db.Set(scanKeysNamedUint64(i), &Rec{Name: "x", Age: i}); err != nil {
+		if err := writeSet(c, scanKeysNamedUint64(i), &Rec{Name: "x", Age: i}); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	var got []scanKeysNamedUint64
-	err := db.ScanKeys(scanKeysNamedUint64(2), func(id scanKeysNamedUint64) (bool, error) {
+	err := readScanKeys(c, scanKeysNamedUint64(2), func(id scanKeysNamedUint64) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -615,20 +484,20 @@ func TestAPI_ScanKeys_NamedUint64KeyType(t *testing.T) {
 type scanKeysNamedString string
 
 func TestAPI_ScanKeys_NamedStringKeyType(t *testing.T) {
-	db, raw := openBoltAndNew[scanKeysNamedString, Rec](t, t.TempDir()+"/named_string.db")
+	c, raw := openBoltAndCollection[scanKeysNamedString, Rec](t, t.TempDir()+"/named_string.db")
 	t.Cleanup(func() {
-		_ = db.Close()
+		_ = c.Close()
 		_ = raw.Close()
 	})
 
 	for i, id := range []scanKeysNamedString{"a", "b", "c"} {
-		if err := db.Set(id, &Rec{Name: "x", Age: i}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: "x", Age: i}); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	var got []scanKeysNamedString
-	err := db.ScanKeys(scanKeysNamedString("b"), func(id scanKeysNamedString) (bool, error) {
+	err := readScanKeys(c, scanKeysNamedString("b"), func(id scanKeysNamedString) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -641,13 +510,13 @@ func TestAPI_ScanKeys_NamedStringKeyType(t *testing.T) {
 }
 
 func TestAPI_SeqScan_StopOnFalse(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 	for i := 1; i <= 4; i++ {
-		mustSetAPIRec(t, db, uint64(i), &Rec{Name: "x", Age: i})
+		mustSetAPIRec(t, c, uint64(i), &Rec{Name: "x", Age: i})
 	}
 
 	var got []uint64
-	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		got = append(got, id)
 		return len(got) < 2, nil
 	})
@@ -660,14 +529,14 @@ func TestAPI_SeqScan_StopOnFalse(t *testing.T) {
 }
 
 func TestAPI_SeqScan_PropagatesCallbackError(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 	for i := 1; i <= 4; i++ {
-		mustSetAPIRec(t, db, uint64(i), &Rec{Name: "x", Age: i})
+		mustSetAPIRec(t, c, uint64(i), &Rec{Name: "x", Age: i})
 	}
 
 	sentinel := errors.New("seqscan stop")
 	var calls int
-	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, rec *Rec) (bool, error) {
 		calls++
 		if id == 2 {
 			return false, sentinel
@@ -683,11 +552,11 @@ func TestAPI_SeqScan_PropagatesCallbackError(t *testing.T) {
 }
 
 func TestIOExt_SeqScan_ReturnsDetachedCopies(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	ioExtMustSetRec(t, db, 1, &Rec{Name: "alice", Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
-	ioExtMustSetRec(t, db, 2, &Rec{Name: "bob", Tags: []string{"db"}, Meta: Meta{Country: "DE"}})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+	ioExtMustSetRec(t, c, 1, &Rec{Name: "alice", Tags: []string{"go"}, Meta: Meta{Country: "NL"}})
+	ioExtMustSetRec(t, c, 2, &Rec{Name: "bob", Tags: []string{"db"}, Meta: Meta{Country: "DE"}})
 
-	if err := db.SeqScan(0, func(id uint64, v *Rec) (bool, error) {
+	if err := readSeqScan(c, 0, func(id uint64, v *Rec) (bool, error) {
 		if id == 1 {
 			v.Name = "mutated"
 			v.Tags[0] = "oops"
@@ -698,20 +567,20 @@ func TestIOExt_SeqScan_ReturnsDetachedCopies(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	again := ioExtMustGetRec(t, db, 1)
+	again := ioExtMustGetRec(t, c, 1)
 	if again.Name != "alice" || again.Tags[0] != "go" || again.Country != "NL" {
 		t.Fatalf("stored value changed after mutating SeqScan value: %#v", again)
 	}
 }
 
 func TestIOExt_SeqScan_StopOnFalse(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 	for i := 1; i <= 3; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
+		ioExtMustSetRec(t, c, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
 	}
 
 	var seen []uint64
-	if err := db.SeqScan(0, func(id uint64, _ *Rec) (bool, error) {
+	if err := readSeqScan(c, 0, func(id uint64, _ *Rec) (bool, error) {
 		seen = append(seen, id)
 		return id != 2, nil
 	}); err != nil {
@@ -723,14 +592,14 @@ func TestIOExt_SeqScan_StopOnFalse(t *testing.T) {
 }
 
 func TestIOExt_SeqScan_PropagatesCallbackError(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 	for i := 1; i <= 3; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
+		ioExtMustSetRec(t, c, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
 	}
 
 	wantErr := errors.New("stop scan")
 	var seen []uint64
-	err := db.SeqScan(0, func(id uint64, _ *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, _ *Rec) (bool, error) {
 		seen = append(seen, id)
 		if id == 2 {
 			return false, wantErr
@@ -746,13 +615,13 @@ func TestIOExt_SeqScan_PropagatesCallbackError(t *testing.T) {
 }
 
 func TestIOExt_RawBoltScan_StopOnFalse(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 	for i := 1; i <= 3; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
+		ioExtMustSetRec(t, c, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
 	}
 
 	var seen []uint64
-	if err := scanRawBolt(t, db, 0, func(id uint64, _ []byte) (bool, error) {
+	if err := scanRawBolt(t, c, 0, func(id uint64, _ []byte) (bool, error) {
 		seen = append(seen, id)
 		return id != 2, nil
 	}); err != nil {
@@ -764,13 +633,13 @@ func TestIOExt_RawBoltScan_StopOnFalse(t *testing.T) {
 }
 
 func TestIOExt_RawBoltScan_MatchesPersistedPayloads(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 	for i := 1; i <= 3; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i), Age: i})
+		ioExtMustSetRec(t, c, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i), Age: i})
 	}
 
 	got := make(map[uint64][]byte)
-	if err := scanRawBolt(t, db, 0, func(id uint64, raw []byte) (bool, error) {
+	if err := scanRawBolt(t, c, 0, func(id uint64, raw []byte) (bool, error) {
 		got[id] = append([]byte(nil), raw...)
 		return true, nil
 	}); err != nil {
@@ -779,7 +648,7 @@ func TestIOExt_RawBoltScan_MatchesPersistedPayloads(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		id := uint64(i)
-		want := ioExtMustReadUint64Raw(t, db, id)
+		want := ioExtMustReadUint64Raw(t, c, id)
 		if !slices.Equal(got[id], want) {
 			t.Fatalf("raw payload mismatch for id=%d", id)
 		}
@@ -787,13 +656,13 @@ func TestIOExt_RawBoltScan_MatchesPersistedPayloads(t *testing.T) {
 }
 
 func TestIOExt_ScanKeys_StopOnFalse(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 	for i := 1; i <= 5; i++ {
-		ioExtMustSetRec(t, db, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
+		ioExtMustSetRec(t, c, uint64(i), &Rec{Name: fmt.Sprintf("n%d", i)})
 	}
 
 	var seen []uint64
-	if err := db.ScanKeys(2, func(id uint64) (bool, error) {
+	if err := readScanKeys(c, 2, func(id uint64) (bool, error) {
 		seen = append(seen, id)
 		return id != 3, nil
 	}); err != nil {
@@ -805,16 +674,16 @@ func TestIOExt_ScanKeys_StopOnFalse(t *testing.T) {
 }
 
 func TestIOExt_ScanKeys_PropagatesCallbackError(t *testing.T) {
-	db, _ := openTempDBString(t, Options{AutoBatchMax: 1})
+	c, _ := openTempStringCollection(t, Options{BatchSoftLimit: 1})
 	for _, id := range []string{"b-key", "a-key", "c-key"} {
-		if err := db.Set(id, &Rec{Name: id}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: id}); err != nil {
 			t.Fatalf("Set(%q): %v", id, err)
 		}
 	}
 
 	wantErr := errors.New("stop keys")
 	var seen []string
-	err := db.ScanKeys("b", func(id string) (bool, error) {
+	err := readScanKeys(c, "b", func(id string) (bool, error) {
 		seen = append(seen, id)
 		return false, wantErr
 	})
@@ -827,17 +696,17 @@ func TestIOExt_ScanKeys_PropagatesCallbackError(t *testing.T) {
 }
 
 func TestScanKeysUint64_SeekOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 5; i++ {
 		r := &Rec{Name: fmt.Sprintf("n%d", i), Age: i}
-		if err := db.Set(uint64(i), r); err != nil {
+		if err := writeSet(c, uint64(i), r); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	var got []uint64
-	err := db.ScanKeys(3, func(id uint64) (bool, error) {
+	err := readScanKeys(c, 3, func(id uint64) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -852,16 +721,16 @@ func TestScanKeysUint64_SeekOrder(t *testing.T) {
 }
 
 func TestScanKeysUint64_TransparentSeekOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{Index: map[string]IndexKind{}, AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{Index: map[string]IndexKind{}, BatchSoftLimit: 1})
 
 	for _, id := range []uint64{5, 1, 3, 2} {
-		if err := db.Set(id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)}); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
 
 	var got []uint64
-	err := db.ScanKeys(2, func(id uint64) (bool, error) {
+	err := readScanKeys(c, 2, func(id uint64) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -876,23 +745,23 @@ func TestScanKeysUint64_TransparentSeekOrder(t *testing.T) {
 }
 
 func TestScanKeysUint64_IndexedUsesUniverse(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
 	for _, id := range []uint64{1, 3} {
-		if err := db.Set(id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)}); err != nil {
+		if err := writeSet(c, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)}); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
 
-	if err := db.Bolt().Update(func(tx *bbolt.Tx) error {
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
 		var key [8]byte
-		return tx.Bucket(db.BucketName()).Put(keycodec.U64BytesWithBuf(2, &key), []byte{0xff})
+		return tx.Bucket(c.dataBucket).Put(keycodec.U64BytesWithBuf(2, &key), []byte{0xff})
 	}); err != nil {
 		t.Fatalf("raw Put: %v", err)
 	}
 
 	var got []uint64
-	if err := db.ScanKeys(0, func(id uint64) (bool, error) {
+	if err := readScanKeys(c, 0, func(id uint64) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	}); err != nil {
@@ -905,7 +774,7 @@ func TestScanKeysUint64_IndexedUsesUniverse(t *testing.T) {
 	}
 
 	got = got[:0]
-	if err := db.ScanKeys(2, func(id uint64) (bool, error) {
+	if err := readScanKeys(c, 2, func(id uint64) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	}); err != nil {
@@ -917,19 +786,85 @@ func TestScanKeysUint64_IndexedUsesUniverse(t *testing.T) {
 	}
 }
 
+func TestScanKeysUint64_IndexedAcceptsIndexView(t *testing.T) {
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
+
+	for _, id := range []uint64{1, 2} {
+		if err := writeSet(c, id, &Rec{Name: fmt.Sprintf("n%d", id), Age: int(id)}); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tx := BeginIndexView()
+	var got []uint64
+	if err := c.ScanKeys(tx, 0, func(id uint64) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("ScanKeys index tx: %v", err)
+	}
+	if tx.boltTx != nil {
+		t.Fatal("ScanKeys opened a bbolt read transaction for numeric index tx")
+	}
+	tx.Release()
+	if !slices.Equal(got, []uint64{1, 2}) {
+		t.Fatalf("ScanKeys index tx=%v want [1 2]", got)
+	}
+
+}
+
+func TestScanKeysStringIndexAcceptsIndexView(t *testing.T) {
+	c, _ := openTempCollectionStringProduct(t, Options{EnableStringKeyIndex: true, BatchSoftLimit: 1})
+	if err := writeSet(c, "a", &Product{SKU: "a", Price: 1}); err != nil {
+		t.Fatalf("Set(a): %v", err)
+	}
+
+	indexTx := BeginIndexView()
+	var got []string
+	if err := c.ScanKeys(indexTx, "", func(key string) (bool, error) {
+		got = append(got, key)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("ScanKeys index tx: %v", err)
+	}
+	if indexTx.boltTx != nil {
+		t.Fatal("string index ScanKeys opened a bbolt read transaction")
+	}
+	indexTx.Release()
+	if !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("ScanKeys string index tx=%v want [a]", got)
+	}
+
+	readTx := BeginView()
+	got = got[:0]
+	if err := c.ScanKeys(readTx, "", func(key string) (bool, error) {
+		got = append(got, key)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("ScanKeys read tx: %v", err)
+	}
+	if readTx.boltTx == nil {
+		t.Fatal("string ScanKeys did not bind a bbolt read transaction")
+	}
+	readTx.Release()
+	if !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("ScanKeys string read tx=%v want [a]", got)
+	}
+}
+
 func TestScanKeys_String_SeekLowerBound(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	for i := 1; i <= 5; i++ {
 		id := fmt.Sprintf("id-%02d", i)
 		r := &Rec{Name: "x", Age: i}
-		if err := db.Set(id, r); err != nil {
+		if err := writeSet(c, id, r); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
 
 	var got []string
-	err := db.ScanKeys("id-03", func(id string) (bool, error) {
+	err := readScanKeys(c, "id-03", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})

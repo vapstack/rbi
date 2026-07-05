@@ -3,6 +3,7 @@ package rbi
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -12,16 +13,15 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/engine"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/persist"
+	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbistats"
@@ -40,16 +40,17 @@ const (
 )
 
 // ValueIndexer defines how a field value is converted into a canonical string
-// representation used as an index key in rbi.
+// representation used as an index key.
 //
 // IndexingValue method must return a stable, deterministic string.
 // Equal field values must produce equal indexing strings.
 // The returned string must not exceed 65535 bytes.
 //
-// Nil ValueIndexer interface scalar values are indexed as null. For a type T
-// that implements ValueIndexer with a value receiver, nil *T scalar values are
-// also indexed as null, including when the nil *T is stored in a ValueIndexer
-// interface. In slice indexes, nil interface elements and nil *T elements for
+// Indexed fields that use ValueIndexer must be declared with concrete types,
+// not with ValueIndexer interface or any other interface type.
+//
+// For a type T that implements ValueIndexer with a value receiver, nil *T
+// scalar values are indexed as null. In slice indexes, nil *T elements for
 // value-receiver T do not emit index keys.
 //
 // Nil pointer-receiver values are passed to IndexingValue;
@@ -60,14 +61,18 @@ const (
 // produced ordering matches the intent.
 type ValueIndexer = schema.ValueIndexer
 
+// Key is the reserved synthetic query field name for record primary keys.
+const Key = "$key"
+
 // Codec overrides default msgpack encoding/decoding for *V.
 //
 // EncodeRBI must write the full encoded form of the receiver to w.
+// It must not mutate the source value.
+//
 // DecodeRBI must populate the receiver from the encoded form read from r.
 //
 // RBI does not retry decoding with msgpack when DecodeRBI returns an error.
-// If fallback decoding is needed, implement it inside the
-// custom codec, for example by using github.com/vmihailenco/msgpack/v5.
+// If fallback decoding is needed, implement it inside the custom codec.
 type Codec interface {
 	EncodeRBI(io.Writer) error
 	DecodeRBI(io.Reader) error
@@ -75,10 +80,9 @@ type Codec interface {
 
 var codecType = reflect.TypeFor[Codec]()
 
-// Options configures indexer and how it works with a bbolt database.
+// Options configures collection and how it works with a bbolt database.
 //
 // Zero-valued option fields use defaults.
-// DefaultOptions returns options with all defaults pre-filled.
 type Options struct {
 	// Index overrides struct rbi tags when non-nil.
 	//
@@ -87,32 +91,33 @@ type Options struct {
 	Index map[string]IndexKind
 
 	// EnableStringKeyIndex enables synthetic string primary-key index.
-	// When set on DB[string,V], queries and filters can reference "$key".
+	// When set on Collection[string,V], queries can reference "$key".
+	//
 	// This can be the only queryable field and still enables indexed mode.
 	//
-	// It affects only DB[string,V] and ignored by numeric-key databases
-	// (as they expose "$key" automatically in indexed mode).
+	// It affects only Collection[string,V] and ignored by numeric-key
+	// collections (as they expose "$key" automatically in indexed mode).
 	//
 	// It is disabled by default to minimize memory usage.
 	EnableStringKeyIndex bool
 
-	// DisableIndexLoad prevents indexer from loading previously persisted index
-	// data from the .rbi file on startup. If set, indexer rebuilds the index
-	// from the underlying bucket.
+	// DisableIndexLoad prevents collection from loading previously persisted
+	// index data from the .rbi file on startup.
+	// If set, indexer rebuilds the index from the underlying bucket.
 	DisableIndexLoad bool
 
-	// DisableIndexStore prevents indexer from saving the in-memory index state
+	// DisableIndexStore prevents collection from saving the index state
 	// to the .rbi file on Close.
 	DisableIndexStore bool
 
 	// PersistedIndexPath overrides the .rbi file path used for persisted index
 	// load/store. If empty, the path is derived from the absolute bbolt path
-	// and bucket name. Relative paths are resolved during New.
+	// and bucket name. Relative paths are resolved during Open.
 	PersistedIndexPath string
 
-	// Logger receives informational indexer messages.
+	// Logger receives informational messages.
 	//
-	// Default: standard logger from package log.
+	// Default: standard logger from log package.
 	Logger *log.Logger
 
 	// BucketName overrides the default bucket name.
@@ -146,6 +151,22 @@ type Options struct {
 	// Default: 1
 	TraceSampleEvery int
 
+	// BatchSoftLimit is the max number of write operations per Bolt write tx.
+	//
+	// One logical Tx is never split, a Tx with more operations still commits
+	// as one unit. For writes touching multiple collections, the smallest
+	// collection limit is used.
+	//
+	// Negative value forces the write scheduler to process one request per
+	// Bolt transaction.
+	//
+	// Default: 64
+	//
+	// Typical range: 4..1024
+	//
+	// Very high values can create commit-size spikes and tail-latency variance.
+	BatchSoftLimit int
+
 	// BucketFillPercent controls bbolt bucket fill factor for write operations.
 	//
 	// Default: 0.8
@@ -160,7 +181,7 @@ type Options struct {
 	// Values too high on churn-heavy workloads can increase write latency.
 	BucketFillPercent float64
 
-	// SnapshotMaterializedPredCacheMaxEntries controls max number of cached
+	// MaterializedPredicateCacheMaxEntries controls max number of cached
 	// materialized predicate bitmaps per published snapshot.
 	//
 	// Negative value disables cache.
@@ -170,56 +191,17 @@ type Options struct {
 	// Typical range: 16..256
 	//
 	// High values on diverse workloads can cause memory growth.
-	SnapshotMaterializedPredCacheMaxEntries int
+	MaterializedPredicateCacheMaxEntries int
 
-	// SnapshotMaterializedPredCacheMaxCardinality skips caching very large
-	// materialized postings to reduce retained heap and GC pressure.
+	// MaterializedPredicateCacheMaxCardinality skips caching very large
+	// materialized postings to reduce retained heap.
 	//
 	// Negative value disables the guard.
 	//
 	// Default: 128K
 	//
 	// Negative (disabled) or very large values can increase memory usage.
-	SnapshotMaterializedPredCacheMaxCardinality int
-
-	// EnableSnapshotStats enables runtime collection of snapshot diagnostics.
-	//
-	// Default: false (disabled).
-	EnableSnapshotStats bool
-
-	// AutoBatchWindow configures the coalescing window for parallel
-	// single-record Set/Patch/Delete operations.
-	//
-	// Negative value disables coalescing waits.
-	//
-	// Default: 50us
-	//
-	// Typical range: 10us..500us
-	//
-	// AutoBatching is only useful when multiple goroutines issue single-record
-	// writes concurrently. Explicit BatchSet/BatchPatch/BatchDelete already
-	// control their own transaction boundaries and do not use this mechanism.
-	//
-	// Higher values can reduce write-path overhead under contention but may
-	// increase single-write latency at low load.
-	AutoBatchWindow time.Duration
-
-	// AutoBatchMax limits max operations merged into one combined write tx.
-	//
-	// Negative value forces the batcher to process one API write request
-	// per Bolt transaction.
-	//
-	// Default: 64
-	//
-	// Typical range: 4..1024
-	//
-	// Very high values can create commit-size spikes and tail-latency variance.
-	AutoBatchMax int
-
-	// EnableAutoBatchStats enables runtime collection of auto-batch stats.
-	//
-	// Default: false (disabled).
-	EnableAutoBatchStats bool
+	MaterializedPredicateCacheMaxCardinality int
 
 	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
 	// pre-aggregated bucket for range predicate acceleration.
@@ -247,15 +229,14 @@ type Options struct {
 }
 
 const (
-	defaultOptionsAnalyzeInterval                  = time.Hour
-	defaultBucketFillPercent                       = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries = 32
-	defaultSnapshotMatPredCacheMaxCardinality      = 128 << 10
-	defaultAutoBatchWindow                         = 50 * time.Microsecond
-	defaultAutoBatchMax                            = 64
-	defaultNumericRangeBucketSize                  = 512
-	defaultNumericRangeBucketMinFieldKeys          = 8192
-	defaultNumericRangeBucketMinSpanKeys           = 1024
+	defaultOptionsAnalyzeInterval                   = time.Hour
+	defaultBucketFillPercent                        = 0.8
+	defaultMaterializedPredicateCacheMaxEntries     = 32
+	defaultMaterializedPredicateCacheMaxCardinality = 128 << 10
+	defaultBatchSoftLimit                           = 64
+	defaultNumericRangeBucketSize                   = 512
+	defaultNumericRangeBucketMinFieldKeys           = 8192
+	defaultNumericRangeBucketMinSpanKeys            = 1024
 )
 
 func (o *Options) setDefaults() {
@@ -271,17 +252,14 @@ func (o *Options) setDefaults() {
 	if o.BucketFillPercent == 0 {
 		o.BucketFillPercent = defaultBucketFillPercent
 	}
-	if o.SnapshotMaterializedPredCacheMaxEntries == 0 {
-		o.SnapshotMaterializedPredCacheMaxEntries = defaultSnapshotMaterializedPredCacheMaxEntries
+	if o.MaterializedPredicateCacheMaxEntries == 0 {
+		o.MaterializedPredicateCacheMaxEntries = defaultMaterializedPredicateCacheMaxEntries
 	}
-	if o.SnapshotMaterializedPredCacheMaxCardinality == 0 {
-		o.SnapshotMaterializedPredCacheMaxCardinality = defaultSnapshotMatPredCacheMaxCardinality
+	if o.MaterializedPredicateCacheMaxCardinality == 0 {
+		o.MaterializedPredicateCacheMaxCardinality = defaultMaterializedPredicateCacheMaxCardinality
 	}
-	if o.AutoBatchWindow == 0 {
-		o.AutoBatchWindow = defaultAutoBatchWindow
-	}
-	if o.AutoBatchMax == 0 {
-		o.AutoBatchMax = defaultAutoBatchMax
+	if o.BatchSoftLimit == 0 {
+		o.BatchSoftLimit = defaultBatchSoftLimit
 	}
 	if o.NumericRangeBucketSize == 0 {
 		o.NumericRangeBucketSize = defaultNumericRangeBucketSize
@@ -301,7 +279,7 @@ func (o Options) validate() error {
 	return nil
 }
 
-// Field represents a single field assignment used by Patch and BatchPatch.
+// Field represents a single field assignment used by Patch.
 // Name is matched against struct field name, "db" tag, or "json" tag,
 // and Value is assigned to the matched field using reflection and conversion rules.
 type Field struct {
@@ -309,74 +287,51 @@ type Field struct {
 	// It can be a struct field name, a "db" tag value, or a "json" tag value.
 	Name string
 	// Value is the new value to assign to the field.
-	// Patch* methods will attempt to convert Value to the field's concrete type,
+	// Patch attempts to convert Value to the field's concrete type,
 	// including numeric widening and some int/float conversions.
 	Value any
 }
 
 const (
 	stringMapBucketSuffix = ".rbimap"
-	rbiDataBucketSuffix   = ".rbidata"
 )
 
-var rbiUIDKey = []byte("uid")
-
-// DB wraps a bbolt database and maintains secondary indexes over values of type *V
-// stored in a single bucket. It supports efficient equality and range queries,
-// as well as array membership and array-length queries for slice fields.
+// Collection maintains secondary indexes over values of type *V
+// stored in a single bbolt bucket.
 //
-// DB is safe for concurrent use.
-type DB[K ~string | ~uint64, V any] struct {
-	vtype  reflect.Type
-	strKey bool
+// Collection is safe for concurrent use.
+type Collection[K ~string | ~uint64, V any] struct {
+	*collection
 
-	bolt         *bbolt.DB
-	dataBucket   []byte
-	strmapBucket []byte
-	metaBucket   []byte
+	vtype reflect.Type
 
-	options     *Options
 	execOptions execOptions[K, V]
-
-	logger  *log.Logger
-	schema  *schema.Schema
-	index   *engine.Index // nil in transparent mode
-	batcher *wexec.Batcher
-
-	closed atomic.Bool
-	broken atomic.Bool
-
-	boltPath string
-	rbiFile  string
-	rbiUID   [persist.UIDLen]byte
-
-	encodeFn func(*V, io.Writer) error
-	decodeFn func(*V, io.Reader) error
+	encodeFn    func(*V, io.Writer) error
+	decodeFn    func(*V, io.Reader) error
 
 	recPool pooled.Pointers[V]
 
-	publishMu sync.RWMutex
-
-	stats rbistats.DB[K]
+	stats rbistats.Collection[K]
 }
 
-// New creates a new indexed DB that uses the provided bbolt database.
+// Open opens or creates a Collection that uses the provided bbolt database.
 //
-// The generic type V must be a struct; otherwise rbierrors.ErrNotStructType is returned.
+// The generic type V must be a struct;
+// otherwise rbierrors.ErrNotStructType is returned.
 //
 // Zero-valued option fields use defaults.
 //
 // If options.BucketName is empty,
 // the name of the value type V is used as the bucket name.
-// New ensures the bucket exists, optionally loads a persisted index from disk,
+// Open ensures the bucket exists, optionally loads a persisted index from disk,
 // builds missing or incompatible index data from bbolt, and sets up field
 // metadata and accessors.
 //
-// Any ExecOptions passed to New become defaults applied to subsequent write
-// operations on the returned DB.
+// Any ExecOptions passed to Open become defaults applied to all write
+// operations on the returned Collection.
 //
-// The resulting DB does not manage the underlying *bbolt.DB lifecycle.
-func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts ...ExecOption[K, V]) (db *DB[K, V], err error) {
+// The resulting Collection does not manage the underlying *bbolt.DB lifecycle.
+func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts ...ExecOption[K, V]) (c *Collection[K, V], err error) {
 	var v V
 	vtype := reflect.TypeOf(v)
 	if vtype == nil {
@@ -404,7 +359,11 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		return nil, fmt.Errorf("bolt instance is nil")
 	}
 	var defaultExecOptions execOptions[K, V]
-	applyExecOptions(&defaultExecOptions, execOpts)
+	for _, opt := range execOpts {
+		if opt != nil {
+			opt(&defaultExecOptions)
+		}
+	}
 	defaultExecOptions = freezeExecOptions(defaultExecOptions)
 	encodeFn, decodeFn, err := defaultCodecMethods[V]()
 	if err != nil {
@@ -426,33 +385,34 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 	}
 
-	if err = regInstance(bolt, boltPath, vname); err != nil {
+	root, part, err := reserveCollection(bolt, boltPath, vname, options.Logger)
+	if err != nil {
 		return nil, err
 	}
-	defer unregInstanceOnError(&err, bolt, vname)
+	defer func() {
+		if err != nil {
+			unreserveCollection(part)
+		}
+	}()
 
-	db = &DB[K, V]{
+	c = &Collection[K, V]{
+		collection: part,
 		vtype:      vtype,
-		bolt:       bolt,
-		dataBucket: []byte(vname),
-		options:    &options,
-		logger:     options.Logger,
-
-		boltPath: boltPath,
-		rbiFile:  rbiFile,
 
 		execOptions: defaultExecOptions,
 		encodeFn:    encodeFn,
 		decodeFn:    decodeFn,
 	}
+	part.options = &options
+	part.boltPath = boltPath
+	part.rbiFile = rbiFile
 
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
-		db.strKey = true
-		db.strmapBucket = append(slices.Clone(db.dataBucket), stringMapBucketSuffix...)
+		part.strKey = true
+		part.strmapBucket = append(slices.Clone(part.dataBucket), stringMapBucketSuffix...)
 	}
-	db.metaBucket = append(slices.Clone(db.dataBucket), rbiDataBucketSuffix...)
-	strKeyIndex := db.strKey && options.EnableStringKeyIndex
+	strKeyIndex := part.strKey && options.EnableStringKeyIndex
 
 	var schemaIndex map[string]schema.IndexKind
 	if options.Index != nil {
@@ -461,71 +421,90 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			schemaIndex[name] = schema.IndexKind(kind)
 		}
 	}
-	db.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex})
+	c.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex, CustomCodec: decodeFn != nil})
 	if err != nil {
 		return nil, err
 	}
 
-	db.index, err = engine.NewIndex(engine.Config{
-		Schema:      db.schema,
-		StrKey:      db.strKey,
+	idx, err := engine.NewIndex(engine.Config{
+		Schema:      c.schema,
+		StrKey:      c.strKey,
 		StrKeyIndex: strKeyIndex,
 
-		SnapshotStats:                               db.options.EnableSnapshotStats,
-		SnapshotMaterializedPredCacheMaxEntries:     db.options.SnapshotMaterializedPredCacheMaxEntries,
-		SnapshotMaterializedPredCacheMaxCardinality: db.options.SnapshotMaterializedPredCacheMaxCardinality,
+		MaterializedPredCacheMaxEntries:     c.options.MaterializedPredicateCacheMaxEntries,
+		MaterializedPredCacheMaxCardinality: c.options.MaterializedPredicateCacheMaxCardinality,
+		RuntimeCachesDirtyOwner:             &root.registry.runtimeCachesDirty,
+		RuntimeCachesRetireEpoch:            &root.registry.runtimeEpoch.issued,
 
-		NumericRangeBucketSize:         db.options.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys: db.options.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:  db.options.NumericRangeBucketMinSpanKeys,
+		NumericRangeBucketSize:         c.options.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys: c.options.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:  c.options.NumericRangeBucketMinSpanKeys,
 
-		AnalyzeInterval: plannerAnalyzeInterval(db.options.AnalyzeInterval),
+		AnalyzeInterval: plannerAnalyzeInterval(c.options.AnalyzeInterval),
 
-		TraceSink:        db.options.TraceSink,
-		TraceSampleEvery: db.options.TraceSampleEvery,
+		TraceSink:        c.options.TraceSink,
+		TraceSampleEvery: c.options.TraceSampleEvery,
 	})
 	if err != nil {
 		return nil, err
 	}
-	db.stats.Mode = rbistats.ModeIndexed
-	if db.index == nil {
-		db.stats.Mode = rbistats.ModeTransparent
-	}
-	db.stats.StringKeys = db.strKey
-	db.stats.IndexFieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
-	db.stats.MeasureFieldCount = len(db.schema.MeasureFields)
-	db.stats.UniqueFieldCount = len(db.schema.Unique)
 
-	err = bolt.Update(func(tx *bbolt.Tx) error {
-		dataExists := tx.Bucket(db.dataBucket) != nil
-		if _, e := tx.CreateBucketIfNotExists(db.dataBucket); e != nil {
+	root.mu.Lock()
+	c.index = idx
+	root.mu.Unlock()
+
+	startupIndexOwned := false
+	if c.index != nil {
+		startupIndexOwned = true
+		startupIndex := c.index
+		defer func() {
+			if err != nil && startupIndexOwned {
+				startupIndex.ReleaseUnpublishedSnapshot()
+			}
+		}()
+	}
+
+	c.stats.Indexed = c.index != nil
+	c.stats.StringKeys = c.strKey
+	c.stats.IndexFieldCount = len(c.schema.Fields) + len(c.schema.MeasureFields)
+	c.stats.MeasureFieldCount = len(c.schema.MeasureFields)
+	c.stats.UniqueFieldCount = len(c.schema.Unique)
+
+	err = root.bolt.Update(func(tx *bbolt.Tx) error {
+		dataExists := tx.Bucket(c.dataBucket) != nil
+		if _, e := tx.CreateBucketIfNotExists(c.dataBucket); e != nil {
 			return e
 		}
-		rbiMeta, e := tx.CreateBucketIfNotExists(db.metaBucket)
+		rbiMeta, e := tx.CreateBucketIfNotExists(root.metaBucket)
 		if e != nil {
 			return e
 		}
-		id := rbiMeta.Get(rbiUIDKey)
+		uidKey := rootCollectionUIDKey(c.dataBucket)
+		id := rbiMeta.Get(uidKey)
 		if id == nil || !dataExists {
-			if _, e = rand.Read(db.rbiUID[:]); e != nil {
+			if _, e = rand.Read(c.rbiUID[:]); e != nil {
 				return fmt.Errorf("generate rbi uid: %w", e)
 			}
-			if e = rbiMeta.Put(rbiUIDKey, db.rbiUID[:]); e != nil {
+			if e = rbiMeta.Put(uidKey, c.rbiUID[:]); e != nil {
 				return fmt.Errorf("store rbi uid: %w", e)
 			}
 		} else {
-			if len(id) != len(db.rbiUID) {
+			if len(id) != len(c.rbiUID) {
 				return fmt.Errorf("invalid rbi uid length: %d", len(id))
 			}
-			copy(db.rbiUID[:], id)
+			copy(c.rbiUID[:], id)
 		}
-		if db.strKey {
-			_, e = createStrMapBucket(tx, db.dataBucket)
+		if c.strKey {
+			_, e = createStrMapBucket(tx, c.dataBucket)
 			return e
 		}
 		return nil
 	})
 	if err != nil {
+		return nil, err
+	}
+
+	if err = root.ensureRegistryCurrent(); err != nil {
 		return nil, err
 	}
 
@@ -535,46 +514,48 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		loadedOrdinaryFieldCount int
 		buildMode                string
 	)
-	if db.index != nil {
+	if c.index != nil {
 		var (
 			skipFields        map[string]struct{}
 			skipMeasureFields map[string]struct{}
 			rebuildReason     string
 		)
-		if _, err = os.Stat(db.rbiFile); err == nil {
+		if _, err = os.Stat(c.rbiFile); err == nil {
 			if options.DisableIndexLoad {
 				rebuildReason = "persisted index load disabled"
 			} else {
-				skipFields, skipMeasureFields, loadedPlannerStats, err = db.loadIndex()
+				skipFields, skipMeasureFields, loadedPlannerStats, err = c.loadIndex()
 				if err != nil {
 					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 				}
 			}
 		} else if os.IsNotExist(err) {
-			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
+			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", c.rbiFile)
 		} else if !os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
 		}
 
 		loadedOrdinaryFieldCount = len(skipFields)
 		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
-		totalFieldCount := len(db.schema.Fields) + len(db.schema.MeasureFields)
+		totalFieldCount := len(c.schema.Fields) + len(c.schema.MeasureFields)
+
 		if rebuildReason != "" {
 			buildMode = "full"
-			db.logger.Printf("rbi: %s", rebuildReason)
-			db.logger.Printf(
+			c.logger.Printf("rbi: %s", rebuildReason)
+			c.logger.Printf(
 				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
 				loadedFieldCount,
 				totalFieldCount,
 			)
+
 		} else if totalFieldCount > 0 {
 			if loadedFieldCount == 0 {
 				buildMode = "full"
-				db.logger.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
-				db.logger.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
+				c.logger.Printf("rbi: persisted index has no compatible field indexes (file=%q)", c.rbiFile)
+				c.logger.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
 			} else if loadedFieldCount < totalFieldCount {
 				buildMode = "partial"
-				db.logger.Printf(
+				c.logger.Printf(
 					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
 					loadedFieldCount,
 					totalFieldCount,
@@ -584,34 +565,56 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 
 		buildStarted := time.Now()
-		if err = db.buildIndex(skipFields, skipMeasureFields); err != nil {
+		if err = c.buildIndex(skipFields, skipMeasureFields); err != nil {
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
 		if buildMode != "" {
-			db.logger.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
+			c.logger.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
 		}
 	}
 
-	db.initBatcher()
+	c.initWriteExecutor()
 
-	if db.index != nil {
-		if err = db.index.PublishCurrentSnapshot(db.bolt, db.dataBucket); err != nil {
+	if c.index != nil {
+		if err = c.index.InstallCurrentSnapshot(root.bolt, c.dataBucket); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
-		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
-			db.index.PublishLoadedPlannerStats(loadedPlannerStats)
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(c.schema.Fields) {
+			c.index.PublishLoadedPlannerStats(loadedPlannerStats)
 
 		} else {
-			if err = db.RefreshPlannerStats(); err != nil {
+			if err = c.index.RefreshPlannerStatsOnSnapshot(c.index.CurrentSnapshot(), c.collection.unavailableErr); err != nil {
 				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
 			}
 		}
-
-		db.startPlannerAnalyzeLoop()
 	}
 
-	return db, nil
+	rootOwnsReadState, publishErr := publishCollectionRegistration(root, c.collection)
+	if rootOwnsReadState {
+		startupIndexOwned = false
+	}
+	if publishErr != nil {
+		err = publishErr
+		return nil, err
+	}
+
+	c.root.mu.Lock()
+	broken := c.root.broken.Load()
+	if !broken {
+		if c.index != nil {
+			c.configureAsyncMaterializedPredSnapshots()
+			c.startPlannerAnalyzeLoop()
+		}
+	}
+	c.root.mu.Unlock()
+
+	if broken {
+		publishCollectionClose(c.collection)
+		return nil, rbierrors.ErrBroken
+	}
+
+	return c, nil
 }
 
 func createStrMapBucket(tx *bbolt.Tx, dataBucket []byte) (*bbolt.Bucket, error) {
@@ -638,138 +641,147 @@ func createStrMapBucket(tx *bbolt.Tx, dataBucket []byte) (*bbolt.Bucket, error) 
 	return m, nil
 }
 
-func (db *DB[K, V]) initBatcher() {
+func rootCollectionUIDKey(dataBucket []byte) []byte {
+	key := make([]byte, 1+binary.MaxVarintLen64+len(dataBucket))
+	key[0] = rootCollectionUIDKeyKind
+	n := binary.PutUvarint(key[1:], uint64(len(dataBucket)))
+	key = key[:1+n+len(dataBucket)]
+	copy(key[1+n:], dataBucket)
+	return key
+}
+
+func (c *Collection[K, V]) initWriteExecutor() {
+	c.root.scheduler.configure(c.options.BatchSoftLimit)
+
 	ops := wexec.RecordOps{
 		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-			return db.encode((*V)(ptr), buf)
+			return c.encode((*V)(ptr), buf)
 		},
 		Decode: func(data []byte) (unsafe.Pointer, error) {
-			val, err := db.decode(data)
+			val, err := c.decode(data)
 			if err != nil {
 				return nil, err
 			}
 			return unsafe.Pointer(val), nil
 		},
 		Release: func(ptr unsafe.Pointer) {
-			db.ReleaseRecords((*V)(ptr))
+			c.ReleaseRecords((*V)(ptr))
 		},
 		ValidateIndex: func(ptr unsafe.Pointer) error {
-			return db.validateIndexedStringValues(ptr)
+			return c.validateIndexedStringValues(ptr)
 		},
 	}
+
 	cfg := wexec.Config{
-		MaxOps:             db.options.AutoBatchMax,
-		Window:             db.options.AutoBatchWindow,
-		MaxQueue:           max(db.options.AutoBatchMax*8, 256),
-		StatsEnabled:       db.options.EnableAutoBatchStats,
-		Unavailable:        db.unavailableErr,
-		Bolt:               db.bolt,
-		DataBucket:         db.dataBucket,
-		StrMapBucket:       db.strmapBucket,
-		BucketFillPercent:  db.options.BucketFillPercent,
-		RejectEmptyPayload: db.decodeFn == nil,
-		PublishMu:          &db.publishMu,
-		StrKey:             db.strKey,
-		Indexed:            db.index != nil,
+		StatsEnabled:       c.root.statsEnabled,
+		DataBucket:         c.dataBucket,
+		StrMapBucket:       c.strmapBucket,
+		BucketFillPercent:  c.options.BucketFillPercent,
+		RejectEmptyPayload: c.decodeFn == nil,
+		StrKey:             c.strKey,
+		Indexed:            c.index != nil,
 		Ops:                &ops,
-		Schema:             db.schema,
+		Schema:             c.schema,
 	}
 
-	if db.index != nil {
-		db.index.ConfigureWrite(&cfg, &db.broken, db.logger)
+	if c.index != nil {
+		c.index.ConfigureWrite(&cfg)
 	}
-	db.batcher = wexec.NewBatcher(cfg)
+	executor := wexec.NewExecutor(cfg)
+
+	c.root.mu.Lock()
+	c.executor = executor
+	c.root.mu.Unlock()
 }
 
-func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
-	result, err := db.index.BuildIndex(
-		db.bolt,
-		db.dataBucket,
-		db.strmapBucket,
+func (c *Collection[K, V]) configureAsyncMaterializedPredSnapshots() {
+	c.index.ConfigureAsyncMaterializedPredSnapshotOps(qexec.AsyncMaterializedPredSnapshotOps{
+		CurrentSeq: c.currentSnapshotSeq,
+		PinCurrentBySeq: func(seq uint64) (*snapshot.View, qexec.AsyncSnapshotPin, bool) {
+			snap, pin, ok := c.collection.pinCurrentReadStateBySnapshotSeq(seq)
+			if !ok {
+				return nil, nil, false
+			}
+			return snap, pin, true
+		},
+	})
+}
+
+func (c *Collection[K, V]) currentSnapshotSeq() uint64 {
+	return c.collection.currentSnapshotSeq()
+}
+
+func (c *Collection[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
+	result, err := c.index.BuildIndex(
+		c.root.bolt,
+		c.dataBucket,
+		c.strmapBucket,
 		skipFields,
 		skipMeasureFields,
-		db.decodeBuildIndexRecord,
-		db.releaseBuildIndexRecord,
+		c.decodeBuildIndexRecord,
+		c.releaseBuildIndexRecord,
 	)
 	if err != nil {
 		return err
 	}
 	if result.Stats {
-		db.stats.BuildTime = result.BuildTime
-		db.stats.BuildRPS = result.BuildRPS
+		c.stats.BuildTime = result.BuildTime
+		c.stats.BuildRPS = result.BuildRPS
 	}
 	return nil
 }
 
-func (db *DB[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
-	val, err := db.decode(data)
+func (c *Collection[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
+	val, err := c.decode(data)
 	if err != nil {
 		return nil, err
 	}
 	return unsafe.Pointer(val), nil
 }
 
-func (db *DB[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
+func (c *Collection[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
 	var zero V
 	val := (*V)(ptr)
 	*val = zero
-	db.recPool.Put(val)
+	c.recPool.Put(val)
 }
 
-func (db *DB[K, V]) validateIndexedStringValues(ptr unsafe.Pointer) error {
-	if db.index == nil || ptr == nil {
+func (c *Collection[K, V]) validateIndexedStringValues(ptr unsafe.Pointer) error {
+	if c.index == nil || ptr == nil {
 		return nil
 	}
-	return db.index.ValidateStringValues(ptr)
+	return c.index.ValidateStringValues(ptr)
 }
 
-func (db *DB[K, V]) loadIndex() (
+func (c *Collection[K, V]) loadIndex() (
 	skipFields map[string]struct{},
 	skipMeasureFields map[string]struct{},
 	plannerStats *rbistats.PlannerSnapshot,
 	err error,
 ) {
-	currentSeq, err := currentBucketSequence(db.bolt, db.dataBucket)
+	currentSeq, err := currentBucketSequence(c.root.bolt, c.dataBucket)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decode: reading current bucket sequence: %w", err)
 	}
 	start := time.Now()
-	result, err := db.index.LoadIndex(db.rbiFile, db.boltPath, db.dataBucket, currentSeq, db.rbiUID)
+	result, err := c.index.LoadIndex(c.rbiFile, c.boltPath, c.dataBucket, currentSeq, c.rbiUID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	db.stats.LoadTime = time.Since(start)
+	c.stats.LoadTime = time.Since(start)
 
 	return result.SkipFields, result.SkipMeasureFields, result.PlannerStats, nil
 }
 
-func (db *DB[K, V]) storeIndex() error {
-	return db.index.StoreIndex(db.rbiFile, db.bolt, db.dataBucket, db.rbiUID)
-}
+func (c *Collection[K, V]) storeIndex() error {
+	tx := BeginIndexView()
+	defer tx.Release()
 
-// disableSync disables fsync for bolt writes. Can help with batch inserts.
-// It should not be used during normal operation.
-//
-// 2026-05-30: removed from public API.
-func (db *DB[K, V]) disableSync() { db.bolt.NoSync = true }
-
-// enableSync enables fsync for bolt writes. See disableSync.
-// By default, fsync is enabled.
-//
-// 2026-05-30: removed from public API.
-func (db *DB[K, V]) enableSync() {
-	db.bolt.NoSync = false
-	_ = db.bolt.Sync()
-}
-
-func (db *DB[K, V]) unavailableErr() error {
-	if db.closed.Load() {
-		return rbierrors.ErrClosed
+	snap, err := tx.closedCollectionSnapshot(c.collection)
+	if err != nil {
+		return err
 	}
-	if db.broken.Load() {
-		return rbierrors.ErrBroken
-	}
-	return nil
+	return c.index.StoreIndexSnapshot(c.rbiFile, snap.Seq, c.rbiUID, snap)
 }
 
 func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
@@ -787,7 +799,7 @@ func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 	return seq, nil
 }
 
-// Stats returns a lightweight database status snapshot.
+// Stats returns a lightweight collection status snapshot.
 //
 // In indexed mode it reports startup build/load timings together with the
 // current published snapshot cardinality and last key.
@@ -796,61 +808,42 @@ func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 // depend on indexed state remain zero-valued: BuildTime, BuildRPS, LoadTime,
 // and KeyCount.
 //
-// LastKey, SnapshotSequence, and auto-batcher fields are populated in both modes.
-func (db *DB[K, V]) Stats() (rbistats.DB[K], error) {
-	if err := db.unavailableErr(); err != nil {
-		return rbistats.DB[K]{}, err
+// LastKey and SnapshotSequence are populated in both modes.
+func (c *Collection[K, V]) Stats() (rbistats.Collection[K], error) {
+	if err := c.collection.unavailableErr(); err != nil {
+		return rbistats.Collection[K]{}, err
 	}
 
-	// do not hold a bbolt read transaction while taking publishMu: writers open
-	// a write transaction before publishing and commit while holding publishMu
-	db.publishMu.RLock()
-	out := db.stats
-	db.publishMu.RUnlock()
+	tx := BeginView()
+	defer tx.Release()
 
+	bucket, read, err := tx.collectionBucket(c.collection)
+	if err != nil {
+		return rbistats.Collection[K]{}, err
+	}
+
+	out := c.stats
 	var seq uint64
-	if db.index != nil {
-		st, err := db.index.DBStats(db.bolt, db.dataBucket, db.unavailableErr)
-		if err != nil {
-			return rbistats.DB[K]{}, err
-		}
-		seq = st.Sequence
-		out.KeyCount = st.KeyCount
-		if st.HasLast {
-			out.LastKey = keycodec.UserKeyFromDataKey[K](st.LastKey, db.strKey)
-		}
 
+	if c.index != nil {
+		if read.snap == nil {
+			return rbistats.Collection[K]{}, rbierrors.ErrNoIndex
+		}
+		seq = read.snap.Seq
+		out.KeyCount = read.snap.UniverseCardinality()
 	} else {
-		tx, err := db.bolt.Begin(false)
-		if err != nil {
-			return rbistats.DB[K]{}, fmt.Errorf("tx error: %w", err)
-		}
-		defer rollback(tx)
+		seq = read.dataSeq
+	}
 
-		b := tx.Bucket(db.dataBucket)
-		if b == nil {
-			return rbistats.DB[K]{}, fmt.Errorf("bucket does not exist")
+	key, _ := bucket.Cursor().Last()
+	if key != nil {
+		if !c.strKey && len(key) != 8 {
+			return rbistats.Collection[K]{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
 		}
-		seq = b.Sequence()
-		key, _ := b.Cursor().Last()
-		if key != nil {
-			if !db.strKey && len(key) != 8 {
-				return rbistats.DB[K]{}, fmt.Errorf("invalid numeric data key length: %d", len(key))
-			}
-			out.LastKey = keycodec.UserKeyFromDataKey[K](keycodec.DataKeyFromBytes(key, db.strKey), db.strKey)
-		}
+		out.LastKey = keycodec.UserKeyFromDataKey[K](keycodec.DataKeyFromBytes(key, c.strKey), c.strKey)
 	}
 
 	out.SnapshotSequence = seq
-
-	queueLen, queueMax, executed, dequeued := db.batcher.BasicStats()
-	out.AutoBatchQueueLen = queueLen
-	out.AutoBatchQueueMax = queueMax
-
-	out.AutoBatchCount = executed
-	if out.AutoBatchCount > 0 {
-		out.AutoBatchAvgSize = float64(dequeued) / float64(out.AutoBatchCount)
-	}
 
 	return out, nil
 }
@@ -863,40 +856,106 @@ func (db *DB[K, V]) Stats() (rbistats.DB[K], error) {
 // When the string key index is enabled, its stats are reported in
 // StringKeyIndex field.
 //
-// On large databases IndexStats can be expensive.
+// On large collections IndexStats can be expensive.
 //
 // In transparent mode it returns a zero-valued IndexStats because no secondary
 // indexes, universe bitmap, or string-key runtime mapping are maintained.
 //
-// If DB is closed or broken, IndexStats returns a zero value.
-func (db *DB[K, V]) IndexStats() rbistats.Index {
-	if err := db.unavailableErr(); err != nil {
+// If Collection is closed or broken, IndexStats returns a zero value.
+func (c *Collection[K, V]) IndexStats() rbistats.Index {
+	if err := c.collection.unavailableErr(); err != nil {
 		return rbistats.Index{}
 	}
 
-	if db.index == nil {
+	if c.index == nil {
 		return rbistats.Index{}
 	}
 
-	return db.index.IndexStats()
-}
-
-func unregInstanceOnError(err *error, bolt *bbolt.DB, vname string) {
-	if *err != nil {
-		unregInstance(bolt, vname)
+	tx := BeginIndexView()
+	defer tx.Release()
+	snap, err := tx.collectionSnapshot(c.collection)
+	if err != nil {
+		return rbistats.Index{}
 	}
+
+	return c.index.IndexStatsOnSnapshot(snap)
 }
 
-// AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.
-//
-// Runtime counters are collected only when Options.EnableAutoBatchStats was
-// enabled for this DB instance; otherwise the method returns a zero value.
-//
-// The method is independent of indexed versus transparent mode. Write-path
-// batching remains active in both modes, so when stats collection is enabled
-// the returned counters and queue state reflect the current write workload.
-func (db *DB[K, V]) AutoBatchStats() rbistats.AutoBatch {
-	return db.batcher.Stats()
+// StoreStats returns store generation diagnostics if store stats were enabled
+// before it was opened. See EnableStoreStats.
+func (c *Collection[K, V]) StoreStats() rbistats.Store {
+	if c.state.Load()&collectionClosed != 0 {
+		return rbistats.Store{}
+	}
+	r := c.root
+	if !r.statsEnabled {
+		return rbistats.Store{}
+	}
+
+	var out rbistats.Store
+	r.mu.Lock()
+	out.OpenCollections = len(r.collections)
+	out.CollectionHighWater = r.collectionHighWater
+	executors := make([]*wexec.Executor, 0, len(r.collections))
+	for _, p := range r.collections {
+		if p.executor != nil {
+			executors = append(executors, p.executor)
+		}
+	}
+	r.mu.Unlock()
+
+	st := r.scheduler.snapshot()
+	out.QueueLen = st.QueueLen
+	out.QueueCap = st.QueueCap
+	out.WorkerRunning = st.WorkerRunning
+	out.QueueHighWater = st.QueueHighWater
+	out.LogicalUnitsSubmitted = st.Submitted
+	out.LogicalUnitsEnqueued = st.Enqueued
+	out.LogicalUnitsDequeued = st.Dequeued
+	out.ExecutedBatches = st.ExecutedBatches
+	out.MultiUnitBatches = st.MultiUnitBatches
+	out.MultiUnitOps = st.MultiUnitOps
+	out.BatchSize1 = st.BatchSize1
+	out.BatchSize2To4 = st.BatchSize2To4
+	out.BatchSize5To8 = st.BatchSize5To8
+	out.BatchSize9Plus = st.BatchSize9Plus
+	out.AvgBatchSize = st.AvgBatchSize
+	out.MaxBatchSeen = st.MaxBatchSeen
+	out.RejectedClosed = st.RejectedClosed
+	out.TxBeginErrors = st.TxBeginErrors
+	out.TxOpErrors = st.TxOpErrors
+	out.TxCommitErrors = st.TxCommitErrors
+
+	for _, executor := range executors {
+		st := executor.ExecutorStats()
+		out.CallbackOps += st.CallbackOps
+		out.UniqueRejected += st.UniqueRejected
+		out.TxOpErrors += st.TxOpErrors
+		out.CallbackErrors += st.CallbackErrors
+	}
+	out.Broken = r.broken.Load()
+
+	rr := &r.registry
+	rr.mu.RLock()
+	current := rr.current.Load()
+	if current == nil {
+		out.Reaped = true
+	} else {
+		out.CurrentEpoch = current.epoch
+	}
+	out.RegistrySize = len(rr.byEpoch)
+	out.StagedGenerations = len(rr.staged)
+	for epoch, ref := range rr.byEpoch {
+		if ref.refs.Load() != 0 {
+			out.PinnedRefs++
+			if out.OldestPinnedEpoch == 0 || epoch < out.OldestPinnedEpoch {
+				out.OldestPinnedEpoch = epoch
+			}
+		}
+		out.RetiredGenerations += len(ref.retired)
+	}
+	rr.mu.RUnlock()
+	return out
 }
 
 // PlannerStats returns the last published planner statistics snapshot together
@@ -908,148 +967,89 @@ func (db *DB[K, V]) AutoBatchStats() rbistats.AutoBatch {
 //
 // In transparent mode no query engine and no runtime planner exist, so the
 // returned planner payload is zero-valued.
-func (db *DB[K, V]) PlannerStats() rbistats.Planner {
-	if db.index == nil {
+func (c *Collection[K, V]) PlannerStats() rbistats.Planner {
+	if c.index == nil {
 		return rbistats.Planner{}
 	}
-	return db.index.PlannerStats()
+	return c.index.PlannerStats()
 }
 
 // Close closes the indexer and persists the current index state
 // to the .rbi file unless index persistence is disabled.
 //
-// After Close, all other methods return rbierrors.ErrClosed.
+// After Close, methods that need to bind a new operation to this Collection return
+// rbierrors.ErrClosed.
 // Subsequent calls to Close are no-op.
 //
+// Close waits for explicit write Tx values that already touched this Collection until
+// user code commits, rolls back, or closes those transactions.
+//
+// Close does not wait for open read or index Tx values. Read and index Tx
+// values that already pinned a root generation continue to read that pinned
+// state until Tx.Close. A read Tx that opened a bbolt read transaction still
+// owns it; if the caller closes the underlying *bbolt.DB while such a Tx is
+// open, bbolt.Close waits for the transaction to close.
+//
 // It does not close the underlying *bbolt.DB.
-func (db *DB[K, V]) Close() error {
-	if !db.closed.CompareAndSwap(false, true) {
+func (c *Collection[K, V]) Close() error {
+	if !c.collection.beginClose() {
 		return nil
 	}
-	defer unregInstance(db.bolt, string(db.dataBucket))
+	defer unreserveCollection(c.collection)
 
-	db.stopAnalyzeLoop()
+	c.stopAnalyzeLoop()
 
-	db.batcher.WakeWaiters()
-
-	db.publishMu.Lock()
-	defer db.publishMu.Unlock()
+	c.root.scheduler.wakeWaiters()
 
 	var err error
 
-	if db.index != nil && !db.options.DisableIndexStore && !db.broken.Load() {
-		err = db.storeIndex()
+	if c.index != nil && !c.options.DisableIndexStore && !c.root.broken.Load() {
+		err = c.storeIndex()
 	}
 
-	if err == nil && db.broken.Load() {
+	if err == nil && c.root.broken.Load() {
 		err = rbierrors.ErrBroken
 	}
+
+	publishCollectionClose(c.collection)
 
 	return err
 }
 
-// Truncate deletes all values stored in the database. This cannot be undone.
+// Truncate deletes all values stored in the collection. This cannot be undone.
+//
+// Do not call Truncate within a transaction, as this will cause a deadlock.
 //
 // Truncate does not reclaim disk space.
-func (db *DB[K, V]) Truncate() error {
-	if err := db.unavailableErr(); err != nil {
+func (c *Collection[K, V]) Truncate() error {
+	if err := c.collection.retain(); err != nil {
 		return err
 	}
-
-	// Keep writer lock order consistent with batched/single write paths:
-	// open bbolt write tx first, then take db.publishMu.
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	db.publishMu.Lock()
-	defer db.publishMu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	prevSeq := uint64(0)
-	if bucket := tx.Bucket(db.dataBucket); bucket != nil {
-		prevSeq = bucket.Sequence()
-		if err = tx.DeleteBucket(db.dataBucket); err != nil {
-			return fmt.Errorf("error deleting bucket: %w", err)
-		}
-	}
-	if db.strKey && tx.Bucket(db.strmapBucket) != nil {
-		if err = tx.DeleteBucket(db.strmapBucket); err != nil {
-			return fmt.Errorf("error deleting string map bucket: %w", err)
-		}
-	}
-
-	bucket, err := tx.CreateBucketIfNotExists(db.dataBucket)
-	if err != nil {
-		return fmt.Errorf("error creating bucket: %w", err)
-	}
-	if err = bucket.SetSequence(prevSeq); err != nil {
-		return fmt.Errorf("restore bucket sequence: %w", err)
-	}
-	if db.strKey {
-		if _, err = createStrMapBucket(tx, db.dataBucket); err != nil {
-			return err
-		}
-	}
-	if db.index == nil {
-		if _, err = bucket.NextSequence(); err != nil {
-			return fmt.Errorf("advance bucket sequence: %w", err)
-		}
-		if err = tx.Commit(); err != nil {
-			return fmt.Errorf("commit error: %w", err)
-		}
-		return nil
-	}
-	seq, err := bucket.NextSequence()
-	if err != nil {
-		return fmt.Errorf("advance bucket sequence: %w", err)
-	}
-
-	staged := db.index.StageTruncate(seq)
-	if err = tx.Commit(); err != nil {
-		db.index.DropStaged(seq)
-		return fmt.Errorf("commit error: %w", err)
-	}
-
-	if err = db.index.PublishCommittedStaged(&db.broken, db.logger, seq, "truncate", staged); err != nil {
-		return err
-	}
-
-	return nil
+	unit := writeUnit{root: c.root, truncate: c.collection}
+	err := c.root.scheduler.submit(&unit)
+	c.collection.releaseRetain()
+	return err
 }
 
 // ReleaseRecords returns records to the record pool.
 //
-// The caller transfers ownership of each passed pointer back to DB.
+// The caller transfers ownership of each passed pointer back to Collection.
 // Passed records must not be used after this call.
 // There is no internal protection against double-release.
 // If unsure about record ownership or lifecycle, do not use this method.
-func (db *DB[K, V]) ReleaseRecords(v ...*V) {
+func (c *Collection[K, V]) ReleaseRecords(v ...*V) {
 	var zero V
 	for _, rec := range v {
 		if rec != nil {
 			*rec = zero
-			db.recPool.Put(rec)
+			c.recPool.Put(rec)
 		}
 	}
 }
 
-// Bolt returns the underlying *bbolt.DB instance used by this DB.
-//
-// Should be used with caution; callers must not mutate buckets managed by RBI,
-// including sequence counters.
-func (db *DB[K, V]) Bolt() *bbolt.DB {
-	return db.bolt
-}
-
 // BucketName returns a name of the bucket at which the data is stored.
-func (db *DB[K, V]) BucketName() []byte {
-	return slices.Clone(db.dataBucket)
+func (c *Collection[K, V]) BucketName() []byte {
+	return slices.Clone(c.dataBucket)
 }
 
 var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
@@ -1099,17 +1099,17 @@ func defaultCodecMethods[V any]() (func(*V, io.Writer) error, func(*V, io.Reader
 	return encodeFn, decodeFn, nil
 }
 
-func (db *DB[K, V]) decode(b []byte) (*V, error) {
-	v := db.recPool.Get()
+func (c *Collection[K, V]) decode(b []byte) (*V, error) {
+	v := c.recPool.Get()
 
 	reader := decodeReaderPool.Get()
 	defer decodeReaderPool.Put(reader)
 
 	reader.Reset(b)
 
-	if db.decodeFn != nil {
-		if err := db.decodeFn(v, reader); err != nil {
-			db.ReleaseRecords(v)
+	if c.decodeFn != nil {
+		if err := c.decodeFn(v, reader); err != nil {
+			c.ReleaseRecords(v)
 			return nil, err
 		}
 		return v, nil
@@ -1121,15 +1121,15 @@ func (db *DB[K, V]) decode(b []byte) (*V, error) {
 	dec.Reset(reader)
 
 	if err := dec.Decode(v); err != nil {
-		db.ReleaseRecords(v)
+		c.ReleaseRecords(v)
 		return nil, err
 	}
 	return v, nil
 }
 
-func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
-	if db.encodeFn != nil {
-		return db.encodeFn(v, b)
+func (c *Collection[K, V]) encode(v *V, b *bytes.Buffer) error {
+	if c.encodeFn != nil {
+		return c.encodeFn(v, b)
 	}
 	enc := msgpackEncPool.Get()
 	enc.Reset(b)
@@ -1166,34 +1166,4 @@ func validateBucketName(name string) error {
 		)
 	}
 	return nil
-}
-
-var (
-	registryMu sync.Mutex
-	registry   = make(map[registryKey]struct{})
-)
-
-type registryKey struct {
-	bolt   *bbolt.DB
-	bucket string
-}
-
-func regInstance(bolt *bbolt.DB, dbPath string, bucket string) error {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-
-	key := registryKey{bolt: bolt, bucket: bucket}
-	if _, exists := registry[key]; exists {
-		return fmt.Errorf("rbi is already open for \"%v\" at %v", bucket, dbPath)
-	}
-
-	registry[key] = struct{}{}
-	return nil
-}
-
-func unregInstance(bolt *bbolt.DB, bucket string) {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-
-	delete(registry, registryKey{bolt: bolt, bucket: bucket})
 }

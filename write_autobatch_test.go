@@ -7,33 +7,33 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/vapstack/rbi/rbierrors"
-	"github.com/vapstack/rbi/rbistats"
-
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 func TestAutoBatchMissingBucketRollsBackWriteTx(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		return tx.DeleteBucket(db.dataBucket)
+	c, _ := openTempUint64Collection(t)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.DeleteBucket(c.dataBucket)
 	}); err != nil {
 		t.Fatalf("delete bucket: %v", err)
 	}
 
-	err := db.Set(1, &Rec{Name: "missing"}, NoBatch[uint64, Rec])
+	err := writeSet(c, 1, &Rec{Name: "missing"})
 	if err == nil || !strings.Contains(err.Error(), "bucket does not exist") {
 		t.Fatalf("expected missing bucket error, got %v", err)
 	}
 
 	done := make(chan error, 1)
 	go func() {
-		tx, err := db.bolt.Begin(true)
+		tx, err := c.root.bolt.Begin(true)
 		if err == nil {
 			err = tx.Rollback()
 		}
@@ -49,14 +49,16 @@ func TestAutoBatchMissingBucketRollsBackWriteTx(t *testing.T) {
 	}
 }
 
-func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+func TestBatch_OnChange_CallbacksRunForSetPatchDelete(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t)
 
 	var (
 		mu     sync.Mutex
 		events []string
 	)
-	cb := func(_ *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
+	cb := func(_ *Tx, key uint64, oldValue, newValue *Rec) error {
 		oldName := "<nil>"
 		newName := "<nil>"
 		if oldValue != nil {
@@ -71,13 +73,13 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 		return nil
 	}
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(cb)); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 10}, OnChange(cb)); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Patch(1, []Field{{Name: "name", Value: "bob"}}, BeforeCommit(cb)); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "name", Value: "bob"}}, OnChange(cb)); err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
-	if err := db.Delete(1, BeforeCommit(cb)); err != nil {
+	if err := writeDelete(c, 1, OnChange(cb)); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -90,17 +92,18 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 		t.Fatalf("unexpected callback events: got=%v want=%v", events, want)
 	}
 
-	bs := db.AutoBatchStats()
+	bs := c.StoreStats()
 	if bs.CallbackOps < 3 {
-		t.Fatalf("expected at least 3 callback ops in auto-batcher stats, got %d", bs.CallbackOps)
+		t.Fatalf("expected at least 3 callback ops in root stats, got %d", bs.CallbackOps)
 	}
 }
 
 func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+		BatchSoftLimit:  16,
 	})
 
 	cloneRec := func(src *Rec) Rec {
@@ -169,7 +172,7 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 	for i := 1; i <= 24; i++ {
 		rec := makeRec(i)
 		id := uint64(i)
-		if err := db.Set(id, &rec, NoBatch[uint64, Rec]); err != nil {
+		if err := writeSet(c, id, &rec); err != nil {
 			t.Fatalf("seed Set(%d): %v", id, err)
 		}
 		model[id] = cloneRec(&rec)
@@ -184,7 +187,7 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 		mu     sync.Mutex
 		events []event
 	)
-	recordCommit := func(_ *bbolt.Tx, id uint64, _, newValue *Rec) error {
+	recordChange := func(_ *Tx, id uint64, _, newValue *Rec) error {
 		mu.Lock()
 		if newValue == nil {
 			events = append(events, event{id: id, delete: true})
@@ -215,7 +218,7 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 		}
 	}
 
-	before := db.AutoBatchStats()
+	before := c.StoreStats()
 	start := make(chan struct{})
 	errCh := make(chan error, len(ops))
 	var wg sync.WaitGroup
@@ -229,17 +232,17 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 			switch op.kind {
 			case 0:
 				rec := op.rec
-				err = db.Set(op.id, &rec, BeforeCommit(recordCommit))
+				err = writeSet(c, op.id, &rec, OnChange(recordChange))
 				if err == nil {
 					poisonRec(&rec)
 				}
 			case 1:
-				err = db.Patch(op.id, op.patch, BeforeCommit(recordCommit))
+				err = writePatch(c, op.id, op.patch, OnChange(recordChange))
 				if err == nil {
 					poisonPatch(op.patch)
 				}
 			default:
-				err = db.Delete(op.id, BeforeCommit(recordCommit))
+				err = writeDelete(c, op.id, OnChange(recordChange))
 			}
 			if err != nil {
 				errCh <- fmt.Errorf("kind=%d id=%d: %w", op.kind, op.id, err)
@@ -262,13 +265,13 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 		}
 	}
 
-	if got, err := db.Count(); err != nil {
+	if got, err := readCount(c); err != nil {
 		t.Fatalf("Count: %v", err)
 	} else if got != uint64(len(model)) {
 		t.Fatalf("Count = %d, want %d", got, len(model))
 	}
 	for id := uint64(1); id <= 40; id++ {
-		got, err := db.Get(id)
+		got, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
@@ -286,7 +289,7 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 
 	assertQuery := func(label string, q *qx.QX, match func(Rec) bool) {
 		t.Helper()
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("%s QueryKeys: %v", label, err)
 		}
@@ -312,34 +315,40 @@ func TestAutoBatchMixedQueuedWritesMatchCommitOrderModel(t *testing.T) {
 		return slices.Contains(rec.Tags, "hot")
 	})
 
-	after := db.AutoBatchStats()
-	if after.MultiRequestBatches <= before.MultiRequestBatches {
-		t.Fatalf("expected queued writes to form a multi-request batch, before=%+v after=%+v", before, after)
+	after := c.StoreStats()
+	if after.CallbackOps <= before.CallbackOps {
+		t.Fatalf("expected queued writes to run callbacks, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestBatch_SequentialSet_DoesNotProduceMultiRequestBatches(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+func TestBatch_SequentialSet_DoesNotProduceMultiUnitBatches(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 16,
 	})
 
-	before := db.AutoBatchStats()
+	before := c.StoreStats()
 	for i := 1; i <= 64; i++ {
-		if err := db.Set(uint64(i), &Rec{
+		if err := writeSet(c, uint64(i), &Rec{
 			Name: fmt.Sprintf("seq-%03d", i),
 			Age:  18 + (i % 50),
 		}); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	after := db.AutoBatchStats()
+	after := waitAutoBatchExtraStats(t, c.root, "sequential batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+64 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+64 &&
+			st.Dequeued == before.LogicalUnitsDequeued+64 &&
+			st.ExecutedBatches == before.ExecutedBatches+64 &&
+			st.BatchSize1 == before.BatchSize1+64
+	})
 
-	enqueuedDelta := after.Enqueued - before.Enqueued
-	if enqueuedDelta != 64 {
-		t.Fatalf("expected all sequential Set writes to be enqueued, delta=%d before=%+v after=%+v", enqueuedDelta, before, after)
+	if after.Submitted != before.LogicalUnitsSubmitted+64 || after.Enqueued != before.LogicalUnitsEnqueued+64 || after.Dequeued != before.LogicalUnitsDequeued+64 {
+		t.Fatalf("expected all sequential Set writes to be enqueued, before=%+v after=%+v", before, after)
 	}
-	if after.MultiRequestBatches != before.MultiRequestBatches {
+	if after.ExecutedBatches != before.ExecutedBatches+64 || after.BatchSize1 != before.BatchSize1+64 || after.MultiUnitBatches != before.MultiUnitBatches {
 		t.Fatalf("expected no multi-request batches for sequential Set calls, before=%+v after=%+v", before, after)
 	}
 	if after.MaxBatchSeen > 1 {
@@ -351,9 +360,9 @@ func TestBatch_SequentialSet_DoesNotProduceMultiRequestBatches(t *testing.T) {
 }
 
 func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
-	if err := db.Set(1, &Rec{
+	if err := writeSet(c, 1, &Rec{
 		Meta:     Meta{Country: "NL"},
 		Name:     "alice",
 		Email:    "alice@example.test",
@@ -366,17 +375,17 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	if err := db.BatchPatch(
+	if err := writePatches(c,
 		[]uint64{1, 1},
 		[]Field{
 			{Name: "age", Value: 31},
 			{Name: "tags", Value: []string{"rust", "db"}},
 		},
 	); err != nil {
-		t.Fatalf("BatchPatch repeated id: %v", err)
+		t.Fatalf("MultiPatch repeated id: %v", err)
 	}
 
-	got, err := db.Get(1)
+	got, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -392,7 +401,7 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 
 	assertContains := func(q *qx.QX, desc string) {
 		t.Helper()
-		ids, qerr := db.QueryKeys(q)
+		ids, qerr := readQueryKeys(c, q)
 		if qerr != nil {
 			t.Fatalf("QueryKeys(%s): %v", desc, qerr)
 		}
@@ -402,7 +411,7 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 	}
 	assertOmits := func(q *qx.QX, desc string) {
 		t.Helper()
-		ids, qerr := db.QueryKeys(q)
+		ids, qerr := readQueryKeys(c, q)
 		if qerr != nil {
 			t.Fatalf("QueryKeys(%s): %v", desc, qerr)
 		}
@@ -418,105 +427,764 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 	assertOmits(qx.Query(qx.HASALL("tags", []string{"go"})), `tag="go"`)
 }
 
-func TestBatch_MaxOne_StillUsesBatcher(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    1,
+func TestBatch_MaxOne_StillUsesRootScheduler(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 1,
 	})
 
-	before := db.AutoBatchStats()
+	before := c.StoreStats()
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	after := db.AutoBatchStats()
-	if after.Submitted != before.Submitted+1 || after.Enqueued != before.Enqueued+1 || after.Dequeued != before.Dequeued+1 {
-		t.Fatalf("expected AutoBatchMax=1 write to still use queue path, before=%+v after=%+v", before, after)
+	after := waitAutoBatchExtraStats(t, c.root, "BatchSoftLimit=1 write settled", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+1 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+1 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.ExecutedBatches == before.ExecutedBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1
+	})
+	if after.Submitted != before.LogicalUnitsSubmitted+1 || after.Enqueued != before.LogicalUnitsEnqueued+1 || after.Dequeued != before.LogicalUnitsDequeued+1 {
+		t.Fatalf("expected BatchSoftLimit=1 write to still use queue path, before=%+v after=%+v", before, after)
 	}
-	if after.BatchSize1 != before.BatchSize1+1 || after.MultiRequestBatches != before.MultiRequestBatches {
-		t.Fatalf("expected AutoBatchMax=1 to execute as a single-request internal batch, before=%+v after=%+v", before, after)
+	if after.ExecutedBatches != before.ExecutedBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.MultiUnitBatches != before.MultiUnitBatches {
+		t.Fatalf("expected BatchSoftLimit=1 to execute as a single-unit physical batch, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestBatch_MaxQueueDerivedFromMaxBatch(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchMax:         16,
-		EnableAutoBatchStats: true,
-	})
-	if got := db.AutoBatchStats().MaxQueue; got != 256 {
-		t.Fatalf("MaxQueue for AutoBatchMax=16 = %d, want 256", got)
-	}
+func TestBatch_CollectionBatchSoftLimitLimitsRootSharedBatch(t *testing.T) {
+	enableStoreStatsForTest(t)
 
-	db, _ = openTempDBUint64(t, Options{
-		AutoBatchMax:         64,
-		EnableAutoBatchStats: true,
-	})
-	if got := db.AutoBatchStats().MaxQueue; got != 512 {
-		t.Fatalf("MaxQueue for AutoBatchMax=64 = %d, want 512", got)
-	}
-}
-
-func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
-	})
-
-	before := db.AutoBatchStats()
-
-	calls := 0
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, NoBatch[uint64, Rec], BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
-		calls++
-		return nil
-	}))
+	raw, _ := openRawBolt(t)
+	slowDB, err := Open[uint64, Rec](raw, testOptions(Options{BatchSoftLimit: 1}))
 	if err != nil {
-		t.Fatalf("Set: %v", err)
+		t.Fatalf("New slow: %v", err)
 	}
-	if calls != 1 {
-		t.Fatalf("expected callback to run exactly once, got %d", calls)
+	fastDB, err := Open[string, Product](raw, testOptions(Options{BatchSoftLimit: 16}))
+	if err != nil {
+		t.Fatalf("New fast: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = slowDB.Close()
+		_ = fastDB.Close()
+		_ = raw.Close()
+	})
+
+	before := slowDB.StoreStats()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(fastDB, "blocker", &Product{SKU: "blocker"}, OnChange(func(*Tx, string, *Product, *Product) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
 	}
 
-	after := db.AutoBatchStats()
-	if after.Submitted != before.Submitted+1 || after.Enqueued != before.Enqueued+1 || after.Dequeued != before.Dequeued+1 {
-		t.Fatalf("expected NoBatch write to use queued internal path, before=%+v after=%+v", before, after)
+	done1 := make(chan error, 1)
+	done2 := make(chan error, 1)
+	go func() {
+		done1 <- writeSet(slowDB, 1, &Rec{Name: "one"})
+	}()
+	go func() {
+		done2 <- writeSet(slowDB, 2, &Rec{Name: "two"})
+	}()
+
+	waitAutoBatchExtraStats(t, slowDB.root, "slow writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker": blockerDone,
+		"one":     done1,
+		"two":     done2,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
 	}
-	if after.BatchSize1 != before.BatchSize1+1 || after.MultiRequestBatches != before.MultiRequestBatches {
-		t.Fatalf("expected NoBatch request to execute as a single-request batch, before=%+v after=%+v", before, after)
+
+	after := waitAutoBatchExtraStats(t, slowDB.root, "BatchSoftLimit=1 collection batches settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+3 &&
+			st.BatchSize1 == before.BatchSize1+3
+	})
+	if after.MultiUnitBatches != before.MultiUnitBatches {
+		t.Fatalf("BatchSoftLimit=1 collection formed shared batch, before=%+v after=%+v", before, after)
 	}
-	if after.CallbackOps != before.CallbackOps+1 {
-		t.Fatalf("expected NoBatch callback to run through internal batcher, before=%+v after=%+v", before, after)
+	if after.ExecutedBatches != before.ExecutedBatches+3 || after.BatchSize1 != before.BatchSize1+3 {
+		t.Fatalf("expected blocker and slow writes to execute as single-unit batches, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAutoBatchRequestLocalApplyFailureDoesNotRejectNeighbor(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempStringCollection(t, Options{BatchSoftLimit: 16})
+	before := c.StoreStats()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(c, "blocker", &Rec{Name: "blocker"}, OnChange(func(*Tx, string, *Rec, *Rec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	badDone := make(chan error, 1)
+	goodDone := make(chan error, 1)
+	go func() {
+		badDone <- writeSet(c, strings.Repeat("x", bbolt.MaxKeySize+1), &Rec{Name: "bad"})
+	}()
+	go func() {
+		goodDone <- writeSet(c, "good", &Rec{Name: "good"})
+	}()
+
+	waitAutoBatchExtraStats(t, c.root, "bad+good writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+
+	if err := <-blockerDone; err != nil {
+		t.Fatalf("blocker write: %v", err)
+	}
+	if err := <-badDone; !errors.Is(err, berrors.ErrKeyTooLarge) {
+		t.Fatalf("bad write err=%v, want ErrKeyTooLarge", err)
+	}
+	if err := <-goodDone; err != nil {
+		t.Fatalf("good write: %v", err)
+	}
+
+	got, err := readGet(c, "good")
+	if err != nil {
+		t.Fatalf("Get(good): %v", err)
+	}
+	defer releaseUniqueRecords(c, got)
+	if got == nil || got.Name != "good" {
+		t.Fatalf("Get(good)=%#v want good record", got)
+	}
+
+	after := waitAutoBatchExtraStats(t, c.root, "bad+good coalesced batch settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.MultiUnitBatches == before.MultiUnitBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1 &&
+			st.BatchSize2To4 == before.BatchSize2To4+1
+	})
+	if after.ExecutedBatches != before.ExecutedBatches+2 || after.MultiUnitBatches != before.MultiUnitBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.BatchSize2To4 != before.BatchSize2To4+1 {
+		t.Fatalf("request-local failure did not run in one multi-unit batch, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestBatch_CrossDBWritesSharePhysicalRootBatch(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	raw, _ := openRawBolt(t)
+	recDB, err := Open[uint64, Rec](raw, testOptions(Options{BatchSoftLimit: 16}))
+	if err != nil {
+		t.Fatalf("New rec: %v", err)
+	}
+	productDB, err := Open[string, Product](raw, testOptions(Options{BatchSoftLimit: 16}))
+	if err != nil {
+		t.Fatalf("New product: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = recDB.Close()
+		_ = productDB.Close()
+		_ = raw.Close()
+	})
+
+	before := recDB.StoreStats()
+	epochBefore := recDB.root.registry.current.Load().epoch
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(recDB, 1, &Rec{Name: "blocker"}, OnChange(func(*Tx, uint64, *Rec, *Rec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	recDone := make(chan error, 1)
+	productDone := make(chan error, 1)
+	go func() {
+		recDone <- writeSet(recDB, 2, &Rec{Name: "queued-rec", Age: 22})
+	}()
+	go func() {
+		productDone <- writeSet(productDB, "queued-product", &Product{SKU: "queued-product", Price: 42})
+	}()
+
+	waitAutoBatchExtraStats(t, recDB.root, "cross-db writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker": blockerDone,
+		"rec":     recDone,
+		"product": productDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
+	}
+
+	after := waitAutoBatchExtraStats(t, recDB.root, "cross-DB batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.MultiUnitBatches == before.MultiUnitBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1 &&
+			st.BatchSize2To4 == before.BatchSize2To4+1 &&
+			st.MaxBatchSeen >= 2
+	})
+	if after.ExecutedBatches != before.ExecutedBatches+2 || after.MultiUnitBatches != before.MultiUnitBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.BatchSize2To4 != before.BatchSize2To4+1 {
+		t.Fatalf("cross-DB writes did not form one root physical batch, before=%+v after=%+v", before, after)
+	}
+	if after.MaxBatchSeen < 2 {
+		t.Fatalf("root physical batch size was not observed, stats=%+v", after)
+	}
+	if got := recDB.root.registry.current.Load().epoch; got != epochBefore+2 {
+		t.Fatalf("root epoch after blocker+crossDB batch=%d want %d", got, epochBefore+2)
+	}
+
+	rec, err := readGet(recDB, 2)
+	if err != nil {
+		t.Fatalf("Get rec: %v", err)
+	}
+	product, err := readGet(productDB, "queued-product")
+	if err != nil {
+		t.Fatalf("Get product: %v", err)
+	}
+	if rec == nil || rec.Name != "queued-rec" || rec.Age != 22 {
+		t.Fatalf("unexpected rec after crossDB batch: %#v", rec)
+	}
+	if product == nil || product.SKU != "queued-product" || product.Price != 42 {
+		t.Fatalf("unexpected product after crossDB batch: %#v", product)
+	}
+}
+
+func TestBatch_OnChangeFailureDoesNotReplayAcceptedNeighbor(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 16})
+	before := c.StoreStats()
+	epochBefore := c.root.registry.current.Load().epoch
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(c, 1, &Rec{Name: "blocker"}, OnChange(func(*Tx, uint64, *Rec, *Rec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	failErr := errors.New("fail current unit")
+	var acceptedCalls atomic.Int32
+	acceptedDone := make(chan error, 1)
+	failedDone := make(chan error, 1)
+	go func() {
+		acceptedDone <- writeSet(c, 2, &Rec{Name: "accepted"}, OnChange(func(*Tx, uint64, *Rec, *Rec) error {
+			acceptedCalls.Add(1)
+			return nil
+		}))
+	}()
+	waitAutoBatchExtraStats(t, c.root, "accepted hook write queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+2 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+2 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 1
+	})
+	go func() {
+		failedDone <- writeSet(c, 3, &Rec{Name: "failed"}, OnChange(func(*Tx, uint64, *Rec, *Rec) error {
+			return failErr
+		}))
+	}()
+
+	waitAutoBatchExtraStats(t, c.root, "hook writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker":  blockerDone,
+		"accepted": acceptedDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
+	}
+	select {
+	case err := <-failedDone:
+		if !errors.Is(err, failErr) {
+			t.Fatalf("failed write error=%v want %v", err, failErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for failed write")
+	}
+
+	if got := acceptedCalls.Load(); got != 1 {
+		t.Fatalf("accepted OnChange calls=%d want 1", got)
+	}
+	if got := c.root.registry.current.Load().epoch; got != epochBefore+2 {
+		t.Fatalf("root epoch after blocker+accepted batch=%d want %d", got, epochBefore+2)
+	}
+	after := waitAutoBatchExtraStats(t, c.root, "hook batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.MultiUnitBatches == before.MultiUnitBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1 &&
+			st.BatchSize2To4 == before.BatchSize2To4+1
+	})
+	if after.ExecutedBatches != before.ExecutedBatches+2 || after.MultiUnitBatches != before.MultiUnitBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.BatchSize2To4 != before.BatchSize2To4+1 {
+		t.Fatalf("hook writes did not execute as one root batch, before=%+v after=%+v", before, after)
+	}
+
+	accepted, err := readGet(c, 2)
+	if err != nil {
+		t.Fatalf("Get accepted: %v", err)
+	}
+	failed, err := readGet(c, 3)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if accepted == nil || accepted.Name != "accepted" {
+		t.Fatalf("accepted unit was not committed: %#v", accepted)
+	}
+	if failed != nil {
+		t.Fatalf("failed unit persisted: %#v", failed)
+	}
+}
+
+func TestBatch_AcceptedUnitsSeeSteppedOldValuesSameCollection(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 16})
+	before := c.StoreStats()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(c, 1, &Rec{Name: "blocker"}, OnChange(func(*Tx, uint64, *Rec, *Rec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	var firstOld, secondOld int
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- writeSet(c, 2, &Rec{Name: "first", Age: 10}, OnChange(func(_ *Tx, _ uint64, oldValue, _ *Rec) error {
+			if oldValue != nil {
+				firstOld = oldValue.Age
+			}
+			return nil
+		}))
+	}()
+	waitAutoBatchExtraStats(t, c.root, "first same-key write queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+2 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+2 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 1
+	})
+	go func() {
+		secondDone <- writeSet(c, 2, &Rec{Name: "second", Age: 20}, OnChange(func(_ *Tx, _ uint64, oldValue, _ *Rec) error {
+			if oldValue != nil {
+				secondOld = oldValue.Age
+			}
+			return nil
+		}))
+	}()
+
+	waitAutoBatchExtraStats(t, c.root, "same-key writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker": blockerDone,
+		"first":   firstDone,
+		"second":  secondDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
+	}
+
+	if firstOld != 0 {
+		t.Fatalf("first old age=%d want 0", firstOld)
+	}
+	if secondOld != 10 {
+		t.Fatalf("second old age=%d want 10", secondOld)
+	}
+	got, err := readGet(c, 2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	if got == nil || got.Name != "second" || got.Age != 20 {
+		t.Fatalf("final value=%#v want second age 20", got)
+	}
+}
+
+func TestBatch_UniqueConflictBetweenUnitsKeepsEarlierUnit(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64CollectionUnique(t, Options{BatchSoftLimit: 16})
+	before := c.StoreStats()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(c, 1, &UniqueTestRec{Email: "blocker@x", Code: 1}, OnChange(func(*Tx, uint64, *UniqueTestRec, *UniqueTestRec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- writeSet(c, 2, &UniqueTestRec{Email: "shared@x", Code: 2})
+	}()
+	waitAutoBatchExtraStats(t, c.root, "first unique write queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+2 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+2 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 1
+	})
+	go func() {
+		secondDone <- writeSet(c, 3, &UniqueTestRec{Email: "shared@x", Code: 3})
+	}()
+
+	waitAutoBatchExtraStats(t, c.root, "unique writes queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker": blockerDone,
+		"first":   firstDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
+	}
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, rbierrors.ErrUniqueViolation) {
+			t.Fatalf("second write error=%v want %v", err, rbierrors.ErrUniqueViolation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for second write")
+	}
+
+	first, err := readGet(c, 2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	second, err := readGet(c, 3)
+	if err != nil {
+		t.Fatalf("Get(3): %v", err)
+	}
+	if first == nil || first.Email != "shared@x" {
+		t.Fatalf("first unique unit was not committed: %#v", first)
+	}
+	if second != nil {
+		t.Fatalf("conflicting unique unit persisted: %#v", second)
+	}
+	after := waitAutoBatchExtraStats(t, c.root, "unique conflict batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.MultiUnitBatches == before.MultiUnitBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1 &&
+			st.BatchSize2To4 == before.BatchSize2To4+1
+	})
+	if after.ExecutedBatches != before.ExecutedBatches+2 || after.MultiUnitBatches != before.MultiUnitBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.BatchSize2To4 != before.BatchSize2To4+1 {
+		t.Fatalf("unique writes did not execute as one root batch, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestBatch_UniqueAcceptedDepartureAllowsLaterUnit(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64CollectionUnique(t, Options{BatchSoftLimit: 16})
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "reuse@x", Code: 1}); err != nil {
+		t.Fatalf("seed Set(1): %v", err)
+	}
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "holder@x", Code: 2}); err != nil {
+		t.Fatalf("seed Set(2): %v", err)
+	}
+	waitAutoBatchExtraStats(t, c.root, "unique transfer seed accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == 2 &&
+			st.Enqueued == 2 &&
+			st.Dequeued == 2 &&
+			st.ExecutedBatches == 2 &&
+			st.BatchSize1 == 2
+	})
+	before := c.StoreStats()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- writeSet(c, 10, &UniqueTestRec{Email: "blocker@x", Code: 10}, OnChange(func(*Tx, uint64, *UniqueTestRec, *UniqueTestRec) error {
+			close(entered)
+			<-release
+			return nil
+		}))
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for blocker hook")
+	}
+
+	departDone := make(chan error, 1)
+	reuseDone := make(chan error, 1)
+	go func() {
+		departDone <- writePatch(c, 1, []Field{{Name: "email", Value: "left@x"}}, PatchStrict)
+	}()
+	waitAutoBatchExtraStats(t, c.root, "unique departure queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+2 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+2 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 1
+	})
+	go func() {
+		reuseDone <- writePatch(c, 2, []Field{{Name: "email", Value: "reuse@x"}}, PatchStrict)
+	}()
+	waitAutoBatchExtraStats(t, c.root, "unique reuse queued behind blocker", func(st rootSchedulerSnapshot) bool {
+		return st.Submitted == before.LogicalUnitsSubmitted+3 &&
+			st.Enqueued == before.LogicalUnitsEnqueued+3 &&
+			st.Dequeued == before.LogicalUnitsDequeued+1 &&
+			st.QueueLen == 2
+	})
+
+	close(release)
+	for name, ch := range map[string]<-chan error{
+		"blocker":   blockerDone,
+		"departure": departDone,
+		"reuse":     reuseDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s write: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %s write", name)
+		}
+	}
+
+	one, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	two, err := readGet(c, 2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	if one == nil || one.Email != "left@x" {
+		t.Fatalf("departure unit did not commit: %#v", one)
+	}
+	if two == nil || two.Email != "reuse@x" {
+		t.Fatalf("reuse unit did not see accepted departure: %#v", two)
+	}
+	after := waitAutoBatchExtraStats(t, c.root, "unique transfer batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.Dequeued == before.LogicalUnitsDequeued+3 &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.MultiUnitBatches == before.MultiUnitBatches+1 &&
+			st.BatchSize1 == before.BatchSize1+1 &&
+			st.BatchSize2To4 == before.BatchSize2To4+1
+	})
+	if after.ExecutedBatches != before.ExecutedBatches+2 || after.MultiUnitBatches != before.MultiUnitBatches+1 || after.BatchSize1 != before.BatchSize1+1 || after.BatchSize2To4 != before.BatchSize2To4+1 {
+		t.Fatalf("unique transfer did not execute as one root batch, before=%+v after=%+v", before, after)
 	}
 }
 
 func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64CollectionUnique(t, Options{
+		BatchSoftLimit: 16,
 	})
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	before := db.AutoBatchStats()
-	if err := db.Patch(1, []Field{{Name: "email", Value: "c@x"}}); err != nil {
-		t.Fatalf("Patch unique field should use auto-batcher path: %v", err)
+	before := c.StoreStats()
+	if err := writePatch(c, 1, []Field{{Name: "email", Value: "c@x"}}); err != nil {
+		t.Fatalf("Patch unique field should use root scheduler path: %v", err)
 	}
-	mid := db.AutoBatchStats()
-	if mid.Enqueued <= before.Enqueued {
-		t.Fatalf("expected patch to be enqueued into auto-batcher, before=%+v after=%+v", before, mid)
+	mid := c.StoreStats()
+	if mid.LogicalUnitsEnqueued <= before.LogicalUnitsEnqueued {
+		t.Fatalf("expected patch to be enqueued into root scheduler, before=%+v after=%+v", before, mid)
 	}
 
-	err := db.Patch(1, []Field{{Name: "email", Value: "b@x"}})
+	err := writePatch(c, 1, []Field{{Name: "email", Value: "b@x"}})
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected unique violation for conflicting email patch, got: %v", err)
 	}
 
-	v1, err := db.Get(1)
+	v1, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -526,68 +1194,67 @@ func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 }
 
 func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 16,
 	})
 
-	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 		var keyBuf [8]byte
-		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf), []byte{0xc1})
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), c.strKey, &keyBuf), []byte{0xc1})
 	}); err != nil {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
 
-	err := db.BatchPatch([]uint64{1, 1}, []Field{{Name: "age", Value: 31}})
+	err := writePatches(c, []uint64{1, 1}, []Field{{Name: "age", Value: 31}})
 	if err == nil || !strings.Contains(err.Error(), "failed to decode existing value") {
-		t.Fatalf("BatchPatch error = %v, want decode existing value", err)
+		t.Fatalf("MultiPatch error = %v, want decode existing value", err)
 	}
 }
 
-func TestBatch_BeforeCommitError_RollsBack(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+func TestBatch_OnChangeError_RollsBack(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
 
-	wantErr := errors.New("before commit failed")
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+	wantErr := errors.New("on change failed")
+	err := writeSet(c, 1, &Rec{Name: "alice", Age: 10}, OnChange(func(_ *Tx, _ uint64, _, _ *Rec) error {
 		return wantErr
 	}))
 	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected BeforeCommit error %v, got %v", wantErr, err)
+		t.Fatalf("expected OnChange error %v, got %v", wantErr, err)
 	}
 
-	got, gerr := db.Get(1)
+	got, gerr := readGet(c, 1)
 	if gerr != nil {
 		t.Fatalf("Get: %v", gerr)
 	}
 	if got != nil {
-		t.Fatalf("expected rollback on BeforeCommit error, got %#v", got)
+		t.Fatalf("expected rollback on OnChange error, got %#v", got)
 	}
 }
 
-func TestBatch_StringKeyBeforeStoreError_DoesNotPersistStringKey(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
+func TestBatch_StringKeyOnChangeError_DoesNotPersistStringKey(t *testing.T) {
+	c, _ := openTempCollectionStringProduct(t)
 
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+	if err := writeSet(c, "p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	hookErr := errors.New("before store fail")
-	err := db.Set(
-		"ghost-before-store",
-		&Product{SKU: "ghost-before-store", Price: 11},
-		BeforeStore(func(_ string, _ *Product, _ *Product) error { return hookErr }),
+	hookErr := errors.New("on change fail")
+	err := writeSet(c,
+		"ghost-on-change",
+		&Product{SKU: "ghost-on-change", Price: 11},
+		OnChange(func(_ *Tx, _ string, _ *Product, _ *Product) error { return hookErr }),
 	)
 	if !errors.Is(err, hookErr) {
-		t.Fatalf("Set must fail with BeforeStore error, got: %v", err)
+		t.Fatalf("Set must fail with OnChange error, got: %v", err)
 	}
-	if got, err := db.Get("ghost-before-store"); err != nil {
-		t.Fatalf("Get(ghost-before-store): %v", err)
+	if got, err := readGet(c, "ghost-on-change"); err != nil {
+		t.Fatalf("Get(ghost-on-change): %v", err)
 	} else if got != nil {
-		t.Fatalf("ghost-before-store must not persist after BeforeStore failure, got %#v", got)
+		t.Fatalf("ghost-on-change must not persist after OnChange failure, got %#v", got)
 	}
 }
 
@@ -600,65 +1267,62 @@ func keysOfMap[V any](m map[uint64]V) []uint64 {
 	return out
 }
 
-func TestAutoBatchExt_BatchAtomic_DuplicatePatchSameID_BeforeStoreSeesSteppedState(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+func TestAutoBatchExt_BatchAtomic_DuplicatePatchSameID_OnChangeSeesSteppedState(t *testing.T) {
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
 	call := 0
 	var seen []string
-	err := db.BatchPatch(
+	err := writePatches(c,
 		[]uint64{1, 1},
 		[]Field{{Name: "age", Value: 99}},
-		BeforeProcess(func(_ uint64, value *Rec) error {
+		OnChange(func(_ *Tx, _ uint64, oldValue, newValue *Rec) error {
 			call++
-			value.Name = fmt.Sprintf("step-%d", call)
-			return nil
-		}),
-		BeforeStore(func(_ uint64, oldValue, newValue *Rec) error {
+			newValue.Name = fmt.Sprintf("step-%d", call)
 			seen = append(seen, fmt.Sprintf("%s->%s", oldValue.Name, newValue.Name))
 			return nil
 		}),
 	)
 	if err != nil {
-		t.Fatalf("BatchPatch: %v", err)
+		t.Fatalf("MultiPatch: %v", err)
 	}
 
 	want := []string{"seed->step-1", "step-1->step-2"}
 	if !slices.Equal(seen, want) {
-		t.Fatalf("BeforeStore sequence = %v, want %v", seen, want)
+		t.Fatalf("OnChange sequence = %v, want %v", seen, want)
 	}
-	if got, err := db.Get(1); err != nil {
+	if got, err := readGet(c, 1); err != nil {
 		t.Fatalf("Get(1): %v", err)
 	} else if got == nil || got.Name != "step-2" || got.Age != 99 {
 		t.Fatalf("unexpected id=1 value: %#v", got)
 	}
 }
 
-func TestAutoBatchExt_BatchAtomic_DuplicateDeleteSameID_BeforeCommitRunsOnce(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+func TestAutoBatchExt_BatchAtomic_DuplicateDeleteSameID_OnChangeRunsOnce(t *testing.T) {
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
 	calls := 0
-	err := db.BatchDelete(
+	err := writeDeletes(c,
 		[]uint64{1, 1},
-		BeforeCommit(func(_ *bbolt.Tx, _ uint64, _ *Rec, _ *Rec) error {
+		OnChange(func(_ *Tx, _ uint64, _ *Rec, _ *Rec) error {
 			calls++
 			return nil
 		}),
 	)
 	if err != nil {
-		t.Fatalf("BatchDelete: %v", err)
+		t.Fatalf("MultiDelete: %v", err)
 	}
 	if calls != 1 {
-		t.Fatalf("BeforeCommit calls = %d, want 1", calls)
+		t.Fatalf("OnChange calls = %d, want 1", calls)
 	}
-	if got, err := db.Get(1); err != nil {
+	if got, err := readGet(c, 1); err != nil {
 		t.Fatalf("Get(1): %v", err)
 	} else if got != nil {
 		t.Fatalf("id=1 must be deleted, got %#v", got)
@@ -666,33 +1330,32 @@ func TestAutoBatchExt_BatchAtomic_DuplicateDeleteSameID_BeforeCommitRunsOnce(t *
 }
 
 func TestAutoBatchExt_BatchAtomic_PatchStrictDuplicateSameID_RollsBackBothSteps(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	err := db.BatchPatch([]uint64{1, 1}, []Field{{Name: "missing", Value: 1}}, PatchStrict)
+	err := writePatches(c, []uint64{1, 1}, []Field{{Name: "missing", Value: 1}}, PatchStrict)
 	if err == nil || !strings.Contains(err.Error(), "cannot patch field") {
-		t.Fatalf("BatchPatch error = %v, want strict patch error", err)
+		t.Fatalf("MultiPatch error = %v, want strict patch error", err)
 	}
 
-	if got, gerr := db.Get(1); gerr != nil {
+	if got, gerr := readGet(c, 1); gerr != nil {
 		t.Fatalf("Get(1): %v", gerr)
 	} else if got == nil || got.Name != "seed" || got.Age != 10 {
-		t.Fatalf("id=1 changed after failed BatchPatch: %#v", got)
+		t.Fatalf("id=1 changed after failed MultiPatch: %#v", got)
 	}
 }
 
 func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchWindow: 200 * time.Microsecond,
-		AutoBatchMax:    16,
+		BatchSoftLimit:  16,
 	})
 
 	for i := 1; i <= 4; i++ {
-		if err := db.Set(uint64(i), &Rec{
+		if err := writeSet(c, uint64(i), &Rec{
 			Name:   fmt.Sprintf("seed-%d", i),
 			Age:    20 + i,
 			Active: i%2 == 0,
@@ -727,7 +1390,7 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 				id := uint64(1 + r.IntN(4))
 				switch r.IntN(3) {
 				case 0:
-					if err := db.Set(id, &Rec{
+					if err := writeSet(c, id, &Rec{
 						Name:   []string{"alice", "bob", "carol"}[r.IntN(3)],
 						Age:    18 + r.IntN(50),
 						Active: r.IntN(2) == 0,
@@ -738,12 +1401,12 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 					}
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(40))}}
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						reportErr(fmt.Errorf("Patch(%d): %w", id, err))
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						reportErr(fmt.Errorf("Delete(%d): %w", id, err))
 						return
 					}
@@ -771,7 +1434,7 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 				}
 
 				q := queries[r.IntN(len(queries))]
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					reportErr(fmt.Errorf("Query: %w", err))
 					return
@@ -805,13 +1468,12 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 }
 
 func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{
-		AutoBatchWindow: 200 * time.Microsecond,
-		AutoBatchMax:    16,
+	c, _ := openTempUint64CollectionUnique(t, Options{
+		BatchSoftLimit: 16,
 	})
 
 	for i := 1; i <= 8; i++ {
-		if err := db.Set(uint64(i), &UniqueTestRec{
+		if err := writeSet(c, uint64(i), &UniqueTestRec{
 			Email: fmt.Sprintf("seed-%d@x", i),
 			Code:  i,
 			Tags:  []string{"seed"},
@@ -845,7 +1507,7 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 				id := uint64(1 + r.IntN(8))
 				switch r.IntN(3) {
 				case 0:
-					err := db.Set(id, &UniqueTestRec{
+					err := writeSet(c, id, &UniqueTestRec{
 						Email: fmt.Sprintf("u%d@x", r.IntN(6)),
 						Code:  1 + r.IntN(6),
 						Tags:  []string{fmt.Sprintf("w%d", r.IntN(3))},
@@ -861,13 +1523,13 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 					} else {
 						patch = []Field{{Name: "tags", Value: []string{fmt.Sprintf("p%d", r.IntN(4))}}}
 					}
-					err := db.Patch(id, patch)
+					err := writePatch(c, id, patch)
 					if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 						reportErr(fmt.Errorf("Patch(%d): %w", id, err))
 						return
 					}
 				default:
-					if err := db.Delete(id); err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
+					if err := writeDelete(c, id); err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 						reportErr(fmt.Errorf("Delete(%d): %w", id, err))
 						return
 					}
@@ -888,7 +1550,7 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 	seenEmail := make(map[string]uint64)
 	seenCode := make(map[int]uint64)
 	for id := uint64(1); id <= 8; id++ {
-		got, err := db.Get(id)
+		got, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
@@ -906,7 +1568,7 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 	}
 
 	for email, id := range seenEmail {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", email)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", email)))
 		if err != nil {
 			t.Fatalf("QueryKeys(email=%s): %v", email, err)
 		}
@@ -915,7 +1577,7 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 		}
 	}
 	for code, id := range seenCode {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("code", code)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("code", code)))
 		if err != nil {
 			t.Fatalf("QueryKeys(code=%d): %v", code, err)
 		}
@@ -926,14 +1588,13 @@ func TestAutoBatchExt_Race_HotUniqueContention_NoInvariantBreak(t *testing.T) {
 }
 
 func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchWindow: 200 * time.Microsecond,
-		AutoBatchMax:    16,
+		BatchSoftLimit:  16,
 	})
 
 	for i := 1; i <= 2; i++ {
-		if err := db.Set(uint64(i), &Rec{
+		if err := writeSet(c, uint64(i), &Rec{
 			Name:     fmt.Sprintf("seed-%d", i),
 			Age:      20 + i,
 			Tags:     []string{"seed"},
@@ -973,14 +1634,11 @@ func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 				fullName := fmt.Sprintf("full-%d", r.IntN(4))
 				country := countries[r.IntN(len(countries))]
 
-				err := db.Patch(
+				err := writePatch(c,
 					id,
 					[]Field{{Name: "age", Value: float64(20 + r.IntN(50))}},
-					BeforeProcess(func(_ uint64, v *Rec) error {
+					OnChange(func(_ *Tx, _ uint64, _ *Rec, v *Rec) error {
 						v.Name = name
-						return nil
-					}),
-					BeforeStore(func(_ uint64, _ *Rec, v *Rec) error {
 						v.FullName = fullName
 						v.Country = country
 						return nil
@@ -1017,7 +1675,7 @@ func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 				}
 
 				q := queries[r.IntN(len(queries))]
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					reportErr(fmt.Errorf("Query: %w", err))
 					return
@@ -1054,17 +1712,15 @@ func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 
 func waitAutoBatchExtraStats(
 	tb testing.TB,
-	db interface {
-		AutoBatchStats() rbistats.AutoBatch
-	},
+	r *rootStore,
 	desc string,
-	ok func(rbistats.AutoBatch) bool,
-) rbistats.AutoBatch {
+	ok func(rootSchedulerSnapshot) bool,
+) rootSchedulerSnapshot {
 	tb.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		stats := db.AutoBatchStats()
+		stats := r.scheduler.snapshot()
 		if ok(stats) {
 			return stats
 		}
@@ -1075,25 +1731,25 @@ func waitAutoBatchExtraStats(
 	}
 }
 
-func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], id K) *V {
+func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, c *Collection[K, V], id K) *V {
 	tb.Helper()
 
 	var got *V
-	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.dataBucket)
+	err := c.root.bolt.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(c.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 		var keyBuf [8]byte
-		raw := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
+		raw := bucket.Get(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf))
 		if raw == nil {
 			return nil
 		}
-		payload, err := rawPayloadForTest(db, raw)
+		payload, err := rawPayloadForTest(c, raw)
 		if err != nil {
 			return err
 		}
-		value, err := db.decode(payload)
+		value, err := c.decode(payload)
 		if err != nil {
 			return err
 		}
@@ -1106,38 +1762,40 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 	return got
 }
 
-func TestAutoBatchExtra_ClosedSetRejectsBeforeAutobatcher(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+func TestAutoBatchExtra_ClosedSetRejectsBeforeRootScheduler(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 16,
 	})
 
-	before := db.AutoBatchStats()
-	if err := db.Close(); err != nil {
+	before := c.root.scheduler.snapshot()
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	err := db.Set(1, &Rec{Name: "closed", Age: 10})
+	err := writeSet(c, 1, &Rec{Name: "closed", Age: 10})
 	if !errors.Is(err, rbierrors.ErrClosed) {
 		t.Fatalf("Set after Close error = %v, want rbierrors.ErrClosed", err)
 	}
 
-	after := db.AutoBatchStats()
-	if after.Submitted != before.Submitted || after.FallbackClosed != before.FallbackClosed {
-		t.Fatalf("closed write must be rejected before autobatcher, before=%+v after=%+v", before, after)
+	after := c.root.scheduler.snapshot()
+	if after.Submitted != before.Submitted || after.RejectedClosed != before.RejectedClosed {
+		t.Fatalf("closed write must be rejected before root scheduler, before=%+v after=%+v", before, after)
 	}
 	if after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
 		t.Fatalf("closed write must not enqueue/dequeue, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    1,
+func TestAutoBatchExtra_CloseWaitsForQueuedGroupedJobAfterInFlightCommit(t *testing.T) {
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 1,
 	})
 
-	before := db.AutoBatchStats()
+	before := c.root.scheduler.snapshot()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1148,7 +1806,7 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 			close(release)
 		}
 	})
-	blockCommit := BeforeCommit(func(*bbolt.Tx, uint64, *Rec, *Rec) error {
+	blockCommit := OnChange(func(*Tx, uint64, *Rec, *Rec) error {
 		close(entered)
 		<-release
 		return nil
@@ -1156,7 +1814,7 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 
 	inFlightDone := make(chan error, 1)
 	go func() {
-		inFlightDone <- db.Set(1, &Rec{Name: "persisted", Age: 11}, blockCommit)
+		inFlightDone <- writeSet(c, 1, &Rec{Name: "persisted", Age: 11}, blockCommit)
 	}()
 
 	select {
@@ -1167,7 +1825,7 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 
 	queuedDone := make(chan error, 1)
 	go func() {
-		queuedDone <- db.BatchSet(
+		queuedDone <- writeSets(c,
 			[]uint64{2, 3},
 			[]*Rec{
 				{Name: "queued-2", Age: 22},
@@ -1176,7 +1834,7 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 		)
 	}()
 
-	waitAutoBatchExtraStats(t, db, "in-flight+queued state", func(st rbistats.AutoBatch) bool {
+	waitAutoBatchExtraStats(t, c.root, "in-flight+queued state", func(st rootSchedulerSnapshot) bool {
 		return st.Submitted == before.Submitted+2 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+1 &&
@@ -1185,7 +1843,7 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 
 	closeDone := make(chan error, 1)
 	go func() {
-		closeDone <- db.Close()
+		closeDone <- c.Close()
 	}()
 
 	releaseCommit := func() {
@@ -1209,8 +1867,8 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 
 	select {
 	case err := <-queuedDone:
-		if !errors.Is(err, rbierrors.ErrClosed) {
-			t.Fatalf("queued grouped job error = %v, want rbierrors.ErrClosed", err)
+		if err != nil {
+			t.Fatalf("queued grouped job error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for queued grouped job")
@@ -1225,34 +1883,33 @@ func TestAutoBatchExtra_CloseFailsQueuedGroupedJobAfterInFlightCommit(t *testing
 		t.Fatal("timeout waiting for Close")
 	}
 
-	after := waitAutoBatchExtraStats(t, db, "mixed close outcomes settled", func(st rbistats.AutoBatch) bool {
+	after := waitAutoBatchExtraStats(t, c.root, "mixed close outcomes settled", func(st rootSchedulerSnapshot) bool {
 		return st.Submitted == before.Submitted+2 &&
 			st.Enqueued == before.Enqueued+2 &&
 			st.Dequeued == before.Dequeued+2 &&
-			st.ExecutedBatches == before.ExecutedBatches+1 &&
-			st.FallbackClosed == before.FallbackClosed &&
+			st.ExecutedBatches == before.ExecutedBatches+2 &&
+			st.RejectedClosed == before.RejectedClosed &&
 			st.QueueLen == 0 &&
 			!st.WorkerRunning
 	})
-	if after.MultiRequestBatches != before.MultiRequestBatches {
-		t.Fatalf("queued grouped job closed before execution must not count as executed multi-request batch, before=%+v after=%+v", before, after)
+	if after.MultiUnitBatches != before.MultiUnitBatches {
+		t.Fatalf("queued grouped job is isolated and must not count as executed multi-request batch, before=%+v after=%+v", before, after)
 	}
 
-	if got := readAutoBatchExtraRawValue(t, db, uint64(1)); got == nil || got.Name != "persisted" || got.Age != 11 {
+	if got := readAutoBatchExtraRawValue(t, c, uint64(1)); got == nil || got.Name != "persisted" || got.Age != 11 {
 		t.Fatalf("id=1 must persist from in-flight writer, got=%#v", got)
 	}
 	for _, id := range []uint64{2, 3} {
-		if got := readAutoBatchExtraRawValue(t, db, id); got != nil {
-			t.Fatalf("id=%d must stay absent after close, got=%#v", id, got)
+		if got := readAutoBatchExtraRawValue(t, c, id); got == nil || got.Name != fmt.Sprintf("queued-%d", id) || got.Age != int(id*11) {
+			t.Fatalf("id=%d must persist from retained queued writer, got=%#v", id, got)
 		}
 	}
 }
 
 func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{
+	c, _ := openTempUint64CollectionUnique(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchWindow: 200 * time.Microsecond,
-		AutoBatchMax:    16,
+		BatchSoftLimit:  16,
 	})
 
 	emails := []string{
@@ -1271,7 +1928,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 	const codeMax = 8
 
 	for i := 1; i <= 4; i++ {
-		if err := db.Set(uint64(i), &UniqueTestRec{
+		if err := writeSet(c, uint64(i), &UniqueTestRec{
 			Email: fmt.Sprintf("seed-%d@x", i),
 			Code:  i,
 			Tags:  []string{tags[i-1]},
@@ -1316,14 +1973,14 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 						email := emails[r.IntN(len(emails))]
 						code := 1 + r.IntN(codeMax)
 						tag := tags[r.IntN(len(tags))]
-						err = db.Set(id, rec, BeforeStore(func(_ uint64, _ *UniqueTestRec, v *UniqueTestRec) error {
+						err = writeSet(c, id, rec, OnChange(func(_ *Tx, _ uint64, _ *UniqueTestRec, v *UniqueTestRec) error {
 							v.Email = email
 							v.Code = code
 							v.Tags = append(v.Tags, tag)
 							return nil
 						}))
 					} else {
-						err = db.Set(id, rec)
+						err = writeSet(c, id, rec)
 					}
 				case 1:
 					var patch []Field
@@ -1337,7 +1994,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 					if r.IntN(2) == 0 {
 						email := emails[r.IntN(len(emails))]
 						code := 1 + r.IntN(codeMax)
-						opts = append(opts, BeforeProcess(func(_ uint64, v *UniqueTestRec) error {
+						opts = append(opts, OnChange(func(_ *Tx, _ uint64, _ *UniqueTestRec, v *UniqueTestRec) error {
 							v.Email = email
 							v.Code = code
 							return nil
@@ -1345,14 +2002,14 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 					}
 					if r.IntN(2) == 0 {
 						tag := tags[r.IntN(len(tags))]
-						opts = append(opts, BeforeStore(func(_ uint64, _ *UniqueTestRec, v *UniqueTestRec) error {
+						opts = append(opts, OnChange(func(_ *Tx, _ uint64, _ *UniqueTestRec, v *UniqueTestRec) error {
 							v.Tags = append(v.Tags, tag)
 							return nil
 						}))
 					}
-					err = db.Patch(id, patch, opts...)
+					err = writePatch(c, id, patch, opts...)
 				default:
-					err = db.Delete(id)
+					err = writeDelete(c, id)
 				}
 
 				if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
@@ -1393,7 +2050,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 					q = qx.Query(qx.HASANY("tags", []string{queryTag}))
 				}
 
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					reportErr(fmt.Errorf("Query: %w", err))
 					return
@@ -1436,7 +2093,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 	seenEmail := make(map[string]uint64)
 	seenCode := make(map[int]uint64)
 	for id := uint64(1); id <= 4; id++ {
-		got, err := db.Get(id)
+		got, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
@@ -1454,7 +2111,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 	}
 
 	for email, id := range seenEmail {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", email)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", email)))
 		if err != nil {
 			t.Fatalf("QueryKeys(email=%q): %v", email, err)
 		}
@@ -1463,7 +2120,7 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 		}
 	}
 	for code, id := range seenCode {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("code", code)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("code", code)))
 		if err != nil {
 			t.Fatalf("QueryKeys(code=%d): %v", code, err)
 		}
@@ -1474,9 +2131,8 @@ func TestAutoBatchExtra_Race_UniqueHookMutations_NoInvariantBreak(t *testing.T) 
 }
 
 func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AutoBatchWindow: 10 * time.Millisecond,
-		AutoBatchMax:    16,
+	c, _ := openTempUint64Collection(t, Options{
+		BatchSoftLimit: 16,
 	})
 
 	firstStarted := make(chan struct{})
@@ -1486,7 +2142,7 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	closeDone := make(chan error, 1)
 
 	go func() {
-		firstDone <- db.Set(1, &Rec{Name: "first", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+		firstDone <- writeSet(c, 1, &Rec{Name: "first", Age: 10}, OnChange(func(_ *Tx, _ uint64, _, _ *Rec) error {
 			close(firstStarted)
 			<-releaseFirst
 			return nil
@@ -1500,18 +2156,18 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	}
 
 	go func() {
-		secondDone <- db.Set(2, &Rec{Name: "second", Age: 20})
+		secondDone <- writeSet(c, 2, &Rec{Name: "second", Age: 20})
 	}()
 
 	go func() {
-		closeDone <- db.Close()
+		closeDone <- c.Close()
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !db.closed.Load() && time.Now().Before(deadline) {
+	for c.state.Load()&collectionClosed == 0 && time.Now().Before(deadline) {
 		time.Sleep(1 * time.Millisecond)
 	}
-	if !db.closed.Load() {
+	if c.state.Load()&collectionClosed == 0 {
 		close(releaseFirst)
 		<-firstDone
 		<-secondDone
@@ -1535,8 +2191,8 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	if err := awaitErr("first Set", firstDone); err != nil && !errors.Is(err, rbierrors.ErrClosed) {
 		t.Fatalf("first Set expected nil or rbierrors.ErrClosed, got: %v", err)
 	}
-	if err := awaitErr("second Set", secondDone); !errors.Is(err, rbierrors.ErrClosed) {
-		t.Fatalf("second Set expected rbierrors.ErrClosed, got: %v", err)
+	if err := awaitErr("second Set", secondDone); err != nil && !errors.Is(err, rbierrors.ErrClosed) {
+		t.Fatalf("second Set expected nil or rbierrors.ErrClosed, got: %v", err)
 	}
 	if err := awaitErr("Close", closeDone); err != nil {
 		t.Fatalf("Close: %v", err)

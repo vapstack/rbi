@@ -26,22 +26,22 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 	}
 
 	var logBuf bytes.Buffer
-	db, raw := openBoltAndNew[uint64, noIndexRec](t, path, Options{
+	c, bolt := openBoltAndCollection[uint64, noIndexRec](t, path, Options{
 		Logger: log.New(&logBuf, "", 0),
 	})
 	defer func() {
-		if db != nil {
-			_ = db.Close()
+		if c != nil {
+			_ = c.Close()
 		}
-		if raw != nil {
-			_ = raw.Close()
+		if bolt != nil {
+			_ = bolt.Close()
 		}
 	}()
 
-	if err := db.Set(1, &noIndexRec{Name: "one", Age: 10}); err != nil {
+	if err := writeSet(c, 1, &noIndexRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &noIndexRec{Name: "two", Age: 20}); err != nil {
+	if err := writeSet(c, 2, &noIndexRec{Name: "two", Age: 20}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
@@ -49,36 +49,36 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 		t.Fatalf("transparent mode must ignore sidecar load/store logs, got %q", logBuf.String())
 	}
 
-	if got, err := db.Get(2); err != nil {
+	if got, err := readGet(c, 2); err != nil {
 		t.Fatalf("Get(2): %v", err)
 	} else if got == nil || got.Name != "two" || got.Age != 20 {
 		t.Fatalf("Get(2)=%#v", got)
 	}
 
-	if err := db.Patch(2, []Field{{Name: "Age", Value: 21}}); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "Age", Value: 21}}); err != nil {
 		t.Fatalf("Patch(2): %v", err)
 	}
-	if got, err := db.Get(2); err != nil {
+	if got, err := readGet(c, 2); err != nil {
 		t.Fatalf("Get(2 after patch): %v", err)
 	} else if got == nil || got.Age != 21 {
 		t.Fatalf("patched Get(2)=%#v", got)
 	}
-	if err := db.Delete(1); err != nil {
+	if err := writeDelete(c, 1); err != nil {
 		t.Fatalf("Delete(1): %v", err)
 	}
-	if got, err := db.Get(1); err != nil {
+	if got, err := readGet(c, 1); err != nil {
 		t.Fatalf("Get(1 after delete): %v", err)
 	} else if got != nil {
 		t.Fatalf("Get(1)=%#v want nil", got)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	db = nil
-	if err := raw.Close(); err != nil {
-		t.Fatalf("raw close: %v", err)
+	c = nil
+	if err := bolt.Close(); err != nil {
+		t.Fatalf("bolt close: %v", err)
 	}
-	raw = nil
+	bolt = nil
 
 	data, err := os.ReadFile(sidecar)
 	if err != nil {
@@ -97,54 +97,54 @@ func TestTransparentMode_WritesAdvanceBucketSequenceAndInvalidateStaleSidecar(t 
 	path := filepath.Join(dir, "transparent_write_seq.db")
 	opts := Options{BucketName: "transparent_write_seq"}
 
-	dbIndexed, rawIndexed := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
-	if err := dbIndexed.Set(1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
+	cIndexed, boltIndexed := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
+	if err := writeSet(cIndexed, 1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("indexed Set(1): %v", err)
 	}
-	if err := dbIndexed.Set(2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
+	if err := writeSet(cIndexed, 2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
 		t.Fatalf("indexed Set(2): %v", err)
 	}
-	sidecar := dbIndexed.rbiFile
-	if err := dbIndexed.Close(); err != nil {
+	sidecar := cIndexed.rbiFile
+	if err := cIndexed.Close(); err != nil {
 		t.Fatalf("indexed Close: %v", err)
 	}
-	if err := rawIndexed.Close(); err != nil {
-		t.Fatalf("indexed raw Close: %v", err)
+	if err := boltIndexed.Close(); err != nil {
+		t.Fatalf("indexed bolt Close: %v", err)
 	}
 
 	storedSeq := readPersistedIndexSequence(t, sidecar)
 
-	dbTransparent, rawTransparent := openBoltAndNew[uint64, noIndexRec](t, path, opts)
-	if err := dbTransparent.Delete(1); err != nil {
+	cTransparent, boltTransparent := openBoltAndCollection[uint64, noIndexRec](t, path, opts)
+	if err := writeDelete(cTransparent, 1); err != nil {
 		t.Fatalf("transparent Delete(1): %v", err)
 	}
-	if err := dbTransparent.Set(3, &noIndexRec{Name: "three", Age: 30}); err != nil {
+	if err := writeSet(cTransparent, 3, &noIndexRec{Name: "three", Age: 30}); err != nil {
 		t.Fatalf("transparent Set(3): %v", err)
 	}
-	if err := dbTransparent.Close(); err != nil {
+	if err := cTransparent.Close(); err != nil {
 		t.Fatalf("transparent Close: %v", err)
 	}
-	if err := rawTransparent.Close(); err != nil {
-		t.Fatalf("transparent raw Close: %v", err)
+	if err := boltTransparent.Close(); err != nil {
+		t.Fatalf("transparent bolt Close: %v", err)
 	}
 
 	if got := readPersistedIndexSequence(t, sidecar); got != storedSeq {
 		t.Fatalf("transparent mode rewrote sidecar sequence: got=%d want=%d", got, storedSeq)
 	}
 
-	dbReopen, rawReopen := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	cReopen, boltReopen := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
 	defer func() {
-		_ = dbReopen.Close()
-		_ = rawReopen.Close()
+		_ = cReopen.Close()
+		_ = boltReopen.Close()
 	}()
 
-	currentSeq := readBucketSequence(t, rawReopen, dbReopen.dataBucket)
+	currentSeq := readBucketSequence(t, boltReopen, cReopen.dataBucket)
 	if currentSeq <= storedSeq {
 		t.Fatalf("bucket sequence did not advance across transparent writes: current=%d stored=%d", currentSeq, storedSeq)
 	}
 
 	allQ := qx.Query()
-	keys, err := dbReopen.QueryKeys(allQ)
+	keys, err := readQueryKeys(cReopen, allQ)
 	if err != nil {
 		t.Fatalf("reopen QueryKeys(all): %v", err)
 	}
@@ -158,15 +158,15 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 	path := filepath.Join(dir, "transparent_truncate_seq.db")
 	opts := Options{BucketName: "transparent_truncate_seq"}
 
-	dbIndexed, rawIndexed := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
-	if err := dbIndexed.Set(1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
+	cIndexed, rawIndexed := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
+	if err := writeSet(cIndexed, 1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
 		t.Fatalf("indexed Set(1): %v", err)
 	}
-	if err := dbIndexed.Set(2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
+	if err := writeSet(cIndexed, 2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
 		t.Fatalf("indexed Set(2): %v", err)
 	}
-	sidecar := dbIndexed.rbiFile
-	if err := dbIndexed.Close(); err != nil {
+	sidecar := cIndexed.rbiFile
+	if err := cIndexed.Close(); err != nil {
 		t.Fatalf("indexed Close: %v", err)
 	}
 	if err := rawIndexed.Close(); err != nil {
@@ -175,7 +175,7 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 
 	storedSeq := readPersistedIndexSequence(t, sidecar)
 
-	dbTransparent, rawTransparent := openBoltAndNew[uint64, noIndexRec](t, path, opts)
+	dbTransparent, rawTransparent := openBoltAndCollection[uint64, noIndexRec](t, path, opts)
 	if err := dbTransparent.Truncate(); err != nil {
 		t.Fatalf("transparent Truncate: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 		t.Fatalf("transparent mode rewrote sidecar sequence: got=%d want=%d", got, storedSeq)
 	}
 
-	dbReopen, rawReopen := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	dbReopen, rawReopen := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
 	defer func() {
 		_ = dbReopen.Close()
 		_ = rawReopen.Close()
@@ -201,13 +201,13 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 		t.Fatalf("bucket sequence did not advance across transparent truncate: current=%d stored=%d", currentSeq, storedSeq)
 	}
 
-	if cnt, err := dbReopen.Count(); err != nil {
+	if cnt, err := readCount(dbReopen); err != nil {
 		t.Fatalf("reopen Count(): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("reopen Count()=%d want 0", cnt)
 	}
 
-	keys, err := dbReopen.QueryKeys(qx.Query())
+	keys, err := readQueryKeys(dbReopen, qx.Query())
 	if err != nil {
 		t.Fatalf("reopen QueryKeys(all): %v", err)
 	}
@@ -221,13 +221,13 @@ func TestIndexPersistence_RejectsSidecarAfterBoltReplacementSameSequence(t *test
 	path := filepath.Join(dir, "replace_same_seq.db")
 	opts := Options{BucketName: "replace_same_seq"}
 
-	db1, raw1 := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
-	if err := db1.Set(1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
+	c1, raw1 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
+	if err := writeSet(c1, 1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
 		t.Fatalf("old Set: %v", err)
 	}
-	sidecar := db1.rbiFile
-	oldSeq := readBucketSequence(t, raw1, db1.dataBucket)
-	if err := db1.Close(); err != nil {
+	sidecar := c1.rbiFile
+	oldSeq := readBucketSequence(t, raw1, c1.dataBucket)
+	if err := c1.Close(); err != nil {
 		t.Fatalf("old Close: %v", err)
 	}
 	if err := raw1.Close(); err != nil {
@@ -238,22 +238,22 @@ func TestIndexPersistence_RejectsSidecarAfterBoltReplacementSameSequence(t *test
 		t.Fatalf("remove old bolt: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	c2, bolt2 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName:        opts.BucketName,
 		DisableIndexLoad:  true,
 		DisableIndexStore: true,
 	})
-	if err := db2.Set(1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
+	if err := writeSet(c2, 1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
 		t.Fatalf("new Set: %v", err)
 	}
-	newSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	newSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if newSeq != oldSeq {
 		t.Fatalf("test requires matching sequence: old=%d new=%d", oldSeq, newSeq)
 	}
-	if err := db2.Close(); err != nil {
+	if err := c2.Close(); err != nil {
 		t.Fatalf("new Close: %v", err)
 	}
-	if err := raw2.Close(); err != nil {
+	if err := bolt2.Close(); err != nil {
 		t.Fatalf("new raw Close: %v", err)
 	}
 	if got := readPersistedIndexSequence(t, sidecar); got != oldSeq {
@@ -261,7 +261,7 @@ func TestIndexPersistence_RejectsSidecarAfterBoltReplacementSameSequence(t *test
 	}
 
 	var logBuf bytes.Buffer
-	db3, raw3 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	db3, raw3 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName: opts.BucketName,
 		Logger:     log.New(&logBuf, "", 0),
 	})
@@ -273,12 +273,12 @@ func TestIndexPersistence_RejectsSidecarAfterBoltReplacementSameSequence(t *test
 	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
 		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
 	}
-	if cnt, err := db3.Count(qx.EQ("age", 10)); err != nil {
+	if cnt, err := readCount(db3, qx.EQ("age", 10)); err != nil {
 		t.Fatalf("Count(old age): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(old age)=%d want 0", cnt)
 	}
-	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	ids, err := readQueryKeys(db3, qx.Query(qx.EQ("age", 20)))
 	if err != nil {
 		t.Fatalf("QueryKeys(new age): %v", err)
 	}
@@ -292,13 +292,13 @@ func TestIndexPersistence_RegeneratesUIDAfterDataBucketRecreateSameSequence(t *t
 	path := filepath.Join(dir, "recreate_bucket_same_seq.db")
 	opts := Options{BucketName: "recreate_bucket_same_seq"}
 
-	db1, raw1 := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
-	if err := db1.Set(1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
+	c1, raw1 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, opts)
+	if err := writeSet(c1, 1, &schemaSubsetRec{Name: "old", Age: 10}); err != nil {
 		t.Fatalf("old Set: %v", err)
 	}
-	sidecar := db1.rbiFile
-	oldSeq := readBucketSequence(t, raw1, db1.dataBucket)
-	if err := db1.Close(); err != nil {
+	sidecar := c1.rbiFile
+	oldSeq := readBucketSequence(t, raw1, c1.dataBucket)
+	if err := c1.Close(); err != nil {
 		t.Fatalf("old Close: %v", err)
 	}
 	if err := raw1.Close(); err != nil {
@@ -319,22 +319,22 @@ func TestIndexPersistence_RegeneratesUIDAfterDataBucketRecreateSameSequence(t *t
 		t.Fatalf("delete raw Close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	c2, bolt2 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName:        opts.BucketName,
 		DisableIndexLoad:  true,
 		DisableIndexStore: true,
 	})
-	if err := db2.Set(1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
+	if err = writeSet(c2, 1, &schemaSubsetRec{Name: "new", Age: 20}); err != nil {
 		t.Fatalf("new Set: %v", err)
 	}
-	newSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	newSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if newSeq != oldSeq {
 		t.Fatalf("test requires matching sequence: old=%d new=%d", oldSeq, newSeq)
 	}
-	if err := db2.Close(); err != nil {
+	if err := c2.Close(); err != nil {
 		t.Fatalf("new Close: %v", err)
 	}
-	if err := raw2.Close(); err != nil {
+	if err := bolt2.Close(); err != nil {
 		t.Fatalf("new raw Close: %v", err)
 	}
 	if got := readPersistedIndexSequence(t, sidecar); got != oldSeq {
@@ -342,7 +342,7 @@ func TestIndexPersistence_RegeneratesUIDAfterDataBucketRecreateSameSequence(t *t
 	}
 
 	var logBuf bytes.Buffer
-	db3, raw3 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	db3, raw3 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName: opts.BucketName,
 		Logger:     log.New(&logBuf, "", 0),
 	})
@@ -354,12 +354,12 @@ func TestIndexPersistence_RegeneratesUIDAfterDataBucketRecreateSameSequence(t *t
 	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
 		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
 	}
-	if cnt, err := db3.Count(qx.EQ("age", 10)); err != nil {
+	if cnt, err := readCount(db3, qx.EQ("age", 10)); err != nil {
 		t.Fatalf("Count(old age): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(old age)=%d want 0", cnt)
 	}
-	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	ids, err := readQueryKeys(db3, qx.Query(qx.EQ("age", 20)))
 	if err != nil {
 		t.Fatalf("QueryKeys(new age): %v", err)
 	}
@@ -373,11 +373,11 @@ func TestIndexPersistence_RejectsPersistedIndexPathReusedForAnotherBucketSameSeq
 	path := filepath.Join(dir, "reuse_sidecar.db")
 	sidecar := filepath.Join(dir, "shared.rbi")
 
-	dbA, rawA := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	dbA, rawA := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName:         "reuse_sidecar_a",
 		PersistedIndexPath: sidecar,
 	})
-	if err := dbA.Set(1, &schemaSubsetRec{Name: "a", Age: 10}); err != nil {
+	if err := writeSet(dbA, 1, &schemaSubsetRec{Name: "a", Age: 10}); err != nil {
 		t.Fatalf("Set bucket A: %v", err)
 	}
 	seqA := readBucketSequence(t, rawA, dbA.dataBucket)
@@ -388,13 +388,13 @@ func TestIndexPersistence_RejectsPersistedIndexPathReusedForAnotherBucketSameSeq
 		t.Fatalf("raw Close bucket A: %v", err)
 	}
 
-	dbB, rawB := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	dbB, rawB := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName:         "reuse_sidecar_b",
 		PersistedIndexPath: sidecar,
 		DisableIndexLoad:   true,
 		DisableIndexStore:  true,
 	})
-	if err := dbB.Set(1, &schemaSubsetRec{Name: "b", Age: 20}); err != nil {
+	if err := writeSet(dbB, 1, &schemaSubsetRec{Name: "b", Age: 20}); err != nil {
 		t.Fatalf("Set bucket B: %v", err)
 	}
 	seqB := readBucketSequence(t, rawB, dbB.dataBucket)
@@ -409,7 +409,7 @@ func TestIndexPersistence_RejectsPersistedIndexPathReusedForAnotherBucketSameSeq
 	}
 
 	var logBuf bytes.Buffer
-	dbB2, rawB2 := openBoltAndNew[uint64, schemaSubsetRec](t, path, Options{
+	dbB2, rawB2 := openBoltAndCollection[uint64, schemaSubsetRec](t, path, Options{
 		BucketName:         "reuse_sidecar_b",
 		PersistedIndexPath: sidecar,
 		Logger:             log.New(&logBuf, "", 0),
@@ -422,12 +422,12 @@ func TestIndexPersistence_RejectsPersistedIndexPathReusedForAnotherBucketSameSeq
 	if gotLog := logBuf.String(); !strings.Contains(gotLog, "bucket id mismatch") {
 		t.Fatalf("expected stale sidecar id mismatch log, got %q", gotLog)
 	}
-	if cnt, err := dbB2.Count(qx.EQ("age", 10)); err != nil {
+	if cnt, err := readCount(dbB2, qx.EQ("age", 10)); err != nil {
 		t.Fatalf("Count(bucket A age): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(bucket A age)=%d want 0", cnt)
 	}
-	ids, err := dbB2.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	ids, err := readQueryKeys(dbB2, qx.Query(qx.EQ("age", 20)))
 	if err != nil {
 		t.Fatalf("QueryKeys(bucket B age): %v", err)
 	}
@@ -440,25 +440,25 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupted_index.db")
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, testOptions(Options{}))
+	c, err := Open[uint64, Rec](bolt, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
-	rbiPath := db.rbiFile
+	rbiPath := c.rbiFile
 
-	if err = db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err = writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err = db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	seq := readBucketSequence(t, rawDB, db.dataBucket)
-	if err = rawDB.Close(); err != nil {
+	seq := readBucketSequence(t, bolt, c.dataBucket)
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 
@@ -470,29 +470,29 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 		t.Fatalf("corrupt .rbi: %v", err)
 	}
 
-	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
 	var logBuf bytes.Buffer
 
-	var db2 *DB[uint64, Rec]
+	var c2 *Collection[uint64, Rec]
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				t.Fatalf("reopen New panicked on corrupted persisted index: %v", r)
 			}
 		}()
-		db2, err = New[uint64, Rec](rawDB2, Options{
+		c2, err = Open[uint64, Rec](bolt2, Options{
 			Logger: log.New(&logBuf, "", 0),
 		})
 	}()
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
+	defer func() { _ = c2.Close() }()
 	gotLog := logBuf.String()
 	if !strings.Contains(gotLog, "persisted index unavailable") {
 		t.Fatalf("expected corrupted persisted index reason in log, got: %q", gotLog)
@@ -522,7 +522,7 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
 	}
 
-	got, err := db2.Get(1)
+	got, err := readGet(c2, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -535,45 +535,45 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing_index.db")
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, testOptions(Options{}))
+	c, err := Open[uint64, Rec](bolt, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
-	rbiPath := db.rbiFile
+	rbiPath := c.rbiFile
 
-	if err = db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err = writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err = db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	if err = rawDB.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 	if err = os.Remove(rbiPath); err != nil {
 		t.Fatalf("remove .rbi: %v", err)
 	}
 
-	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
 	var logBuf bytes.Buffer
 
-	db2, err := New[uint64, Rec](rawDB2, Options{
+	c2, err := Open[uint64, Rec](bolt2, Options{
 		Logger: log.New(&logBuf, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	gotLog := logBuf.String()
 	if !strings.Contains(gotLog, "persisted index missing") {
@@ -592,7 +592,7 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
 	}
 
-	got, err := db2.Get(1)
+	got, err := readGet(c2, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -605,20 +605,20 @@ func TestWrap_LoggerOptionReceivesIndexBuildLogs(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "custom_logger.db")
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB.Close() }()
+	defer func() { _ = bolt.Close() }()
 
 	var customLogBuf bytes.Buffer
-	db, err := New[uint64, Rec](rawDB, Options{
+	c, err := Open[uint64, Rec](bolt, Options{
 		Logger: log.New(&customLogBuf, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = c.Close() }()
 
 	gotLog := customLogBuf.String()
 	if !strings.Contains(gotLog, "persisted index missing") {
@@ -630,22 +630,22 @@ func TestWrap_MissingPersistedIndex_WithIndexStoreDisabled_StillLogsRebuild(t *t
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing_index_store_disabled.db")
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB.Close() }()
+	defer func() { _ = bolt.Close() }()
 
 	var logBuf bytes.Buffer
 
-	db, err := New[uint64, Rec](rawDB, Options{
+	c, err := Open[uint64, Rec](bolt, Options{
 		DisableIndexStore: true,
 		Logger:            log.New(&logBuf, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = c.Close() }()
 
 	gotLog := logBuf.String()
 	if !strings.Contains(gotLog, "persisted index missing") {
@@ -665,37 +665,37 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 
 	const bucket = "schema_mismatch"
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, testOptions(Options{
+	c, err := Open[uint64, Rec](bolt, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 	}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Email: "alice@example.test"}); err != nil {
+	if err = writeSet(c, 1, &Rec{Name: "alice", Age: 30, Email: "alice@example.test"}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	if err := rawDB.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 
-	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
 	var logBuf bytes.Buffer
 
-	db2, err := New[uint64, schemaSubsetRec](rawDB2, Options{
+	c2, err := Open[uint64, schemaSubsetRec](bolt2, Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 		Logger:          log.New(&logBuf, "", 0),
@@ -703,7 +703,7 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	gotLog := logBuf.String()
 	if strings.Contains(gotLog, "persisted index unavailable") {
@@ -722,7 +722,7 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
 	}
 
-	got, err := db2.Get(1)
+	got, err := readGet(c2, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -730,7 +730,7 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 		t.Fatalf("expected record after partial persisted load, got %#v", got)
 	}
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("age", 30)))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatalf("QueryKeys(age=30): %v", err)
 	}
@@ -745,50 +745,50 @@ func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
 
 	const bucket = "planner_partial"
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, plannerStatsPartialBaseRec](rawDB, testOptions(Options{
+	c, err := Open[uint64, plannerStatsPartialBaseRec](bolt, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 	}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
-	if err := db.Set(1, &plannerStatsPartialBaseRec{Name: "alice"}); err != nil {
+	if err = writeSet(c, 1, &plannerStatsPartialBaseRec{Name: "alice"}); err != nil {
 		t.Fatalf("seed Set(1): %v", err)
 	}
-	if err := db.Set(2, &plannerStatsPartialBaseRec{Name: "bob"}); err != nil {
+	if err = writeSet(c, 2, &plannerStatsPartialBaseRec{Name: "bob"}); err != nil {
 		t.Fatalf("seed Set(2): %v", err)
 	}
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err = c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("initial RefreshPlannerStats: %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	if err := rawDB.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 
-	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
-	db2, err := New[uint64, plannerStatsPartialNextRec](rawDB2, testOptions(Options{
+	c2, err := Open[uint64, plannerStatsPartialNextRec](bolt2, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 	}))
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
+	defer func() { _ = c2.Close() }()
 
-	got := db2.PlannerStats()
+	got := c2.PlannerStats()
 	if got.UniverseCardinality != 2 {
 		t.Fatalf("planner universe=%d want=2", got.UniverseCardinality)
 	}
@@ -812,12 +812,12 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 
 	const bucket = "len_zero_partial"
 
-	rawDB, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, lenZeroComplementPartialBaseRec](rawDB, testOptions(Options{
+	c, err := Open[uint64, lenZeroComplementPartialBaseRec](bolt, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 	}))
@@ -831,26 +831,26 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 		if i%5 == 0 {
 			rec.Tags = []string{"go"}
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err = writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	if err := db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
-	if err := rawDB.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 
-	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	defer func() { _ = rawDB2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
 	var logBuf bytes.Buffer
 
-	db2, err := New[uint64, lenZeroComplementPartialNextRec](rawDB2, Options{
+	c2, err := Open[uint64, lenZeroComplementPartialNextRec](bolt2, Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
 		Logger:          log.New(&logBuf, "", 0),
@@ -858,7 +858,7 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	gotLog := logBuf.String()
 	if strings.Contains(gotLog, "persisted index unavailable") {
@@ -887,7 +887,7 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 		}
 	}
 	emptyTagsQ := qx.Query(qx.EQ("tags", []string{}))
-	got, err := db2.QueryKeys(emptyTagsQ)
+	got, err := readQueryKeys(c2, emptyTagsQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
@@ -899,36 +899,36 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "close_store_failpoint.db")
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	defer func() { _ = raw.Close() }()
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
+	defer func() { _ = bolt.Close() }()
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	db.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
-	err := db.Close()
+	c.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
+	err := c.Close()
 	if err == nil {
 		t.Fatalf("expected store index error on Close")
 	}
 
-	if !db.closed.Load() {
+	if c.state.Load()&collectionClosed == 0 {
 		t.Fatal("expected db to be marked closed even when storeIndex fails")
 	}
-	if _, statErr := os.Stat(db.rbiFile); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(c.rbiFile); !os.IsNotExist(statErr) {
 		t.Fatalf("expected persisted index to stay absent after failed Close, statErr=%v", statErr)
 	}
-	if err = db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("second Close must be no-op, got: %v", err)
 	}
 
-	if err = raw.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err = bolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket missing after close")
 		}
 		var keyBuf [8]byte
-		if b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf)) == nil {
+		if b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), c.strKey, &keyBuf)) == nil {
 			return fmt.Errorf("record missing after close")
 		}
 		return nil
@@ -941,46 +941,46 @@ func TestPersistedIndex_RemainsPresentUntilClose(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persisted_index_sequence.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("seed Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("seed raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
 	defer func() {
-		_ = db2.Close()
-		_ = raw2.Close()
+		_ = c2.Close()
+		_ = bolt2.Close()
 	}()
 
-	if _, err := os.Stat(db2.rbiFile); err != nil {
+	if _, err := os.Stat(c2.rbiFile); err != nil {
 		t.Fatalf("expected persisted index before write, stat err=%v", err)
 	}
-	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	if currentSeq := readBucketSequence(t, raw2, db2.dataBucket); currentSeq != storedSeq {
+	storedSeq := readPersistedIndexSequence(t, c2.rbiFile)
+	if currentSeq := readBucketSequence(t, bolt2, c2.dataBucket); currentSeq != storedSeq {
 		t.Fatalf("expected persisted index sequence=%d before write, got bucket sequence=%d", storedSeq, currentSeq)
 	}
-	if err := db2.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
+	if err := writeSet(c2, 2, &Rec{Name: "bob", Age: 31}); err != nil {
 		t.Fatalf("Set after reopen: %v", err)
 	}
-	if _, err := os.Stat(db2.rbiFile); err != nil {
+	if _, err := os.Stat(c2.rbiFile); err != nil {
 		t.Fatalf("expected persisted index to remain present after write, stat err=%v", err)
 	}
-	if currentSeq := readBucketSequence(t, raw2, db2.dataBucket); currentSeq <= storedSeq {
+	if currentSeq := readBucketSequence(t, bolt2, c2.dataBucket); currentSeq <= storedSeq {
 		t.Fatalf("expected bucket sequence to advance after write, before=%d after=%d", storedSeq, currentSeq)
 	}
-	if staleSeq := readPersistedIndexSequence(t, db2.rbiFile); staleSeq != storedSeq {
+	if staleSeq := readPersistedIndexSequence(t, c2.rbiFile); staleSeq != storedSeq {
 		t.Fatalf("expected persisted index sequence to stay stale until Close, before=%d after=%d", storedSeq, staleSeq)
 	}
-	if err := db2.Close(); err != nil {
+	if err := c2.Close(); err != nil {
 		t.Fatalf("Close after write: %v", err)
 	}
-	if freshSeq := readPersistedIndexSequence(t, db2.rbiFile); freshSeq != readBucketSequence(t, raw2, db2.dataBucket) {
+	if freshSeq := readPersistedIndexSequence(t, c2.rbiFile); freshSeq != readBucketSequence(t, bolt2, c2.dataBucket) {
 		t.Fatalf("expected Close to refresh persisted index sequence, got %d", freshSeq)
 	}
 }
@@ -989,45 +989,45 @@ func TestPersistedIndex_RebuildsAfterCloseFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "close_store_failure_rebuild.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("seed Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("seed raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
-	if err := db2.Set(2, &Rec{Name: "bob", Age: 40}); err != nil {
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
+	if err := writeSet(c2, 2, &Rec{Name: "bob", Age: 40}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	persistedPath := db2.rbiFile
-	db2.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
-	if err := db2.Close(); err == nil {
+	persistedPath := c2.rbiFile
+	c2.rbiFile = filepath.Join(t.TempDir(), "missing", "index.rbi")
+	if err := c2.Close(); err == nil {
 		t.Fatalf("expected store index error on Close")
 	}
 	if _, err := os.Stat(persistedPath); err != nil {
 		t.Fatalf("expected stale persisted index file to remain after failed Close, stat err=%v", err)
 	}
 	staleSeq := readPersistedIndexSequence(t, persistedPath)
-	currentSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	currentSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if staleSeq == currentSeq {
 		t.Fatalf("expected persisted index sequence to stay stale after failed Close, seq=%d", staleSeq)
 	}
-	if err := raw2.Close(); err != nil {
+	if err := bolt2.Close(); err != nil {
 		t.Fatalf("raw2 close: %v", err)
 	}
 
-	db3, raw3 := openBoltAndNew[uint64, Rec](t, path)
+	db3, raw3 := openBoltAndCollection[uint64, Rec](t, path)
 	defer func() {
 		_ = db3.Close()
 		_ = raw3.Close()
 	}()
 
-	ids, err := db3.QueryKeys(qx.Query())
+	ids, err := readQueryKeys(db3, qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys after reopen: %v", err)
 	}
@@ -1041,35 +1041,35 @@ func TestPersistedIndex_NoOpDeleteKeepsSequence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persisted_index_noop_delete.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("seed Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("seed raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
 	defer func() {
-		_ = db2.Close()
-		_ = raw2.Close()
+		_ = c2.Close()
+		_ = bolt2.Close()
 	}()
 
-	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	beforeSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	storedSeq := readPersistedIndexSequence(t, c2.rbiFile)
+	beforeSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if storedSeq != beforeSeq {
 		t.Fatalf("expected persisted index sequence=%d before no-op delete, got bucket sequence=%d", storedSeq, beforeSeq)
 	}
 
-	if err := db2.Delete(999); err != nil {
+	if err := writeDelete(c2, 999); err != nil {
 		t.Fatalf("Delete missing: %v", err)
 	}
 
-	afterStoredSeq := readPersistedIndexSequence(t, db2.rbiFile)
-	afterSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	afterStoredSeq := readPersistedIndexSequence(t, c2.rbiFile)
+	afterSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if afterSeq != beforeSeq {
 		t.Fatalf("expected missing Delete to keep bucket sequence=%d, got %d", beforeSeq, afterSeq)
 	}
@@ -1082,33 +1082,33 @@ func TestIndexPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"java"}}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "bob", Age: 20, Tags: []string{"java"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
 	t.Cleanup(func() {
-		if err := db2.Close(); err != nil {
+		if err := c2.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := raw2.Close(); err != nil {
+		if err := bolt2.Close(); err != nil {
 			t.Fatal(err)
 		}
 	})
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1116,7 +1116,7 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("expected [1], got %v", ids)
 	}
 
-	st, err := db2.Stats()
+	st, err := c2.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
@@ -1152,68 +1152,68 @@ func TestIndexPersistence_RelativeBoltPathKeepsSidecarWithOriginalCWD(t *testing
 		t.Fatalf("chdir db dir: %v", err)
 	}
 
-	raw, err := bbolt.Open(name, 0o600, nil)
+	bolt, err := bbolt.Open(name, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	c, err := Open[uint64, schemaSubsetRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
 
 	wantBoltPath := filepath.Join(dbDir, name)
-	if db.boltPath != wantBoltPath {
-		_ = db.Close()
-		_ = raw.Close()
-		t.Fatalf("boltPath=%q want %q", db.boltPath, wantBoltPath)
+	if c.boltPath != wantBoltPath {
+		_ = c.Close()
+		_ = bolt.Close()
+		t.Fatalf("boltPath=%q want %q", c.boltPath, wantBoltPath)
 	}
-	if err := db.Set(1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
-		_ = db.Close()
-		_ = raw.Close()
+	if err = writeSet(c, 1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := os.Chdir(otherDir); err != nil {
-		_ = db.Close()
-		_ = raw.Close()
+	if err = os.Chdir(otherDir); err != nil {
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("chdir other dir: %v", err)
 	}
-	if err := db.Close(); err != nil {
-		_ = raw.Close()
+	if err = c.Close(); err != nil {
+		_ = bolt.Close()
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 
 	wantSidecar := filepath.Join(dbDir, name+"."+opts.BucketName+".rbi")
-	if _, err := os.Stat(wantSidecar); err != nil {
+	if _, err = os.Stat(wantSidecar); err != nil {
 		t.Fatalf("stat original cwd sidecar: %v", err)
 	}
 	wrongSidecar := filepath.Join(otherDir, name+"."+opts.BucketName+".rbi")
-	if _, err := os.Stat(wrongSidecar); !os.IsNotExist(err) {
+	if _, err = os.Stat(wrongSidecar); !os.IsNotExist(err) {
 		t.Fatalf("sidecar resolved from changed cwd: statErr=%v", err)
 	}
 
-	if err := os.Chdir(dbDir); err != nil {
+	if err = os.Chdir(dbDir); err != nil {
 		t.Fatalf("chdir db dir before reopen: %v", err)
 	}
-	raw2, err := bbolt.Open(name, 0o600, nil)
+	bolt2, err := bbolt.Open(name, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	db2, err := New[uint64, schemaSubsetRec](raw2, opts)
+	c2, err := Open[uint64, schemaSubsetRec](bolt2, opts)
 	if err != nil {
-		_ = raw2.Close()
+		_ = bolt2.Close()
 		t.Fatalf("reopen New: %v", err)
 	}
 	defer func() {
-		_ = db2.Close()
-		_ = raw2.Close()
+		_ = c2.Close()
+		_ = bolt2.Close()
 	}()
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1249,39 +1249,39 @@ func TestRegistry_RelativeBoltPathUsesBoltHandleIdentity(t *testing.T) {
 		t.Fatalf("chdir db dir: %v", err)
 	}
 
-	raw, err := bbolt.Open(name, 0o600, nil)
+	bolt, err := bbolt.Open(name, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	c, err := Open[uint64, schemaSubsetRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
 
-	if err := os.Chdir(otherDir); err != nil {
-		_ = db.Close()
-		_ = raw.Close()
+	if err = os.Chdir(otherDir); err != nil {
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("chdir other dir: %v", err)
 	}
-	db2, err := New[uint64, schemaSubsetRec](raw, opts)
+	c2, err := Open[uint64, schemaSubsetRec](bolt, opts)
 	if err == nil {
-		_ = db2.Close()
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c2.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("New accepted second DB wrapper for same Bolt handle and bucket")
 	}
 	if !strings.Contains(err.Error(), "already open") {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("New err=%v want already open", err)
 	}
 
-	if err := db.Close(); err != nil {
-		_ = raw.Close()
+	if err = c.Close(); err != nil {
+		_ = bolt.Close()
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 }
@@ -1321,67 +1321,67 @@ func TestIndexPersistence_PersistedIndexPathOverridesRelativeBoltPathCWD(t *test
 	if err := os.Chdir(dbDir); err != nil {
 		t.Fatalf("chdir db dir: %v", err)
 	}
-	raw, err := bbolt.Open(name, 0o600, nil)
+	bolt, err := bbolt.Open(name, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 	if err := os.Chdir(runDir); err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("chdir run dir: %v", err)
 	}
-	db, err := New[uint64, schemaSubsetRec](raw, opts)
+	c, err := Open[uint64, schemaSubsetRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("New: %v", err)
 	}
-	if db.rbiFile != sidecar {
-		_ = db.Close()
-		_ = raw.Close()
-		t.Fatalf("rbiFile=%q want %q", db.rbiFile, sidecar)
+	if c.rbiFile != sidecar {
+		_ = c.Close()
+		_ = bolt.Close()
+		t.Fatalf("rbiFile=%q want %q", c.rbiFile, sidecar)
 	}
-	if err := db.Set(1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
-		_ = db.Close()
-		_ = raw.Close()
+	if err = writeSet(c, 1, &schemaSubsetRec{Name: "alice", Age: 10}); err != nil {
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Close(); err != nil {
-		_ = raw.Close()
+	if err = c.Close(); err != nil {
+		_ = bolt.Close()
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	if _, err := os.Stat(sidecar); err != nil {
+	if _, err = os.Stat(sidecar); err != nil {
 		t.Fatalf("stat explicit sidecar: %v", err)
 	}
 	defaultSidecar := filepath.Join(runDir, name+"."+opts.BucketName+".rbi")
-	if _, err := os.Stat(defaultSidecar); !os.IsNotExist(err) {
+	if _, err = os.Stat(defaultSidecar); !os.IsNotExist(err) {
 		t.Fatalf("default sidecar was written despite override: statErr=%v", err)
 	}
 
-	if err := os.Chdir(dbDir); err != nil {
+	if err = os.Chdir(dbDir); err != nil {
 		t.Fatalf("chdir db dir before reopen: %v", err)
 	}
-	raw2, err := bbolt.Open(name, 0o600, nil)
+	bolt2, err := bbolt.Open(name, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	if err := os.Chdir(runDir); err != nil {
-		_ = raw2.Close()
+	if err = os.Chdir(runDir); err != nil {
+		_ = bolt2.Close()
 		t.Fatalf("chdir run dir before reopen New: %v", err)
 	}
-	db2, err := New[uint64, schemaSubsetRec](raw2, opts)
+	c2, err := Open[uint64, schemaSubsetRec](bolt2, opts)
 	if err != nil {
-		_ = raw2.Close()
+		_ = bolt2.Close()
 		t.Fatalf("reopen New: %v", err)
 	}
 	defer func() {
-		_ = db2.Close()
-		_ = raw2.Close()
+		_ = c2.Close()
+		_ = bolt2.Close()
 	}()
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1392,20 +1392,20 @@ func TestIndexPersistence_PersistedIndexPathOverridesRelativeBoltPathCWD(t *test
 
 func TestIndexPersistence_PersistedIndexPathRejectsBoltPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reject_same_path.db")
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 	defer func() {
-		_ = raw.Close()
+		_ = bolt.Close()
 	}()
 
-	db, err := New[uint64, schemaSubsetRec](raw, testOptions(Options{
+	c, err := Open[uint64, schemaSubsetRec](bolt, testOptions(Options{
 		BucketName:         "reject_same_path",
 		PersistedIndexPath: path,
 	}))
 	if err == nil {
-		_ = db.Close()
+		_ = c.Close()
 		t.Fatalf("New accepted PersistedIndexPath matching Bolt database path")
 	}
 	if !strings.Contains(err.Error(), "PersistedIndexPath cannot match Bolt database path") {
@@ -1417,10 +1417,10 @@ func TestIndexPersistence_LargeFieldRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist_large.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
 	const rows = 4096
 	for i := 0; i < rows; i++ {
-		if err := db.Set(uint64(i+1), &Rec{
+		if err := writeSet(c, uint64(i+1), &Rec{
 			Name:  fmt.Sprintf("user_%04d", i),
 			Email: fmt.Sprintf("user_%04d@example.test", i),
 			Age:   i,
@@ -1429,24 +1429,24 @@ func TestIndexPersistence_LargeFieldRoundTrip(t *testing.T) {
 		}
 	}
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
 	t.Cleanup(func() {
-		if err := db2.Close(); err != nil {
+		if err := c2.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := raw2.Close(); err != nil {
+		if err := bolt2.Close(); err != nil {
 			t.Fatal(err)
 		}
 	})
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "user_0007")))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("name", "user_0007")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1454,7 +1454,7 @@ func TestIndexPersistence_LargeFieldRoundTrip(t *testing.T) {
 		t.Fatalf("expected [8], got %v", ids)
 	}
 
-	ids, err = db2.QueryKeys(qx.Query(qx.EQ("name", "user_4095")))
+	ids, err = readQueryKeys(c2, qx.Query(qx.EQ("name", "user_4095")))
 	if err != nil {
 		t.Fatalf("QueryKeys(last): %v", err)
 	}
@@ -1467,7 +1467,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist_len_zero_complement_all_empty.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path)
 	for i := 1; i <= 90; i++ {
 		rec := &Rec{
 			Name:  fmt.Sprintf("u_%d", i),
@@ -1477,12 +1477,12 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 		if i%5 == 0 {
 			rec.Tags = []string{"go"}
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
 	for i := 1; i <= 90; i++ {
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string(nil)}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: []string(nil)}}); err != nil {
 			t.Fatalf("Patch(%d): %v", i, err)
 		}
 	}
@@ -1491,7 +1491,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	for i := 1; i <= 90; i++ {
 		want = append(want, uint64(i))
 	}
-	gotBeforeClose, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	gotBeforeClose, err := readQueryKeys(c, qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags) before close: %v", err)
 	}
@@ -1499,24 +1499,24 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 		t.Fatalf("unexpected empty-tags ids before reopen: got=%v want=%v", gotBeforeClose, want)
 	}
 
-	if err = db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err = raw.Close(); err != nil {
+	if err = bolt.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path)
 	t.Cleanup(func() {
-		if err = db2.Close(); err != nil {
+		if err = c2.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err = raw2.Close(); err != nil {
+		if err = bolt2.Close(); err != nil {
 			t.Fatal(err)
 		}
 	})
 
-	gotAfterReopen, err := db2.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	gotAfterReopen, err := readQueryKeys(c2, qx.Query(qx.EQ("tags", []string{})))
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags) after reopen: %v", err)
 	}
@@ -1550,41 +1550,41 @@ func TestIndexPersistence_RebuildsValueIndexerFieldAfterTypeChange(t *testing.T)
 	path := filepath.Join(dir, "vi_type_change.db")
 	opts := testOptions(Options{BucketName: "vi_type_change"})
 
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("initial bbolt.Open: %v", err)
 	}
-	db, err := New[uint64, persistedVIOldRec](raw, opts)
+	c, err := Open[uint64, persistedVIOldRec](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		t.Fatalf("initial New: %v", err)
 	}
-	if err = db.Set(1, &persistedVIOldRec{Code: 7}); err != nil {
-		_ = db.Close()
-		_ = raw.Close()
+	if err = writeSet(c, 1, &persistedVIOldRec{Code: 7}); err != nil {
+		_ = c.Close()
+		_ = bolt.Close()
 		t.Fatalf("Set: %v", err)
 	}
-	if err = db.Close(); err != nil {
-		_ = raw.Close()
+	if err = c.Close(); err != nil {
+		_ = bolt.Close()
 		t.Fatalf("initial Close: %v", err)
 	}
-	if err = raw.Close(); err != nil {
-		t.Fatalf("initial raw Close: %v", err)
+	if err = bolt.Close(); err != nil {
+		t.Fatalf("initial bolt Close: %v", err)
 	}
 
-	raw2, err := bbolt.Open(path, 0o600, nil)
+	bolt2, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		t.Fatalf("reopen bbolt.Open: %v", err)
 	}
-	db2, err := New[uint64, persistedVINewRec](raw2, opts)
+	c2, err := Open[uint64, persistedVINewRec](bolt2, opts)
 	if err != nil {
-		_ = raw2.Close()
+		_ = bolt2.Close()
 		t.Fatalf("reopen New: %v", err)
 	}
-	defer func() { _ = db2.Close() }()
-	defer func() { _ = raw2.Close() }()
+	defer func() { _ = c2.Close() }()
+	defer func() { _ = bolt2.Close() }()
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("code", persistedVINew(7))))
+	ids, err := readQueryKeys(c2, qx.Query(qx.EQ("code", persistedVINew(7))))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1671,21 +1671,21 @@ func readPersistedIndexFormatByteFromReader(tb testing.TB, reader *bufio.Reader)
 func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "truncate_sequence.db")
 
-	db1, raw1 := openBoltAndNew[uint64, Rec](t, path)
-	if err := db1.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+	c1, bolt1 := openBoltAndCollection[uint64, Rec](t, path)
+	if err := writeSet(c1, 1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
 
 	persistedPath := path + ".Rec.rbi"
-	initialSeq := readBucketSequence(t, raw1, db1.dataBucket)
+	initialSeq := readBucketSequence(t, bolt1, c1.dataBucket)
 	if initialSeq == 0 {
 		t.Fatalf("expected sequence to advance after write, got %d", initialSeq)
 	}
-	if err := db1.Close(); err != nil {
+	if err := c1.Close(); err != nil {
 		t.Fatalf("Close(db1): %v", err)
 	}
-	if err := raw1.Close(); err != nil {
-		t.Fatalf("Close(raw1): %v", err)
+	if err := bolt1.Close(); err != nil {
+		t.Fatalf("Close(bolt1): %v", err)
 	}
 
 	storedSeq := readPersistedIndexSequence(t, persistedPath)
@@ -1693,38 +1693,38 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 		t.Fatalf("persisted sequence mismatch: stored=%d bucket=%d", storedSeq, initialSeq)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{DisableIndexStore: true})
-	if err := db2.Truncate(); err != nil {
+	c2, bolt2 := openBoltAndCollection[uint64, Rec](t, path, Options{DisableIndexStore: true})
+	if err := c2.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	truncateSeq := readBucketSequence(t, raw2, db2.dataBucket)
+	truncateSeq := readBucketSequence(t, bolt2, c2.dataBucket)
 	if truncateSeq <= storedSeq {
 		t.Fatalf("truncate must preserve monotonic sequence: stored=%d truncate=%d", storedSeq, truncateSeq)
 	}
-	if err := db2.Close(); err != nil {
-		t.Fatalf("Close(db2): %v", err)
+	if err := c2.Close(); err != nil {
+		t.Fatalf("Close(c2): %v", err)
 	}
-	if err := raw2.Close(); err != nil {
-		t.Fatalf("Close(raw2): %v", err)
+	if err := bolt2.Close(); err != nil {
+		t.Fatalf("Close(bolt2): %v", err)
 	}
 
 	if got := readPersistedIndexSequence(t, persistedPath); got != storedSeq {
 		t.Fatalf("DisableIndexStore should keep old sidecar untouched: got=%d want=%d", got, storedSeq)
 	}
 
-	db3, raw3 := openBoltAndNew[uint64, Rec](t, path)
-	defer func() { _ = db3.Close() }()
-	defer func() { _ = raw3.Close() }()
+	c3, bolt3 := openBoltAndCollection[uint64, Rec](t, path)
+	defer func() { _ = c3.Close() }()
+	defer func() { _ = bolt3.Close() }()
 
-	if got := readBucketSequence(t, raw3, db3.dataBucket); got != truncateSeq {
+	if got := readBucketSequence(t, bolt3, c3.dataBucket); got != truncateSeq {
 		t.Fatalf("reopened bucket sequence mismatch: got=%d want=%d", got, truncateSeq)
 	}
-	if snap := db3.SnapshotStats(); snap.Sequence != truncateSeq {
+	if snap := c3.SnapshotStats(); snap.Sequence != truncateSeq {
 		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.Sequence, truncateSeq)
 	}
 
-	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 30)))
+	ids, err := readQueryKeys(c3, qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatalf("QueryKeys(after reopen): %v", err)
 	}

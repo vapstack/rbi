@@ -3,10 +3,11 @@ package rbi
 import (
 	"errors"
 	"fmt"
-	"github.com/vapstack/rbi/rbierrors"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/vapstack/rbi/rbierrors"
 
 	"github.com/vapstack/qx"
 )
@@ -73,17 +74,17 @@ func dedupStringsInplace(s []string) []string {
 }
 
 func TestSort_OrderStability_WithDupValues(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 10; i++ {
-		if err := db.Set(uint64(i), &Rec{Age: 20}); err != nil {
+		if err := writeSet(c, uint64(i), &Rec{Age: 20}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	q := qx.Query(qx.EQ("age", 20)).Sort("age", qx.ASC)
 
-	ids, err := db.QueryKeys(q)
+	ids, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,19 +97,19 @@ func TestSort_OrderStability_WithDupValues(t *testing.T) {
 }
 
 func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 320)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 320)
 
 	runChecks := func(label string, queries []*qx.QX) {
 		t.Helper()
 		for i, q := range queries {
 			q := q
 			t.Run(fmt.Sprintf("%s_q%d_%s", label, i, queryTestOrderLabel(q)), func(t *testing.T) {
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					t.Fatalf("QueryKeys: %v", err)
 				}
-				want, err := expectedKeysUint64(t, db, q)
+				want, err := expectedKeysUint64(t, c, q)
 				if err != nil {
 					t.Fatalf("expectedKeysUint64: %v", err)
 				}
@@ -133,16 +134,16 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	runChecks("base", baseQueries)
 
 	// Mutate basic/slice/scalar order fields and verify subsequent snapshots.
-	if err := db.Patch(1, []Field{{Name: "age", Value: 99}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "age", Value: 99}}); err != nil {
 		t.Fatalf("Patch(age): %v", err)
 	}
-	if err := db.Patch(2, []Field{{Name: "tags", Value: []string{"ops", "go"}}}); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "tags", Value: []string{"ops", "go"}}}); err != nil {
 		t.Fatalf("Patch(tags): %v", err)
 	}
-	if err := db.Patch(3, []Field{{Name: "country", Value: "NL"}}); err != nil {
+	if err := writePatch(c, 3, []Field{{Name: "country", Value: "NL"}}); err != nil {
 		t.Fatalf("Patch(country): %v", err)
 	}
-	if err := db.Set(1001, &Rec{
+	if err := writeSet(c, 1001, &Rec{
 		Meta:     Meta{Country: "DE"},
 		Name:     "mutated-user",
 		Email:    "mutated-user@example.com",
@@ -154,7 +155,7 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Set(mutated): %v", err)
 	}
-	if err := db.Delete(4); err != nil {
+	if err := writeDelete(c, 4); err != nil {
 		t.Fatalf("Delete(mutated): %v", err)
 	}
 
@@ -170,9 +171,9 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 }
 
 func TestQuery_ArrayPosOrder_AcceptsArrayPriorityLiteral(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	if err := db.BatchSet(
+	if err := writeSets(c,
 		[]uint64{1, 2, 3, 4},
 		[]*Rec{
 			{Meta: Meta{Country: "PL"}},
@@ -181,10 +182,10 @@ func TestQuery_ArrayPosOrder_AcceptsArrayPriorityLiteral(t *testing.T) {
 			{Meta: Meta{Country: "DE"}},
 		},
 	); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+		t.Fatalf("MultiSet: %v", err)
 	}
 
-	got, err := db.QueryKeys(qx.Query().SortBy(qx.POS("country", [2]string{"DE", "NL"}), qx.ASC))
+	got, err := readQueryKeys(c, qx.Query().SortBy(qx.POS("country", [2]string{"DE", "NL"}), qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -207,8 +208,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			db, _ := openTempDBUint64(t)
-			_ = seedData(t, db, 420)
+			c, _ := openTempUint64Collection(t)
+			_ = seedData(t, c, 420)
 
 			r := newRand(tc.seed)
 			countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US", "JP"}
@@ -323,18 +324,18 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 				switch x := r.IntN(100); {
 				case x < 45:
 					rec := randomRec(id)
-					if err := db.Set(id, rec); err != nil {
+					if err := writeSet(c, id, rec); err != nil {
 						t.Fatalf("Set(seed=%d,step=%d,id=%d): %v", tc.seed, step, id, err)
 					}
 					opsLog = append(opsLog, fmt.Sprintf("step=%d set id=%d tags=%v country=%s age=%d active=%v", step, id, rec.Tags, rec.Country, rec.Age, rec.Active))
 				case x < 80:
 					patch := randomPatch()
-					if err := db.Patch(id, patch); err != nil {
+					if err := writePatch(c, id, patch); err != nil {
 						t.Fatalf("Patch(seed=%d,step=%d,id=%d): %v", tc.seed, step, id, err)
 					}
 					opsLog = append(opsLog, fmt.Sprintf("step=%d patch id=%d patch=%v", step, id, patch))
 				default:
-					if err := db.Delete(id); err != nil {
+					if err := writeDelete(c, id); err != nil {
 						t.Fatalf("Delete(seed=%d,step=%d,id=%d): %v", tc.seed, step, id, err)
 					}
 					opsLog = append(opsLog, fmt.Sprintf("step=%d delete id=%d", step, id))
@@ -342,11 +343,11 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 
 				for qi := 0; qi < 3; qi++ {
 					q := randomQuery()
-					got, err := db.QueryKeys(q)
+					got, err := readQueryKeys(c, q)
 					if err != nil {
 						t.Fatalf("QueryKeys(seed=%d,step=%d,qi=%d): %v\nq=%+v", tc.seed, step, qi, err, q)
 					}
-					want, err := expectedKeysUint64(t, db, q)
+					want, err := expectedKeysUint64(t, c, q)
 					if err != nil {
 						t.Fatalf("expectedKeysUint64(seed=%d,step=%d,qi=%d): %v\nq=%+v", tc.seed, step, qi, err, q)
 					}
@@ -371,8 +372,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 							if queryTestOrderIsArrayPosOnField(q, "tags") {
 								gid := got[first]
 								wid := want[first]
-								gv, _ := db.Get(gid)
-								wv, _ := db.Get(wid)
+								gv, _ := readGet(c, gid)
+								wv, _ := readGet(c, wid)
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, tag := range vals {
@@ -392,8 +393,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 							} else if queryTestOrderIsArrayPosOnField(q, "country") {
 								gid := got[first]
 								wid := want[first]
-								gv, _ := db.Get(gid)
-								wv, _ := db.Get(wid)
+								gv, _ := readGet(c, gid)
+								wv, _ := readGet(c, wid)
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, country := range vals {
@@ -431,16 +432,16 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 }
 
 func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndFieldIndexView(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 260)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 260)
 
 	check := func(label string, q *qx.QX) {
 		t.Helper()
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("%s QueryKeys: %v", label, err)
 		}
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("%s expectedKeysUint64: %v", label, err)
 		}
@@ -459,13 +460,13 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndFieldIndexView(t *test
 	baseDescQ := queryOrderSortByArrayPos(qx.Query(qx.EQ("active", false)), "country", []string{"NL", "NL", "PL"}, qx.DESC).Offset(3).Limit(120)
 	check("base-desc", baseDescQ)
 
-	if err := db.Patch(5, []Field{{Name: "country", Value: "NL"}}); err != nil {
+	if err := writePatch(c, 5, []Field{{Name: "country", Value: "NL"}}); err != nil {
 		t.Fatalf("Patch(5 country): %v", err)
 	}
-	if err := db.Patch(6, []Field{{Name: "country", Value: "PL"}}); err != nil {
+	if err := writePatch(c, 6, []Field{{Name: "country", Value: "PL"}}); err != nil {
 		t.Fatalf("Patch(6 country): %v", err)
 	}
-	if err := db.Set(1001, &Rec{
+	if err := writeSet(c, 1001, &Rec{
 		Meta:     Meta{Country: "NL"},
 		Name:     "dup-priority",
 		Email:    "dup-priority@example.test",
@@ -484,10 +485,10 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndFieldIndexView(t *test
 	check("overlay-desc", overlayDescQ)
 }
 
-func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) []uint64 {
+func collectIDsByTagDistinctLen(t *testing.T, c *Collection[uint64, Rec], wantLen int) []uint64 {
 	t.Helper()
 	ids := make([]uint64, 0, 64)
-	err := db.ScanKeys(0, func(id uint64) (bool, error) {
+	err := readScanKeys(c, 0, func(id uint64) (bool, error) {
 		ids = append(ids, id)
 		return true, nil
 	})
@@ -497,14 +498,14 @@ func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) 
 
 	out := make([]uint64, 0, len(ids))
 	for _, id := range ids {
-		rec, err := db.Get(id)
+		rec, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("collectIDsByTagDistinctLen Get(%d): %v", id, err)
 		}
 		if rec != nil && countDistinct(rec.Tags) == wantLen {
 			out = append(out, id)
 		}
-		db.ReleaseRecords(rec)
+		c.ReleaseRecords(rec)
 	}
 	return out
 }
@@ -518,7 +519,7 @@ func queryOrderSortByArrayPos(q *qx.QX, field string, priority []string, dir qx.
 }
 
 func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 200; i++ {
 		rec := &Rec{
@@ -535,36 +536,36 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 		default:
 			rec.Tags = nil
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
-	gotEmpty, err := db.QueryKeys(emptyQ)
+	gotEmpty, err := readQueryKeys(c, emptyQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
-	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
+	wantEmpty := collectIDsByTagDistinctLen(t, c, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
 	ascQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(3).Limit(120)
-	gotAsc, err := db.QueryKeys(ascQ)
+	gotAsc, err := readQueryKeys(c, ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count): %v", err)
 	}
-	wantAsc, err := expectedKeysUint64(t, db, ascQ)
+	wantAsc, err := expectedKeysUint64(t, c, ascQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(ASC array count): %v", err)
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
 	descQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.DESC).Offset(2).Limit(100)
-	gotDesc, err := db.QueryKeys(descQ)
+	gotDesc, err := readQueryKeys(c, descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count): %v", err)
 	}
-	wantDesc, err := expectedKeysUint64(t, db, descQ)
+	wantDesc, err := expectedKeysUint64(t, c, descQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(DESC array count): %v", err)
 	}
@@ -572,24 +573,24 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 }
 
 func TestQuery_ByArrayCount_AfterLenIndexEmptied(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
-	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test", Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "one", Email: "one@example.test", Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "two", Email: "two@example.test"}); err != nil {
+	if err := writeSet(c, 2, &Rec{Name: "two", Email: "two@example.test"}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test"}); err != nil {
+	if err := writeSet(c, 1, &Rec{Name: "one", Email: "one@example.test"}); err != nil {
 		t.Fatalf("Set(1 empty tags): %v", err)
 	}
 
 	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(array count after empty len index): %v", err)
 	}
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(array count after empty len index): %v", err)
 	}
@@ -597,7 +598,7 @@ func TestQuery_ByArrayCount_AfterLenIndexEmptied(t *testing.T) {
 }
 
 func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 240; i++ {
 		rec := &Rec{
@@ -614,20 +615,20 @@ func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
 		default:
 			rec.Tags = nil
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
 
-	zeroCount := len(collectIDsByTagDistinctLen(t, db, 0))
+	zeroCount := len(collectIDsByTagDistinctLen(t, c, 0))
 	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(zeroCount + 5).Limit(80)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -635,7 +636,7 @@ func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
 }
 
 func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{})
+	c, _ := openTempUint64Collection(t, Options{})
 
 	for i := 1; i <= 220; i++ {
 		rec := &Rec{
@@ -652,7 +653,7 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 		default:
 			rec.Tags = nil
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
@@ -662,36 +663,36 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 		if i%3 == 0 {
 			tags = []string{"go"}
 		}
-		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: tags}}); err != nil {
+		if err := writePatch(c, uint64(i), []Field{{Name: "tags", Value: tags}}); err != nil {
 			t.Fatalf("Patch(%d): %v", i, err)
 		}
 	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
-	gotEmpty, err := db.QueryKeys(emptyQ)
+	gotEmpty, err := readQueryKeys(c, emptyQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
-	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
+	wantEmpty := collectIDsByTagDistinctLen(t, c, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
 	ascQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", true)), "tags", qx.ASC).Offset(1).Limit(110)
-	gotAsc, err := db.QueryKeys(ascQ)
+	gotAsc, err := readQueryKeys(c, ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count overlay): %v", err)
 	}
-	wantAsc, err := expectedKeysUint64(t, db, ascQ)
+	wantAsc, err := expectedKeysUint64(t, c, ascQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(ASC array count overlay): %v", err)
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
 	descQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", false)), "tags", qx.DESC).Offset(2).Limit(110)
-	gotDesc, err := db.QueryKeys(descQ)
+	gotDesc, err := readQueryKeys(c, descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count overlay): %v", err)
 	}
-	wantDesc, err := expectedKeysUint64(t, db, descQ)
+	wantDesc, err := expectedKeysUint64(t, c, descQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(DESC array count overlay): %v", err)
 	}
@@ -699,7 +700,7 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 }
 
 func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{})
+	c, _ := openTempUint64Collection(t, Options{})
 
 	for i := 1; i <= 180; i++ {
 		rec := &Rec{
@@ -716,12 +717,12 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 		default:
 			rec.Tags = nil
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
 
-	if err := db.Set(1001, &Rec{
+	if err := writeSet(c, 1001, &Rec{
 		Name:   "u_1001",
 		Email:  "u_1001@example.test",
 		Age:    1001,
@@ -730,7 +731,7 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Set(1001): %v", err)
 	}
-	if err := db.Set(1002, &Rec{
+	if err := writeSet(c, 1002, &Rec{
 		Name:   "u_1002",
 		Email:  "u_1002@example.test",
 		Age:    1002,
@@ -739,35 +740,35 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Set(1002): %v", err)
 	}
-	if err := db.Delete(1); err != nil {
+	if err := writeDelete(c, 1); err != nil {
 		t.Fatalf("Delete(1): %v", err)
 	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
-	gotEmpty, err := db.QueryKeys(emptyQ)
+	gotEmpty, err := readQueryKeys(c, emptyQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
-	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
+	wantEmpty := collectIDsByTagDistinctLen(t, c, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
 	ascQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", true)), "tags", qx.ASC).Offset(1).Limit(120)
-	gotAsc, err := db.QueryKeys(ascQ)
+	gotAsc, err := readQueryKeys(c, ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count insert/delete): %v", err)
 	}
-	wantAsc, err := expectedKeysUint64(t, db, ascQ)
+	wantAsc, err := expectedKeysUint64(t, c, ascQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(ASC array count insert/delete): %v", err)
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
 	descQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", false)), "tags", qx.DESC).Offset(2).Limit(120)
-	gotDesc, err := db.QueryKeys(descQ)
+	gotDesc, err := readQueryKeys(c, descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count insert/delete): %v", err)
 	}
-	wantDesc, err := expectedKeysUint64(t, db, descQ)
+	wantDesc, err := expectedKeysUint64(t, c, descQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(DESC array count insert/delete): %v", err)
 	}
@@ -775,8 +776,8 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 }
 
 func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 200)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 200)
 
 	// order + NOT branch
 	// exercise the negative ordered path directly without forcing universe materialization
@@ -784,12 +785,12 @@ func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
 		qx.NOT(qx.EQ("country", "NL")),
 	).Sort("age", qx.ASC).Offset(3).Limit(25)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -797,7 +798,7 @@ func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
 }
 
 func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	c, _ := openTempUint64Collection(t)
 
 	for i := 1; i <= 120; i++ {
 		email := fmt.Sprintf("user%03d@example.com", i)
@@ -814,7 +815,7 @@ func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
 			Tags:     []string{"go"},
 			FullName: fmt.Sprintf("FN-%03d", i),
 		}
-		if err := db.Set(uint64(i), rec); err != nil {
+		if err := writeSet(c, uint64(i), rec); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
 	}
@@ -823,12 +824,12 @@ func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
 		qx.PREFIX("email", "user10"),
 	).Sort("email", qx.ASC).Limit(15)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -836,20 +837,20 @@ func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
 }
 
 func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 220)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 220)
 
 	priority := []string{"go", "java", "ops"}
 	q := queryOrderSortByArrayPos(qx.Query(
 		qx.NOT(qx.CONTAINS("country", "land")),
 	), "tags", priority, qx.ASC).Offset(2).Limit(30)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -857,20 +858,20 @@ func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
 }
 
 func TestQuery_ByArrayPos_WithNegation_NoLimit(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 220)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 220)
 
 	priority := []string{"go", "java", "ops"}
 	q := queryOrderSortByArrayPos(qx.Query(
 		qx.NOT(qx.CONTAINS("country", "land")),
 	), "tags", priority, qx.ASC)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -878,19 +879,19 @@ func TestQuery_ByArrayPos_WithNegation_NoLimit(t *testing.T) {
 }
 
 func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 220)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 220)
 
 	q := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
 	), "tags", qx.DESC).Offset(1).Limit(40)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -898,19 +899,19 @@ func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
 }
 
 func TestQuery_ByArrayCount_WithNegation_NoLimit(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 220)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 220)
 
 	q := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
 	), "tags", qx.DESC)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -918,8 +919,8 @@ func TestQuery_ByArrayCount_WithNegation_NoLimit(t *testing.T) {
 }
 
 func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 70_000)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 70_000)
 
 	queries := []*qx.QX{
 		queryOrderSortByArrayPos(qx.Query(), "country", []string{
@@ -929,7 +930,7 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 	}
 
 	for _, q := range queries {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("QueryKeys(%+v): %v", q, err)
 		}
@@ -937,7 +938,7 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 			t.Fatalf("expected broad ordered result to exercise bucket materialization route, got %d rows for %+v", len(got), q)
 		}
 
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 		}
@@ -947,11 +948,11 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 	followUp := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
 	), "tags", qx.DESC)
-	gotFollowUp, err := db.QueryKeys(followUp)
+	gotFollowUp, err := readQueryKeys(c, followUp)
 	if err != nil {
 		t.Fatalf("QueryKeys(follow-up): %v", err)
 	}
-	wantFollowUp, err := expectedKeysUint64(t, db, followUp)
+	wantFollowUp, err := expectedKeysUint64(t, c, followUp)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(follow-up): %v", err)
 	}
@@ -959,8 +960,8 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 }
 
 func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 80_000)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 80_000)
 
 	queries := []*qx.QX{
 		qx.Query().Sort("age", qx.ASC),
@@ -970,7 +971,7 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 	}
 
 	for _, q := range queries {
-		got, err := db.QueryKeys(q)
+		got, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("QueryKeys(%+v): %v", q, err)
 		}
@@ -978,7 +979,7 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 			t.Fatalf("expected broad ordered result, got %d rows for %+v", len(got), q)
 		}
 
-		want, err := expectedKeysUint64(t, db, q)
+		want, err := expectedKeysUint64(t, c, q)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 		}
@@ -988,11 +989,11 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 	followUp := qx.Query(
 		qx.NOT(qx.EQ("active", true)),
 	).Sort("age", qx.ASC)
-	gotFollowUp, err := db.QueryKeys(followUp)
+	gotFollowUp, err := readQueryKeys(c, followUp)
 	if err != nil {
 		t.Fatalf("QueryKeys(follow-up): %v", err)
 	}
-	wantFollowUp, err := expectedKeysUint64(t, db, followUp)
+	wantFollowUp, err := expectedKeysUint64(t, c, followUp)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(follow-up): %v", err)
 	}
@@ -1000,15 +1001,15 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 }
 
 func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 300)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 300)
 
 	// negative result + ORDER must preserve ordered output without duplicates
 	q := qx.Query(
 		qx.NOT(qx.EQ("country", "NL")),
 	).Sort("age", qx.ASC).Limit(120)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1021,7 +1022,7 @@ func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -1029,180 +1030,180 @@ func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
 }
 
 func TestQueryExt_ArrayPosPointer_AllPriorities_ASC_IncludesNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllPriorities_DESC_IncludesNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_ActiveFilter_ASC_IncludesNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_ActiveFilter_DESC_IncludesNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.DESC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_EqNilOnly_ASC_ReturnsNilRows(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_EqNilOnly_DESC_ReturnsNilRows(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.DESC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_SkipWindowIntoNilTail_ASC(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Offset(4).Limit(8))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Offset(4).Limit(8))
 }
 
 func TestQueryExt_ArrayPosPointer_SkipWindowIntoNilTail_DESC(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC).Offset(3).Limit(3))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC).Offset(3).Limit(3))
 }
 
 func TestQueryExt_ArrayPosPointer_LimitWindowCrossesIntoNilTail_ASC(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Limit(5))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Limit(5))
 }
 
 func TestQueryExt_ArrayPosPointer_NegativePredicate_RetainsNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.NOT(qx.EQ("active", true))), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.NOT(qx.EQ("active", true))), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_PatchToNil_RetainsExpandedNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	if err := db.Patch(6, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	c := seedQueryExtOptArrayPosCollection(t)
+	if err := writePatch(c, 6, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(6 opt=nil): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_PatchFromNilToValue_RetainsRemainingNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	if err := db.Patch(1, []Field{{Name: "opt", Value: "delta"}}); err != nil {
+	c := seedQueryExtOptArrayPosCollection(t)
+	if err := writePatch(c, 1, []Field{{Name: "opt", Value: "delta"}}); err != nil {
 		t.Fatalf("Patch(1 opt=delta): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{"alpha", "beta", "", "gamma", "delta"}, qx.ASC))
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", []string{"alpha", "beta", "", "gamma", "delta"}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_DeleteNonNil_RetainsNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	if err := db.Delete(6); err != nil {
+	c := seedQueryExtOptArrayPosCollection(t)
+	if err := writeDelete(c, 6); err != nil {
 		t.Fatalf("Delete(6): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_InsertNil_RetainsNewNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	if err := db.Set(7, &Rec{Name: "nil-3", Opt: nil, Active: true}); err != nil {
+	c := seedQueryExtOptArrayPosCollection(t)
+	if err := writeSet(c, 7, &Rec{Name: "nil-3", Opt: nil, Active: true}); err != nil {
 		t.Fatalf("Set(7): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_QueryValues_AllPriorities_ASC_RetainsNilTail(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtItemsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtItemsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_CountMatchesOrderedResultSet_WhenUnbounded(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtCountMatchesOrderedResultSet(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtCountMatchesOrderedResultSet(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_ASC_WithPriorities(t *testing.T) {
-	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	c := seedQueryExtOptAllNilCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_DESC_WithPriorities(t *testing.T) {
-	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
+	c := seedQueryExtOptAllNilCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_ASC_EmptyPriorities(t *testing.T) {
-	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
+	c := seedQueryExtOptAllNilCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_ASC_EmptyPriorities_FallsBackToIDOrder(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
+	c := seedQueryExtOptArrayPosCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_Window_EmptyPriorities(t *testing.T) {
-	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC).Offset(1).Limit(2))
+	c := seedQueryExtOptAllNilCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC).Offset(1).Limit(2))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilAfterPatches_ASC(t *testing.T) {
-	db := seedQueryExtOptArrayPosDB(t)
+	c := seedQueryExtOptArrayPosCollection(t)
 	for _, id := range []uint64{2, 3, 4, 6} {
-		if err := db.Patch(id, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+		if err := writePatch(c, id, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 			t.Fatalf("Patch(%d opt=nil): %v", id, err)
 		}
 	}
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilPredicate_DESC(t *testing.T) {
-	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", []string{"alpha"}, qx.DESC))
+	c := seedQueryExtOptAllNilCollection(t)
+	assertQueryExtIDsMatchExpected(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", []string{"alpha"}, qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownBasicOrderField(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC).Offset(7).Limit(9))
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 64)
+	assertQueryExtCountMatchesBaseQuery(t, c, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC).Offset(7).Limit(9))
 }
 
 func TestQueryExt_CountIgnoresUnknownArrayPosOrderField(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "no_such_field", []string{"a", "b"}, qx.ASC))
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 64)
+	assertQueryExtCountMatchesBaseQuery(t, c, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "no_such_field", []string{"a", "b"}, qx.ASC))
 }
 
 func TestQueryExt_CountIgnoresUnknownArrayCountOrderField(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, queryExtSortByArrayCount(qx.Query(qx.EQ("active", true)), "no_such_field", qx.DESC))
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 64)
+	assertQueryExtCountMatchesBaseQuery(t, c, queryExtSortByArrayCount(qx.Query(qx.EQ("active", true)), "no_such_field", qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownSecondaryOrderField(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 64)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 64)
 
 	q := qx.Query(qx.EQ("active", true))
 	q.Order = []qx.Order{
 		{By: qx.REF("age")},
 		{By: qx.REF("no_such_field"), Desc: true},
 	}
-	assertQueryExtCountMatchesBaseQuery(t, db, q)
+	assertQueryExtCountMatchesBaseQuery(t, c, q)
 }
 
 func TestQueryExt_CountIgnoresUnknownOrderFieldOnNoopQuery(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query().Sort("no_such_field", qx.DESC))
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 64)
+	assertQueryExtCountMatchesBaseQuery(t, c, qx.Query().Sort("no_such_field", qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownOrderFieldOnEmptyDB(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC))
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	assertQueryExtCountMatchesBaseQuery(t, c, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC))
 }
 
 func TestQueryExt_OrderBasicPointer_NilTailChurn_MatchesSeqScanAndPrepared(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1:  {Name: "nil-a", Opt: nil, Active: true, Tags: []string{"go"}},
@@ -1219,7 +1220,7 @@ func TestQueryExt_OrderBasicPointer_NilTailChurn_MatchesSeqScanAndPrepared(t *te
 		12: {Name: "zz-a", Opt: strPtr("zz"), Active: false, Tags: []string{"rust", "go"}},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1245,52 +1246,52 @@ func TestQueryExt_OrderBasicPointer_NilTailChurn_MatchesSeqScanAndPrepared(t *te
 	check := func(step string) {
 		for _, tc := range tests {
 			t.Run(step+"_"+tc.name, func(t *testing.T) {
-				assertQueryExtAllReadPathsMatchExpected(t, db, tc.q)
+				assertQueryExtAllReadPathsMatchExpected(t, c, tc.q)
 			})
 		}
 	}
 
 	check("initial")
 
-	if err := db.Patch(2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(2 opt=nil): %v", err)
 	}
-	if err := db.Patch(5, []Field{{Name: "opt", Value: "ab"}}); err != nil {
+	if err := writePatch(c, 5, []Field{{Name: "opt", Value: "ab"}}); err != nil {
 		t.Fatalf("Patch(5 opt=ab): %v", err)
 	}
-	if err := db.Patch(11, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	if err := writePatch(c, 11, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(11 opt=nil): %v", err)
 	}
 	check("after_nil_flip")
 
-	if err := db.Patch(1, []Field{{Name: "opt", Value: ""}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "opt", Value: ""}}); err != nil {
 		t.Fatalf("Patch(1 opt=''): %v", err)
 	}
-	if err := db.Delete(4); err != nil {
+	if err := writeDelete(c, 4); err != nil {
 		t.Fatalf("Delete(4): %v", err)
 	}
-	if err := db.Set(13, &Rec{Name: "nil-new", Opt: nil, Active: true, Tags: []string{"db", "ops"}}); err != nil {
+	if err := writeSet(c, 13, &Rec{Name: "nil-new", Opt: nil, Active: true, Tags: []string{"db", "ops"}}); err != nil {
 		t.Fatalf("Set(13): %v", err)
 	}
-	if err := db.Set(14, &Rec{Name: "az-new", Opt: strPtr("az"), Active: false, Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 14, &Rec{Name: "az-new", Opt: strPtr("az"), Active: false, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(14): %v", err)
 	}
 	check("after_insert_delete")
 
-	if err := db.Patch(7, []Field{{Name: "active", Value: false}}); err != nil {
+	if err := writePatch(c, 7, []Field{{Name: "active", Value: false}}); err != nil {
 		t.Fatalf("Patch(7 active=false): %v", err)
 	}
-	if err := db.Patch(8, []Field{{Name: "opt", Value: "aa"}}); err != nil {
+	if err := writePatch(c, 8, []Field{{Name: "opt", Value: "aa"}}); err != nil {
 		t.Fatalf("Patch(8 opt=aa): %v", err)
 	}
-	if err := db.Delete(9); err != nil {
+	if err := writeDelete(c, 9); err != nil {
 		t.Fatalf("Delete(9): %v", err)
 	}
 	check("after_tail_churn")
 }
 
 func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1:  {Name: "zero-nil-1", Tags: nil, Active: true},
@@ -1305,7 +1306,7 @@ func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *te
 		10: {Name: "three-distinct", Tags: []string{"ops", "go", "db"}, Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1331,46 +1332,46 @@ func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *te
 	check := func(step string) {
 		for _, tc := range tests {
 			t.Run(step+"_"+tc.name, func(t *testing.T) {
-				assertQueryExtAllReadPathsMatchExpected(t, db, tc.q)
+				assertQueryExtAllReadPathsMatchExpected(t, c, tc.q)
 			})
 		}
 	}
 
 	check("initial")
 
-	if err := db.BatchPatch([]uint64{1, 2, 3, 4}, []Field{{Name: "tags", Value: []string{"go"}}}); err != nil {
-		t.Fatalf("BatchPatch(densify zeros): %v", err)
+	if err := writePatches(c, []uint64{1, 2, 3, 4}, []Field{{Name: "tags", Value: []string{"go"}}}); err != nil {
+		t.Fatalf("MultiPatch(densify zeros): %v", err)
 	}
 	check("after_dense_nonempty")
 
-	if err := db.BatchPatch([]uint64{1, 2, 3, 4, 5}, []Field{{Name: "tags", Value: []string{}}}); err != nil {
-		t.Fatalf("BatchPatch(restore zeros): %v", err)
+	if err := writePatches(c, []uint64{1, 2, 3, 4, 5}, []Field{{Name: "tags", Value: []string{}}}); err != nil {
+		t.Fatalf("MultiPatch(restore zeros): %v", err)
 	}
 	check("after_zero_complement_return")
 
-	if err := db.Patch(8, []Field{{Name: "tags", Value: []string{"ops", "ops", "ops"}}}); err != nil {
+	if err := writePatch(c, 8, []Field{{Name: "tags", Value: []string{"ops", "ops", "ops"}}}); err != nil {
 		t.Fatalf("Patch(8 tags): %v", err)
 	}
-	if err := db.Patch(9, []Field{{Name: "tags", Value: []string{"go", "db", "ops", "ops"}}}); err != nil {
+	if err := writePatch(c, 9, []Field{{Name: "tags", Value: []string{"go", "db", "ops", "ops"}}}); err != nil {
 		t.Fatalf("Patch(9 tags): %v", err)
 	}
-	if err := db.Patch(10, []Field{{Name: "tags", Value: []string{"rust", "rust"}}}); err != nil {
+	if err := writePatch(c, 10, []Field{{Name: "tags", Value: []string{"rust", "rust"}}}); err != nil {
 		t.Fatalf("Patch(10 tags): %v", err)
 	}
-	if err := db.Delete(6); err != nil {
+	if err := writeDelete(c, 6); err != nil {
 		t.Fatalf("Delete(6): %v", err)
 	}
-	if err := db.Set(11, &Rec{Name: "zero-new", Tags: nil, Active: true}); err != nil {
+	if err := writeSet(c, 11, &Rec{Name: "zero-new", Tags: nil, Active: true}); err != nil {
 		t.Fatalf("Set(11): %v", err)
 	}
-	if err := db.Set(12, &Rec{Name: "two-new", Tags: []string{"ops", "go", "go"}, Active: false}); err != nil {
+	if err := writeSet(c, 12, &Rec{Name: "two-new", Tags: []string{"ops", "go", "go"}, Active: false}); err != nil {
 		t.Fatalf("Set(12): %v", err)
 	}
 	check("after_distinct_churn")
 }
 
 func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Active: true},
@@ -1383,7 +1384,7 @@ func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 		8: {Name: "aa-off", Opt: strPtr("aa"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1409,20 +1410,20 @@ func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 	check := func(step string) {
 		for _, tc := range tests {
 			t.Run(step+"_"+tc.name, func(t *testing.T) {
-				assertQueryExtraPublicReadPathsMatchExpected(t, db, tc.q)
+				assertQueryExtraPublicReadPathsMatchExpected(t, c, tc.q)
 			})
 		}
 	}
 
 	check("initial")
 
-	if err := db.Patch(1, []Field{{Name: "opt", Value: "ad"}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "opt", Value: "ad"}}); err != nil {
 		t.Fatalf("Patch(1 opt=ad): %v", err)
 	}
-	if err := db.Patch(4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	if err := writePatch(c, 4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(4 opt=nil): %v", err)
 	}
-	if err := db.Patch(7, []Field{{Name: "opt", Value: "aa"}}); err != nil {
+	if err := writePatch(c, 7, []Field{{Name: "opt", Value: "aa"}}); err != nil {
 		t.Fatalf("Patch(7 opt=aa): %v", err)
 	}
 
@@ -1430,7 +1431,7 @@ func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 }
 
 func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Active: true},
@@ -1442,7 +1443,7 @@ func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
 		7: {Name: "nil-b", Opt: nil, Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1467,9 +1468,9 @@ func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assertQueryExtAllReadPathsMatchExpected(t, db, tc.q)
+			assertQueryExtAllReadPathsMatchExpected(t, c, tc.q)
 
-			got, err := db.QueryKeys(tc.q)
+			got, err := readQueryKeys(c, tc.q)
 			if err != nil {
 				t.Fatalf("QueryKeys(%+v): %v", tc.q, err)
 			}
@@ -1481,7 +1482,7 @@ func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
 }
 
 func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Age: 10, Active: true},
@@ -1490,7 +1491,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 		4: {Name: "ab-a", Opt: strPtr("ab"), Age: 40, Active: true},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1518,7 +1519,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := db.QueryKeys(tc.q)
+			_, err := readQueryKeys(c, tc.q)
 			if !errors.Is(err, rbierrors.ErrInvalidQuery) {
 				t.Fatalf("QueryKeys(%+v) err=%v, want rbierrors.ErrInvalidQuery", tc.q, err)
 			}
@@ -1527,7 +1528,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 }
 
 func TestQueryExt_OrderBasicNilShortCircuit_ReturnsEmptyResult(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Active: true},
@@ -1536,7 +1537,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_ReturnsEmptyResult(t *testing.T) {
 		4: {Name: "charlie", Opt: strPtr("ac"), Active: true},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1547,7 +1548,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_ReturnsEmptyResult(t *testing.T) {
 		qx.CONTAINS("name", "a"),
 	).Sort("opt", qx.ASC).Limit(8)
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
@@ -1557,7 +1558,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_ReturnsEmptyResult(t *testing.T) {
 }
 
 func TestQueryExt_OrderBasicPointerPrefixWithNegativeBaseOps_RemainsExact(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
 	rows := map[uint64]*Rec{
 		1:  {Name: "nil-a", Opt: nil, Active: true},
@@ -1572,7 +1573,7 @@ func TestQueryExt_OrderBasicPointerPrefixWithNegativeBaseOps_RemainsExact(t *tes
 		10: {Name: "ax-off", Opt: strPtr("ax"), Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
@@ -1607,23 +1608,23 @@ func TestQueryExt_OrderBasicPointerPrefixWithNegativeBaseOps_RemainsExact(t *tes
 	check := func(step string) {
 		for _, tc := range tests {
 			t.Run(step+"_"+tc.name, func(t *testing.T) {
-				assertQueryExtraPublicReadPathsMatchExpected(t, db, tc.q)
+				assertQueryExtraPublicReadPathsMatchExpected(t, c, tc.q)
 			})
 		}
 	}
 
 	check("initial")
 
-	if err := db.Patch(1, []Field{{Name: "opt", Value: "ae"}, {Name: "active", Value: false}}); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "opt", Value: "ae"}, {Name: "active", Value: false}}); err != nil {
 		t.Fatalf("Patch(1): %v", err)
 	}
-	if err := db.Patch(4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+	if err := writePatch(c, 4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(4): %v", err)
 	}
-	if err := db.Patch(8, []Field{{Name: "active", Value: false}}); err != nil {
+	if err := writePatch(c, 8, []Field{{Name: "active", Value: false}}); err != nil {
 		t.Fatalf("Patch(8): %v", err)
 	}
-	if err := db.Set(11, &Rec{Name: "af-off", Opt: strPtr("af"), Active: false}); err != nil {
+	if err := writeSet(c, 11, &Rec{Name: "af-off", Opt: strPtr("af"), Active: false}); err != nil {
 		t.Fatalf("Set(11): %v", err)
 	}
 

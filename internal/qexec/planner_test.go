@@ -933,11 +933,11 @@ func TestPlannerORNoOrder_LateAlwaysTrueBranchUsesUniversePage(t *testing.T) {
 
 func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1015,11 +1015,11 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 
 func TestPlannerORNoOrder_BroadResidualRangeStaysLazyDuringAdaptiveLimit(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1101,11 +1101,11 @@ func TestPlannerORNoOrder_BroadResidualRangeStaysLazyDuringAdaptiveLimit(t *test
 
 func TestPlannerORNoOrder_ExactLeadWithComplementRangeResidualNotExhausted(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1178,8 +1178,8 @@ func TestPlannerORNoOrder_ExactLeadWithComplementRangeResidualNotExhausted(t *te
 
 func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 4; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1252,8 +1252,8 @@ func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T
 
 func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1351,8 +1351,8 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 
 func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazyWithoutMatPredCache(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 0,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 0,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1457,8 +1457,8 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 
 func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -1950,8 +1950,8 @@ func TestInitOrderedORBranchEstimates_ExcludesCoveredLeafFromCard(t *testing.T) 
 
 func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	_ = seedData(t, db, 20_000)
 
@@ -1989,8 +1989,8 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 
 func TestPlannerOROrderObserverHotCheckDoesNotTouchSeenKeys(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	_ = seedData(t, db, 1)
 	view := db.engine.currentQueryViewForTests()
@@ -2018,8 +2018,8 @@ func TestPlannerOROrderObserverHotCheckDoesNotTouchSeenKeys(t *testing.T) {
 
 func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2117,8 +2117,8 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 
 func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2225,8 +2225,8 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 
 func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2337,8 +2337,8 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 
 func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -2484,8 +2484,8 @@ func TestPlannerORBranchCheckCounts_LargeImpossibleBranchWithZeroLenCoveredRetur
 
 func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -3351,11 +3351,11 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 
 func TestOrderedLimitBaseCoreStats_NullableComplementCacheUsesBuildCardinality(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 	for i := 0; i < 5; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: true}

@@ -509,17 +509,17 @@ func filterResearchAllocQueries(classFilter, queryFilter []string) ([]researchAl
 	return out, nil
 }
 
-func runResearchAllocQuery(db *rbi.DB[uint64, UserBench], kind researchAllocRunKind, q *qx.QX) error {
+func runResearchAllocQuery(c *rbi.Collection[uint64, UserBench], kind researchAllocRunKind, q *qx.QX) error {
 	switch kind {
 	case researchAllocRunItems:
-		items, err := db.Query(q)
-		db.ReleaseRecords(items...)
+		items, err := stressReadQuery(c, q)
+		c.ReleaseRecords(items...)
 		return err
 	case researchAllocRunKeys:
-		_, err := db.QueryKeys(q)
+		_, err := stressReadQueryKeys(c, q)
 		return err
 	case researchAllocRunCount:
-		_, err := db.Count(q.Filter)
+		_, err := stressReadCount(c, q.Filter)
 		return err
 	default:
 		return fmt.Errorf("unknown alloc run kind %d", kind)
@@ -542,9 +542,9 @@ var allocTurnoverCountries = [...]string{"US", "NL", "DE", "PL", "SE", "FR", "GB
 var allocTurnoverPlans = [...]string{"free", "basic", "pro", "enterprise"}
 var allocTurnoverStatuses = [...]string{"active", "trial", "paused", "banned"}
 
-func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, error) {
-	if handle == nil || handle.DB == nil {
-		return nil, fmt.Errorf("alloc turnover requires an open DB handle")
+func buildAllocTurnoverRing(handle *CollectionHandle, limit int) (*allocTurnoverRing, error) {
+	if handle == nil || handle.Collection == nil {
+		return nil, fmt.Errorf("alloc turnover requires an open collection handle")
 	}
 	if limit <= 0 {
 		limit = defaultAllocTurnoverRingSize
@@ -557,7 +557,7 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 	ids := make([]uint64, 0, len(ords))
 	want := 0
 	pos := 0
-	err := handle.DB.ScanKeys(0, func(id uint64) (bool, error) {
+	err := stressReadScanKeys(handle.Collection, 0, func(id uint64) (bool, error) {
 		pos++
 		if want >= len(ords) {
 			return false, nil
@@ -575,7 +575,7 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 
 	entries := make([]allocTurnoverEntry, 0, len(ids))
 	for _, id := range ids {
-		rec, err := handle.DB.Get(id)
+		rec, err := stressReadGet(handle.Collection, id)
 		if err != nil {
 			return nil, err
 		}
@@ -587,7 +587,7 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 			basePatch: allocBasePatch(rec),
 			altPatch:  allocAltPatch(rec),
 		})
-		handle.DB.ReleaseRecords(rec)
+		handle.Collection.ReleaseRecords(rec)
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("alloc turnover ring is empty")
@@ -595,7 +595,7 @@ func buildAllocTurnoverRing(handle *DBHandle, limit int) (*allocTurnoverRing, er
 	return &allocTurnoverRing{entries: entries}, nil
 }
 
-func (r *allocTurnoverRing) apply(db *rbi.DB[uint64, UserBench]) error {
+func (r *allocTurnoverRing) apply(c *rbi.Collection[uint64, UserBench]) error {
 	if r == nil || len(r.entries) == 0 {
 		return nil
 	}
@@ -608,7 +608,7 @@ func (r *allocTurnoverRing) apply(db *rbi.DB[uint64, UserBench]) error {
 	if entry.altActive {
 		patch = entry.basePatch
 	}
-	if err := db.Patch(entry.id, patch); err != nil {
+	if err := stressWritePatch(c, entry.id, patch); err != nil {
 		return err
 	}
 	entry.altActive = !entry.altActive

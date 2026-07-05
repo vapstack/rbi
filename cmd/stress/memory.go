@@ -32,7 +32,7 @@ func applyMemorySummarySample(out *MemorySummary, s *MemorySnapshot) {
 	out.MaxUniverseCard = max(out.MaxUniverseCard, s.Snapshot.UniverseCard)
 }
 
-func CaptureMemorySnapshot(db *DBHandle, forceGC bool) *MemorySnapshot {
+func CaptureMemorySnapshot(c *CollectionHandle, forceGC bool) *MemorySnapshot {
 	if forceGC {
 		runtime.GC()
 	}
@@ -66,13 +66,14 @@ func CaptureMemorySnapshot(db *DBHandle, forceGC bool) *MemorySnapshot {
 		NextGCBytes:       ms.NextGC,
 		NumGC:             ms.NumGC,
 	}
-	if db != nil {
-		snap.Process = captureProcessMemory(db.DBFile)
-		if db.DB != nil {
-			stats := db.DB.SnapshotStats()
+	if c != nil {
+		snap.Process = captureProcessMemory(c.DBFile)
+		if c.Collection != nil {
+			stats := c.Collection.SnapshotStats()
+			root := c.Collection.StoreStats()
 			snap.Snapshot = SnapshotMemoryStats{
-				RegistrySize: stats.RegistrySize,
-				PinnedRefs:   stats.PinnedRefs,
+				RegistrySize: root.RegistrySize,
+				PinnedRefs:   root.PinnedRefs,
 				UniverseCard: stats.UniverseCard,
 			}
 		}

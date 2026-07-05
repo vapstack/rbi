@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/pooled"
@@ -17,21 +15,20 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/rbistats"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
 func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 
 	var count int
-	prepareReadBenchSnapshot(b, db)
+	prepareReadBenchSnapshot(b, c)
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for b.Loop() {
 		count = 0
-		if err := db.ScanKeys(0, func(_ uint64) (bool, error) {
+		if err := readScanKeys(c, 0, func(_ uint64) (bool, error) {
 			count++
 			return true, nil
 		}); err != nil {
@@ -42,9 +39,9 @@ func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
 }
 
 func Benchmark_Read_Query_Items_SimpleFetch(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.EQ("country", "US")).Sort("age", qx.DESC).Limit(20)
-	runReadQueryBench(b, db, q)
+	runReadQueryBench(b, c, q)
 }
 
 func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
@@ -56,9 +53,9 @@ func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
 func Benchmark_Read_Query_Items_GT_NoMatch(b *testing.B) {
 	// This no-match read microbenchmark mostly measures fixed query overhead;
 	// Cold cache rotation stretches runtime without adding much signal.
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.GT("age", 100))
-	runReadQueryBench(b, db, q)
+	runReadQueryBench(b, c, q)
 }
 
 const (
@@ -69,25 +66,40 @@ const (
 )
 
 var writeBenchEncodePool pooled.Buffers
+var writeBenchHookSink uint64
 
-func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
-	return buildWriteBenchDBWithOptions(b, Options{
+func buildWriteBenchCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, uint64) {
+	return buildWriteBenchCollectionWithOptions(b, Options{
 		DisableIndexStore: true,
 	})
 }
 
-func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
+func buildWriteBenchTransparentCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, uint64) {
+	return buildWriteBenchCollectionWithOptions(b, Options{
+		DisableIndexStore: true,
+		Index:             map[string]IndexKind{},
+	})
+}
+
+func openWriteBenchCollection(b *testing.B, opts Options) (*Collection[uint64, UserBench], *bbolt.DB) {
 	b.Helper()
 
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_write_seeded.db")
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
+	c, bolt := openBoltAndCollection[uint64, UserBench](b, path, opts)
 	b.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	db.disableSync()
+	return c, bolt
+}
+
+func buildWriteBenchCollectionWithOptions(b *testing.B, opts Options) (*Collection[uint64, UserBench], *bbolt.DB, uint64) {
+	b.Helper()
+
+	c, bolt := openWriteBenchCollection(b, opts)
+	c.disableSync()
 
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -109,7 +121,7 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 		vals = append(vals, rec)
 
 		if len(ids) >= writeBenchSeedBatch {
-			if err := db.BatchSet(ids, vals); err != nil {
+			if err := writeSets(c, ids, vals); err != nil {
 				b.Fatalf("seed error: %v", err)
 			}
 			ids = ids[:0]
@@ -117,56 +129,14 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 		}
 	}
 	if len(ids) > 0 {
-		if err := db.BatchSet(ids, vals); err != nil {
+		if err := writeSets(c, ids, vals); err != nil {
 			b.Fatal(err)
 		}
 	}
 
-	db.enableSync()
+	c.enableSync()
 
-	return db, raw, uint64(writeBenchSeedCount)
-}
-
-func ensureBenchSideBucket(b *testing.B, raw *bbolt.DB, name string) []byte {
-	b.Helper()
-
-	bucketName := []byte(name)
-	if err := raw.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucketName)
-		return err
-	}); err != nil {
-		b.Fatalf("ensure side bucket %q: %v", name, err)
-	}
-
-	return bucketName
-}
-
-func appendBenchSideBucket(tx *bbolt.Tx, bucketName, payload []byte) error {
-	bucket := tx.Bucket(bucketName)
-	if bucket == nil {
-		return fmt.Errorf("side bucket %q does not exist", string(bucketName))
-	}
-
-	seq, err := bucket.NextSequence()
-	if err != nil {
-		return fmt.Errorf("side bucket next sequence: %w", err)
-	}
-
-	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], seq)
-	if err = bucket.Put(key[:], payload); err != nil {
-		return fmt.Errorf("side bucket put: %w", err)
-	}
-
-	return nil
-}
-
-func appendBenchAuditLog(tx *bbolt.Tx, bucketName []byte, key uint64, rec *UserBench) error {
-	var payload [24]byte
-	binary.BigEndian.PutUint64(payload[0:8], key)
-	binary.BigEndian.PutUint64(payload[8:16], uint64(rec.Age))
-	binary.BigEndian.PutUint64(payload[16:24], math.Float64bits(rec.Score))
-	return appendBenchSideBucket(tx, bucketName, payload[:])
+	return c, bolt, uint64(writeBenchSeedCount)
 }
 
 func writeBenchUpdateRecords() (*UserBench, *UserBench) {
@@ -233,64 +203,64 @@ func buildWriteBenchBatchUpdateInput(batchSize int) ([]uint64, []*UserBench, []*
 	return ids, valsA, valsB
 }
 
-func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
+func rawSetBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
 	b := writeBenchEncodePool.Get()
 	defer writeBenchEncodePool.Put(b)
 
-	if err := db.encode(rec, b); err != nil {
+	if err := c.encode(rec, b); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
 
 	return raw.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.dataBucket)
+		bucket := tx.Bucket(c.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		bucket.FillPercent = db.options.BucketFillPercent
+		bucket.FillPercent = c.options.BucketFillPercent
 		var keyBuf [8]byte
-		if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf), b.Bytes()); err != nil {
+		if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf), b.Bytes()); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
 		return nil
 	})
 }
 
-func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []schema.PatchItem) error {
+func rawPatchBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, patch []schema.PatchItem) error {
 	return raw.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.dataBucket)
+		bucket := tx.Bucket(c.dataBucket)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 
 		var keyBuf [8]byte
-		key := keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf)
+		key := keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf)
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
 			return nil
 		}
 
-		oldVal, err := db.decode(oldBytes)
+		oldVal, err := c.decode(oldBytes)
 		if err != nil {
 			return fmt.Errorf("decode old: %w", err)
 		}
-		newVal, err := db.decode(oldBytes)
+		newVal, err := c.decode(oldBytes)
 		if err != nil {
-			db.ReleaseRecords(oldVal)
+			c.ReleaseRecords(oldVal)
 			return fmt.Errorf("decode new: %w", err)
 		}
-		defer db.ReleaseRecords(oldVal, newVal)
+		defer c.ReleaseRecords(oldVal, newVal)
 
-		if err = db.schema.Patch.Apply(unsafe.Pointer(newVal), patch, true); err != nil {
+		if err = c.schema.Patch.Apply(unsafe.Pointer(newVal), patch, true); err != nil {
 			return fmt.Errorf("apply patch: %w", err)
 		}
 
 		b := writeBenchEncodePool.Get()
 		defer writeBenchEncodePool.Put(b)
-		if err = db.encode(newVal, b); err != nil {
+		if err = c.encode(newVal, b); err != nil {
 			return fmt.Errorf("encode: %w", err)
 		}
 
-		bucket.FillPercent = db.options.BucketFillPercent
+		bucket.FillPercent = c.options.BucketFillPercent
 		if err = bucket.Put(key, b.Bytes()); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
@@ -298,7 +268,7 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 	})
 }
 
-func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], startOffset uint64) {
+func churnWriteBenchSetNew(b *testing.B, c *Collection[uint64, UserBench], startOffset uint64) {
 	b.Helper()
 
 	ids := make([]uint64, 0, writeBenchUserBatchSize)
@@ -312,8 +282,8 @@ func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], start
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(high churn new): %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			b.Fatalf("MultiSet(high churn new): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -329,7 +299,7 @@ func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], start
 	flush()
 }
 
-func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA, recB *UserBench) {
+func churnWriteBenchUpdate(b *testing.B, c *Collection[uint64, UserBench], recA, recB *UserBench) {
 	b.Helper()
 
 	ids := make([]uint64, 0, writeBenchUserBatchSize)
@@ -339,8 +309,8 @@ func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA,
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(high churn update): %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			b.Fatalf("MultiSet(high churn update): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -356,15 +326,42 @@ func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA,
 	flush()
 }
 
-func churnWriteBenchPatchIndexed(b *testing.B, db *DB[uint64, UserBench], patch []Field) {
+func churnWriteBenchPatch(b *testing.B, c *Collection[uint64, UserBench], patch []Field) {
 	b.Helper()
 
 	ids := make([]uint64, 0, writeBenchHighChurnOps)
 	for i := 0; i < writeBenchHighChurnOps; i++ {
 		ids = append(ids, uint64(i+1))
 	}
-	if err := db.BatchPatch(ids, patch); err != nil {
-		b.Fatalf("BatchPatch(high churn patch): %v", err)
+	if err := writePatches(c, ids, patch); err != nil {
+		b.Fatalf("MultiPatch(high churn patch): %v", err)
+	}
+}
+
+func seedWriteBenchDeleteKeys(b *testing.B, c *Collection[uint64, UserBench], start uint64, count int) {
+	b.Helper()
+
+	c.disableSync()
+	defer c.enableSync()
+
+	rec := &UserBench{Name: "delete", Age: 20, Country: "US"}
+	ids := make([]uint64, 0, writeBenchSeedBatch)
+	vals := make([]*UserBench, 0, writeBenchSeedBatch)
+	for i := 0; i < count; i++ {
+		ids = append(ids, start+uint64(i))
+		vals = append(vals, rec)
+		if len(ids) == writeBenchSeedBatch {
+			if err := writeSets(c, ids, vals); err != nil {
+				b.Fatalf("seed delete: %v", err)
+			}
+			ids = ids[:0]
+			vals = vals[:0]
+		}
+	}
+	if len(ids) != 0 {
+		if err := writeSets(c, ids, vals); err != nil {
+			b.Fatalf("seed delete: %v", err)
+		}
 	}
 }
 
@@ -372,24 +369,24 @@ func Benchmark_Write_Set_New_Indexed(b *testing.B) {
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
 	b.Run("StableBase", func(b *testing.B) {
-		db, _, startOffset := buildWriteBenchDB(b)
-		prepareWriteBenchStableBase(b, db)
+		c, _, startOffset := buildWriteBenchCollection(b)
+		prepareWriteBenchStableBase(b, c)
 
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
 			id := startOffset + uint64(i) + 1
-			if err := db.Set(id, rec); err != nil {
+			if err := writeSet(c, id, rec); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 
 	b.Run("HighChurn", func(b *testing.B) {
-		db, _, startOffset := buildWriteBenchDB(b)
-		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
-			churnWriteBenchSetNewIndexed(b, db, startOffset)
+		c, _, startOffset := buildWriteBenchCollection(b)
+		prepareWriteBenchHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchSetNew(b, c, startOffset)
 		})
 
 		startOffset += writeBenchHighChurnOps
@@ -398,16 +395,16 @@ func Benchmark_Write_Set_New_Indexed(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			id := startOffset + uint64(i) + 1
-			if err := db.Set(id, rec); err != nil {
+			if err := writeSet(c, id, rec); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 }
 
-func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
-	db, raw, startOffset := buildWriteBenchDB(b)
-	prepareWriteBenchStableBase(b, db)
+func Benchmark_Write_Set_New_RawBolt(b *testing.B) {
+	c, bolt, startOffset := buildWriteBenchCollection(b)
+	prepareWriteBenchStableBase(b, c)
 
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
@@ -416,52 +413,89 @@ func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		id := startOffset + uint64(i) + 1
-		if err := rawSetBench(db, raw, id, rec); err != nil {
+		if err := rawSetBench(c, bolt, id, rec); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func Benchmark_Write_Update_Indexed(b *testing.B) {
-	recA, recB := writeBenchUpdateRecords()
+func Benchmark_Write_Set_New_Transparent(b *testing.B) {
+	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
 	b.Run("StableBase", func(b *testing.B) {
-		db, _, _ := buildWriteBenchDB(b)
-		targetID := uint64(1000)
-		prepareWriteBenchStableBase(b, db)
+		c, _, startOffset := buildWriteBenchTransparentCollection(b)
+		prepareWriteBenchTransparentBase(b, c)
 
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+			id := startOffset + uint64(i) + 1
+			if err := writeSet(c, id, rec); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 
 	b.Run("HighChurn", func(b *testing.B) {
-		db, _, _ := buildWriteBenchDB(b)
-		targetID := uint64(1000)
-		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
-			churnWriteBenchUpdateIndexed(b, db, recA, recB)
+		c, _, startOffset := buildWriteBenchTransparentCollection(b)
+		prepareWriteBenchTransparentHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchSetNew(b, c, startOffset)
 		})
 
+		startOffset += writeBenchHighChurnOps
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+			id := startOffset + uint64(i) + 1
+			if err := writeSet(c, id, rec); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 }
 
-func Benchmark_Write_Update_NoIndex(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Update_Indexed(b *testing.B) {
+	recA, recB := writeBenchUpdateRecords()
+
+	b.Run("StableBase", func(b *testing.B) {
+		c, _, _ := buildWriteBenchCollection(b)
+		targetID := uint64(1000)
+		prepareWriteBenchStableBase(b, c)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("HighChurn", func(b *testing.B) {
+		c, _, _ := buildWriteBenchCollection(b)
+		targetID := uint64(1000)
+		prepareWriteBenchHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchUpdate(b, c, recA, recB)
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func Benchmark_Write_Update_RawBolt(b *testing.B) {
+	c, bolt, _ := buildWriteBenchCollection(b)
 	targetID := uint64(1000)
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
 	recA, recB := writeBenchUpdateRecords()
 
@@ -469,10 +503,46 @@ func Benchmark_Write_Update_NoIndex(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if err := rawSetBench(db, raw, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+		if err := rawSetBench(c, bolt, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+func Benchmark_Write_Update_Transparent(b *testing.B) {
+	recA, recB := writeBenchUpdateRecords()
+
+	b.Run("StableBase", func(b *testing.B) {
+		c, _, _ := buildWriteBenchTransparentCollection(b)
+		targetID := uint64(1000)
+		prepareWriteBenchTransparentBase(b, c)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("HighChurn", func(b *testing.B) {
+		c, _, _ := buildWriteBenchTransparentCollection(b)
+		targetID := uint64(1000)
+		prepareWriteBenchTransparentHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchUpdate(b, c, recA, recB)
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func Benchmark_Write_Patch_Indexed(b *testing.B) {
@@ -480,20 +550,20 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 	patchB := []Field{{Name: "age", Value: 200}}
 
 	b.Run("StableBase", func(b *testing.B) {
-		db, _, _ := buildWriteBenchDB(b)
+		c, _, _ := buildWriteBenchCollection(b)
 		targetID := uint64(2000)
-		prepareWriteBenchStableBase(b, db)
+		prepareWriteBenchStableBase(b, c)
 
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
 			if i%2 == 0 {
-				if err := db.Patch(targetID, patchA); err != nil {
+				if err := writePatch(c, targetID, patchA); err != nil {
 					b.Fatal(err)
 				}
 			} else {
-				if err := db.Patch(targetID, patchB); err != nil {
+				if err := writePatch(c, targetID, patchB); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -501,10 +571,10 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 	})
 
 	b.Run("HighChurn", func(b *testing.B) {
-		db, _, _ := buildWriteBenchDB(b)
+		c, _, _ := buildWriteBenchCollection(b)
 		targetID := uint64(2000)
-		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
-			churnWriteBenchPatchIndexed(b, db, patchA)
+		prepareWriteBenchHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchPatch(b, c, patchA)
 		})
 
 		b.ReportAllocs()
@@ -512,11 +582,11 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			if i%2 == 0 {
-				if err := db.Patch(targetID, patchA); err != nil {
+				if err := writePatch(c, targetID, patchA); err != nil {
 					b.Fatal(err)
 				}
 			} else {
-				if err := db.Patch(targetID, patchB); err != nil {
+				if err := writePatch(c, targetID, patchB); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -524,10 +594,10 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 	})
 }
 
-func Benchmark_Write_Patch_NoIndex(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Patch_RawBolt(b *testing.B) {
+	c, bolt, _ := buildWriteBenchCollection(b)
 	targetID := uint64(2000)
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
 	patchA := []schema.PatchItem{{Name: "age", Value: 100}}
 	patchB := []schema.PatchItem{{Name: "age", Value: 200}}
@@ -542,20 +612,131 @@ func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 		} else {
 			patch = patchB
 		}
-		if err := rawPatchBench(db, raw, targetID, patch); err != nil {
+		if err := rawPatchBench(c, bolt, targetID, patch); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func Benchmark_Write_Update_BeforeStore(b *testing.B) {
-	db, _, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Patch_Transparent(b *testing.B) {
+	patchA := []Field{{Name: "age", Value: 100}}
+	patchB := []Field{{Name: "age", Value: 200}}
+
+	b.Run("StableBase", func(b *testing.B) {
+		c, _, _ := buildWriteBenchTransparentCollection(b)
+		targetID := uint64(2000)
+		prepareWriteBenchTransparentBase(b, c)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if i%2 == 0 {
+				if err := writePatch(c, targetID, patchA); err != nil {
+					b.Fatal(err)
+				}
+			} else {
+				if err := writePatch(c, targetID, patchB); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("HighChurn", func(b *testing.B) {
+		c, _, _ := buildWriteBenchTransparentCollection(b)
+		targetID := uint64(2000)
+		prepareWriteBenchTransparentHighChurn(b, c, func(b *testing.B, c *Collection[uint64, UserBench]) {
+			churnWriteBenchPatch(b, c, patchA)
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if i%2 == 0 {
+				if err := writePatch(c, targetID, patchA); err != nil {
+					b.Fatal(err)
+				}
+			} else {
+				if err := writePatch(c, targetID, patchB); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+}
+
+func Benchmark_Write_Delete_Indexed(b *testing.B) {
+	b.Run("StableBase", func(b *testing.B) {
+		c, _, startOffset := buildWriteBenchCollection(b)
+		requireBenchSnapshotPublished(b, currentBenchSnapshot(b, c))
+
+		start := startOffset + 1
+		seedWriteBenchDeleteKeys(b, c, start, b.N)
+		requireBenchSnapshotPublished(b, c.SnapshotStats())
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeDelete(c, start+uint64(i)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("HighChurn", func(b *testing.B) {
+		c, _, startOffset := buildWriteBenchCollection(b)
+		requireBenchSnapshotPublished(b, currentBenchSnapshot(b, c))
+
+		churnWriteBenchSetNew(b, c, startOffset)
+		start := startOffset + writeBenchHighChurnOps + 1
+		seedWriteBenchDeleteKeys(b, c, start, b.N)
+		requireBenchSnapshotPublished(b, c.SnapshotStats())
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := writeDelete(c, start+uint64(i)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func Benchmark_Write_Delete_Transparent(b *testing.B) {
+	c, _ := openWriteBenchCollection(b, Options{
+		DisableIndexStore: true,
+		Index:             map[string]IndexKind{},
+	})
+	prepareWriteBenchTransparentBase(b, c)
+
+	b.StopTimer()
+	seedWriteBenchDeleteKeys(b, c, 1, b.N)
+	b.StartTimer()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := writeDelete(c, uint64(i+1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func Benchmark_Write_Update_OnChangeMutate(b *testing.B) {
+	c, _, _ := buildWriteBenchCollection(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
 	var modifiedTS uint64
-	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
+	onChange := OnChange(func(_ *Tx, _ uint64, _ *UserBench, newValue *UserBench) error {
 		newValue.Score = float64(modifiedTS + 1)
 		modifiedTS++
 		return nil
@@ -565,90 +746,81 @@ func Benchmark_Write_Update_BeforeStore(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB), beforeStore); err != nil {
+		if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB), onChange); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Update_OnChangeObserve(b *testing.B) {
+	c, _, _ := buildWriteBenchCollection(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
-	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
-	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, key uint64, _ *UserBench, newValue *UserBench) error {
-		return appendBenchAuditLog(tx, auditBucket, key, newValue)
+	var sink uint64
+	onChange := OnChange(func(_ *Tx, key uint64, _ *UserBench, newValue *UserBench) error {
+		sink += key + uint64(newValue.Age) + math.Float64bits(newValue.Score)
+		return nil
 	})
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB), beforeCommit); err != nil {
+		if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB), onChange); err != nil {
 			b.Fatal(err)
 		}
 	}
+	writeBenchHookSink = sink
 }
 
-func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Update_OnChangeMutateMakePatch(b *testing.B) {
+	c, _, _ := buildWriteBenchCollection(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
-	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
 	var modifiedTS uint64
-	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
+	var patchCount uint64
+	onChange := OnChange(func(_ *Tx, _ uint64, oldValue, newValue *UserBench) error {
 		newValue.Score = float64(modifiedTS + 1)
 		modifiedTS++
-		return nil
-	})
-	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-		patch, err := db.MakePatch(oldValue, newValue)
+		patch, err := c.MakePatch(oldValue, newValue)
 		if err != nil {
 			return err
 		}
-		payload, err := msgpack.Marshal(patch)
-		if err != nil {
-			return fmt.Errorf("marshal patch: %w", err)
-		}
-		return appendBenchSideBucket(tx, patchBucket, payload)
+		patchCount += uint64(len(patch))
+		return nil
 	})
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB), beforeStore, beforeCommit); err != nil {
+		if err := writeSet(c, targetID, benchWriteRecordForIteration(i, recA, recB), onChange); err != nil {
 			b.Fatal(err)
 		}
 	}
+	writeBenchHookSink = patchCount
 }
 
-func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Update_OnChangeMutateMakePatch_MultiSet(b *testing.B) {
+	c, _, _ := buildWriteBenchCollection(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
-	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
 	var modifiedTS uint64
-	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
+	var patchCount uint64
+	onChange := OnChange(func(_ *Tx, _ uint64, oldValue, newValue *UserBench) error {
 		newValue.Score = float64(modifiedTS + 1)
 		modifiedTS++
-		return nil
-	})
-	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-		patch, err := db.MakePatch(oldValue, newValue)
+		patch, err := c.MakePatch(oldValue, newValue)
 		if err != nil {
 			return err
 		}
-		payload, err := msgpack.Marshal(patch)
-		if err != nil {
-			return fmt.Errorf("marshal patch: %w", err)
-		}
-		return appendBenchSideBucket(tx, patchBucket, payload)
+		patchCount += uint64(len(patch))
+		return nil
 	})
 
 	b.ResetTimer()
@@ -659,21 +831,23 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testi
 		if i%2 != 0 {
 			vals = valsB
 		}
-		if err := db.BatchSet(ids, vals, beforeStore, beforeCommit); err != nil {
+		if err := writeSets(c, ids, vals, onChange); err != nil {
 			b.Fatal(err)
 		}
 	}
+	writeBenchHookSink = patchCount
 	b.ReportMetric(writeBenchUserBatchSize, "rows/op")
 }
 
-func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
-	db, raw, _ := buildWriteBenchDB(b)
+func Benchmark_Write_Update_OnChangeObserve_MultiSet(b *testing.B) {
+	c, _, _ := buildWriteBenchCollection(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
-	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
-	prepareWriteBenchStableBase(b, db)
+	prepareWriteBenchStableBase(b, c)
 
-	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, key uint64, _ *UserBench, newValue *UserBench) error {
-		return appendBenchAuditLog(tx, auditBucket, key, newValue)
+	var sink uint64
+	onChange := OnChange(func(_ *Tx, key uint64, _ *UserBench, newValue *UserBench) error {
+		sink += key + uint64(newValue.Age) + math.Float64bits(newValue.Score)
+		return nil
 	})
 
 	b.ResetTimer()
@@ -684,14 +858,15 @@ func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
 		if i%2 != 0 {
 			vals = valsB
 		}
-		if err := db.BatchSet(ids, vals, beforeCommit); err != nil {
+		if err := writeSets(c, ids, vals, onChange); err != nil {
 			b.Fatal(err)
 		}
 	}
+	writeBenchHookSink = sink
 	b.ReportMetric(writeBenchUserBatchSize, "rows/op")
 }
 
-func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testing.B) {
+func Benchmark_Write_Update_OnChangeMutateMakePatch_Parallel(b *testing.B) {
 	for _, tc := range []struct {
 		name string
 		opts Options
@@ -700,41 +875,34 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 			name: "SingleRequestBatches",
 			opts: Options{
 				DisableIndexStore: true,
-				AutoBatchWindow:   -1,
-				AutoBatchMax:      1,
+				BatchSoftLimit:    1,
 			},
 		},
 		{
 			name: "WithAutoBatching",
 			opts: Options{
 				DisableIndexStore: true,
-				AutoBatchWindow:   200 * time.Microsecond,
-				AutoBatchMax:      16,
+				BatchSoftLimit:    16,
 			},
 		},
 	} {
 		tc := tc
 		b.Run(tc.name, func(b *testing.B) {
-			db, raw, _ := buildWriteBenchDBWithOptions(b, tc.opts)
+			enableStoreStatsForTest(b)
+			c, _, _ := buildWriteBenchCollectionWithOptions(b, tc.opts)
 			recA, recB := writeBenchUpdateRecords()
-			patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
-			prepareWriteBenchStableBase(b, db)
+			prepareWriteBenchStableBase(b, c)
 
 			var modifiedTS atomic.Uint64
-			beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
+			var patchCount atomic.Uint64
+			onChange := OnChange(func(_ *Tx, _ uint64, oldValue, newValue *UserBench) error {
 				newValue.Score = float64(modifiedTS.Add(1))
-				return nil
-			})
-			beforeCommit := BeforeCommit(func(tx *bbolt.Tx, _ uint64, oldValue, newValue *UserBench) error {
-				patch, err := db.MakePatch(oldValue, newValue)
+				patch, err := c.MakePatch(oldValue, newValue)
 				if err != nil {
 					return err
 				}
-				payload, err := msgpack.Marshal(patch)
-				if err != nil {
-					return fmt.Errorf("marshal patch: %w", err)
-				}
-				return appendBenchSideBucket(tx, patchBucket, payload)
+				patchCount.Add(uint64(len(patch)))
+				return nil
 			})
 
 			var (
@@ -751,7 +919,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 				for pb.Next() {
 					n := opSeq.Add(1)
 					id := uint64(1 + (n % 4096))
-					if err := db.Set(id, benchWriteRecordForIteration(int(n), recA, recB), beforeStore, beforeCommit); err != nil {
+					if err := writeSet(c, id, benchWriteRecordForIteration(int(n), recA, recB), onChange); err != nil {
 						errMu.Lock()
 						if firstErr == nil {
 							firstErr = err
@@ -770,8 +938,9 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 				b.Fatal(firstErr)
 			}
 
-			st := db.AutoBatchStats()
-			b.ReportMetric(float64(st.MultiRequestBatches), "multi_request_batches")
+			writeBenchHookSink = patchCount.Load()
+			st := c.StoreStats()
+			b.ReportMetric(float64(st.MultiUnitBatches), "multi_unit_batches")
 			b.ReportMetric(st.AvgBatchSize, "avg_batch")
 		})
 	}
@@ -779,42 +948,71 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 
 /**/
 
-func currentBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) rbistats.Snapshot {
+func currentBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V]) rbistats.Snapshot {
 	b.Helper()
 	b.StopTimer()
-	return db.SnapshotStats()
+	return c.SnapshotStats()
 }
 
 func requireBenchSnapshotPublished(b *testing.B, st rbistats.Snapshot) {
 	b.Helper()
-	if st.Sequence == 0 || st.RegistrySize == 0 {
+	if st.Sequence == 0 {
 		b.Fatalf("expected published snapshot, got %+v", st)
 	}
 }
 
-func prepareReadBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) {
+func prepareReadBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V]) {
 	b.Helper()
-	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, c))
 	b.StartTimer()
 }
 
-func prepareWriteBenchStableBase[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) {
+func prepareWriteBenchStableBase[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V]) {
 	b.Helper()
-	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, c))
 	b.StartTimer()
 }
 
-func prepareWriteBenchHighChurn[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V], churn func(*testing.B, *DB[K, V])) {
+func prepareWriteBenchTransparentBase[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V]) {
+	b.Helper()
+	b.StopTimer()
+	st, err := c.Stats()
+	if err != nil {
+		b.Fatalf("Stats: %v", err)
+	}
+	if st.Indexed {
+		b.Fatalf("expected transparent collection")
+	}
+	b.StartTimer()
+}
+
+func prepareWriteBenchTransparentHighChurn[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V], churn func(*testing.B, *Collection[K, V])) {
 	b.Helper()
 
-	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
-	churn(b, db)
-	requireBenchSnapshotPublished(b, db.SnapshotStats())
+	prepareWriteBenchTransparentBase(b, c)
+	b.StopTimer()
+	churn(b, c)
+	st, err := c.Stats()
+	if err != nil {
+		b.Fatalf("Stats: %v", err)
+	}
+	if st.Indexed {
+		b.Fatalf("expected transparent collection")
+	}
+	b.StartTimer()
+}
+
+func prepareWriteBenchHighChurn[K ~string | ~uint64, V any](b *testing.B, c *Collection[K, V], churn func(*testing.B, *Collection[K, V])) {
+	b.Helper()
+
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, c))
+	churn(b, c)
+	requireBenchSnapshotPublished(b, c.SnapshotStats())
 	b.StartTimer()
 }
 
 func Benchmark_Write_Helper_MakePatch(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	b.ReportAllocs()
 
 	v1 := &UserBench{
@@ -844,7 +1042,7 @@ func Benchmark_Write_Helper_MakePatch(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var err error
-		buf, err = db.MakePatchInto(v1, v2, buf)
+		buf, err = c.MakePatchInto(v1, v2, buf)
 		if err != nil {
 			b.Fatal(err)
 		}

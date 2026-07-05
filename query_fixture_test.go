@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"fmt"
-	"github.com/vapstack/rbi/rbierrors"
 	"math"
 	"math/rand/v2"
 	"path/filepath"
@@ -13,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"unsafe"
+
+	"github.com/vapstack/rbi/rbierrors"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -105,17 +106,17 @@ func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
 	return reflect.Value{}, true
 }
 
-func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
-	idx, _ := db.idxFromUserKeyWithCreated(id)
+func (c *Collection[K, V]) idxFromUserKey(id K) uint64 {
+	idx, _ := c.idxFromUserKeyWithCreated(id)
 	return idx
 }
 
-func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
-	if db.strKey {
+func (c *Collection[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
+	if c.strKey {
 		var out uint64
-		err := db.bolt.View(func(tx *bbolt.Tx) error {
+		err := c.root.bolt.View(func(tx *bbolt.Tx) error {
 			var keyBuf [8]byte
-			v := tx.Bucket(db.dataBucket).Get(keycodec.UserKeyBytesWithBuf(id, true, &keyBuf))
+			v := tx.Bucket(c.dataBucket).Get(keycodec.UserKeyBytesWithBuf(id, true, &keyBuf))
 			if v == nil {
 				return nil
 			}
@@ -145,37 +146,37 @@ type Rec struct {
 	Opt      *string `db:"opt"                       rbi:"index"`
 }
 
-func openTempDBUint64(t *testing.T, options ...Options) (*DB[uint64, Rec], string) {
+func openTempUint64Collection(t *testing.T, options ...Options) (*Collection[uint64, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_uint64.db")
-	db, raw := openBoltAndNew[uint64, Rec](t, path, options...)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path, options...)
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db, path
+	return c, path
 }
 
-func openTempDBString(t *testing.T, options ...Options) (*DB[string, Rec], string) {
+func openTempStringCollection(t *testing.T, options ...Options) (*Collection[string, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_string.db")
-	db, raw := openBoltAndNew[string, Rec](t, path, options...)
+	c, bolt := openBoltAndCollection[string, Rec](t, path, options...)
 
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
-	return db, path
+	return c, path
 }
 
-func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, options ...Options) (*DB[K, V], *bbolt.DB) {
+func openBoltAndCollection[K ~string | ~uint64, V any](tb testing.TB, path string, options ...Options) (*Collection[K, V], *bbolt.DB) {
 	tb.Helper()
-	raw, err := bbolt.Open(path, 0o600, nil)
+	bolt, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		tb.Fatalf("bbolt.Open: %v", err)
 	}
@@ -184,21 +185,19 @@ func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, opti
 		opts = options[0]
 	}
 	opts = testOptions(opts)
-	opts.EnableAutoBatchStats = true
-	opts.EnableSnapshotStats = true
-	db, err := New[K, V](raw, opts)
+	c, err := Open[K, V](bolt, opts)
 	if err != nil {
-		_ = raw.Close()
+		_ = bolt.Close()
 		tb.Fatalf("New: %v", err)
 	}
-	return db, raw
+	return c, bolt
 }
 
-func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
+func seedData(t *testing.T, c *Collection[uint64, Rec], n int) []uint64 {
 	t.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	r := newRand(1)
 	ids := make([]uint64, 0, n)
@@ -223,8 +222,8 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		if err := writeSets(c, batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(seed batch=%d): %v", len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -258,11 +257,11 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 	return ids
 }
 
-func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(i int) *Rec) {
+func seedGeneratedUint64Data(t *testing.T, c *Collection[uint64, Rec], n int, gen func(i int) *Rec) {
 	t.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
@@ -275,8 +274,8 @@ func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		if err := writeSets(c, batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(seed batch=%d): %v", len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -902,8 +901,8 @@ func evalPreparedExprBool(rec *Rec, e qir.Expr) (bool, error) {
 	return out, nil
 }
 
-// expectedKeysUint64 scans the DB linearly and applies logic to produce the expected result set
-func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, error) {
+// expectedKeysUint64 scans the Collection linearly and applies logic to produce the expected result set
+func expectedKeysUint64(t testing.TB, c *Collection[uint64, Rec], q *qx.QX) ([]uint64, error) {
 	t.Helper()
 
 	type row struct {
@@ -913,7 +912,7 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 
 	var rows []row
 
-	err := db.SeqScan(0, func(id uint64, v *Rec) (bool, error) {
+	err := readSeqScan(c, 0, func(id uint64, v *Rec) (bool, error) {
 		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
@@ -1025,9 +1024,9 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	return out, nil
 }
 
-// expectedKeysString scans the DB linearly and applies query semantics for
+// expectedKeysString scans the Collection linearly and applies query semantics for
 // string-key databases. Ordering/tie-breaks follow internal idx order.
-func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, error) {
+func expectedKeysString(t testing.TB, c *Collection[string, Rec], q *qx.QX) ([]string, error) {
 	t.Helper()
 
 	type row struct {
@@ -1037,7 +1036,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 	}
 
 	var rows []row
-	err := db.SeqScan("", func(id string, v *Rec) (bool, error) {
+	err := readSeqScan(c, "", func(id string, v *Rec) (bool, error) {
 		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
@@ -1045,7 +1044,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 		if ok {
 			rows = append(rows, row{
 				id:  id,
-				idx: db.idxFromUserKey(id),
+				idx: c.idxFromUserKey(id),
 				rec: v,
 			})
 		}
@@ -1191,10 +1190,10 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 	return slices.Equal(sortedStringIDs(a), sortedStringIDs(b))
 }
 
-func runQueryKeysChecked(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
+func runQueryKeysChecked(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) []uint64 {
 	t.Helper()
 
-	ids, err := db.QueryKeys(q)
+	ids, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
@@ -1293,11 +1292,11 @@ type metamorphicDataProfile struct {
 	hotTagP     float64
 }
 
-func seedMetamorphicDataProfile(t *testing.T, db *DB[uint64, Rec], n int, p metamorphicDataProfile) {
+func seedMetamorphicDataProfile(t *testing.T, c *Collection[uint64, Rec], n int, p metamorphicDataProfile) {
 	t.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	r := newRand(173 + int64(n) + int64(p.scoreLevels)*11)
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland", "US", "JP"}
@@ -1313,8 +1312,8 @@ func seedMetamorphicDataProfile(t *testing.T, db *DB[uint64, Rec], n int, p meta
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			t.Fatalf("BatchSet(seed profile batch=%d): %v", len(ids), err)
+		if err := writeSets(c, ids, vals); err != nil {
+			t.Fatalf("MultiSet(seed profile batch=%d): %v", len(ids), err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -1511,26 +1510,26 @@ func capturedNotInOrderOffsetQuery() *qx.QX {
 	).Sort("score", qx.ASC).Offset(446).Limit(70)
 }
 
-func openSkewedNotInRegressionDB(t *testing.T) *DB[uint64, Rec] {
+func openSkewedNotInRegressionCollection(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	seedMetamorphicDataProfile(t, c, 8_000, metamorphicDataProfile{
 		name:        "Skewed",
 		scoreLevels: 30_000,
 		activeTrue:  0.88,
 		hotCountryP: 0.75,
 		hotTagP:     0.85,
 	})
-	return db
+	return c
 }
 
 func assertNotInOrderOffsetQueryMatchesReference(t *testing.T, q *qx.QX) {
 	t.Helper()
 
-	db := openSkewedNotInRegressionDB(t)
+	c := openSkewedNotInRegressionCollection(t)
 
-	got := runQueryKeysChecked(t, db, q)
-	want, err := expectedKeysUint64(t, db, q)
+	got := runQueryKeysChecked(t, c, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -1539,8 +1538,8 @@ func assertNotInOrderOffsetQueryMatchesReference(t *testing.T, q *qx.QX) {
 
 type queryContract[K ~uint64 | ~string] struct {
 	t         testing.TB
-	db        *DB[K, Rec]
-	reference func(testing.TB, *DB[K, Rec], *qx.QX) ([]K, error)
+	clc       *Collection[K, Rec]
+	reference func(testing.TB, *Collection[K, Rec], *qx.QX) ([]K, error)
 	equal     func(*qx.QX, []K, []K) bool
 }
 
@@ -1553,7 +1552,7 @@ type queryContractReference[K ~uint64 | ~string] struct {
 
 func (r *queryContractReference[K]) page(c queryContract[K], q *qx.QX) []K {
 	if !r.pageSet {
-		keys, err := c.reference(c.t, c.db, q)
+		keys, err := c.reference(c.t, c.clc, q)
 		if err != nil {
 			c.t.Fatalf("reference keys(%+v): %v", q, err)
 		}
@@ -1570,7 +1569,7 @@ func (r *queryContractReference[K]) full(c queryContract[K], q *qx.QX) []K {
 		} else {
 			fullQ := cloneQuery(q)
 			clearQueryOrderWindowForTest(fullQ)
-			keys, err := c.reference(c.t, c.db, fullQ)
+			keys, err := c.reference(c.t, c.clc, fullQ)
 			if err != nil {
 				c.t.Fatalf("reference keys(%+v): %v", fullQ, err)
 			}
@@ -1588,11 +1587,11 @@ func (r *queryContractReference[K]) count(c queryContract[K], q *qx.QX) uint64 {
 	return uint64(len(r.full(c, q)))
 }
 
-func newUint64QueryContract(t testing.TB, db *DB[uint64, Rec]) queryContract[uint64] {
+func newUint64QueryContract(t testing.TB, c *Collection[uint64, Rec]) queryContract[uint64] {
 	t.Helper()
 	return queryContract[uint64]{
 		t:         t,
-		db:        db,
+		clc:       c,
 		reference: expectedKeysUint64,
 		equal:     queryIDsEqual,
 	}
@@ -1612,7 +1611,7 @@ func (c queryContract[K]) ReferenceFullKeys(q *qx.QX) []K {
 
 func (c queryContract[K]) AssertQueryKeysMatchReference(q *qx.QX) []K {
 	c.t.Helper()
-	got, err := c.db.QueryKeys(q)
+	got, err := readQueryKeys(c.clc, q)
 	if err != nil {
 		c.t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
@@ -1650,20 +1649,20 @@ func (c queryContract[K]) assertKeysMatchReference(label string, q *qx.QX, got [
 func (c queryContract[K]) AssertQueryRecordsMatchReference(q *qx.QX) []*Rec {
 	c.t.Helper()
 
-	got, err := c.db.Query(q)
+	got, err := readQuery(c.clc, q)
 	if err != nil {
 		c.t.Fatalf("Query(%+v): %v", q, err)
 	}
 
 	if len(q.Order) > 0 {
 		wantIDs := c.ReferenceKeys(q)
-		want := c.batchGet("BatchGet(reference keys)", wantIDs)
+		want := c.recordsByKeys("reference keys", wantIDs)
 		queryContractAssertRecordSlicesEqual(c.t, "Query", q, got, want)
 		return got
 	}
 
 	fullIDs := c.ReferenceFullKeys(q)
-	full := c.batchGet("BatchGet(full reference keys)", fullIDs)
+	full := c.recordsByKeys("full reference keys", fullIDs)
 	if queryContractNoOrderWindow(q) {
 		if err := queryContractValidateNoOrderRecordsWindow(q, got, full); err != nil {
 			c.t.Fatalf("Query no-order window mismatch: %v\nq=%+v\nitems=%v", err, q, queryContractRecordSignatures(got))
@@ -1680,11 +1679,11 @@ func (c queryContract[K]) AssertQueryRecordsMatchReference(q *qx.QX) []*Rec {
 func (c queryContract[K]) AssertQueryRecordsMatchKeys(q *qx.QX, keys []K) []*Rec {
 	c.t.Helper()
 
-	got, err := c.db.Query(q)
+	got, err := readQuery(c.clc, q)
 	if err != nil {
 		c.t.Fatalf("Query(%+v): %v", q, err)
 	}
-	want := c.batchGet("BatchGet(QueryKeys result)", keys)
+	want := c.recordsByKeys("QueryKeys result", keys)
 	queryContractAssertRecordSlicesEqual(c.t, "Query vs QueryKeys", q, got, want)
 	return got
 }
@@ -1700,7 +1699,7 @@ func (c queryContract[K]) assertCountMatchesReference(q *qx.QX, ref *queryContra
 	c.t.Helper()
 
 	want := ref.count(c, q)
-	got, err := c.db.Count(q.Filter)
+	got, err := readCount(c.clc, q.Filter)
 	if err != nil {
 		c.t.Fatalf("Count(%+v): %v", q, err)
 	}
@@ -1714,24 +1713,24 @@ func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContra
 	c.t.Helper()
 	var ref queryContractReference[K]
 
-	keys, err := c.db.QueryKeys(q)
+	keys, err := readQueryKeys(c.clc, q)
 	if err != nil {
 		c.t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
 	c.assertKeysMatchReference("QueryKeys", q, keys, &ref)
 
-	got, err := c.db.Query(q)
+	got, err := readQuery(c.clc, q)
 	if err != nil {
 		c.t.Fatalf("Query(%+v): %v", q, err)
 	}
 
 	if len(q.Order) > 0 {
 		wantIDs := ref.page(c, q)
-		want := c.batchGet("BatchGet(reference keys)", wantIDs)
+		want := c.recordsByKeys("reference keys", wantIDs)
 		queryContractAssertRecordSlicesEqual(c.t, "Query", q, got, want)
 	} else {
 		fullIDs := ref.full(c, q)
-		full := c.batchGet("BatchGet(full reference keys)", fullIDs)
+		full := c.recordsByKeys("full reference keys", fullIDs)
 		if queryContractNoOrderWindow(q) {
 			if err := queryContractValidateNoOrderRecordsWindow(q, got, full); err != nil {
 				c.t.Fatalf("Query no-order window mismatch: %v\nq=%+v\nitems=%v", err, q, queryContractRecordSignatures(got))
@@ -1741,7 +1740,7 @@ func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContra
 		}
 	}
 
-	wantByKeys := c.batchGet("BatchGet(QueryKeys result)", keys)
+	wantByKeys := c.recordsByKeys("QueryKeys result", keys)
 	queryContractAssertRecordSlicesEqual(c.t, "Query vs QueryKeys", q, got, wantByKeys)
 
 	c.assertCountMatchesReference(q, &ref)
@@ -1749,9 +1748,9 @@ func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContra
 	return ref
 }
 
-func (c queryContract[K]) batchGet(label string, ids []K) []*Rec {
+func (c queryContract[K]) recordsByKeys(label string, ids []K) []*Rec {
 	c.t.Helper()
-	items, err := c.db.BatchGet(ids...)
+	items, err := readValues(c.clc, ids...)
 	if err != nil {
 		c.t.Fatalf("%s: %v", label, err)
 	}
@@ -1910,10 +1909,10 @@ func queryContractAssertRecordSlicesEqual(t testing.TB, label string, q *qx.QX, 
 	}
 }
 
-func seedQueryExtOptArrayPosDB(t *testing.T) *DB[uint64, Rec] {
+func seedQueryExtOptArrayPosCollection(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
 
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-1", Opt: nil, Active: true},
 		2: {Name: "alpha", Opt: strPtr("alpha"), Active: true},
@@ -1923,17 +1922,17 @@ func seedQueryExtOptArrayPosDB(t *testing.T) *DB[uint64, Rec] {
 		6: {Name: "gamma", Opt: strPtr("gamma"), Active: true},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	return db
+	return c
 }
 
-func seedQueryExtOptAllNilDB(t *testing.T) *DB[uint64, Rec] {
+func seedQueryExtOptAllNilCollection(t *testing.T) *Collection[uint64, Rec] {
 	t.Helper()
 
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 	rows := map[uint64]*Rec{
 		1: {Name: "nil-a", Opt: nil, Active: true},
 		2: {Name: "nil-b", Opt: nil, Active: false},
@@ -1941,11 +1940,11 @@ func seedQueryExtOptAllNilDB(t *testing.T) *DB[uint64, Rec] {
 		4: {Name: "nil-d", Opt: nil, Active: false},
 	}
 	for id, rec := range rows {
-		if err := db.Set(id, rec); err != nil {
+		if err := writeSet(c, id, rec); err != nil {
 			t.Fatalf("Set(%d): %v", id, err)
 		}
 	}
-	return db
+	return c
 }
 
 func queryExtOptPriority() []string {
@@ -1964,26 +1963,26 @@ func queryExtSortByArrayCount(q *qx.QX, field string, dir qx.OrderDirection) *qx
 	return q.SortBy(qx.LEN(field), dir)
 }
 
-func assertQueryExtIDsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
+func assertQueryExtIDsMatchExpected(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) []uint64 {
 	t.Helper()
-	contract := newUint64QueryContract(t, db)
+	contract := newUint64QueryContract(t, c)
 	contract.AssertQueryKeysMatchReference(q)
 	return contract.ReferenceKeys(q)
 }
 
-func assertQueryExtItemsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtItemsMatchExpected(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
-	newUint64QueryContract(t, db).AssertQueryRecordsMatchReference(q)
+	newUint64QueryContract(t, c).AssertQueryRecordsMatchReference(q)
 }
 
-func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
 
-	got, err := db.QueryKeys(q)
+	got, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
-	cnt, err := db.Count(q.Filter)
+	cnt, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("Count(%+v): %v", q, err)
 	}
@@ -1992,14 +1991,14 @@ func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, db *DB[uint64, Rec
 	}
 }
 
-func assertQueryExtCountMatchesBaseQuery(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtCountMatchesBaseQuery(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
-	newUint64QueryContract(t, db).AssertCountMatchesReference(q)
+	newUint64QueryContract(t, c).AssertCountMatchesReference(q)
 }
 
-func assertQueryExtAllReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtAllReadPathsMatchExpected(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
-	newUint64QueryContract(t, db).assertAllReadPathsMatchReference(q)
+	newUint64QueryContract(t, c).assertAllReadPathsMatchReference(q)
 }
 
 func queryExtItemNames(t testing.TB, items []*Rec) []string {
@@ -2023,20 +2022,20 @@ func queryExtItemNamesOK(items []*Rec) ([]string, bool) {
 	return out, true
 }
 
-func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtConcurrentReadStable(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
 
-	wantPage, err := expectedKeysUint64(t, db, q)
+	wantPage, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(page %+v): %v", q, err)
 	}
-	wantItems, err := db.BatchGet(wantPage...)
+	wantItems, err := readValues(c, wantPage...)
 	if err != nil {
-		t.Fatalf("BatchGet(wantPage): %v", err)
+		t.Fatalf("readValues(wantPage): %v", err)
 	}
 	countQ := cloneQuery(q)
 	clearQueryExtOrderWindow(countQ)
-	wantAll, err := expectedKeysUint64(t, db, countQ)
+	wantAll, err := expectedKeysUint64(t, c, countQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(count %+v): %v", countQ, err)
 	}
@@ -2049,7 +2048,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 		go func(gid int) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				gotKeys, err := db.QueryKeys(q)
+				gotKeys, err := readQueryKeys(c, q)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
 					return
@@ -2059,7 +2058,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 					return
 				}
 
-				gotItems, err := db.Query(q)
+				gotItems, err := readQuery(c, q)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
 					return
@@ -2075,7 +2074,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 					}
 				}
 
-				gotCount, err := db.Count(q.Filter)
+				gotCount, err := readCount(c, q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -2096,12 +2095,12 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 	}
 }
 
-func assertQueryExtraPublicReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+func assertQueryExtraPublicReadPathsMatchExpected(t *testing.T, c *Collection[uint64, Rec], q *qx.QX) {
 	t.Helper()
 
-	assertQueryExtIDsMatchExpected(t, db, q)
-	assertQueryExtItemsMatchExpected(t, db, q)
-	assertQueryExtCountMatchesBaseQuery(t, db, q)
+	assertQueryExtIDsMatchExpected(t, c, q)
+	assertQueryExtItemsMatchExpected(t, c, q)
+	assertQueryExtCountMatchesBaseQuery(t, c, q)
 }
 
 func queryExtOrderedORNegativeResidualFixture() ([]uint64, []*Rec, []*Rec, *qx.QX) {

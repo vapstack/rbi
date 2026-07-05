@@ -1,6 +1,8 @@
 package snapshot
 
 import (
+	"sync/atomic"
+
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
@@ -31,8 +33,10 @@ type View struct {
 }
 
 type CacheConfig struct {
-	MatPredMaxEntries int
-	MatPredMaxCard    uint64
+	MatPredMaxEntries        int
+	MatPredMaxCard           uint64
+	RuntimeCachesDirtyOwner  *atomic.Bool
+	RuntimeCachesRetireEpoch *atomic.Uint64
 }
 
 type Storage struct {

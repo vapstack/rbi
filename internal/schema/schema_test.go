@@ -173,8 +173,35 @@ type schemaTestAnonymousTaggedTimeRec struct {
 
 type schemaTestNamedTime time.Time
 
+type schemaTestNamedTimeRec struct {
+	When schemaTestNamedTime `db:"when" rbi:"index"`
+}
+
 type schemaTestNamedTimePtrRec struct {
 	When *schemaTestNamedTime `db:"when" rbi:"index"`
+}
+
+type schemaTestNamedTimeSliceVI []schemaTestNamedTime
+
+func (v schemaTestNamedTimeSliceVI) IndexingValue() string {
+	return ""
+}
+
+type schemaTestNamedTimeSliceVIRec struct {
+	When schemaTestNamedTimeSliceVI `db:"when" rbi:"index"`
+}
+
+type schemaTestPtrReceiverNamedTimeVI time.Time
+
+func (v *schemaTestPtrReceiverNamedTimeVI) IndexingValue() string {
+	if v == nil {
+		return "<nil>"
+	}
+	return time.Time(*v).UTC().Format(time.RFC3339Nano)
+}
+
+type schemaTestPtrReceiverNamedTimeVIRec struct {
+	When *schemaTestPtrReceiverNamedTimeVI `db:"when" rbi:"index"`
 }
 
 type schemaTestUintptrSliceIndexRec struct {
@@ -608,15 +635,17 @@ func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
 		t.Fatalf("anonymous time index accessor=(%+v,%v)", acc, ok)
 	}
 
-	rt, err = Compile(reflect.TypeFor[schemaTestNamedTimePtrRec](), Config{})
-	if err != nil {
-		t.Fatalf("Compile named time pointer: %v", err)
-	}
-	if f := rt.Fields["when"]; f == nil || !IsNativeTimeField(f) || !f.Ptr || !slices.Equal(f.Index, []int{0}) {
-		t.Fatalf("named time pointer index field=%+v", f)
-	}
-	if acc, ok := rt.IndexedByName["when"]; !ok || acc.PatchOrdinal < 0 {
-		t.Fatalf("named time pointer index accessor=(%+v,%v)", acc, ok)
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[schemaTestNamedTimeRec](),
+		reflect.TypeFor[schemaTestNamedTimePtrRec](),
+		reflect.TypeFor[schemaTestNamedTimeSliceVIRec](),
+		reflect.TypeFor[schemaTestPtrReceiverNamedTimeVIRec](),
+	} {
+		if _, err = Compile(typ, Config{}); err == nil {
+			t.Fatalf("Compile(%v) err=nil want unsupported named time wrapper", typ)
+		} else if msg := err.Error(); !strings.Contains(msg, "unsupported named") || !strings.Contains(msg, "cannot be encoded by msgpack") {
+			t.Fatalf("Compile(%v) err=%v want unsupported named msgpack error", typ, err)
+		}
 	}
 
 	rt, err = Compile(reflect.TypeFor[schemaTestAnonymousTaggedVIRec](), Config{})

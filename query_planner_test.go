@@ -134,19 +134,19 @@ func traceContractAssertORBranches(t testing.TB, branches []rbitrace.ORBranch, w
 
 type traceContractCase struct {
 	name   string
-	run    func(t *testing.T, db *DB[uint64, Rec]) uint64
+	run    func(t *testing.T, c *Collection[uint64, Rec]) uint64
 	assert func(t *testing.T, ev rbitrace.Event, rowsReturned uint64)
 }
 
 func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 	recorder := &traceContractRecorder{}
 
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        recorder.sink,
 		TraceSampleEvery: 1,
 	})
-	_ = seedData(t, db, 20_000)
+	_ = seedData(t, c, 20_000)
 
 	countORHybridExpr := qx.OR(
 		qx.AND(
@@ -170,7 +170,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 	cases := []traceContractCase{
 		{
 			name: "query_keys_order_basic_limit",
-			run: func(t *testing.T, db *DB[uint64, Rec]) uint64 {
+			run: func(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 				t.Helper()
 
 				q := qx.Query(
@@ -179,7 +179,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 					qx.LT("age", 45),
 				).Sort("age", qx.ASC).Limit(120)
 
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					t.Fatalf("QueryKeys: %v", err)
 				}
@@ -217,7 +217,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 		},
 		{
 			name: "query_values_order_basic_limit",
-			run: func(t *testing.T, db *DB[uint64, Rec]) uint64 {
+			run: func(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 				t.Helper()
 
 				q := qx.Query(
@@ -226,7 +226,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 					qx.LT("age", 45),
 				).Sort("age", qx.ASC).Limit(80)
 
-				items, err := db.Query(q)
+				items, err := readQuery(c, q)
 				if err != nil {
 					t.Fatalf("Query: %v", err)
 				}
@@ -234,7 +234,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 					t.Fatalf("expected non-empty records")
 				}
 				n := uint64(len(items))
-				db.ReleaseRecords(items...)
+				c.ReleaseRecords(items...)
 				return n
 			},
 			assert: func(t *testing.T, ev rbitrace.Event, rowsReturned uint64) {
@@ -260,7 +260,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 		},
 		{
 			name: "query_keys_or_no_order_limit",
-			run: func(t *testing.T, db *DB[uint64, Rec]) uint64 {
+			run: func(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 				t.Helper()
 
 				q := qx.Query(
@@ -270,7 +270,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 					),
 				).Limit(120)
 
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					t.Fatalf("QueryKeys: %v", err)
 				}
@@ -300,7 +300,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 		},
 		{
 			name: "query_keys_or_order_limit",
-			run: func(t *testing.T, db *DB[uint64, Rec]) uint64 {
+			run: func(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 				t.Helper()
 
 				q := qx.Query(
@@ -310,7 +310,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 					),
 				).Sort("age", qx.ASC).Limit(80)
 
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					t.Fatalf("QueryKeys: %v", err)
 				}
@@ -349,11 +349,11 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 		},
 		{
 			name: "count_or_hybrid",
-			run: func(t *testing.T, db *DB[uint64, Rec]) uint64 {
+			run: func(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 				t.Helper()
 
 				q := qx.Query(countORHybridExpr)
-				cnt, err := db.Count(q.Filter)
+				cnt, err := readCount(c, q.Filter)
 				if err != nil {
 					t.Fatalf("Count: %v", err)
 				}
@@ -395,7 +395,7 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 		tc := cases[i]
 		t.Run(tc.name, func(t *testing.T) {
 			mark := recorder.mark()
-			rowsReturned := tc.run(t, db)
+			rowsReturned := tc.run(t, c)
 			ev := recorder.lastSince(t, mark)
 			tc.assert(t, ev, rowsReturned)
 		})
@@ -405,14 +405,14 @@ func TestTraceContract_PublicAPIFamilies(t *testing.T) {
 func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 	recorder := &traceContractRecorder{}
 
-	db, _ := openTempDBUint64(t, Options{
+	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        recorder.sink,
 		TraceSampleEvery: 1,
 	})
 
 	countries := []string{"US", "DE", "FR", "GB"}
-	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, c, 160_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%06d@example.com", i),
@@ -433,15 +433,15 @@ func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 
 	mark := recorder.mark()
 
-	first, err := db.Count(q.Filter)
+	first, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("first Count: %v", err)
 	}
-	second, err := db.Count(q.Filter)
+	second, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("second Count: %v", err)
 	}
-	third, err := db.Count(q.Filter)
+	third, err := readCount(c, q.Filter)
 	if err != nil {
 		t.Fatalf("third Count: %v", err)
 	}
@@ -491,14 +491,14 @@ func TestTraceContract_CountComplementLifecycle(t *testing.T) {
 /**/
 
 func TestPlannerStatsCollector_FullRefreshReflectsSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 3_000)
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 3_000)
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
-	got := db.PlannerStats()
+	got := c.PlannerStats()
 	if got.UniverseCardinality != 3_000 {
 		t.Fatalf("universe mismatch: got=%d want=3000", got.UniverseCardinality)
 	}
@@ -530,51 +530,51 @@ func TestResolvePlannerAnalyzeInterval(t *testing.T) {
 }
 
 func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: -1})
 
-	s0 := db.PlannerStats()
+	s0 := c.PlannerStats()
 
 	time.Sleep(30 * time.Millisecond)
 
-	s1 := db.PlannerStats()
+	s1 := c.PlannerStats()
 	if s1.Version != s0.Version {
 		t.Fatalf("snapshot version changed while scheduler disabled: before=%d after=%d", s0.Version, s1.Version)
 	}
 }
 
 func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 10 * time.Millisecond})
+	c, _ := openTempUint64Collection(t, Options{AnalyzeInterval: 10 * time.Millisecond})
 
-	s0 := db.PlannerStats()
+	s0 := c.PlannerStats()
 
-	if latest, ok := waitPlannerStatsVersionGreater(db, s0.Version, 250*time.Millisecond); !ok {
+	if latest, ok := waitPlannerStatsVersionGreater(c, s0.Version, 250*time.Millisecond); !ok {
 		t.Fatalf("expected background refresh to advance snapshot version: start=%d latest=%d", s0.Version, latest)
 	}
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	closedSnapshot := db.PlannerStats()
+	closedSnapshot := c.PlannerStats()
 
 	time.Sleep(35 * time.Millisecond)
 
-	afterSnapshot := db.PlannerStats()
+	afterSnapshot := c.PlannerStats()
 	if afterSnapshot.Version != closedSnapshot.Version {
 		t.Fatalf("snapshot version changed after close: before=%d after=%d", closedSnapshot.Version, afterSnapshot.Version)
 	}
 }
 
-func waitPlannerStatsVersionGreater(db *DB[uint64, Rec], version uint64, timeout time.Duration) (uint64, bool) {
+func waitPlannerStatsVersionGreater(c *Collection[uint64, Rec], version uint64, timeout time.Duration) (uint64, bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		s := db.PlannerStats()
+		s := c.PlannerStats()
 		if s.Version > version {
 			return s.Version, true
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	s := db.PlannerStats()
+	s := c.PlannerStats()
 	if s.Version == 0 {
 		return 0, false
 	}
@@ -582,16 +582,16 @@ func waitPlannerStatsVersionGreater(db *DB[uint64, Rec], version uint64, timeout
 }
 
 func TestPlannerStats_RefreshAndVersion(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	_ = seedData(t, db, 1_000)
+	c, _ := openTempUint64Collection(t)
+	_ = seedData(t, c, 1_000)
 
-	s0 := db.PlannerStats()
+	s0 := c.PlannerStats()
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
-	s1 := db.PlannerStats()
+	s1 := c.PlannerStats()
 
 	if s1.Version <= s0.Version {
 		t.Fatalf("version did not advance: before=%d after=%d", s0.Version, s1.Version)
@@ -613,7 +613,7 @@ func TestPlannerStats_RefreshAndVersion(t *testing.T) {
 
 	// Returned snapshot must be safe to mutate by caller.
 	s1.Fields["country"] = rbistats.PlannerField{}
-	s2 := db.PlannerStats()
+	s2 := c.PlannerStats()
 	if s2.Fields["country"].DistinctKeys == 0 {
 		t.Fatalf("snapshot was mutated by caller")
 	}
@@ -622,21 +622,21 @@ func TestPlannerStats_RefreshAndVersion(t *testing.T) {
 func TestPlannerStats_PersistedIndexLoadRestoresSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "planner_stats_persist.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 2_000)
-	if err := db.RefreshPlannerStats(); err != nil {
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 2_000)
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
-	want := db.PlannerStats()
+	want := c.PlannerStats()
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw.Close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	db2, raw2 := openBoltAndCollection[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
 		_ = db2.Close()
 		_ = raw2.Close()
@@ -669,16 +669,16 @@ func TestPlannerStats_PersistedIndexLoadRestoresSnapshot(t *testing.T) {
 func TestPlannerStats_ClosePersistsPublishedSnapshotWithoutRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "planner_stats_persist_reuse.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
-	_ = seedData(t, db, 256)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	_ = seedData(t, c, 256)
 
-	if err := db.RefreshPlannerStats(); err != nil {
+	if err := c.RefreshPlannerStats(); err != nil {
 		t.Fatalf("RefreshPlannerStats: %v", err)
 	}
 
-	before := db.PlannerStats()
+	before := c.PlannerStats()
 
-	if err := db.Set(10_001, &Rec{
+	if err := writeSet(c, 10_001, &Rec{
 		Meta:     Meta{Country: "ZZ"},
 		Name:     "planner-persist-new",
 		Email:    "planner-persist-new@example.com",
@@ -691,14 +691,14 @@ func TestPlannerStats_ClosePersistsPublishedSnapshotWithoutRebuild(t *testing.T)
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := raw.Close(); err != nil {
+	if err := bolt.Close(); err != nil {
 		t.Fatalf("raw.Close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	db2, raw2 := openBoltAndCollection[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
 	t.Cleanup(func() {
 		_ = db2.Close()
 		_ = raw2.Close()
@@ -756,15 +756,15 @@ func plannerExtSeedPath(t *testing.T) string {
 		}
 
 		path := filepath.Join(dir, "seed.db")
-		db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
-		_ = seedData(t, db, 8_000)
+		c, bolt := openBoltAndCollection[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+		_ = seedData(t, c, 8_000)
 
-		if err = db.Close(); err != nil {
+		if err = c.Close(); err != nil {
 			plannerExtSeeded.err = err
-			_ = raw.Close()
+			_ = bolt.Close()
 			return
 		}
-		if err = raw.Close(); err != nil {
+		if err = bolt.Close(); err != nil {
 			plannerExtSeeded.err = err
 			return
 		}
@@ -783,16 +783,16 @@ func plannerExtCopyDB(t *testing.T, src string) string {
 	return copySeededDBWithSidecars(t, src, "planner_ext.db")
 }
 
-func plannerExtOpenSeededDB(t *testing.T, opts Options) *DB[uint64, Rec] {
+func plannerExtOpenSeededCollection(t *testing.T, opts Options) *Collection[uint64, Rec] {
 	t.Helper()
 
 	path := plannerExtCopyDB(t, plannerExtSeedPath(t))
-	db, raw := openBoltAndNew[uint64, Rec](t, path, opts)
+	c, bolt := openBoltAndCollection[uint64, Rec](t, path, opts)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db
+	return c
 }
 
 func plannerExtQuery005() *qx.QX {
@@ -1112,13 +1112,13 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 		mu     sync.Mutex
 		events []rbitrace.Event
 	)
-	db := plannerExtOpenSeededDB(t, Options{
+	c := plannerExtOpenSeededCollection(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        func(ev rbitrace.Event) { mu.Lock(); events = append(events, ev); mu.Unlock() },
 		TraceSampleEvery: 1,
 	})
 
-	newUint64QueryContract(t, db).AssertQueryKeysMatchReference(q)
+	newUint64QueryContract(t, c).AssertQueryKeysMatchReference(q)
 
 	mu.Lock()
 	err := plannerExtRequireTrace(events)
@@ -1130,7 +1130,7 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 
 func plannerExtRunConcurrentQueries(
 	t *testing.T,
-	db *DB[uint64, Rec],
+	c *Collection[uint64, Rec],
 	q *qx.QX,
 	workers int,
 	rounds int,
@@ -1146,7 +1146,7 @@ func plannerExtRunConcurrentQueries(
 		go func(worker int) {
 			defer wg.Done()
 			for round := 0; round < rounds; round++ {
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					errCh <- fmt.Errorf("worker=%d round=%d QueryKeys: %w", worker, round, err)
 					return
@@ -1263,13 +1263,13 @@ func TestPlannerExt_AdversarialPlannerCorpus(t *testing.T) {
 }
 
 func TestPlannerExt_Race_OrderedEqAndInSameFieldAgeAsc(t *testing.T) {
-	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
+	c := plannerExtOpenSeededCollection(t, Options{AnalyzeInterval: -1})
 	q := plannerExtQuery005()
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	plannerExtRunConcurrentQueries(t, db, q, 8, 20, func(got []uint64) error {
+	plannerExtRunConcurrentQueries(t, c, q, 8, 20, func(got []uint64) error {
 		if !queryIDsEqual(q, got, want) {
 			return fmt.Errorf("got=%v want=%v", got, want)
 		}
@@ -1278,13 +1278,13 @@ func TestPlannerExt_Race_OrderedEqAndInSameFieldAgeAsc(t *testing.T) {
 }
 
 func TestPlannerExt_Race_OrderedOROverlappingCountryINAgeAsc(t *testing.T) {
-	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
+	c := plannerExtOpenSeededCollection(t, Options{AnalyzeInterval: -1})
 	q := plannerExtQuery296()
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	plannerExtRunConcurrentQueries(t, db, q, 8, 20, func(got []uint64) error {
+	plannerExtRunConcurrentQueries(t, c, q, 8, 20, func(got []uint64) error {
 		if !queryIDsEqual(q, got, want) {
 			return fmt.Errorf("got=%v want=%v", got, want)
 		}
@@ -1293,16 +1293,16 @@ func TestPlannerExt_Race_OrderedOROverlappingCountryINAgeAsc(t *testing.T) {
 }
 
 func TestPlannerExt_Race_NoOrderORDuplicatesOnOverlap(t *testing.T) {
-	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
+	c := plannerExtOpenSeededCollection(t, Options{AnalyzeInterval: -1})
 	q := plannerExtQuery570()
 	fullQ := cloneQuery(q)
 	fullQ.Window.Offset = 0
 	fullQ.Window.Limit = 0
-	full, err := expectedKeysUint64(t, db, fullQ)
+	full, err := expectedKeysUint64(t, c, fullQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full): %v", err)
 	}
-	plannerExtRunConcurrentQueries(t, db, q, 8, 20, func(got []uint64) error {
+	plannerExtRunConcurrentQueries(t, c, q, 8, 20, func(got []uint64) error {
 		return plannerExtValidateNoOrderWindow(q, got, full)
 	})
 }
@@ -1312,14 +1312,14 @@ func TestPlannerExt_Race_TraceUnderConcurrentQueries(t *testing.T) {
 		mu     sync.Mutex
 		events []rbitrace.Event
 	)
-	db := plannerExtOpenSeededDB(t, Options{
+	c := plannerExtOpenSeededCollection(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        func(ev rbitrace.Event) { mu.Lock(); events = append(events, ev); mu.Unlock() },
 		TraceSampleEvery: 1,
 	})
 
 	q := plannerExtQuery717()
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -1332,7 +1332,7 @@ func TestPlannerExt_Race_TraceUnderConcurrentQueries(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for round := 0; round < 20; round++ {
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					errCh <- err
 					return
@@ -1369,9 +1369,9 @@ func TestPlannerExt_Race_TraceUnderConcurrentQueries(t *testing.T) {
 }
 
 func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
-	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
+	c := plannerExtOpenSeededCollection(t, Options{AnalyzeInterval: -1})
 	q := plannerExtQuery1269()
-	want, err := expectedKeysUint64(t, db, q)
+	want, err := expectedKeysUint64(t, c, q)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
@@ -1384,7 +1384,7 @@ func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for round := 0; round < 20; round++ {
-				got, err := db.QueryKeys(q)
+				got, err := readQueryKeys(c, q)
 				if err != nil {
 					errCh <- err
 					return
@@ -1401,7 +1401,7 @@ func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			if err := db.RefreshPlannerStats(); err != nil {
+			if err := c.RefreshPlannerStats(); err != nil {
 				errCh <- err
 				return
 			}
@@ -1412,7 +1412,7 @@ func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			s := db.PlannerStats()
+			s := c.PlannerStats()
 			if s.Fields != nil {
 				s.Fields["country"] = rbistats.PlannerField{}
 			}
@@ -1431,7 +1431,7 @@ func TestPlannerExt_Race_RefreshPlannerStatsDuringQueries(t *testing.T) {
 func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) {
 	const analyzeInterval = 5 * time.Millisecond
 
-	db := plannerExtOpenSeededDB(t, Options{
+	c := plannerExtOpenSeededCollection(t, Options{
 		AnalyzeInterval:  analyzeInterval,
 		TraceSink:        func(rbitrace.Event) {},
 		TraceSampleEvery: 1,
@@ -1452,7 +1452,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 	exps := make([]expectation, 0, len(queries))
 	for _, q := range queries {
 		if len(q.Order) > 0 || (q.Window.Offset == 0 && q.Window.Limit == 0) {
-			want, err := expectedKeysUint64(t, db, q)
+			want, err := expectedKeysUint64(t, c, q)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 			}
@@ -1463,15 +1463,15 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 		fullQ := cloneQuery(q)
 		fullQ.Window.Offset = 0
 		fullQ.Window.Limit = 0
-		full, err := expectedKeysUint64(t, db, fullQ)
+		full, err := expectedKeysUint64(t, c, fullQ)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
 		}
 		exps = append(exps, expectation{q: q, full: full})
 	}
 
-	startVersion := db.PlannerStats().Version
-	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
+	startVersion := c.PlannerStats().Version
+	if latest, ok := waitPlannerStatsVersionGreater(c, startVersion, 250*time.Millisecond); !ok {
 		t.Fatalf("expected periodic analyzer to advance planner stats: start=%d latest=%d", startVersion, latest)
 	}
 
@@ -1485,7 +1485,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 			for round := 0; round < 20; round++ {
 				for i := range exps {
 					exp := exps[(worker+round+i)%len(exps)]
-					got, err := db.QueryKeys(exp.q)
+					got, err := readQueryKeys(c, exp.q)
 					if err != nil {
 						errCh <- fmt.Errorf("worker=%d round=%d QueryKeys(%+v): %w", worker, round, exp.q, err)
 						return
@@ -1512,7 +1512,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 			defer wg.Done()
 			lastVersion := uint64(0)
 			for round := 0; round < 200; round++ {
-				s := db.PlannerStats()
+				s := c.PlannerStats()
 				if s.AnalyzeInterval != analyzeInterval {
 					errCh <- fmt.Errorf("reader=%d round=%d analyze interval mismatch: got=%v want=%v", reader, round, s.AnalyzeInterval, analyzeInterval)
 					return
@@ -1541,7 +1541,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 	go func() {
 		defer wg.Done()
 		for round := 0; round < 25; round++ {
-			if err := db.RefreshPlannerStats(); err != nil {
+			if err := c.RefreshPlannerStats(); err != nil {
 				errCh <- fmt.Errorf("RefreshPlannerStats round=%d: %w", round, err)
 				return
 			}

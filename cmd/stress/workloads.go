@@ -49,8 +49,8 @@ func runReadProfileByIDItems(ctx *WorkloadContext, rng *rand.Rand) (string, erro
 	id := pickReadID(rng, currentMaxID)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	item, err := ctx.DB.Get(id)
-	ctx.DB.ReleaseRecords(item)
+	item, err := stressReadGet(ctx.Collection, id)
+	ctx.Collection.ReleaseRecords(item)
 	return queryName, err
 }
 
@@ -63,8 +63,8 @@ func runReadAccountByEmailItems(ctx *WorkloadContext, rng *rand.Rand) (string, e
 	q := qx.Query(qx.EQ("email", email)).Limit(1)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	items, err := stressReadQuery(ctx.Collection, q)
+	ctx.Collection.ReleaseRecords(items...)
 	return queryName, err
 }
 
@@ -78,8 +78,8 @@ func runReadMemberDirectoryPrefixItems(ctx *WorkloadContext, rng *rand.Rand) (st
 	).Sort("name", qx.ASC).Limit(12)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	items, err := stressReadQuery(ctx.Collection, q)
+	ctx.Collection.ReleaseRecords(items...)
 	return queryName, err
 }
 
@@ -92,8 +92,8 @@ func runReadRecentCountryActiveItems(ctx *WorkloadContext, rng *rand.Rand) (stri
 	).Sort("last_login", qx.DESC).Limit(20)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	items, err := stressReadQuery(ctx.Collection, q)
+	ctx.Collection.ReleaseRecords(items...)
 	return queryName, err
 }
 
@@ -112,8 +112,8 @@ func runReadActiveRegionProItems(ctx *WorkloadContext, rng *rand.Rand) (string, 
 	).Sort("last_login", qx.DESC).Limit(40)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	items, err := stressReadQuery(ctx.Collection, q)
+	ctx.Collection.ReleaseRecords(items...)
 	return queryName, err
 }
 
@@ -134,7 +134,7 @@ func runReadFrontpageCandidateKeys(ctx *WorkloadContext, rng *rand.Rand) (string
 	).Sort("score", qx.DESC).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -159,7 +159,7 @@ func runReadModerationQueueKeys(ctx *WorkloadContext, rng *rand.Rand) (string, e
 	).Sort("created_at", qx.DESC).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -175,8 +175,8 @@ func runReadLeaderboardTopItems(ctx *WorkloadContext, _ *rand.Rand) (string, err
 	).Sort("score", qx.DESC).Limit(50)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	items, err := stressReadQuery(ctx.Collection, q)
+	ctx.Collection.ReleaseRecords(items...)
 	return queryName, err
 }
 
@@ -195,7 +195,7 @@ func runReadSignupDashboardCount(ctx *WorkloadContext, rng *rand.Rand) (string, 
 	)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.Count(q.Filter)
+	_, err := stressReadCount(ctx.Collection, q.Filter)
 	return queryName, err
 }
 
@@ -212,7 +212,7 @@ func runReadInactiveCleanupKeys(ctx *WorkloadContext, _ *rand.Rand) (string, err
 	).Limit(250)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -230,7 +230,7 @@ func runReadStaffAuditFeedKeys(ctx *WorkloadContext, rng *rand.Rand) (string, er
 	).Sort("last_login", qx.DESC).Limit(120)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -265,7 +265,7 @@ func runReadDiscoveryExploreKeys(ctx *WorkloadContext, rng *rand.Rand) (string, 
 	).Sort("created_at", qx.DESC).Limit(150)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -283,7 +283,7 @@ func runReadDormantArchivePageKeys(ctx *WorkloadContext, rng *rand.Rand) (string
 	).Sort("last_login", qx.ASC).Offset(skip).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.QueryKeys(q)
+	_, err := stressReadQueryKeys(ctx.Collection, q)
 	return queryName, err
 }
 
@@ -303,7 +303,7 @@ func runWriteTouchLastSeen(ctx *WorkloadContext, rng *rand.Rand) (string, error)
 	}
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Patch(id, patch)
+	return queryName, stressWritePatch(ctx.Collection, id, patch)
 }
 
 func runWriteVoteKarma(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -322,7 +322,7 @@ func runWriteVoteKarma(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
 	}
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Patch(id, patch)
+	return queryName, stressWritePatch(ctx.Collection, id, patch)
 }
 
 func runWriteProfileEdit(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -344,7 +344,7 @@ func runWriteProfileEdit(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
 	}
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Patch(id, patch)
+	return queryName, stressWritePatch(ctx.Collection, id, patch)
 }
 
 func runWriteModerationAction(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -367,7 +367,7 @@ func runWriteModerationAction(ctx *WorkloadContext, rng *rand.Rand) (string, err
 	}
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Patch(id, patch)
+	return queryName, stressWritePatch(ctx.Collection, id, patch)
 }
 
 func runWriteBulkPatch(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -392,7 +392,7 @@ func runWriteBulkPatch(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
 	}
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Patch(id, patch)
+	return queryName, stressWritePatch(ctx.Collection, id, patch)
 }
 
 func runWriteFullSetExisting(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -405,7 +405,7 @@ func runWriteFullSetExisting(ctx *WorkloadContext, rng *rand.Rand) (string, erro
 	user := generateUser(rng, id)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Set(id, user)
+	return queryName, stressWriteSet(ctx.Collection, id, user)
 }
 
 func runWriteInsert(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
@@ -414,5 +414,5 @@ func runWriteInsert(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
 	user := generateUser(rng, newID)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	return queryName, ctx.DB.Set(newID, user)
+	return queryName, stressWriteSet(ctx.Collection, newID, user)
 }

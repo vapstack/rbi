@@ -9,33 +9,31 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbitrace"
 
 	"github.com/vapstack/qx"
-	"go.etcd.io/bbolt"
 )
 
 func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
 	qNoLimit := qx.Query(qx.EQ("email", "a@x"))
 	qLimit1 := qx.Query(qx.EQ("email", "a@x")).Limit(1)
 
-	idsNoLimit, err := db.QueryKeys(qNoLimit)
+	idsNoLimit, err := readQueryKeys(c, qNoLimit)
 	if err != nil {
 		t.Fatalf("QueryKeys(no limit): %v", err)
 	}
-	idsLimit1, err := db.QueryKeys(qLimit1)
+	idsLimit1, err := readQueryKeys(c, qLimit1)
 	if err != nil {
 		t.Fatalf("QueryKeys(limit=1): %v", err)
 	}
@@ -53,11 +51,11 @@ func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
 		qx.EQ("code", 1),
 	).Limit(1)
 
-	idsAndNoLimit, err := db.QueryKeys(qAndNoLimit)
+	idsAndNoLimit, err := readQueryKeys(c, qAndNoLimit)
 	if err != nil {
 		t.Fatalf("QueryKeys(and no limit): %v", err)
 	}
-	idsAndLimit1, err := db.QueryKeys(qAndLimit1)
+	idsAndLimit1, err := readQueryKeys(c, qAndLimit1)
 	if err != nil {
 		t.Fatalf("QueryKeys(and limit=1): %v", err)
 	}
@@ -74,9 +72,9 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 		},
 		TraceSampleEvery: 1,
 	}
-	db, _ := openTempDBUint64Unique(t, opts)
+	c, _ := openTempUint64CollectionUnique(t, opts)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
@@ -118,7 +116,7 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			before := len(events)
-			ids, err := db.QueryKeys(tc.q)
+			ids, err := readQueryKeys(c, tc.q)
 			if err != nil {
 				t.Fatalf("QueryKeys: %v", err)
 			}
@@ -137,21 +135,21 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 }
 
 func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 	opt := "present"
-	if err := db.Set(3, &UniqueTestRec{Email: "c@x", Code: 3, Opt: &opt}); err != nil {
+	if err := writeSet(c, 3, &UniqueTestRec{Email: "c@x", Code: 3, Opt: &opt}); err != nil {
 		t.Fatalf("Set(3): %v", err)
 	}
 
 	t.Run("offset", func(t *testing.T) {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Offset(1))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", "c@x")).Offset(1))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -161,7 +159,7 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 	})
 
 	t.Run("ordered_nullable_unique", func(t *testing.T) {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Sort("code", qx.DESC))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("opt", nil)).Sort("code", qx.DESC))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -172,7 +170,7 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 	})
 
 	t.Run("invalid_order_field", func(t *testing.T) {
-		if _, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Sort("missing", qx.ASC)); err == nil {
+		if _, err := readQueryKeys(c, qx.Query(qx.EQ("email", "c@x")).Sort("missing", qx.ASC)); err == nil {
 			t.Fatalf("expected QueryKeys to fail for unknown order field")
 		}
 	})
@@ -186,16 +184,16 @@ func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
 		},
 		TraceSampleEvery: 1,
 	}
-	db, _ := openTempDBUint64Unique(t, opts)
+	c, _ := openTempUint64CollectionUnique(t, opts)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Limit(1))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("opt", nil)).Limit(1))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -215,16 +213,16 @@ func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
 }
 
 func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Tags: []string{"db"}}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Tags: []string{"db"}}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	c1, err := db.Count(qx.EQ("email", "a@x"))
+	c1, err := readCount(c, qx.EQ("email", "a@x"))
 	if err != nil {
 		t.Fatalf("Count(eq unique): %v", err)
 	}
@@ -232,7 +230,7 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 		t.Fatalf("expected count=1, got %d", c1)
 	}
 
-	c2, err := db.Count(
+	c2, err := readCount(c,
 		qx.EQ("email", "a@x"),
 		qx.EQ("code", 1),
 	)
@@ -243,7 +241,7 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 		t.Fatalf("expected count=1, got %d", c2)
 	}
 
-	c3, err := db.Count(
+	c3, err := readCount(c,
 		qx.EQ("email", "a@x"),
 		qx.EQ("code", 2),
 	)
@@ -256,40 +254,40 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 }
 
 func TestUnique_Set_DuplicateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	err := db.Set(2, &UniqueTestRec{Email: "a@x", Code: 2})
+	err := writeSet(c, 2, &UniqueTestRec{Email: "a@x", Code: 2})
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
 func TestUnique_Set_SameRecordUpdateAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 }
 
 func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	err := db.Patch(2, []Field{{Name: "email", Value: "a@x"}}, PatchStrict)
+	err := writePatch(c, 2, []Field{{Name: "email", Value: "a@x"}}, PatchStrict)
 	if err == nil {
 		t.Fatalf("expected unique violation")
 	}
@@ -299,33 +297,33 @@ func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
 }
 
 func TestUnique_NilAllowedMultipleTimes(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 }
 
 func TestUnique_OptDuplicateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
 	v := "same"
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: &v}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: &v}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &v})
+	err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &v})
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
-func TestUnique_BatchSet_DuplicateWithinBatchRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiSet_DuplicateWithinBatchRejected(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
 	ids := []uint64{1, 2}
 	vals := []*UniqueTestRec{
@@ -333,16 +331,26 @@ func TestUnique_BatchSet_DuplicateWithinBatchRejected(t *testing.T) {
 		{Email: "a@x", Code: 2},
 	}
 
-	err := db.BatchSet(ids, vals)
+	err := writeSets(c, ids, vals)
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
+
+	for _, id := range ids {
+		v, err := readGet(c, id)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", id, err)
+		}
+		if v != nil {
+			t.Fatalf("id=%d was inserted despite rejected MultiSet: %#v", id, v)
+		}
+	}
 }
 
-func TestUnique_BatchSet_DuplicateAgainstDBRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiSet_DuplicateAgainstDBRejected(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
@@ -352,19 +360,19 @@ func TestUnique_BatchSet_DuplicateAgainstDBRejected(t *testing.T) {
 		{Email: "a@x", Code: 3},
 	}
 
-	err := db.BatchSet(ids, vals)
+	err := writeSets(c, ids, vals)
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 }
 
-func TestUnique_BatchSet_SwapValuesAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiSet_SwapValuesAllowed(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "y@x", Code: 20}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "y@x", Code: 20}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
@@ -374,18 +382,18 @@ func TestUnique_BatchSet_SwapValuesAllowed(t *testing.T) {
 		{Email: "x@x", Code: 20},
 	}
 
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet swap should be allowed, got: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet swap should be allowed, got: %v", err)
 	}
 }
 
-func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiSet_DuplicateID_TransientConflictResolvedByLastWrite(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
@@ -397,11 +405,11 @@ func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *tes
 		{Email: "u3@x", Code: 1},
 	}
 
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet duplicate-id transient conflict should resolve by last write, got: %v", err)
+	if err := writeSets(c, ids, vals); err != nil {
+		t.Fatalf("MultiSet duplicate-id transient conflict should resolve by last write, got: %v", err)
 	}
 
-	v1, err := db.Get(1)
+	v1, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
@@ -411,7 +419,7 @@ func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *tes
 
 	// Ensure unique index state is consistent.
 	q := qx.Query(qx.EQ("email", "u2@x"))
-	idsU2, err := db.QueryKeys(q)
+	idsU2, err := readQueryKeys(c, q)
 	if err != nil {
 		t.Fatalf("QueryKeys(email=u2@x): %v", err)
 	}
@@ -419,7 +427,7 @@ func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *tes
 		t.Fatalf("unexpected owners for u2@x: %v", idsU2)
 	}
 
-	idsU3, err := db.QueryKeys(qx.Query(qx.EQ("email", "u3@x")))
+	idsU3, err := readQueryKeys(c, qx.Query(qx.EQ("email", "u3@x")))
 	if err != nil {
 		t.Fatalf("QueryKeys(email=u3@x): %v", err)
 	}
@@ -428,17 +436,17 @@ func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *tes
 	}
 }
 
-func TestUnique_BatchSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	err := db.BatchSet(
+	err := writeSets(c,
 		[]uint64{1, 1},
 		[]*UniqueTestRec{
 			{Email: "u3@x", Code: 1},
@@ -449,24 +457,24 @@ func TestUnique_BatchSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
-	v1, err := db.Get(1)
+	v1, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
 	if v1 == nil || v1.Email != "u1@x" || v1.Code != 1 {
-		t.Fatalf("id=1 should remain unchanged after rejected BatchSet, got: %#v", v1)
+		t.Fatalf("id=1 should remain unchanged after rejected MultiSet, got: %#v", v1)
 	}
 }
 
-func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T) {
+func TestUnique_MultiSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T) {
 	t.Run("final_non_conflicting_value_passes", func(t *testing.T) {
-		db, _ := openTempDBUint64Unique(t)
+		c, _ := openTempUint64CollectionUnique(t)
 
-		if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
+		if err := writeSet(c, 2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 			t.Fatalf("Set(2): %v", err)
 		}
 
-		err := db.BatchSet(
+		err := writeSets(c,
 			[]uint64{1, 1},
 			[]*UniqueTestRec{
 				{Email: "u2@x", Code: 1}, // transient conflict
@@ -474,10 +482,10 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 			},
 		)
 		if err != nil {
-			t.Fatalf("BatchSet should succeed with final non-conflicting value, got: %v", err)
+			t.Fatalf("MultiSet should succeed with final non-conflicting value, got: %v", err)
 		}
 
-		v1, err := db.Get(1)
+		v1, err := readGet(c, 1)
 		if err != nil {
 			t.Fatalf("Get(1): %v", err)
 		}
@@ -487,13 +495,13 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 	})
 
 	t.Run("final_conflicting_value_fails", func(t *testing.T) {
-		db, _ := openTempDBUint64Unique(t)
+		c, _ := openTempUint64CollectionUnique(t)
 
-		if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
+		if err := writeSet(c, 2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 			t.Fatalf("Set(2): %v", err)
 		}
 
-		err := db.BatchSet(
+		err := writeSets(c,
 			[]uint64{1, 1},
 			[]*UniqueTestRec{
 				{Email: "u3@x", Code: 1},
@@ -504,18 +512,18 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 			t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 		}
 
-		v1, err := db.Get(1)
+		v1, err := readGet(c, 1)
 		if err != nil {
 			t.Fatalf("Get(1): %v", err)
 		}
 		if v1 != nil {
-			t.Fatalf("id=1 should not be inserted on failed BatchSet, got: %#v", v1)
+			t.Fatalf("id=1 should not be inserted on failed MultiSet, got: %#v", v1)
 		}
 	})
 }
 
 func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{AutoBatchMax: 1})
+	c, _ := openTempUint64CollectionUnique(t, Options{BatchSoftLimit: 1})
 
 	type modelRec struct {
 		Email string
@@ -573,7 +581,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 	checkState := func(step int) {
 		t.Helper()
 
-		cnt, err := db.Count()
+		cnt, err := readCount(c)
 		if err != nil {
 			t.Fatalf("step=%d Count(): %v", step, err)
 		}
@@ -583,7 +591,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 
 		liveEmails := make(map[string]struct{}, len(model))
 		for id, exp := range model {
-			v, err := db.Get(id)
+			v, err := readGet(c, id)
 			if err != nil {
 				t.Fatalf("step=%d Get(%d): %v", step, id, err)
 			}
@@ -594,7 +602,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 				t.Fatalf("step=%d value mismatch id=%d: got=%#v want=%#v", step, id, v, exp)
 			}
 
-			ids, err := db.QueryKeys(qx.Query(qx.EQ("email", exp.Email)))
+			ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", exp.Email)))
 			if err != nil {
 				t.Fatalf("step=%d QueryKeys(email=%q): %v", step, exp.Email, err)
 			}
@@ -602,7 +610,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 				t.Fatalf("step=%d email index mismatch for %q: %v", step, exp.Email, ids)
 			}
 
-			ids, err = db.QueryKeys(qx.Query(qx.EQ("code", exp.Code)))
+			ids, err = readQueryKeys(c, qx.Query(qx.EQ("code", exp.Code)))
 			if err != nil {
 				t.Fatalf("step=%d QueryKeys(code=%d): %v", step, exp.Code, err)
 			}
@@ -618,7 +626,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			if _, live := liveEmails[email]; live {
 				continue
 			}
-			ids, err := db.QueryKeys(qx.Query(qx.EQ("email", email)))
+			ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", email)))
 			if err != nil {
 				t.Fatalf("step=%d QueryKeys(stale email=%q): %v", step, email, err)
 			}
@@ -668,7 +676,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			next[id] = rec
 			wantUniqueErr := hasUniqueViolation(next)
 
-			err := db.Set(id, &UniqueTestRec{
+			err := writeSet(c, id, &UniqueTestRec{
 				Email: rec.Email,
 				Code:  rec.Code,
 				Tags:  slices.Clone(rec.Tags),
@@ -685,7 +693,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 				model = next
 			}
 
-		case 1: // BatchSet (with possible duplicate ids)
+		case 1: // MultiSet (with possible duplicate ids)
 			n := 2 + r.Intn(5)
 			ids := make([]uint64, n)
 			vals := make([]*UniqueTestRec, n)
@@ -704,14 +712,14 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			}
 			wantUniqueErr := hasUniqueViolation(next)
 
-			err := db.BatchSet(ids, vals)
+			err := writeSets(c, ids, vals)
 			if wantUniqueErr {
 				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
-					t.Fatalf("step=%d BatchSet expected rbierrors.ErrUniqueViolation, got: %v", step, err)
+					t.Fatalf("step=%d MultiSet expected rbierrors.ErrUniqueViolation, got: %v", step, err)
 				}
 			} else {
 				if err != nil {
-					t.Fatalf("step=%d BatchSet unexpected err: %v", step, err)
+					t.Fatalf("step=%d MultiSet unexpected err: %v", step, err)
 				}
 				model = next
 			}
@@ -725,7 +733,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			}
 			wantUniqueErr := hasUniqueViolation(next)
 
-			err := db.Patch(id, patch)
+			err := writePatch(c, id, patch)
 			if wantUniqueErr {
 				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 					t.Fatalf("step=%d Patch expected rbierrors.ErrUniqueViolation, got: %v patch=%v", step, err, patch)
@@ -737,7 +745,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 				model = next
 			}
 
-		case 3: // BatchPatch (with possible duplicate ids)
+		case 3: // MultiPatch (with possible duplicate ids)
 			n := 2 + r.Intn(5)
 			ids := make([]uint64, n)
 			for i := 0; i < n; i++ {
@@ -752,33 +760,33 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			}
 			wantUniqueErr := hasUniqueViolation(next)
 
-			err := db.BatchPatch(ids, patch)
+			err := writePatches(c, ids, patch)
 			if wantUniqueErr {
 				if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
-					t.Fatalf("step=%d BatchPatch expected rbierrors.ErrUniqueViolation, got: %v patch=%v ids=%v", step, err, patch, ids)
+					t.Fatalf("step=%d MultiPatch expected rbierrors.ErrUniqueViolation, got: %v patch=%v ids=%v", step, err, patch, ids)
 				}
 			} else {
 				if err != nil {
-					t.Fatalf("step=%d BatchPatch unexpected err: %v patch=%v ids=%v", step, err, patch, ids)
+					t.Fatalf("step=%d MultiPatch unexpected err: %v patch=%v ids=%v", step, err, patch, ids)
 				}
 				model = next
 			}
 
 		case 4: // Delete
 			id := uint64(1 + r.Intn(48))
-			if err := db.Delete(id); err != nil {
+			if err := writeDelete(c, id); err != nil {
 				t.Fatalf("step=%d Delete(%d): %v", step, id, err)
 			}
 			delete(model, id)
 
-		default: // BatchDelete (with possible duplicate ids)
+		default: // MultiDelete (with possible duplicate ids)
 			n := 1 + r.Intn(5)
 			ids := make([]uint64, n)
 			for i := 0; i < n; i++ {
 				ids[i] = uint64(1 + r.Intn(48))
 			}
-			if err := db.BatchDelete(ids); err != nil {
-				t.Fatalf("step=%d BatchDelete(%v): %v", step, ids, err)
+			if err := writeDeletes(c, ids); err != nil {
+				t.Fatalf("step=%d MultiDelete(%v): %v", step, ids, err)
 			}
 			for _, id := range ids {
 				delete(model, id)
@@ -792,10 +800,11 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 }
 
 func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{
+	enableStoreStatsForTest(t)
+
+	c, _ := openTempUint64CollectionUnique(t, Options{
 		AnalyzeInterval: -1,
-		AutoBatchWindow: 5 * time.Millisecond,
-		AutoBatchMax:    16,
+		BatchSoftLimit:  16,
 	})
 
 	type modelRec struct {
@@ -834,34 +843,14 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 	for i := 1; i <= 12; i++ {
 		id := uint64(i)
 		rec := makeRec(i)
-		if err := db.Set(id, &UniqueTestRec{
+		if err := writeSet(c, id, &UniqueTestRec{
 			Email: rec.Email,
 			Code:  rec.Code,
 			Tags:  slices.Clone(rec.Tags),
-		}, NoBatch[uint64, UniqueTestRec]); err != nil {
+		}); err != nil {
 			t.Fatalf("seed Set(%d): %v", id, err)
 		}
 		model[id] = rec
-	}
-
-	type event struct {
-		id     uint64
-		delete bool
-		rec    modelRec
-	}
-	var (
-		mu     sync.Mutex
-		events []event
-	)
-	recordCommit := func(_ *bbolt.Tx, id uint64, _, newValue *UniqueTestRec) error {
-		mu.Lock()
-		if newValue == nil {
-			events = append(events, event{id: id, delete: true})
-		} else {
-			events = append(events, event{id: id, rec: cloneRec(newValue)})
-		}
-		mu.Unlock()
-		return nil
 	}
 
 	type op struct {
@@ -892,7 +881,7 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 		}
 	}
 
-	before := db.AutoBatchStats()
+	before := c.StoreStats()
 	start := make(chan struct{})
 	errCh := make(chan error, len(ops))
 	var wg sync.WaitGroup
@@ -910,11 +899,11 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 					Code:  op.rec.Code,
 					Tags:  slices.Clone(op.rec.Tags),
 				}
-				err = db.Set(op.id, &rec, BeforeCommit(recordCommit))
+				err = writeSet(c, op.id, &rec)
 			case 1:
-				err = db.Patch(op.id, op.patch, BeforeCommit(recordCommit))
+				err = writePatch(c, op.id, op.patch)
 			default:
-				err = db.Delete(op.id, BeforeCommit(recordCommit))
+				err = writeDelete(c, op.id)
 			}
 			if err != nil && !errors.Is(err, rbierrors.ErrUniqueViolation) {
 				errCh <- fmt.Errorf("kind=%d id=%d: %w", op.kind, op.id, err)
@@ -928,34 +917,36 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	for i := range events {
-		ev := events[i]
-		if ev.delete {
-			delete(model, ev.id)
-		} else {
-			model[ev.id] = ev.rec
+	actual := make(map[uint64]modelRec, 48)
+	for id := uint64(1); id <= 40; id++ {
+		got, err := readGet(c, id)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", id, err)
+		}
+		if got != nil {
+			actual[id] = cloneRec(got)
 		}
 	}
 
-	if got, err := db.Count(); err != nil {
+	if got, err := readCount(c); err != nil {
 		t.Fatalf("Count: %v", err)
-	} else if got != uint64(len(model)) {
-		t.Fatalf("Count = %d, want %d", got, len(model))
+	} else if got != uint64(len(actual)) {
+		t.Fatalf("Count = %d, want %d", got, len(actual))
 	}
 
-	byEmail := make(map[string]uint64, len(model))
-	byCode := make(map[int]uint64, len(model))
-	for id, exp := range model {
+	byEmail := make(map[string]uint64, len(actual))
+	byCode := make(map[int]uint64, len(actual))
+	for id, exp := range actual {
 		if prev, ok := byEmail[exp.Email]; ok && prev != id {
-			t.Fatalf("model duplicate email %q: ids %d and %d", exp.Email, prev, id)
+			t.Fatalf("duplicate email %q: ids %d and %d", exp.Email, prev, id)
 		}
 		byEmail[exp.Email] = id
 		if prev, ok := byCode[exp.Code]; ok && prev != id {
-			t.Fatalf("model duplicate code %d: ids %d and %d", exp.Code, prev, id)
+			t.Fatalf("duplicate code %d: ids %d and %d", exp.Code, prev, id)
 		}
 		byCode[exp.Code] = id
 
-		got, err := db.Get(id)
+		got, err := readGet(c, id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
@@ -963,14 +954,14 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 			t.Fatalf("Get(%d) = %#v, want %#v", id, got, exp)
 		}
 
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", exp.Email)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", exp.Email)))
 		if err != nil {
 			t.Fatalf("QueryKeys(email=%q): %v", exp.Email, err)
 		}
 		if len(ids) != 1 || ids[0] != id {
 			t.Fatalf("email index mismatch for %q: got %v want [%d]", exp.Email, ids, id)
 		}
-		ids, err = db.QueryKeys(qx.Query(qx.EQ("code", exp.Code)))
+		ids, err = readQueryKeys(c, qx.Query(qx.EQ("code", exp.Code)))
 		if err != nil {
 			t.Fatalf("QueryKeys(code=%d): %v", exp.Code, err)
 		}
@@ -978,25 +969,12 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 			t.Fatalf("code index mismatch for %d: got %v want [%d]", exp.Code, ids, id)
 		}
 	}
-	for id := uint64(1); id <= 40; id++ {
-		if _, ok := model[id]; ok {
-			continue
-		}
-		got, err := db.Get(id)
-		if err != nil {
-			t.Fatalf("Get(%d): %v", id, err)
-		}
-		if got != nil {
-			t.Fatalf("Get(%d) = %#v, want nil", id, got)
-		}
-	}
-
-	gotHot, err := db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"hot"})))
+	gotHot, err := readQueryKeys(c, qx.Query(qx.HASANY("tags", []string{"hot"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(tags has hot): %v", err)
 	}
-	wantHot := make([]uint64, 0, len(model))
-	for id, rec := range model {
+	wantHot := make([]uint64, 0, len(actual))
+	for id, rec := range actual {
 		if slices.Contains(rec.Tags, "hot") {
 			wantHot = append(wantHot, id)
 		}
@@ -1007,8 +985,11 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 		t.Fatalf("hot tag index mismatch: got %v want %v", gotHot, wantHot)
 	}
 
-	after := db.AutoBatchStats()
-	if after.MultiRequestBatches <= before.MultiRequestBatches {
+	waitAutoBatchExtraStats(t, c.root, "shared unique auto-batch accounting settled", func(st rootSchedulerSnapshot) bool {
+		return st.MultiUnitBatches > before.MultiUnitBatches
+	})
+	after := c.StoreStats()
+	if after.MultiUnitBatches <= before.MultiUnitBatches {
 		t.Fatalf("expected shared auto-batch path, before=%+v after=%+v", before, after)
 	}
 	if after.UniqueRejected <= before.UniqueRejected {
@@ -1017,21 +998,21 @@ func TestUnique_SharedAutoBatchRandomMixedWrites_ModelConsistency(t *testing.T) 
 }
 
 func TestUnique_DeleteThenReuseAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Delete(1); err != nil {
+	if err := writeDelete(c, 1); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "a@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "a@x", Code: 2}); err != nil {
 		t.Fatalf("Set(2) after delete should be allowed: %v", err)
 	}
 }
 
 func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 
 	const workers = 32
 
@@ -1048,7 +1029,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 		wg.Add(1)
 		go func(id uint64, code int) {
 			defer wg.Done()
-			err := db.Set(id, &UniqueTestRec{
+			err := writeSet(c, id, &UniqueTestRec{
 				Email: "same@x",
 				Code:  code,
 			})
@@ -1076,7 +1057,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 		t.Fatalf("expected exactly one successful insert, got %d", got)
 	}
 
-	total, err := db.Count()
+	total, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1084,7 +1065,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 		t.Fatalf("expected total count=1, got %d", total)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "same@x")))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("email", "same@x")))
 	if err != nil {
 		t.Fatalf("QueryKeys(email=same@x): %v", err)
 	}
@@ -1097,7 +1078,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 		t.Fatalf("winner mismatch: set winner=%d query winner=%d", gotWinner, ids[0])
 	}
 
-	v, err := db.Get(gotWinner)
+	v, err := readGet(c, gotWinner)
 	if err != nil {
 		t.Fatalf("Get(winner): %v", err)
 	}
@@ -1106,103 +1087,103 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 	}
 }
 
-func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiPatch_DuplicateWithinBatchRejected(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
 	ids := []uint64{1, 2}
-	err := db.BatchPatch(ids, []Field{{Name: "email", Value: "dup@x"}}, PatchStrict)
+	err := writePatches(c, ids, []Field{{Name: "email", Value: "dup@x"}}, PatchStrict)
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
-	v1, err := db.Get(1)
+	v1, err := readGet(c, 1)
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
 	if v1 == nil || v1.Email != "a@x" || v1.Code != 1 {
-		t.Fatalf("id=1 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v1)
+		t.Fatalf("id=1 must stay unchanged after rejected MultiPatch(..., PatchStrict), got: %#v", v1)
 	}
-	v2, err := db.Get(2)
+	v2, err := readGet(c, 2)
 	if err != nil {
 		t.Fatalf("Get(2): %v", err)
 	}
 	if v2 == nil || v2.Email != "b@x" || v2.Code != 2 {
-		t.Fatalf("id=2 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v2)
+		t.Fatalf("id=2 must stay unchanged after rejected MultiPatch(..., PatchStrict), got: %#v", v2)
 	}
 }
 
-func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiPatch_DuplicateAgainstDBRejected(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(3, &UniqueTestRec{Email: "c@x", Code: 3}); err != nil {
+	if err := writeSet(c, 3, &UniqueTestRec{Email: "c@x", Code: 3}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	ids := []uint64{2, 3}
-	err := db.BatchPatch(ids, []Field{{Name: "code", Value: 1}}, PatchStrict)
+	err := writePatches(c, ids, []Field{{Name: "code", Value: 1}}, PatchStrict)
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
 
-	v2, err := db.Get(2)
+	v2, err := readGet(c, 2)
 	if err != nil {
 		t.Fatalf("Get(2): %v", err)
 	}
 	if v2 == nil || v2.Email != "b@x" || v2.Code != 2 {
-		t.Fatalf("id=2 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v2)
+		t.Fatalf("id=2 must stay unchanged after rejected MultiPatch(..., PatchStrict), got: %#v", v2)
 	}
-	v3, err := db.Get(3)
+	v3, err := readGet(c, 3)
 	if err != nil {
 		t.Fatalf("Get(3): %v", err)
 	}
 	if v3 == nil || v3.Email != "c@x" || v3.Code != 3 {
-		t.Fatalf("id=3 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v3)
+		t.Fatalf("id=3 must stay unchanged after rejected MultiPatch(..., PatchStrict), got: %#v", v3)
 	}
 
-	owners, err := db.QueryKeys(qx.Query(qx.EQ("code", 1)))
+	owners, err := readQueryKeys(c, qx.Query(qx.EQ("code", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys(code=1): %v", err)
 	}
 	if len(owners) != 1 || owners[0] != 1 {
-		t.Fatalf("unexpected owners for code=1 after failed BatchPatch(..., PatchStrict): %v", owners)
+		t.Fatalf("unexpected owners for code=1 after failed MultiPatch(..., PatchStrict): %v", owners)
 	}
 }
 
-func TestUnique_BatchPatch_SwapValuesAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+func TestUnique_MultiPatch_SwapValuesAllowed(t *testing.T) {
+	c, _ := openTempUint64CollectionUnique(t)
 
-	if err := db.Set(1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
+	if err := writeSet(c, 1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set(2, &UniqueTestRec{Email: "y@x", Code: 20}); err != nil {
+	if err := writeSet(c, 2, &UniqueTestRec{Email: "y@x", Code: 20}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Patch(1, []Field{{Name: "email", Value: "tmp@x"}}, PatchStrict); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "email", Value: "tmp@x"}}, PatchStrict); err != nil {
 		t.Fatalf("Patch(1, ..., PatchStrict)->tmp: %v", err)
 	}
-	if err := db.Patch(2, []Field{{Name: "email", Value: "x@x"}}, PatchStrict); err != nil {
+	if err := writePatch(c, 2, []Field{{Name: "email", Value: "x@x"}}, PatchStrict); err != nil {
 		t.Fatalf("Patch(2, ..., PatchStrict)->x: %v", err)
 	}
-	if err := db.Patch(1, []Field{{Name: "email", Value: "y@x"}}, PatchStrict); err != nil {
+	if err := writePatch(c, 1, []Field{{Name: "email", Value: "y@x"}}, PatchStrict); err != nil {
 		t.Fatalf("Patch(1, ..., PatchStrict)->y: %v", err)
 	}
-	v1, err := db.Get(1)
+	v1, err := readGet(c, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, err := db.Get(2)
+	v2, err := readGet(c, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1212,22 +1193,22 @@ func TestUnique_BatchPatch_SwapValuesAllowed(t *testing.T) {
 }
 
 func TestUnique_OptNilReleasesAndReuseAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
+	c, _ := openTempUint64CollectionUnique(t)
 	s := "same"
 
-	err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: &s})
+	err := writeSet(c, 1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: &s})
 	if err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	err = db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s})
+	err = writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s})
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected unique violation on Opt duplicate, got: %v", err)
 	}
-	if err = db.Patch(1, []Field{{Name: "opt", Value: nil}}, PatchStrict); err != nil {
+	if err = writePatch(c, 1, []Field{{Name: "opt", Value: nil}}, PatchStrict); err != nil {
 		t.Fatalf("Patch(1, ..., PatchStrict) opt=nil: %v", err)
 	}
-	if err = db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s}); err != nil {
+	if err = writeSet(c, 2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s}); err != nil {
 		t.Fatalf("Set(2) after releasing opt should be allowed: %v", err)
 	}
 }
@@ -1239,14 +1220,14 @@ type UniqueTestRec struct {
 	Tags  []string `db:"tags"  rbi:"index"`
 }
 
-func openTempDBUint64Unique(t *testing.T, options ...Options) (*DB[uint64, UniqueTestRec], string) {
+func openTempUint64CollectionUnique(t *testing.T, options ...Options) (*Collection[uint64, UniqueTestRec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_unique.db")
-	db, raw := openBoltAndNew[uint64, UniqueTestRec](t, path, options...)
+	c, bolt := openBoltAndCollection[uint64, UniqueTestRec](t, path, options...)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db, path
+	return c, path
 }

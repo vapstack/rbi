@@ -148,7 +148,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 
 func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -187,7 +187,7 @@ func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 
 func TestEvalSimple_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
@@ -233,7 +233,7 @@ func TestEvalSimple_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 
 func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: -1,
+		MaterializedPredCacheMaxEntries: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 25_000, func(i int) *Rec {
@@ -271,7 +271,7 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 
 func TestCount_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
@@ -318,7 +318,7 @@ func TestCount_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 
 func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: -1,
+		MaterializedPredCacheMaxEntries: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -362,7 +362,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 
 func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldIndexUnchanged(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 6_000, func(i int) *Rec {
@@ -408,7 +408,7 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 
 func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 6_000, func(i int) *Rec {
@@ -709,7 +709,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 
 func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -759,7 +759,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 
 func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
@@ -817,7 +817,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 
 func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries:     -1,
+		MaterializedPredCacheMaxEntries:             -1,
 		SnapshotMaterializedPredCacheMaxCardinality: 32,
 	})
 
@@ -876,7 +876,7 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	}
 
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -926,7 +926,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 	}
 
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -978,7 +978,7 @@ func TestBuildAsyncRangeComplementMaterializedPred_AllocsPerRunStayZeroAfterWarm
 	}
 
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 64,
+		MaterializedPredCacheMaxEntries: 64,
 	})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -1028,7 +1028,7 @@ func TestBuildAsyncRangeComplementMaterializedPred_AllocsPerRunStayZeroAfterWarm
 
 func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: -1,
+		MaterializedPredCacheMaxEntries: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 6_000, func(i int) *Rec {

@@ -33,6 +33,61 @@ const (
 	nilIndexEntryKey           = indexdata.NilIndexEntryKey
 )
 
+type testSnapshotPin struct {
+}
+
+func (testSnapshotPin) Unpin() {}
+
+type testSnapshotSource struct {
+	mu      sync.RWMutex
+	current *snapshot.View
+	bySeq   map[uint64]*snapshot.View
+}
+
+func newTestSnapshotSource() *testSnapshotSource {
+	return &testSnapshotSource{bySeq: make(map[uint64]*snapshot.View)}
+}
+
+func (s *testSnapshotSource) Current() *snapshot.View {
+	s.mu.RLock()
+	current := s.current
+	s.mu.RUnlock()
+	return current
+}
+
+func (s *testSnapshotSource) Publish(snap *snapshot.View) {
+	s.mu.Lock()
+	s.current = snap
+	s.bySeq[snap.Seq] = snap
+	s.mu.Unlock()
+}
+
+func (s *testSnapshotSource) PinCurrent() (*snapshot.View, uint64, AsyncSnapshotPin) {
+	s.mu.RLock()
+	snap := s.current
+	s.mu.RUnlock()
+	if snap == nil {
+		return nil, 0, nil
+	}
+	return snap, snap.Seq, testSnapshotPin{}
+}
+
+func (s *testSnapshotSource) PinBySeq(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {
+	s.mu.RLock()
+	snap, ok := s.bySeq[seq]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, nil, false
+	}
+	return snap, testSnapshotPin{}, true
+}
+
+func (*testSnapshotSource) Unpin(_ uint64, pin AsyncSnapshotPin) {
+	if pin != nil {
+		pin.Unpin()
+	}
+}
+
 func testFieldIndexViewFromSlots(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldIndexView {
 	if acc.Ordinal >= len(slots) {
 		return indexdata.FieldIndexView{}
@@ -62,7 +117,7 @@ type Options struct {
 	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
 
-	SnapshotMaterializedPredCacheMaxEntries     int
+	MaterializedPredCacheMaxEntries             int
 	SnapshotMaterializedPredCacheMaxCardinality int
 
 	NumericRangeBucketSize         int
@@ -117,7 +172,7 @@ type testOptions struct {
 type testDB struct {
 	rt       *schema.Schema
 	exec     *Runtime
-	registry *snapshot.Registry
+	registry *testSnapshotSource
 	snap     *snapshot.View
 	seq      uint64
 	cfg      snapshot.CacheConfig
@@ -133,7 +188,7 @@ type DB[K ~string | ~uint64, V any] struct {
 }
 
 type queryEngine struct {
-	snapshot *snapshot.Registry
+	snapshot *testSnapshotSource
 	schema   *schema.Schema
 	exec     *Runtime
 	cfg      snapshot.CacheConfig
@@ -219,11 +274,11 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 	})
 
 	cfg := snapshot.CacheConfig{
-		MatPredMaxEntries: options.SnapshotMaterializedPredCacheMaxEntries,
+		MatPredMaxEntries: options.MaterializedPredCacheMaxEntries,
 		MatPredMaxCard:    uint64(options.SnapshotMaterializedPredCacheMaxCardinality),
 	}
 	qe := &queryEngine{
-		snapshot: snapshot.NewRegistry(false),
+		snapshot: newTestSnapshotSource(),
 		schema:   rt,
 		exec:     exec,
 		cfg:      cfg,
@@ -247,8 +302,9 @@ func (qe *queryEngine) configureAsyncMaterializedPredWarmup() {
 			}
 			return 0
 		},
-		PinBySeq: qe.snapshot.PinBySeq,
-		Unpin:    qe.snapshot.Unpin,
+		PinCurrentBySeq: func(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {
+			return qe.snapshot.PinBySeq(seq)
+		},
 	})
 }
 
@@ -281,8 +337,8 @@ func (o *Options) setDefaults() {
 	if o.TraceSink != nil && o.TraceSampleEvery == 0 {
 		o.TraceSampleEvery = 1
 	}
-	if o.SnapshotMaterializedPredCacheMaxEntries == 0 {
-		o.SnapshotMaterializedPredCacheMaxEntries = testMatPredCacheMaxEntries
+	if o.MaterializedPredCacheMaxEntries == 0 {
+		o.MaterializedPredCacheMaxEntries = testMatPredCacheMaxEntries
 	}
 	if o.SnapshotMaterializedPredCacheMaxCardinality == 0 {
 		o.SnapshotMaterializedPredCacheMaxCardinality = testMatPredCacheMaxCard
@@ -311,7 +367,7 @@ func (db *DB[K, V]) Set(id K, newVal *V) error {
 	return nil
 }
 
-func (db *DB[K, V]) BatchSet(ids []K, vals []*V) error {
+func (db *DB[K, V]) MultiSet(ids []K, vals []*V) error {
 	entries := make([]snapshot.BatchEntry, len(ids))
 	for i := range ids {
 		idx := fixtureUint64Key(ids[i])
@@ -392,14 +448,6 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	return out, nil
 }
 
-func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
-	out := make([]*V, len(ids))
-	for i := range ids {
-		out[i] = db.values[fixtureUint64Key(ids[i])]
-	}
-	return out, nil
-}
-
 func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	prepared, err := qir.PrepareCountExprsResolved(db.engine.exec, exprs...)
 	if err != nil {
@@ -472,8 +520,8 @@ func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(
 		ids[i-1] = uint64(i)
 		vals[i-1] = gen(i)
 	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
 	}
 }
 
@@ -599,8 +647,8 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 		if len(batchIDs) == 0 {
 			return
 		}
-		if err := db.BatchSet(batchIDs, batchVals); err != nil {
-			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		if err := db.MultiSet(batchIDs, batchVals); err != nil {
+			t.Fatalf("MultiSet(seed batch=%d): %v", len(batchIDs), err)
 		}
 		batchIDs = batchIDs[:0]
 		batchVals = batchVals[:0]
@@ -691,7 +739,7 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 		MatPredMaxEntries: opts.MatPredCacheMaxEntries,
 		MatPredMaxCard:    opts.MatPredCacheMaxCard,
 	}
-	registry := snapshot.NewRegistry(false)
+	registry := newTestSnapshotSource()
 	snap := newEmptySnapshotForTests(0, rt, cfg)
 	registry.Publish(snap)
 	exec.ConfigureAsyncMaterializedPredSnapshotOps(AsyncMaterializedPredSnapshotOps{
@@ -701,8 +749,9 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 			}
 			return 0
 		},
-		PinBySeq: registry.PinBySeq,
-		Unpin:    registry.Unpin,
+		PinCurrentBySeq: func(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {
+			return registry.PinBySeq(seq)
+		},
 	})
 	return &testDB{
 		rt:       rt,

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"slices"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -32,60 +31,7 @@ func (op Op) String() string {
 	}
 }
 
-func opName(op Op, reqLen int, atomicAll bool, maxOps int) string {
-	if reqLen == 0 {
-		return "batch"
-	}
-	if !atomicAll {
-		if reqLen != 1 || maxOps > 1 {
-			return "batch"
-		}
-		switch op {
-		case opSet:
-			return "set"
-		case opPatch:
-			return "patch"
-		case opDelete:
-			return "delete"
-		default:
-			return "batch"
-		}
-	}
-	if reqLen == 1 {
-		switch op {
-		case opSet:
-			return "set"
-		case opPatch:
-			return "patch"
-		case opDelete:
-			return "delete"
-		default:
-			return "batch"
-		}
-	}
-	switch op {
-	case opSet:
-		return "batch_set"
-	case opPatch:
-		return "batch_patch"
-	case opDelete:
-		return "batch_delete"
-	default:
-		return "batch"
-	}
-}
-
-type reqPolicy uint8
-
-const (
-	reqRepeatIDSafeShared reqPolicy = 1 << iota
-	reqSetDeleteCoalescible
-)
-
-var (
-	errEmptyPayload = errors.New("empty msgpack payload")
-	errUnknownOp    = errors.New("unknown auto-batch op")
-)
+var errEmptyPayload = errors.New("empty msgpack payload")
 
 const stringValuePrefixLen = 8
 
@@ -93,7 +39,6 @@ type request struct {
 	op Op
 	id keycodec.DataKey
 
-	setValue    unsafe.Pointer
 	setBaseline unsafe.Pointer
 	setPayload  *bytes.Buffer
 	payloadOff  uint8
@@ -101,158 +46,116 @@ type request struct {
 	patch []schema.PatchItem
 
 	patchIgnoreUnknown bool
+	generationDepth    uint8
 
-	beforeProcess []BeforeProcessHook
-	beforeStore   []BeforeStoreHook
-	beforeCommit  []BeforeCommitHook
-	cloneValue    CloneFunc
-	policy        reqPolicy
+	onChange   []OnChangeHook
+	cloneValue CloneFunc
 
-	replacedBy *request
-
-	Err  error
-	Done chan error
-}
-
-type writeJob struct {
-	reqs       []*request
-	isolated   bool
-	done       chan error
-	enqueuedAt int64
+	Err error
 }
 
 type Batch struct {
-	ex   *Batcher
-	reqs []*request
-	n    int
+	ex    *Executor
+	reqs  []request
+	hooks bool
 }
 
-func (b *Batcher) NewBatch(capHint int) Batch {
-	reqs := requestScratchPool.Get(capHint)[:capHint]
+func (b *Executor) NewBatch() Batch {
+	reqs := requestScratchPool.Get(64)
 	return Batch{
 		ex:   b,
 		reqs: reqs,
 	}
 }
 
-func (batch *Batch) AddSet(key keycodec.DataKey, newVal unsafe.Pointer, beforeStore []BeforeStoreHook, beforeCommit []BeforeCommitHook, cloneValue CloneFunc) error {
-	req, err := batch.ex.buildSetRequest(key, newVal, beforeStore, beforeCommit, cloneValue)
+func (batch *Batch) AddSet(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, cloneValue CloneFunc, depth uint8) error {
+	req, err := batch.ex.buildSetRequest(key, newVal, onChange, cloneValue, depth)
 	if err != nil {
 		return err
 	}
-	batch.reqs[batch.n] = req
-	batch.n++
+	if len(onChange) != 0 {
+		batch.hooks = true
+	}
+	batch.reqs = append(batch.reqs, req)
 	return nil
 }
 
-func (batch *Batch) AddPatch(key keycodec.DataKey, patch []schema.PatchItem, ignoreUnknown bool, beforeProcess []BeforeProcessHook, beforeStore []BeforeStoreHook, beforeCommit []BeforeCommitHook) {
-	batch.reqs[batch.n] = batch.ex.buildPatchRequest(key, patch, ignoreUnknown, beforeProcess, beforeStore, beforeCommit)
-	batch.n++
+// AddPatch takes ownership of patch until the request is released.
+func (batch *Batch) AddPatch(key keycodec.DataKey, patch []schema.PatchItem, ignoreUnknown bool, onChange []OnChangeHook, depth uint8) {
+	if len(onChange) != 0 {
+		batch.hooks = true
+	}
+	batch.reqs = append(batch.reqs, batch.ex.buildPatchRequest(key, patch, ignoreUnknown, onChange, depth))
 }
 
-func (batch *Batch) AddDelete(key keycodec.DataKey, beforeCommit []BeforeCommitHook) {
-	batch.reqs[batch.n] = batch.ex.buildDeleteRequest(key, beforeCommit)
-	batch.n++
+func (batch *Batch) AddDelete(key keycodec.DataKey, onChange []OnChangeHook, depth uint8) {
+	if len(onChange) != 0 {
+		batch.hooks = true
+	}
+	batch.reqs = append(batch.reqs, batch.ex.buildDeleteRequest(key, onChange, depth))
 }
 
-func (batch *Batch) Submit(isolated bool) error {
-	reqs := batch.reqs[:batch.n]
-	batch.reqs = nil
-	batch.n = 0
-	err := batch.ex.submit(reqs, isolated)
-	requestScratchPool.Put(reqs)
-	return err
+func (batch *Batch) HasOnChange() bool {
+	return batch.hooks
 }
 
 func (batch *Batch) Cancel() {
-	reqs := batch.reqs[:batch.n]
+	reqs := batch.reqs
 	batch.reqs = nil
-	batch.n = 0
+	batch.hooks = false
 	for i := 0; i < len(reqs); i++ {
-		batch.ex.releaseRequest(reqs[i])
+		batch.ex.releaseRequest(&reqs[i])
 	}
 	requestScratchPool.Put(reqs)
 }
 
-func (b *Batcher) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, beforeStore []BeforeStoreHook, beforeCommit []BeforeCommitHook, cloneValue CloneFunc) (*request, error) {
-	req := requestPool.Get()
+func (b *Executor) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, cloneValue CloneFunc, depth uint8) (request, error) {
+	var req request
 	req.op = opSet
 	req.id = key
-	req.beforeStore = beforeStore
-	req.beforeCommit = beforeCommit
+	req.onChange = onChange
 	req.cloneValue = cloneValue
-	if len(beforeStore) > 0 && cloneValue != nil {
+	req.generationDepth = depth
+	if len(onChange) != 0 && cloneValue != nil {
 		var err error
 		if req.setBaseline, err = cloneValue(req.id, newVal); err != nil {
-			requestPool.Put(req)
-			return nil, err
+			return request{}, err
 		}
 	} else {
 		buf := encodePool.Get()
 		req.payloadOff = reserveStringValuePrefix(buf, b.strKey)
 		if err := b.ops.Encode(newVal, buf); err != nil {
 			encodePool.Put(buf)
-			requestPool.Put(req)
-			return nil, formatPrepareErr(prepareErrEncode, err)
+			return request{}, formatPrepareErr(prepareErrEncode, err)
 		}
 		if b.rejectEmptyPayload && buf.Len() == int(req.payloadOff) {
 			encodePool.Put(buf)
-			requestPool.Put(req)
-			return nil, formatPrepareErr(prepareErrEncode, errEmptyPayload)
+			return request{}, formatPrepareErr(prepareErrEncode, errEmptyPayload)
 		}
-		req.setValue = newVal
 		req.setPayload = buf
-	}
-	if len(beforeStore) == 0 && len(beforeCommit) == 0 && !b.indexed {
-		req.policy = reqSetDeleteCoalescible
 	}
 	return req, nil
 }
 
-func (b *Batcher) buildPatchRequest(key keycodec.DataKey, patch []schema.PatchItem, ignoreUnknown bool, beforeProcess []BeforeProcessHook, beforeStore []BeforeStoreHook, beforeCommit []BeforeCommitHook) *request {
-	req := requestPool.Get()
+// buildPatchRequest takes ownership of patch until releaseRequest.
+func (b *Executor) buildPatchRequest(key keycodec.DataKey, patch []schema.PatchItem, ignoreUnknown bool, onChange []OnChangeHook, depth uint8) request {
+	var req request
 	req.op = opPatch
 	req.id = key
-	if cap(req.patch) < len(patch) {
-		req.patch = slices.Grow(req.patch, len(patch))
-	}
-	req.patch = req.patch[:len(patch)]
-	copy(req.patch, patch)
-
+	req.generationDepth = depth
+	req.patch = patch
 	req.patchIgnoreUnknown = ignoreUnknown
-	req.beforeProcess = beforeProcess
-	req.beforeStore = beforeStore
-	req.beforeCommit = beforeCommit
+	req.onChange = onChange
 
-	rt := b.schema
-
-	if !b.indexed || !rt.HasUnique {
-		req.policy = reqRepeatIDSafeShared
-
-	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 {
-		touchesUnique := false
-		for i := range patch {
-			if rt.PatchNameTouchesUnique(patch[i].Name) {
-				touchesUnique = true
-				break
-			}
-		}
-		if !touchesUnique {
-			req.policy = reqRepeatIDSafeShared
-		}
-	}
 	return req
 }
 
-func (b *Batcher) buildDeleteRequest(key keycodec.DataKey, beforeCommit []BeforeCommitHook) *request {
-	req := requestPool.Get()
+func (b *Executor) buildDeleteRequest(key keycodec.DataKey, onChange []OnChangeHook, depth uint8) request {
+	var req request
 	req.op = opDelete
 	req.id = key
-	req.beforeCommit = beforeCommit
-	req.policy = reqRepeatIDSafeShared
-	if len(beforeCommit) == 0 && !b.strKey && !b.indexed {
-		req.policy |= reqSetDeleteCoalescible
-	}
+	req.generationDepth = depth
+	req.onChange = onChange
 	return req
 }
 
@@ -263,77 +166,33 @@ func (req *request) payloadBytes() []byte {
 	return req.setPayload.Bytes()[req.payloadOff:]
 }
 
-func (b *Batcher) releaseRequest(req *request) {
+func (b *Executor) releaseRequest(req *request) {
 	if req.setBaseline != nil {
 		b.ops.Release(req.setBaseline)
 		req.setBaseline = nil
 	}
-	requestPool.Put(req)
-}
-
-func (req *request) hasPolicy(policy reqPolicy) bool {
-	return req.policy&policy != 0
-}
-
-func (req *request) canCoalesceSetDelete() bool {
-	return req.replacedBy == nil && req.hasPolicy(reqSetDeleteCoalescible)
-}
-
-func (req *request) canShareRepeatedID() bool {
-	return req.replacedBy == nil && req.hasPolicy(reqRepeatIDSafeShared)
-}
-
-func assignRequestErr(reqs []*request, err error) {
-	for i := 0; i < len(reqs); i++ {
-		req := reqs[i]
-		if req.Err == nil {
-			req.Err = err
-		}
+	if req.setPayload != nil {
+		encodePool.Put(req.setPayload)
+		req.setPayload = nil
 	}
+	req.payloadOff = 0
+	schema.ReleasePatchItemSlice(req.patch)
+	req.patch = nil
+	req.patchIgnoreUnknown = false
+	req.generationDepth = 0
+	req.onChange = nil
+	req.cloneValue = nil
+	req.op = 0
+	req.id = keycodec.DataKey{}
+	req.Err = nil
 }
 
-func firstRequestErr(reqs []*request) error {
+func firstRequestErr(reqs []request) error {
 	for i := 0; i < len(reqs); i++ {
-		req := reqs[i]
+		req := &reqs[i]
 		if req.Err != nil {
 			return req.Err
 		}
 	}
 	return nil
-}
-
-func resolveRequestErrs(reqs []*request) {
-	for i := 0; i < len(reqs); i++ {
-		req := reqs[i]
-		if req.replacedBy == nil {
-			continue
-		}
-		target := req.replacedBy
-		for target.replacedBy != nil {
-			target = target.replacedBy
-		}
-		req.Err = target.Err
-	}
-}
-
-func finishJobs(batch []*writeJob) {
-	for _, job := range batch {
-		resolveRequestErrs(job.reqs)
-	}
-	for _, job := range batch {
-		var err error
-		if len(job.reqs) == 1 {
-			err = job.reqs[0].Err
-		} else {
-			err = firstRequestErr(job.reqs)
-		}
-		job.done <- err
-	}
-}
-
-func failJobs(batch []*writeJob, err error) {
-	for _, job := range batch {
-		assignRequestErr(job.reqs, err)
-	}
-	finishJobs(batch)
 }

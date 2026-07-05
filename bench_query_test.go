@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
 )
 
@@ -37,10 +38,64 @@ type UserBench struct {
 	Blob    []byte   `db:"-"       rbi:"-"`
 }
 
+type queryIRBenchResolver struct{}
+
+func (queryIRBenchResolver) ResolveField(name string) (qir.FieldInfo, bool) {
+	switch name {
+	case "id":
+		return qir.FieldInfo{Ordinal: 0, Caps: qir.FieldCapAll}, true
+	case "country":
+		return qir.FieldInfo{Ordinal: 1, Caps: qir.FieldCapAll}, true
+	case "plan":
+		return qir.FieldInfo{Ordinal: 2, Caps: qir.FieldCapAll}, true
+	case "status":
+		return qir.FieldInfo{Ordinal: 3, Caps: qir.FieldCapAll}, true
+	case "age":
+		return qir.FieldInfo{Ordinal: 4, Caps: qir.FieldCapAll}, true
+	case "score":
+		return qir.FieldInfo{Ordinal: 5, Caps: qir.FieldCapAll}, true
+	case "name":
+		return qir.FieldInfo{Ordinal: 6, Caps: qir.FieldCapAll}, true
+	case "email":
+		return qir.FieldInfo{Ordinal: 7, Caps: qir.FieldCapAll}, true
+	case "tags":
+		return qir.FieldInfo{Ordinal: 8, Caps: qir.FieldCapAll}, true
+	case "roles":
+		return qir.FieldInfo{Ordinal: 9, Caps: qir.FieldCapAll}, true
+	}
+	return qir.FieldInfo{Ordinal: qir.NoFieldOrdinal}, false
+}
+
 const (
 	benchN     = 500_000
 	benchBatch = 100_000
 )
+
+var benchQueryIRSink int
+
+func Benchmark_Query_IR_PrepareAverageQuery(b *testing.B) {
+	q := qx.Query(
+		qx.EQ("status", "active"),
+		qx.IN("country", []string{"US", "DE", "NL"}),
+		qx.GTE("age", 25),
+		qx.LT("age", 55),
+		qx.HASANY("tags", []string{"go", "ops"}),
+	).Sort("score", qx.DESC).Limit(100)
+
+	resolver := queryIRBenchResolver{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		prepared, err := qir.PrepareQuery(q, resolver)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchQueryIRSink += int(prepared.Expr.Op) + int(prepared.Limit)
+		prepared.Release()
+	}
+}
 
 func benchOptions() Options {
 	return testOptions(Options{
@@ -49,22 +104,22 @@ func benchOptions() Options {
 	})
 }
 
-func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openBenchDB(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-*")
 	if err != nil {
 		b.Fatalf("os.MkdirTemp: %v", err)
 	}
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions())
-	return db, raw, dir
+	c, bolt := openBoltAndCollection[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions())
+	return c, bolt, dir
 }
 
-func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
+func seedBenchData(tb testing.TB, c *Collection[uint64, UserBench], n int) {
 	tb.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	r := newRand(1)
 
@@ -98,8 +153,8 @@ func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			tb.Fatalf("BatchSet(seed): %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			tb.Fatalf("MultiSet(seed): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -136,7 +191,7 @@ func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
 }
 
 type cachedBenchUserDB struct {
-	db  *DB[uint64, UserBench]
+	clc *Collection[uint64, UserBench]
 	raw *bbolt.DB
 	dir string
 }
@@ -150,26 +205,26 @@ func benchDBFamilyKey(n int) string {
 	return "user_uint64/" + strconv.Itoa(n)
 }
 
-func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
-	return buildBenchDBWithMode(b, n, benchCacheModes[0])
+func buildBenchCollection(b *testing.B, n int) *Collection[uint64, UserBench] {
+	return buildBenchCollectionWithMode(b, n, benchCacheModes[0])
 }
 
-func buildBenchDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
+func buildBenchCollectionWithMode(b *testing.B, n int, mode benchCacheMode) *Collection[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
 
 	key := benchDBFamilyKey(n)
-	if cached := benchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
-		return cached.db
+	if cached := benchDBs[key]; cached != nil && cached.clc != nil && cached.clc.state.Load()&collectionClosed == 0 {
+		return cached.clc
 	}
 
-	db, raw, dir := openBenchDB(b)
+	c, bolt, dir := openBenchDB(b)
 
 	b.StopTimer()
-	seedBenchData(b, db, n)
+	seedBenchData(b, c, n)
 
-	// s := db.Stats()
+	// s := c.Stats()
 	// b.Logf("total size: %v", s.IndexSize)
 	// b.Logf("index size: %v", s.IndexFieldSize)
 	// b.Logf("index build rps: %v", s.IndexBuildRPS)
@@ -178,57 +233,57 @@ func buildBenchDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, 
 	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
 
 	b.StartTimer()
-	benchDBs[key] = &cachedBenchUserDB{db: db, raw: raw, dir: dir}
+	benchDBs[key] = &cachedBenchUserDB{clc: c, raw: bolt, dir: dir}
 	registerBenchSuiteCleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		_ = os.RemoveAll(dir)
 	})
-	return db
+	return c
 }
 
-func warmBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func warmBenchCountOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchCountOnceUint64(b, db, q)
+	runBenchCountOnceUint64(b, c, q)
 }
 
-func runBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func runBenchCountOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
-	if _, err := db.Count(q.Filter); err != nil {
+	if _, err := readCount(c, q.Filter); err != nil {
 		b.Fatal(err)
 	}
 }
 
-func warmBenchQueryKeysOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func warmBenchQueryKeysOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchQueryKeysOnceUint64(b, db, q)
+	runBenchQueryKeysOnceUint64(b, c, q)
 }
 
-func runBenchQueryKeysOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func runBenchQueryKeysOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
-	if _, err := db.QueryKeys(q); err != nil {
+	if _, err := readIndexQueryKeys(c, q); err != nil {
 		b.Fatal(err)
 	}
 }
 
-func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func warmBenchReadQueryOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchReadQueryOnceUint64(b, db, q)
+	runBenchReadQueryOnceUint64(b, c, q)
 }
 
-func runBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func runBenchReadQueryOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
-	items, err := db.Query(q)
+	items, err := readQuery(c, q)
 	if err != nil {
 		b.Fatal(err)
 	}
-	db.ReleaseRecords(items...)
+	c.ReleaseRecords(items...)
 }
 
 func runBenchCacheModes(b *testing.B, fn func(*testing.B, benchCacheMode)) {
@@ -244,55 +299,55 @@ func runBenchCacheModes(b *testing.B, fn func(*testing.B, benchCacheMode)) {
 func runCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithMode(b, benchN, mode)
-		runCountBenchWithMode(b, db, qf(), mode)
+		c := buildBenchCollectionWithMode(b, benchN, mode)
+		runCountBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func runQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithMode(b, benchN, mode)
-		runQueryKeysBenchWithMode(b, db, qf(), mode)
+		c := buildBenchCollectionWithMode(b, benchN, mode)
+		runQueryKeysBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func runReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithMode(b, benchN, mode)
-		runReadQueryBenchWithMode(b, db, qf(), mode)
+		c := buildBenchCollectionWithMode(b, benchN, mode)
+		runReadQueryBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func Benchmark_Query_Index_Count_Simple_EQ_Count(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.EQ("country", "NL"))
-	runCountBench(b, db, q)
+	runCountBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Count_Simple_IN_Count(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.IN("country", []string{"NL", "DE", "PL"}))
-	runCountBench(b, db, q)
+	runCountBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Count_Simple_HASANY_Count(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.HASANY("roles", []string{"admin", "moderator"}))
-	runCountBench(b, db, q)
+	runCountBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Count_Simple_HASALL_Count(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.HASALL("tags", []string{"go", "db"}))
-	runCountBench(b, db, q)
+	runCountBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Count_Simple_NOTIN_Count(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.NOTIN("status", []string{"banned"}))
-	runCountBench(b, db, q)
+	runCountBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Count_Realistic_FeedEligible(b *testing.B) {
@@ -434,15 +489,15 @@ func Benchmark_Query_Index_Count_Gap_HeavyOR_MultiBranch(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Simple_First100(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query().Limit(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Limit(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Heavy_Range_Order_Limit(b *testing.B) {
@@ -494,14 +549,14 @@ func Benchmark_Query_Index_Keys_Heavy_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_DashboardFilter_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	// SELECT * FROM users WHERE status='active' AND plan='enterprise' AND country='US' LIMIT 100
 	q := qx.Query(
 		qx.EQ("status", "active"),
 		qx.EQ("plan", "enterprise"),
 		qx.EQ("country", "US"),
 	).Limit(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing.B) {
@@ -515,45 +570,45 @@ func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing
 }
 
 func Benchmark_Query_Index_Keys_Realistic_LeaderBoard(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query().Sort("score", qx.DESC).Limit(10)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Permissions_HasAny_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
 	q := qx.Query(
 		qx.HASANY("roles", []string{"admin", "moderator"}),
 	).Limit(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Permissions_HasAny_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
 	q := qx.Query(
 		qx.HASANY("roles", []string{"admin", "moderator"}),
 	)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
 		qx.HASALL("tags", []string{"go", "db"}),
 	).Limit(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
 		qx.HASALL("tags", []string{"go", "db"}),
 	)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Exclusion_Limit(b *testing.B) {
@@ -579,9 +634,9 @@ func Benchmark_Query_Index_Keys_Realistic_Exclusion_All(b *testing.B) {
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
 	// This prefix-only microbenchmark is sensitive to cache-mode turnover
 	// overhead; keep it single-mode so Cold rotation does not dominate runtime.
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.PREFIX("email", "user10")).Limit(10)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Order_Limit(b *testing.B) {
@@ -652,18 +707,18 @@ func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	b.ReportAllocs()
 
 	q := qx.Query(
 		qx.EQ("status", "active"),
 	).Sort("age", qx.ASC).Limit(20)
 
-	prepareReadBenchSnapshot(b, db)
-	warmBenchQueryKeysOnceUint64(b, db, q)
+	prepareReadBenchSnapshot(b, c)
+	warmBenchQueryKeysOnceUint64(b, c, q)
 	b.ResetTimer()
 	for b.Loop() {
-		ids, err := db.QueryKeys(q)
+		ids, err := readIndexQueryKeys(c, q)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -682,38 +737,38 @@ func Benchmark_Query_Index_Keys_Sort_DeepOffset_Limit(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Sort_Complex_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(
 		qx.EQ("country", "DE"),
 		qx.HASANY("tags", []string{"rust", "go"}),
 	).Sort("age", qx.DESC).Limit(50)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	priority := []string{"enterprise", "pro", "basic", "free"}
 	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.POS("plan", priority), qx.ASC).Limit(50)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	priority := []string{"enterprise", "pro", "basic", "free"}
 	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.POS("plan", priority), qx.ASC)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.LEN("roles"), qx.DESC).Limit(50)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
+	c := buildBenchCollection(b, benchN)
 	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.LEN("roles"), qx.DESC)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBench(b, c, q)
 }
 
 func Benchmark_Query_Index_Keys_Gap_FacetedSearch_OR_Order_Offset_Limit(b *testing.B) {
@@ -828,16 +883,16 @@ func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *
 	})
 }
 
-func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
-	runQueryKeysBenchWithMode(b, db, q, benchCacheModes[0])
+func runQueryKeysBench(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
+	runQueryKeysBenchWithMode(b, c, q, benchCacheModes[0])
 }
 
-func runQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
+func runQueryKeysBenchWithMode(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchQueryKeysOnceUint64,
@@ -845,21 +900,21 @@ func runQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX
 		buildUserBenchTurnoverRingUint64,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchQueryKeysOnceUint64(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchQueryKeysOnceUint64(b, c, q)
 	}
 }
 
-func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
-	runCountBenchWithMode(b, db, q, benchCacheModes[0])
+func runCountBench(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
+	runCountBenchWithMode(b, c, q, benchCacheModes[0])
 }
 
-func runCountBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
+func runCountBenchWithMode(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchCountOnceUint64,
@@ -867,21 +922,21 @@ func runCountBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mo
 		buildUserBenchTurnoverRingUint64,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchCountOnceUint64(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchCountOnceUint64(b, c, q)
 	}
 }
 
-func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
-	runReadQueryBenchWithMode(b, db, q, benchCacheModes[0])
+func runReadQueryBench(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
+	runReadQueryBenchWithMode(b, c, q, benchCacheModes[0])
 }
 
-func runReadQueryBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
+func runReadQueryBenchWithMode(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchReadQueryOnceUint64,
@@ -889,8 +944,8 @@ func runReadQueryBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX
 		buildUserBenchTurnoverRingUint64,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchReadQueryOnceUint64(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchReadQueryOnceUint64(b, c, q)
 	}
 }
 
@@ -900,17 +955,17 @@ func sortedIDs(in []uint64) []uint64 {
 	return out
 }
 
-func Benchmark_Query_UniqueEQ(b *testing.B) {
-	db := openBenchDBUint64Unique(b, 20_000)
+func Benchmark_Query_Index_Keys_UniqueEQ(b *testing.B) {
+	c := openBenchUint64CollectionUnique(b, 20_000)
 	q := qx.Query(qx.EQ("email", "u010000@example.com"))
 
 	b.ReportAllocs()
-	if _, err := db.QueryKeys(q); err != nil {
+	if _, err := readIndexQueryKeys(c, q); err != nil {
 		b.Fatal(err)
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		ids, err := db.QueryKeys(q)
+		ids, err := readIndexQueryKeys(c, q)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -920,16 +975,16 @@ func Benchmark_Query_UniqueEQ(b *testing.B) {
 	}
 }
 
-func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
+func openBenchUint64CollectionUnique(b *testing.B, n int) *Collection[uint64, UniqueTestRec] {
 	b.Helper()
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_unique.db")
 
-	db, raw := openBoltAndNew[uint64, UniqueTestRec](b, path)
-	db.disableSync()
+	c, bolt := openBoltAndCollection[uint64, UniqueTestRec](b, path)
+	c.disableSync()
 	b.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
 
 	ids := make([]uint64, 0, 1000)
@@ -938,8 +993,8 @@ func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet: %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			b.Fatalf("MultiSet: %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -956,7 +1011,7 @@ func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
 		}
 	}
 	flush()
-	return db
+	return c
 }
 
 type dynamicBenchDistribution int
@@ -1093,11 +1148,11 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 }
 
 var (
-	dynamicBenchMu  sync.Mutex
-	dynamicBenchDBs = make(map[string]*cachedDynamicBenchDB)
+	dynamicBenchMu          sync.Mutex
+	dynamicBenchCollections = make(map[string]*cachedDynamicBenchDB)
 )
 
-func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openDynamicBenchCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-dynamic-*")
 	if err != nil {
@@ -1107,12 +1162,12 @@ func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string
 
 	opts := benchOptions()
 	opts.AnalyzeInterval = -1
-	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
-	return db, raw, path
+	c, bolt := openBoltAndCollection[uint64, UserBench](b, path, opts)
+	return c, bolt, path
 }
 
 type cachedDynamicBenchDB struct {
-	db   *DB[uint64, UserBench]
+	clc  *Collection[uint64, UserBench]
 	raw  *bbolt.DB
 	path string
 }
@@ -1129,28 +1184,28 @@ func dynamicBenchProfileCacheKey(profile dynamicBenchProfile) string {
 	)
 }
 
-func buildBenchDBDynamicProfileWithMode(b *testing.B, profile dynamicBenchProfile, mode benchCacheMode) *DB[uint64, UserBench] {
+func buildBenchCollectionDynamicProfileWithMode(b *testing.B, profile dynamicBenchProfile, mode benchCacheMode) *Collection[uint64, UserBench] {
 	b.Helper()
 	dynamicBenchMu.Lock()
 	defer dynamicBenchMu.Unlock()
 
 	key := dynamicBenchProfileCacheKey(profile)
-	if cached := dynamicBenchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
-		return cached.db
+	if cached := dynamicBenchCollections[key]; cached != nil && cached.clc != nil && cached.clc.state.Load()&collectionClosed == 0 {
+		return cached.clc
 	}
 
-	db, raw, path := openDynamicBenchDB(b)
+	c, bolt, path := openDynamicBenchCollection(b)
 
 	b.StopTimer()
-	seedBenchDataDynamicProfile(b, db, profile)
+	seedBenchDataDynamicProfile(b, c, profile)
 	b.StartTimer()
-	dynamicBenchDBs[key] = &cachedDynamicBenchDB{db: db, raw: raw, path: path}
+	dynamicBenchCollections[key] = &cachedDynamicBenchDB{clc: c, raw: bolt, path: path}
 	registerBenchSuiteCleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		_ = os.RemoveAll(filepath.Dir(path))
 	})
-	return db
+	return c
 }
 
 func pickIndexByDistribution(r *rand.Rand, n int, z *rand.Zipf) int {
@@ -1190,11 +1245,11 @@ func scoreForDynamicProfile(r *rand.Rand, i int, p dynamicBenchProfile, scoreZip
 	}
 }
 
-func seedBenchDataDynamicProfile(tb testing.TB, db *DB[uint64, UserBench], profile dynamicBenchProfile) {
+func seedBenchDataDynamicProfile(tb testing.TB, c *Collection[uint64, UserBench], profile dynamicBenchProfile) {
 	tb.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	r := newRand(profile.seed)
 
@@ -1248,8 +1303,8 @@ func seedBenchDataDynamicProfile(tb testing.TB, db *DB[uint64, UserBench], profi
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			tb.Fatalf("BatchSet(seed dynamic): %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			tb.Fatalf("MultiSet(seed dynamic): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -1294,13 +1349,13 @@ func seedBenchDataDynamicProfile(tb testing.TB, db *DB[uint64, UserBench], profi
 func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
 		for _, profile := range dynamicBenchProfiles {
-			profile := profile
-			b.Run(profile.name, func(b *testing.B) {
-				db := buildBenchDBDynamicProfileWithMode(b, profile, mode)
+			p := profile
+			b.Run(p.name, func(b *testing.B) {
+				c := buildBenchCollectionDynamicProfileWithMode(b, p, mode)
 				for _, qc := range dynamicBenchQueries {
-					qc := qc
-					b.Run(qc.name, func(b *testing.B) {
-						runQueryKeysBenchWithMode(b, db, qc.query(), mode)
+					q := qc
+					b.Run(q.name, func(b *testing.B) {
+						runQueryKeysBenchWithMode(b, c, q.query(), mode)
 					})
 				}
 			})
@@ -1344,18 +1399,18 @@ var (
 	benchStressAllRoles = []string{"member", "trusted", "moderator", "admin", "staff", "bot"}
 )
 
-func openBenchStressDB(b *testing.B) (*DB[uint64, StressBenchUser], *bbolt.DB, string) {
+func openBenchStressCollection(b *testing.B) (*Collection[uint64, StressBenchUser], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-stress-*")
 	if err != nil {
 		b.Fatalf("os.MkdirTemp: %v", err)
 	}
-	db, raw := openBoltAndNew[uint64, StressBenchUser](b, filepath.Join(dir, "bench_stress.db"), benchOptions())
-	return db, raw, dir
+	c, bolt := openBoltAndCollection[uint64, StressBenchUser](b, filepath.Join(dir, "bench_stress.db"), benchOptions())
+	return c, bolt, dir
 }
 
 type cachedBenchStressDB struct {
-	db  *DB[uint64, StressBenchUser]
+	clc *Collection[uint64, StressBenchUser]
 	raw *bbolt.DB
 	dir string
 }
@@ -1369,34 +1424,34 @@ func benchStressDBFamilyKey(n int) string {
 	return "stress_uint64/" + strconv.Itoa(n)
 }
 
-func buildBenchStressDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, StressBenchUser] {
+func buildBenchStressCollectionWithMode(b *testing.B, n int, mode benchCacheMode) *Collection[uint64, StressBenchUser] {
 	b.Helper()
 	benchStressMu.Lock()
 	defer benchStressMu.Unlock()
 
 	key := benchStressDBFamilyKey(n)
-	if cached := benchStressDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
-		return cached.db
+	if cached := benchStressDBs[key]; cached != nil && cached.clc != nil && cached.clc.state.Load()&collectionClosed == 0 {
+		return cached.clc
 	}
 
-	db, raw, dir := openBenchStressDB(b)
+	c, bolt, dir := openBenchStressCollection(b)
 	b.StopTimer()
-	seedBenchStressData(b, db, n)
+	seedBenchStressData(b, c, n)
 	b.StartTimer()
-	benchStressDBs[key] = &cachedBenchStressDB{db: db, raw: raw, dir: dir}
+	benchStressDBs[key] = &cachedBenchStressDB{clc: c, raw: bolt, dir: dir}
 	registerBenchSuiteCleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		_ = os.RemoveAll(dir)
 	})
-	return db
+	return c
 }
 
-func seedBenchStressData(tb testing.TB, db *DB[uint64, StressBenchUser], n int) {
+func seedBenchStressData(tb testing.TB, c *Collection[uint64, StressBenchUser], n int) {
 	tb.Helper()
 
-	db.disableSync()
-	defer db.enableSync()
+	c.disableSync()
+	defer c.enableSync()
 
 	rng := newRand(17)
 	namePrefixes := []string{"u_", "user_", "dev_", "mod_", "news_", "anon_"}
@@ -1408,8 +1463,8 @@ func seedBenchStressData(tb testing.TB, db *DB[uint64, StressBenchUser], n int) 
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.BatchSet(ids, vals); err != nil {
-			tb.Fatalf("BatchSet(seed stress): %v", err)
+		if err := writeSets(c, ids, vals); err != nil {
+			tb.Fatalf("MultiSet(seed stress): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -1567,40 +1622,40 @@ func benchStressPickRoles(rng *rand.Rand) []string {
 	return out
 }
 
-func warmBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+func warmBenchCountOnceStress(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchCountOnceStress(b, db, q)
+	runBenchCountOnceStress(b, c, q)
 }
 
-func runBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+func runBenchCountOnceStress(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX) {
 	b.Helper()
-	if _, err := db.Count(q.Filter); err != nil {
+	if _, err := readCount(c, q.Filter); err != nil {
 		b.Fatal(err)
 	}
 }
 
-func warmBenchQueryKeysOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+func warmBenchQueryKeysOnceStress(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchQueryKeysOnceStress(b, db, q)
+	runBenchQueryKeysOnceStress(b, c, q)
 }
 
-func runBenchQueryKeysOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+func runBenchQueryKeysOnceStress(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX) {
 	b.Helper()
-	if _, err := db.QueryKeys(q); err != nil {
+	if _, err := readIndexQueryKeys(c, q); err != nil {
 		b.Fatal(err)
 	}
 }
 
-func runStressCountBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
+func runStressCountBenchWithMode(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchCountOnceStress,
@@ -1608,17 +1663,17 @@ func runStressCountBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], 
 		buildStressBenchTurnoverRing,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchCountOnceStress(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchCountOnceStress(b, c, q)
 	}
 }
 
-func runStressQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
+func runStressQueryKeysBenchWithMode(b *testing.B, c *Collection[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchQueryKeysOnceStress,
@@ -1626,24 +1681,24 @@ func runStressQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUse
 		buildStressBenchTurnoverRing,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchQueryKeysOnceStress(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchQueryKeysOnceStress(b, c, q)
 	}
 }
 
 func runStressCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithMode(b, benchStressN, mode)
-		runStressCountBenchWithMode(b, db, qf(), mode)
+		c := buildBenchStressCollectionWithMode(b, benchStressN, mode)
+		runStressCountBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func runStressQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithMode(b, benchStressN, mode)
-		runStressQueryKeysBenchWithMode(b, db, qf(), mode)
+		c := buildBenchStressCollectionWithMode(b, benchStressN, mode)
+		runStressQueryKeysBenchWithMode(b, c, qf(), mode)
 	})
 }
 

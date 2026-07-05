@@ -7,6 +7,20 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 )
 
+type RuntimeCachesRetired struct {
+	matPred      qcache.MaterializedPredRetired
+	numericRange qcache.NumericRangeBucketRetired
+}
+
+func (r RuntimeCachesRetired) Release() {
+	r.matPred.Release()
+	r.numericRange.Release()
+}
+
+func (r RuntimeCachesRetired) Empty() bool {
+	return r.matPred.IsEmpty() && r.numericRange.IsEmpty()
+}
+
 func inheritNumericRangeBucketCache(next, prev *View) {
 	if prev == nil || next.numericRangeBucketCache == nil || prev.numericRangeBucketCache == nil {
 		return
@@ -15,9 +29,19 @@ func inheritNumericRangeBucketCache(next, prev *View) {
 }
 
 func (v *View) initRuntimeCaches(s *schema.Schema, cfg CacheConfig) {
-	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(len(s.Indexed), cfg.MatPredMaxCard)
+	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCacheWithRetireContext(
+		len(s.Indexed),
+		cfg.MatPredMaxCard,
+		cfg.RuntimeCachesDirtyOwner,
+		cfg.RuntimeCachesRetireEpoch,
+	)
 	if cfg.MatPredMaxEntries > 0 {
-		v.matPredCache = qcache.GetMaterializedPredCache(cfg.MatPredMaxEntries, cfg.MatPredMaxCard)
+		v.matPredCache = qcache.GetMaterializedPredCacheWithRetireContext(
+			cfg.MatPredMaxEntries,
+			cfg.MatPredMaxCard,
+			cfg.RuntimeCachesDirtyOwner,
+			cfg.RuntimeCachesRetireEpoch,
+		)
 	}
 }
 
@@ -214,12 +238,7 @@ func (v *View) RuntimeMaterializedPredSeenEntryCount() int {
 }
 
 func (v *View) drainRetiredRuntimeCaches() {
-	if v.numericRangeBucketCache != nil {
-		v.numericRangeBucketCache.DrainRetired()
-	}
-	if v.matPredCache != nil {
-		v.matPredCache.DrainRetired()
-	}
+	v.TakeRetiredRuntimeCaches().Release()
 }
 
 func (v *View) releaseRuntimeCaches() {
@@ -234,6 +253,28 @@ func (v *View) releaseRuntimeCaches() {
 	v.runtimeMatPredSeen.Clear()
 	v.runtimeMatPredObserved.Clear()
 	v.runtimeMatPredDirty.Clear()
+}
+
+func (v *View) RuntimeCachesDirty() bool {
+	return (v.matPredCache != nil && v.matPredCache.RetiredDirty()) ||
+		(v.numericRangeBucketCache != nil && v.numericRangeBucketCache.RetiredDirty())
+}
+
+func (v *View) TakeRetiredRuntimeCaches() RuntimeCachesRetired {
+	return v.TakeRetiredRuntimeCachesBefore(^uint64(0))
+}
+
+func (v *View) TakeRetiredRuntimeCachesBefore(safeEpoch uint64) RuntimeCachesRetired {
+	var retired RuntimeCachesRetired
+	// The root registry supplies safeEpoch after retaining current read states;
+	// caches detach only payloads older than that reader barrier.
+	if v.matPredCache != nil && v.matPredCache.RetiredDirty() {
+		retired.matPred = v.matPredCache.TakeRetiredBefore(safeEpoch)
+	}
+	if v.numericRangeBucketCache != nil && v.numericRangeBucketCache.RetiredDirty() {
+		retired.numericRange = v.numericRangeBucketCache.TakeRetiredBefore(safeEpoch)
+	}
+	return retired
 }
 
 func (v *View) ShouldPromoteRuntimeMaterializedPredKey(key qcache.MaterializedPredKey) bool {

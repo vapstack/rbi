@@ -289,9 +289,6 @@ func TestMaterializedPredCacheInitClearsEntriesIndexAndCounters(t *testing.T) {
 	if got := cache.OversizedCount(); got != 0 {
 		t.Fatalf("OversizedCount after init=%d want 0", got)
 	}
-	if got := cache.Clock(); got != 0 {
-		t.Fatalf("Clock after init=%d want 0", got)
-	}
 	if got := cache.Limit(); got != limit {
 		t.Fatalf("Limit after init=%d want %d", got, limit)
 	}
@@ -895,6 +892,69 @@ func TestMaterializedPredCache_RetainDrainRetiredAndMaxCardinality(t *testing.T)
 	cache.ReleaseRef()
 }
 
+func TestMaterializedPredCache_RetiredBacklogRejectsAdmissionUntilDrain(t *testing.T) {
+	cache := GetMaterializedPredCache(1, 0)
+	defer cache.ReleaseRef()
+
+	keyA := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a")
+	keyB := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "b")
+	keyC := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "c")
+
+	cache.Store(keyA, qcacheTestPosting(1))
+	cache.Store(keyB, qcacheTestPosting(2))
+	if len(cache.retired) != 1 {
+		t.Fatalf("expected one retired entry before drain, got=%d", len(cache.retired))
+	}
+	cache.Store(keyC, qcacheTestPosting(3))
+	if cache.Has(keyC) {
+		t.Fatal("expected admission to be rejected while retired backlog is full")
+	}
+	if !cache.Has(keyB) {
+		t.Fatal("expected resident entry to remain while backlog is full")
+	}
+
+	cache.DrainRetired()
+	cache.Store(keyC, qcacheTestPosting(3))
+	if !cache.Has(keyC) {
+		t.Fatal("expected admission to resume after retired drain")
+	}
+}
+
+func TestMaterializedPredCacheTakeRetiredBeforeUsesEpoch(t *testing.T) {
+	var epoch atomic.Uint64
+	epoch.Store(1)
+
+	cache := GetMaterializedPredCacheWithRetireContext(1, 0, nil, &epoch)
+	defer cache.ReleaseRef()
+
+	keyA := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a")
+	keyB := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "b")
+	cache.Store(keyA, qcacheTestPosting(1))
+	cache.Store(keyB, qcacheTestPosting(2))
+	if len(cache.retired) != 1 {
+		t.Fatalf("expected one retired entry before drain, got=%d", len(cache.retired))
+	}
+
+	retained := cache.TakeRetiredBefore(1)
+	if !retained.IsEmpty() {
+		retained.Release()
+		t.Fatal("expected retired entry at safe epoch to remain protected")
+	}
+	retained.Release()
+	if len(cache.retired) != 1 {
+		t.Fatalf("expected retained retired entry after same-epoch drain, got=%d", len(cache.retired))
+	}
+
+	retired := cache.TakeRetiredBefore(2)
+	if retired.IsEmpty() {
+		t.Fatal("expected older retired entry to detach")
+	}
+	retired.Release()
+	if cache.retired != nil {
+		t.Fatal("expected materialized retired entries to be drained by epoch")
+	}
+}
+
 func TestMaterializedPredCacheEntryPool_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	run := func() {
 		var entries [4]*materializedPredCacheEntry
@@ -1040,7 +1100,7 @@ func TestMaterializedPredCache_InheritCapsOversizedEntries(t *testing.T) {
 		MaterializedPredKeyForScalar("c", qir.OpPREFIX, "3"),
 	} {
 		ids := posting.BuildFromSorted([]uint64{1, 2})
-		entry := newMaterializedPredCacheEntry(ids, true, &prev.clock)
+		entry := newMaterializedPredCacheEntry(ids, true)
 		prev.mu.Lock()
 		if !prev.insertLocked(key, entry) {
 			prev.mu.Unlock()
@@ -1072,41 +1132,61 @@ func TestMaterializedPredCache_InheritCapsOversizedEntries(t *testing.T) {
 	}
 }
 
-func TestMaterializedPredCache_InheritPreservesRecencyStamps(t *testing.T) {
-	prev := GetMaterializedPredCache(8, 0)
-	next := GetMaterializedPredCache(8, 0)
+func TestMaterializedPredCache_LoadHitSurvivesSecondChanceTurnover(t *testing.T) {
+	cache := GetMaterializedPredCache(2, 0)
+	defer cache.ReleaseRef()
+
+	hot := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "hot")
+	cold := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "cold")
+	next := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "next")
+
+	cache.Store(hot, qcacheTestPosting(1))
+	cache.Store(cold, qcacheTestPosting(2))
+	ids, ok := cache.Load(hot)
+	if !ok {
+		t.Fatal("expected hot key to load")
+	}
+	ids.Release()
+
+	cache.Store(next, qcacheTestPosting(3))
+
+	if ids, ok = cache.Load(hot); !ok {
+		t.Fatal("expected hot key to survive second-chance turnover")
+	}
+	ids.Release()
+	if ids, ok = cache.Load(cold); ok {
+		ids.Release()
+		t.Fatal("expected cold key to be evicted before touched hot key")
+	}
+}
+
+func TestMaterializedPredCache_InheritPreservesSecondChanceState(t *testing.T) {
+	prev := GetMaterializedPredCache(2, 0)
+	next := GetMaterializedPredCache(2, 0)
 	defer prev.ReleaseRef()
 	defer next.ReleaseRef()
 
-	keyA := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a")
-	keyB := MaterializedPredKeyForScalar("name", qir.OpPREFIX, "b")
-	entryA := newMaterializedPredCacheEntry(posting.BuildFromSorted([]uint64{1}), false, &prev.clock)
-	entryA.stamp.Store(7)
-	entryB := newMaterializedPredCacheEntry(posting.BuildFromSorted([]uint64{2}), false, &prev.clock)
-	entryB.stamp.Store(13)
-	prev.clock.Store(13)
+	hot := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "hot")
+	cold := MaterializedPredKeyForScalar("name", qir.OpPREFIX, "cold")
+	churn := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "churn")
 
-	prev.mu.Lock()
-	if !prev.insertLocked(keyA, entryA) || !prev.insertLocked(keyB, entryB) {
-		prev.mu.Unlock()
-		t.Fatal("failed to insert inherited entries")
+	prev.Store(hot, qcacheTestPosting(1))
+	prev.Store(cold, qcacheTestPosting(2))
+	ids, ok := prev.Load(hot)
+	if !ok {
+		t.Fatal("expected hot key to load")
 	}
-	prev.count.Add(2)
-	prev.mu.Unlock()
+	ids.Release()
 
 	next.InheritFrom(prev, FieldChangeSet{})
+	next.Store(churn, qcacheTestPosting(3))
 
-	next.mu.RLock()
-	gotA, okA := next.lookupLocked(&keyA)
-	gotB, okB := next.lookupLocked(&keyB)
-	next.mu.RUnlock()
-	if !okA || gotA == nil || gotA.stamp.Load() != 7 {
-		t.Fatalf("expected first inherited stamp to stay at 7")
+	if ids, ok = next.Load(hot); !ok {
+		t.Fatal("expected inherited hot key to survive turnover")
 	}
-	if !okB || gotB == nil || gotB.stamp.Load() != 13 {
-		t.Fatalf("expected second inherited stamp to stay at 13")
-	}
-	if got := next.Clock(); got != 13 {
-		t.Fatalf("expected inherited clock to continue from max stamp, got=%d", got)
+	ids.Release()
+	if ids, ok = next.Load(cold); ok {
+		ids.Release()
+		t.Fatal("expected inherited cold key to be evicted before inherited hot key")
 	}
 }

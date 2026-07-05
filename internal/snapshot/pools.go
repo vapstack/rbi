@@ -7,11 +7,7 @@ const (
 	batchEntrySlicePoolMaxCap = 16 << 10
 )
 
-var snapshotRefPool = pooled.Pointers[Ref]{Clear: true}
-
 var snapshotUniverseOwnerPool = pooled.Pointers[universeOwner]{Clear: true}
-
-var snapshotRetiredListPool = pooled.Slices[*View]{MaxCap: 64, Clear: pooled.ClearCap}
 
 var batchEntrySlicePool = pooled.Slices[BatchEntry]{MaxCap: batchEntrySlicePoolMaxCap, Clear: pooled.ClearCap}
 

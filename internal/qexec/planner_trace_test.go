@@ -370,8 +370,8 @@ func TestTracer_OROrderRouteWorkSeparatesExactBucketPenalty(t *testing.T) {
 
 func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{
@@ -469,8 +469,8 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 
 func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
 		return &Rec{

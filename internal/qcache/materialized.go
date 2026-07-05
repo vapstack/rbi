@@ -31,30 +31,39 @@ const (
 )
 
 type MaterializedPredCache struct {
-	refs           atomic.Int32
-	mu             sync.RWMutex
-	slots          []materializedPredCacheSlot
-	index          map[uint64]int
-	retired        []*materializedPredCacheEntry
-	count          atomic.Int32
-	oversizedCount atomic.Int32
-	clock          atomic.Uint64
-	freeHint       int
-	maxEntries     int
-	maxCard        uint64
+	refs                  atomic.Int32
+	mu                    sync.RWMutex
+	slots                 []materializedPredCacheSlot
+	index                 map[uint64]int
+	retired               []materializedPredRetiredEntry
+	count                 atomic.Int32
+	oversizedCount        atomic.Int32
+	retiredDirty          atomic.Bool
+	retiredOwner          *atomic.Bool
+	retireEpoch           *atomic.Uint64
+	freeHint              int
+	evictHand             int
+	maxEntries            int
+	maxCard               uint64
+	retiredOversizedCount int32
 }
 
 type materializedPredCacheEntry struct {
-	refs      atomic.Int32
-	ids       posting.List
-	oversized bool
-	stamp     atomic.Uint64
+	refs       atomic.Int32
+	referenced atomic.Bool
+	ids        posting.List
+	oversized  bool
 }
 
 // MaterializedPredRetired carries detached retired entries past the caller's
 // reader barrier so payload release can run without blocking new readers.
 type MaterializedPredRetired struct {
-	entries []*materializedPredCacheEntry
+	entries []materializedPredRetiredEntry
+}
+
+type materializedPredRetiredEntry struct {
+	entry *materializedPredCacheEntry
+	epoch uint64
 }
 
 type materializedPredCacheSlot struct {
@@ -123,18 +132,29 @@ func RecentKeyLimit(materializedLimit int) int {
 }
 
 func GetMaterializedPredCache(maxEntries int, maxCardinality uint64) *MaterializedPredCache {
+	return GetMaterializedPredCacheWithRetireContext(maxEntries, maxCardinality, nil, nil)
+}
+
+func GetMaterializedPredCacheWithRetireContext(maxEntries int, maxCardinality uint64, owner *atomic.Bool, epoch *atomic.Uint64) *MaterializedPredCache {
 	c := materializedPredCachePool.Get()
 	c.refs.Store(1)
-	c.Init(maxEntries, maxCardinality)
+	c.InitWithRetireContext(maxEntries, maxCardinality, owner, epoch)
 	return c
 }
 
 func (c *MaterializedPredCache) Init(maxEntries int, maxCardinality uint64) {
+	c.InitWithRetireContext(maxEntries, maxCardinality, nil, nil)
+}
+
+func (c *MaterializedPredCache) InitWithRetireContext(maxEntries int, maxCardinality uint64, owner *atomic.Bool, epoch *atomic.Uint64) {
 	c.mu.Lock()
 	c.clearLocked()
 	c.count.Store(0)
 	c.oversizedCount.Store(0)
-	c.clock.Store(0)
+	c.retiredOversizedCount = 0
+	c.evictHand = 0
+	c.retiredOwner = owner
+	c.retireEpoch = epoch
 	c.maxEntries = maxEntries
 	c.maxCard = maxCardinality
 	if maxEntries <= 0 {
@@ -175,10 +195,6 @@ func (c *MaterializedPredCache) OversizedCount() int32 {
 	return c.oversizedCount.Load()
 }
 
-func (c *MaterializedPredCache) Clock() uint64 {
-	return c.clock.Load()
-}
-
 func (c *MaterializedPredCache) Limit() int {
 	return c.maxEntries
 }
@@ -200,8 +216,7 @@ func (c *MaterializedPredCache) Load(key MaterializedPredKey) (posting.List, boo
 		return posting.List{}, false
 	}
 
-	entry.touch(&c.clock)
-
+	entry.markReferenced()
 	return entry.ids.Borrow(), true
 }
 
@@ -243,7 +258,7 @@ func (c *MaterializedPredCache) Store(key MaterializedPredKey, ids posting.List)
 		return
 	}
 	stored := materializedPredCacheStoredIDs(ids)
-	entry := newMaterializedPredCacheEntry(stored, false, &c.clock)
+	entry := newMaterializedPredCacheEntry(stored, false)
 	if !c.insertLocked(key, entry) {
 		c.mu.Unlock()
 		entry.release()
@@ -279,7 +294,7 @@ func (c *MaterializedPredCache) TryStoreOversized(key MaterializedPredKey, ids p
 		return false
 	}
 	stored := materializedPredCacheStoredIDs(ids)
-	entry := newMaterializedPredCacheEntry(stored, true, &c.clock)
+	entry := newMaterializedPredCacheEntry(stored, true)
 	if !c.insertLocked(key, entry) {
 		c.mu.Unlock()
 		entry.release()
@@ -310,9 +325,9 @@ func (c *MaterializedPredCache) LoadOrStore(key MaterializedPredKey, ids posting
 
 	c.mu.Lock()
 	if entry, ok := c.lookupLocked(&key); ok {
+		entry.markReferenced()
 		c.mu.Unlock()
 		ids.Release()
-		entry.touch(&c.clock)
 		return entry.ids.Borrow(), true
 	}
 	if int(c.count.Load()) >= limit && !c.evictLocked(matPredCacheEvictPreferRegular) {
@@ -320,7 +335,7 @@ func (c *MaterializedPredCache) LoadOrStore(key MaterializedPredKey, ids posting
 		return ids, false
 	}
 	stored := materializedPredCacheStoredIDs(ids)
-	entry := newMaterializedPredCacheEntry(stored, false, &c.clock)
+	entry := newMaterializedPredCacheEntry(stored, false)
 	if !c.insertLocked(key, entry) {
 		c.mu.Unlock()
 		entry.release()
@@ -350,9 +365,9 @@ func (c *MaterializedPredCache) TryLoadOrStoreOversized(key MaterializedPredKey,
 
 	c.mu.Lock()
 	if entry, ok := c.lookupLocked(&key); ok {
+		entry.markReferenced()
 		c.mu.Unlock()
 		ids.Release()
-		entry.touch(&c.clock)
 		return entry.ids.Borrow(), true
 	}
 	if c.oversizedCount.Load() >= MaterializedPredOversizedLimit(limit) && !c.evictLocked(matPredCacheEvictOversizedOnly) {
@@ -364,7 +379,7 @@ func (c *MaterializedPredCache) TryLoadOrStoreOversized(key MaterializedPredKey,
 		return ids, false
 	}
 	stored := materializedPredCacheStoredIDs(ids)
-	entry := newMaterializedPredCacheEntry(stored, true, &c.clock)
+	entry := newMaterializedPredCacheEntry(stored, true)
 	if !c.insertLocked(key, entry) {
 		c.mu.Unlock()
 		entry.release()
@@ -384,7 +399,6 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, changes
 	}
 
 	oversizedLimit := MaterializedPredOversizedLimit(limit)
-	var maxStamp uint64
 
 	prev.mu.RLock()
 	c.mu.Lock()
@@ -413,11 +427,9 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, changes
 		if entryOversized && oversized >= oversizedLimit {
 			continue
 		}
+		// Adjacent snapshots share unchanged entries; eviction detaches slots,
+		// while the posting payload survives until every retained cache releases it.
 		entry.retain()
-		stamp := entry.stamp.Load()
-		if stamp > maxStamp {
-			maxStamp = stamp
-		}
 		if !c.insertLocked(key, entry) {
 			entry.release()
 			break
@@ -431,9 +443,6 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, changes
 
 	c.mu.Unlock()
 	prev.mu.RUnlock()
-	if maxStamp > c.clock.Load() {
-		c.clock.Store(maxStamp)
-	}
 }
 
 func materializedPredFieldMatchesChange(changes FieldChangeSet, field string, changedOnly bool) bool {
@@ -490,7 +499,8 @@ func (c *MaterializedPredCache) Clear() {
 	c.clearLocked()
 	c.count.Store(0)
 	c.oversizedCount.Store(0)
-	c.clock.Store(0)
+	c.retiredOversizedCount = 0
+	c.evictHand = 0
 	c.mu.Unlock()
 }
 
@@ -499,12 +509,55 @@ func (c *MaterializedPredCache) DrainRetired() {
 }
 
 func (c *MaterializedPredCache) TakeRetired() MaterializedPredRetired {
+	return c.TakeRetiredBefore(^uint64(0))
+}
+
+func (c *MaterializedPredCache) TakeRetiredBefore(safeEpoch uint64) MaterializedPredRetired {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	retired := c.retired
-	c.retired = nil
+	if retired != nil {
+		// Detach only entries older than the reader barrier; newer evictions stay
+		// linked so borrowed postings remain valid for in-flight cache readers.
+		eligible := 0
+		for i := range retired {
+			if retired[i].epoch < safeEpoch {
+				eligible++
+			}
+		}
+		switch eligible {
+		case 0:
+			retired = nil
+		case len(retired):
+			c.retired = nil
+			c.retiredOversizedCount = 0
+			c.retiredDirty.Store(false)
+		default:
+			detached := materializedPredCacheRetiredPool.Get(eligible)
+			kept := retired[:0]
+			oversized := int32(0)
+			for i := range retired {
+				retiredEntry := retired[i]
+				if retiredEntry.epoch < safeEpoch {
+					detached = append(detached, retiredEntry)
+				} else {
+					if retiredEntry.entry.oversized {
+						oversized++
+					}
+					kept = append(kept, retiredEntry)
+				}
+			}
+			c.retired = kept
+			c.retiredOversizedCount = oversized
+			retired = detached
+		}
+	}
 	return MaterializedPredRetired{entries: retired}
+}
+
+func (c *MaterializedPredCache) RetiredDirty() bool {
+	return c.retiredDirty.Load()
 }
 
 func (r MaterializedPredRetired) Release() {
@@ -512,9 +565,13 @@ func (r MaterializedPredRetired) Release() {
 		return
 	}
 	for i := range r.entries {
-		r.entries[i].release()
+		r.entries[i].entry.release()
 	}
 	materializedPredCacheRetiredPool.Put(r.entries)
+}
+
+func (r MaterializedPredRetired) IsEmpty() bool {
+	return r.entries == nil
 }
 
 func (c *MaterializedPredCache) release() {
@@ -526,6 +583,8 @@ func (c *MaterializedPredCache) release() {
 	c.slots = c.slots[:0]
 	c.maxEntries = 0
 	c.maxCard = 0
+	c.retiredOwner = nil
+	c.retireEpoch = nil
 }
 
 func (c *MaterializedPredCache) lookupLocked(key *MaterializedPredKey) (*materializedPredCacheEntry, bool) {
@@ -577,10 +636,23 @@ func (c *MaterializedPredCache) firstFreeSlotLocked() int {
 }
 
 func (c *MaterializedPredCache) retireEntryLocked(entry *materializedPredCacheEntry) {
+	// Eviction removes the slot, not the payload. Root cleanup releases retired
+	// entries after safeEpoch passes the eviction epoch.
 	if c.retired == nil {
 		c.retired = materializedPredCacheRetiredPool.Get(1)
 	}
-	c.retired = append(c.retired, entry)
+	epoch := uint64(0)
+	if c.retireEpoch != nil {
+		epoch = c.retireEpoch.Load()
+	}
+	c.retired = append(c.retired, materializedPredRetiredEntry{entry: entry, epoch: epoch})
+	if entry.oversized {
+		c.retiredOversizedCount++
+	}
+	c.retiredDirty.CompareAndSwap(false, true)
+	if c.retiredOwner != nil {
+		c.retiredOwner.CompareAndSwap(false, true)
+	}
 }
 
 func (c *MaterializedPredCache) clearLocked() {
@@ -596,48 +668,57 @@ func (c *MaterializedPredCache) clearLocked() {
 	}
 	if c.retired != nil {
 		for i := range c.retired {
-			c.retired[i].release()
+			c.retired[i].entry.release()
 		}
 		materializedPredCacheRetiredPool.Put(c.retired)
 		c.retired = nil
 	}
+	c.retiredDirty.Store(false)
+	c.retiredOversizedCount = 0
 	c.freeHint = 0
+	c.evictHand = 0
 }
 
 func (c *MaterializedPredCache) findVictimLocked(mode materializedPredCacheEvictMode) int {
-	if len(c.slots) == 0 {
+	if mode == matPredCacheEvictOversizedOnly {
+		return c.findVictimByClassLocked(true)
+	}
+	if idx := c.findVictimByClassLocked(false); idx >= 0 {
+		return idx
+	}
+	return c.findVictimByClassLocked(true)
+}
+
+func (c *MaterializedPredCache) findVictimByClassLocked(oversized bool) int {
+	n := len(c.slots)
+	if n == 0 {
 		return -1
 	}
-	evictIdx := -1
-	fallbackIdx := -1
-	evictStamp := ^uint64(0)
-	fallbackStamp := ^uint64(0)
-	for i := range c.slots {
-		slot := c.slots[i]
-		if !slot.used {
-			continue
-		}
-		stamp := slot.entry.stamp.Load()
-		if slot.entry.oversized {
-			if mode != matPredCacheEvictOversizedOnly && stamp <= fallbackStamp {
-				fallbackIdx = i
-				fallbackStamp = stamp
+	start := c.evictHand
+	for pass := 0; pass < 2; pass++ {
+		for step := 0; step < n; step++ {
+			idx := start + step
+			if idx >= n {
+				idx -= n
 			}
-			if mode == matPredCacheEvictOversizedOnly && stamp <= evictStamp {
-				evictIdx = i
-				evictStamp = stamp
+			slot := c.slots[idx]
+			if !slot.used || slot.entry.oversized != oversized {
+				continue
 			}
-			continue
-		}
-		if mode != matPredCacheEvictOversizedOnly && stamp <= evictStamp {
-			evictIdx = i
-			evictStamp = stamp
+			if slot.entry.referenced.Load() {
+				if pass == 0 {
+					slot.entry.referenced.Store(false)
+				}
+				continue
+			}
+			c.evictHand = idx + 1
+			if c.evictHand == n {
+				c.evictHand = 0
+			}
+			return idx
 		}
 	}
-	if evictIdx >= 0 {
-		return evictIdx
-	}
-	return fallbackIdx
+	return -1
 }
 
 func (c *MaterializedPredCache) evictLocked(mode materializedPredCacheEvictMode) bool {
@@ -646,6 +727,14 @@ func (c *MaterializedPredCache) evictLocked(mode materializedPredCacheEvictMode)
 		return false
 	}
 	slot := c.slots[idx]
+	// Retired entries count against eviction capacity so cache churn cannot
+	// grow an unbounded backlog while reader epochs are pinned.
+	if len(c.retired) >= c.maxEntries {
+		return false
+	}
+	if slot.entry.oversized && c.retiredOversizedCount >= MaterializedPredOversizedLimit(c.maxEntries) {
+		return false
+	}
 	c.slots[idx] = materializedPredCacheSlot{}
 	if len(c.slots) > materializedPredCacheLinearMaxEntries {
 		if c.index[slot.hash] == idx {
@@ -701,12 +790,12 @@ func materializedPredCacheStoredIDs(ids posting.List) posting.List {
 	return ids
 }
 
-func newMaterializedPredCacheEntry(ids posting.List, oversized bool, clock *atomic.Uint64) *materializedPredCacheEntry {
+func newMaterializedPredCacheEntry(ids posting.List, oversized bool) *materializedPredCacheEntry {
 	entry := materializedPredCacheEntryPool.Get()
 	entry.refs.Store(1)
+	entry.referenced.Store(false)
 	entry.ids = ids
 	entry.oversized = oversized
-	entry.touch(clock)
 	return entry
 }
 
@@ -715,7 +804,7 @@ func (e *materializedPredCacheEntry) retain() {
 }
 
 func (e *materializedPredCacheEntry) release() {
-	if e == nil || e.refs.Add(-1) != 0 {
+	if e.refs.Add(-1) != 0 {
 		return
 	}
 	if !e.ids.IsEmpty() {
@@ -724,8 +813,10 @@ func (e *materializedPredCacheEntry) release() {
 	materializedPredCacheEntryPool.Put(e)
 }
 
-func (e *materializedPredCacheEntry) touch(clock *atomic.Uint64) {
-	e.stamp.Store(clock.Add(1))
+func (e *materializedPredCacheEntry) markReferenced() {
+	if !e.referenced.Load() {
+		e.referenced.Store(true)
+	}
 }
 
 func (c *RecentKeyCache) Clear() {

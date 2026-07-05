@@ -5,142 +5,69 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/rbierrors"
-	"go.etcd.io/bbolt"
 )
 
 // Get returns the value stored by id or nil if key was not found.
-func (db *DB[K, V]) Get(id K) (*V, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, err
+func (c *Collection[K, V]) Get(tx *Tx, id K) (*V, error) {
+	if tx == nil {
+		return nil, rbierrors.ErrNilTx
 	}
-
-	tx, err := db.bolt.Begin(false)
+	bucket, _, err := tx.collectionBucket(c.collection)
 	if err != nil {
-		return nil, fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	return db.getTx(tx, id)
-}
-
-func (db *DB[K, V]) GetTx(tx *bbolt.Tx, id K) (*V, error) {
-	if err := db.unavailableErr(); err != nil {
 		return nil, err
-	}
-	return db.getTx(tx, id)
-}
-
-func (db *DB[K, V]) getTx(tx *bbolt.Tx, id K) (*V, error) {
-	bucket := tx.Bucket(db.dataBucket)
-	if bucket == nil {
-		return nil, fmt.Errorf("bucket does not exist")
 	}
 
 	var keyBuf [8]byte
-	v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
+	v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf))
 	if v == nil {
 		return nil, nil
 	}
 
-	r, err := db.decodeStoredValue(v)
+	r, err := c.decodeStoredValue(v)
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return r, nil
 }
 
-// BatchGet retrieves multiple values by their IDs in a single read transaction.
-// The returned slice has the same length as ids; any missing keys have a nil
-// entry at the corresponding index.
-func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return nil, fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	return db.batchGetTx(tx, ids...)
-}
-
-func (db *DB[K, V]) BatchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	return db.batchGetTx(tx, ids...)
-}
-
-// batchGetTx retrieves multiple values by IDs using an existing read transaction.
-func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
-	bucket := tx.Bucket(db.dataBucket)
-	if bucket == nil {
-		return nil, fmt.Errorf("bucket does not exist")
-	}
-
-	s := make([]*V, len(ids))
-	var keyBuf [8]byte
-	for i, id := range ids {
-		v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
-		if v == nil {
-			continue
-		}
-		value, err := db.decodeStoredValue(v)
-		if err != nil {
-			return s, fmt.Errorf("decode: %w", err)
-		}
-		s[i] = value
-	}
-	return s, nil
-}
-
 // ScanKeys iterates over live keys greater than or equal to seek and calls fn
 // for each key. Scan stops when fn returns false or a non-nil error.
 //
-// Indexed DB iterates the current in-memory snapshot.
+// Indexed collection iterates the current in-memory snapshot.
 // Other modes scan the data bucket inside a read-only transaction which remains
 // open for the duration of the scan.
 //
-// The callback must not call methods on the DB instance.
-//
 // Numeric keys are returned in numeric order,
 // string keys are returned in bbolt lexicographic byte order.
-func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
-	if err := db.unavailableErr(); err != nil {
+func (c *Collection[K, V]) ScanKeys(tx *Tx, seek K, fn func(K) (bool, error)) error {
+	if tx == nil {
+		return rbierrors.ErrNilTx
+	}
+	if !c.strKey && c.index != nil {
+		snap, err := tx.collectionSnapshot(c.collection)
+		if err != nil {
+			return err
+		}
+		return c.index.ScanKeysOnSnapshot(snap, keycodec.UserKeyUint(seek), keycodec.UserKeyUintScanFunc(fn))
+	}
+	if c.strKey && c.index != nil && c.index.HasStringKeyIndex() {
+		snap, err := tx.collectionSnapshot(c.collection)
+		if err != nil {
+			return err
+		}
+		return c.index.ScanStringKeysOnSnapshot(snap, keycodec.UserKeyString(seek), keycodec.UserKeyStringScanFunc(fn))
+	}
+
+	b, _, err := tx.collectionBucket(c.collection)
+	if err != nil {
 		return err
 	}
 
-	if !db.strKey && db.index != nil {
-		return db.index.ScanKeys(keycodec.UserKeyUint(seek), keycodec.UserKeyUintScanFunc(fn))
-	}
-	if db.strKey && db.index != nil && db.index.HasStringKeyIndex() {
-		return db.index.ScanStringKeys(keycodec.UserKeyString(seek), keycodec.UserKeyStringScanFunc(fn))
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	b := tx.Bucket(db.dataBucket)
-	if b == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-
-	c := b.Cursor()
+	cur := b.Cursor()
 	var keyBuf [8]byte
-	if db.strKey {
+	if c.strKey {
 		call := keycodec.UserKeyStringScanFunc(fn)
-		for key, _ := c.Seek(keycodec.UserKeyBytesWithBuf(seek, true, &keyBuf)); key != nil; key, _ = c.Next() {
+		for key, _ := cur.Seek(keycodec.UserKeyBytesWithBuf(seek, true, &keyBuf)); key != nil; key, _ = cur.Next() {
 			more, err := call(string(key))
 			if err != nil || !more {
 				return err
@@ -150,7 +77,7 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	}
 
 	call := keycodec.UserKeyUintScanFunc(fn)
-	for key, _ := c.Seek(keycodec.UserKeyBytesWithBuf(seek, false, &keyBuf)); key != nil; key, _ = c.Next() {
+	for key, _ := cur.Seek(keycodec.UserKeyBytesWithBuf(seek, false, &keyBuf)); key != nil; key, _ = cur.Next() {
 		if len(key) != 8 {
 			return fmt.Errorf("invalid numeric data key length: %d", len(key))
 		}
@@ -168,34 +95,23 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 // The scan runs inside a read-only transaction which remains open for the
 // duration of the scan.
 //
-// The callback must not call methods on the DB instance. SeqScan keeps the
-// read transaction open while fn runs, and re-entering DB from the callback can
-// deadlock.
-//
 // Records passed to fn can optionally be returned back using ReleaseRecords
 // to minimize GC pressure.
-func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
-	if err := db.unavailableErr(); err != nil {
+func (c *Collection[K, V]) SeqScan(tx *Tx, seek K, fn func(K, *V) (bool, error)) error {
+	if tx == nil {
+		return rbierrors.ErrNilTx
+	}
+	b, _, err := tx.collectionBucket(c.collection)
+	if err != nil {
 		return err
 	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	b := tx.Bucket(db.dataBucket)
-	if b == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	c := b.Cursor()
+	cur := b.Cursor()
 
 	var keyBuf [8]byte
-	key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf))
-	if db.strKey {
+	key, value := cur.Seek(keycodec.UserKeyBytesWithBuf(seek, c.strKey, &keyBuf))
+	if c.strKey {
 		for key != nil {
-			val, err := db.decodeStoredValue(value)
+			val, err := c.decodeStoredValue(value)
 			if err != nil {
 				return fmt.Errorf("decode: %w", err)
 			}
@@ -203,7 +119,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 			if err != nil || !more {
 				return err
 			}
-			key, value = c.Next()
+			key, value = cur.Next()
 		}
 		return nil
 	}
@@ -211,7 +127,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		if len(key) != 8 {
 			return fmt.Errorf("invalid numeric data key length: %d", len(key))
 		}
-		val, err := db.decodeStoredValue(value)
+		val, err := c.decodeStoredValue(value)
 		if err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
@@ -219,13 +135,13 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		if err != nil || !more {
 			return err
 		}
-		key, value = c.Next()
+		key, value = cur.Next()
 	}
 	return nil
 }
 
-func (db *DB[K, V]) decodeStoredValue(data []byte) (*V, error) {
-	if db.strKey {
+func (c *Collection[K, V]) decodeStoredValue(data []byte) (*V, error) {
+	if c.strKey {
 		if len(data) < 8 {
 			return nil, fmt.Errorf("%w: value shorter than 8 bytes", rbierrors.ErrInvalidStringStorageFormat)
 		}
@@ -234,5 +150,5 @@ func (db *DB[K, V]) decodeStoredValue(data []byte) (*V, error) {
 		}
 		data = data[8:]
 	}
-	return db.decode(data)
+	return c.decode(data)
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qagg"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbistats"
 	"go.etcd.io/bbolt"
@@ -31,65 +32,59 @@ const (
 	ValueKindString = qagg.ValueKindString
 )
 
-// Aggregate evaluates a reduction query against the current index snapshot.
-func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
-	if err := db.unavailableErr(); err != nil {
+// Aggregate evaluates a reduction query against the transaction's index snapshot.
+func (c *Collection[K, V]) Aggregate(tx *Tx, q *qx.QX) (Result, error) {
+	if tx == nil {
+		return Result{}, rbierrors.ErrNilTx
+	}
+	snap, err := c.indexSnapshot(tx)
+	if err != nil {
 		return Result{}, err
 	}
-
-	if db.index == nil {
-		return Result{}, rbierrors.ErrNoIndex
-	}
-
-	return db.index.Aggregate(q)
+	return c.index.AggregateOnSnapshot(snap, q)
 }
 
 // Count evaluates the given filter predicates and returns the number of matching records.
 // Zero predicates mean match-all.
-func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
-	if err := db.unavailableErr(); err != nil {
+func (c *Collection[K, V]) Count(tx *Tx, exprs ...qx.Expr) (uint64, error) {
+	if tx == nil {
+		return 0, rbierrors.ErrNilTx
+	}
+	snap, err := c.indexSnapshot(tx)
+	if err != nil {
 		return 0, err
 	}
+	return c.index.CountOnSnapshot(snap, exprs...)
+}
 
-	if db.index == nil {
-		return 0, rbierrors.ErrNoIndex
-	}
-	return db.index.Count(exprs...)
+func (c *Collection[K, V]) indexSnapshot(tx *Tx) (*snapshot.View, error) {
+	return tx.collectionSnapshot(c.collection)
 }
 
 // Query evaluates the given query against the index and returns all matching values.
-func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, err
+func (c *Collection[K, V]) Query(tx *Tx, q *qx.QX) ([]*V, error) {
+	if tx == nil {
+		return nil, rbierrors.ErrNilTx
 	}
-
-	if db.index == nil {
-		return nil, rbierrors.ErrNoIndex
-	}
-	var out []*V
-	err := db.index.Query(q, db.bolt, db.dataBucket, db.unavailableErr, func(tx *bbolt.Tx, ids []uint64) error {
-		var err error
-		out, err = db.batchGetTxCompact(tx, ids)
-		return err
-	})
+	boltTx, ids, err := c.queryIDs(tx, q, true)
 	if err != nil {
 		return nil, err
-	}
-	return out, nil
-}
-
-func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) {
-	bucket := tx.Bucket(db.dataBucket)
-	if bucket == nil {
-		return nil, fmt.Errorf("bucket does not exist")
 	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	return c.loadQueryValues(boltTx, ids)
+}
+
+func (c *Collection[K, V]) loadQueryValues(tx *bbolt.Tx, ids []uint64) ([]*V, error) {
+	bucket := tx.Bucket(c.dataBucket)
+	if bucket == nil {
+		return nil, fmt.Errorf("bucket does not exist")
+	}
 
 	out := make([]*V, 0, len(ids))
-	if db.strKey {
-		m, err := db.stringMap(tx)
+	if c.strKey {
+		m, err := c.stringMap(tx)
 		if err != nil {
 			return nil, err
 		}
@@ -97,30 +92,30 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) 
 		for _, idx := range ids {
 			key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
 			if key == nil {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("%w: missing string reverse key for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
 			}
 			v := bucket.Get(key)
 			if v == nil {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("%w: missing string data for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
 			}
 			if len(v) < 8 {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("%w: value shorter than %d bytes", rbierrors.ErrInvalidStringStorageFormat, 8)
 			}
 			storedIdx := keycodec.U64FromBytes(v[:8])
 			if storedIdx == 0 {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("%w: zero string id", rbierrors.ErrInvalidStringStorageFormat)
 			}
 			if storedIdx != idx {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("%w: string idx mismatch rev=%d value=%d", rbierrors.ErrInvalidStringStorageFormat, idx, storedIdx)
 			}
-			value, err := db.decode(v[8:])
+			value, err := c.decode(v[8:])
 			if err != nil {
-				db.ReleaseRecords(out...)
+				c.ReleaseRecords(out...)
 				return nil, fmt.Errorf("decode: %w", err)
 			}
 			out = append(out, value)
@@ -132,12 +127,12 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) 
 	for _, idx := range ids {
 		v := bucket.Get(keycodec.U64BytesWithBuf(idx, &key))
 		if v == nil {
-			db.ReleaseRecords(out...)
+			c.ReleaseRecords(out...)
 			return nil, fmt.Errorf("missing numeric data for id %d", idx)
 		}
-		value, err := db.decodeStoredValue(v)
+		value, err := c.decodeStoredValue(v)
 		if err != nil {
-			db.ReleaseRecords(out...)
+			c.ReleaseRecords(out...)
 			return nil, fmt.Errorf("decode: %w", err)
 		}
 		out = append(out, value)
@@ -146,61 +141,74 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []uint64) ([]*V, error) 
 }
 
 // QueryKeys evaluates the given query against the index and returns all matching ids.
-func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, err
+func (c *Collection[K, V]) QueryKeys(tx *Tx, q *qx.QX) ([]K, error) {
+	if tx == nil {
+		return nil, rbierrors.ErrNilTx
 	}
-
-	if db.index == nil {
-		return nil, rbierrors.ErrNoIndex
-	}
-
-	var out []K
-	if db.strKey {
-		err := db.index.Query(q, db.bolt, db.dataBucket, db.unavailableErr, func(tx *bbolt.Tx, ids []uint64) error {
-			m, err := db.stringMap(tx)
-			if err != nil {
-				return err
-			}
-			if len(ids) == 0 {
-				return nil
-			}
-			out = make([]K, 0, len(ids))
-			var mapKey [8]byte
-			for _, idx := range ids {
-				key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
-				if key == nil {
-					return fmt.Errorf("%w: missing string reverse key for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
-				}
-				s := string(key)
-				out = append(out, *(*K)(unsafe.Pointer(&s)))
-			}
-			return nil
-		})
+	if c.strKey {
+		boltTx, ids, err := c.queryIDs(tx, q, true)
 		if err != nil {
 			return nil, err
 		}
+		m, err := c.stringMap(boltTx)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		out := make([]K, 0, len(ids))
+		var mapKey [8]byte
+		for _, idx := range ids {
+			key := m.Get(keycodec.U64BytesWithBuf(idx, &mapKey))
+			if key == nil {
+				return nil, fmt.Errorf("%w: missing string reverse key for idx %d", rbierrors.ErrInvalidStringStorageFormat, idx)
+			}
+			s := string(key)
+			out = append(out, *(*K)(unsafe.Pointer(&s)))
+		}
 		return out, nil
 	}
-
-	if err := db.index.QueryKeys(q, func(ids []uint64) error {
-		out = db.queryKeysFromIDs(ids)
-		return nil
-	}); err != nil {
+	ids, err := c.queryKeyIDs(tx, q, true)
+	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return c.queryKeysFromIDs(ids), nil
 }
 
-func (db *DB[K, V]) queryKeysFromIDs(ids []uint64) []K {
+func (c *Collection[K, V]) queryKeysFromIDs(ids []uint64) []K {
 	if len(ids) == 0 {
 		return nil
 	}
 	return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids))
 }
 
-func (db *DB[K, V]) stringMap(tx *bbolt.Tx) (*bbolt.Bucket, error) {
-	m := tx.Bucket(db.strmapBucket)
+func (c *Collection[K, V]) queryIDs(tx *Tx, q *qx.QX, tryEmpty bool) (*bbolt.Tx, []uint64, error) {
+	_, read, err := tx.collectionBucket(c.collection)
+	if err != nil {
+		return nil, nil, err
+	}
+	if read.snap == nil {
+		return nil, nil, rbierrors.ErrNoIndex
+	}
+
+	ids, err := c.index.QueryIDsOnSnapshot(read.snap, q, tryEmpty)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx.boltTx, ids, nil
+}
+
+func (c *Collection[K, V]) queryKeyIDs(tx *Tx, q *qx.QX, tryEmpty bool) ([]uint64, error) {
+	snap, err := c.indexSnapshot(tx)
+	if err != nil {
+		return nil, err
+	}
+	return c.index.QueryIDsOnSnapshot(snap, q, tryEmpty)
+}
+
+func (c *Collection[K, V]) stringMap(tx *bbolt.Tx) (*bbolt.Bucket, error) {
+	m := tx.Bucket(c.strmapBucket)
 	if m == nil {
 		return nil, fmt.Errorf("%w: missing string map bucket", rbierrors.ErrInvalidStringStorageFormat)
 	}
@@ -217,16 +225,23 @@ func (db *DB[K, V]) stringMap(tx *bbolt.Tx) (*bbolt.Bucket, error) {
 //
 // In transparent mode planner stats are disabled because no runtime index
 // exists; the method returns rbierrors.ErrNoIndex.
-func (db *DB[K, V]) RefreshPlannerStats() error {
-	if err := db.unavailableErr(); err != nil {
+func (c *Collection[K, V]) RefreshPlannerStats() error {
+	if err := c.collection.unavailableErr(); err != nil {
 		return err
 	}
 
-	if db.index == nil {
+	if c.index == nil {
 		return rbierrors.ErrNoIndex
 	}
 
-	return db.index.RefreshPlannerStats(db.unavailableErr)
+	tx := BeginIndexView()
+	defer tx.Release()
+	snap, err := tx.collectionSnapshot(c.collection)
+	if err != nil {
+		return err
+	}
+
+	return c.index.RefreshPlannerStatsOnSnapshot(snap, c.collection.unavailableErr)
 }
 
 func plannerAnalyzeInterval(v time.Duration) time.Duration {
@@ -239,15 +254,15 @@ func plannerAnalyzeInterval(v time.Duration) time.Duration {
 	return v
 }
 
-func (db *DB[K, V]) startPlannerAnalyzeLoop() {
-	db.index.StartAnalyzeLoop(db.RefreshPlannerStats, plannerAnalyzeTerminalError, plannerAnalyzeResetFailure)
+func (c *Collection[K, V]) startPlannerAnalyzeLoop() {
+	c.index.StartAnalyzeLoop(c.RefreshPlannerStats, plannerAnalyzeTerminalError, plannerAnalyzeResetFailure)
 }
 
-func (db *DB[K, V]) stopAnalyzeLoop() {
-	if db.index == nil {
+func (c *Collection[K, V]) stopAnalyzeLoop() {
+	if c.index == nil {
 		return
 	}
-	db.index.StopAnalyzeLoop()
+	c.index.StopAnalyzeLoop()
 }
 
 func plannerAnalyzeTerminalError(err error) bool {
@@ -260,28 +275,42 @@ func plannerAnalyzeResetFailure(error) bool {
 
 // SnapshotStats returns diagnostics for published index snapshots.
 //
-// Runtime snapshot diagnostics are collected only when
-// Options.EnableSnapshotStats was enabled for this DB instance;
-// otherwise SnapshotStats returns zero value.
-//
-// In indexed mode it reports the current published snapshot sequence,
-// universe cardinality, registry size, and pin counts.
+// In indexed mode it reports Collection's current published snapshot
+// sequence and universe cardinality.
 //
 // In transparent mode no published index snapshots are maintained, so the
-// returned diagnostics remain zero-valued even when snapshot stats collection
-// is enabled.
+// returned diagnostics remain zero-valued.
 //
-// On closed or broken DB, SnapshotStats returns zero value.
-func (db *DB[K, V]) SnapshotStats() rbistats.Snapshot {
-	if db.index == nil {
+// On closed or broken Collection, SnapshotStats returns zero value.
+func (c *Collection[K, V]) SnapshotStats() rbistats.Snapshot {
+	if c.index == nil {
 		return rbistats.Snapshot{}
 	}
-	if !db.options.EnableSnapshotStats {
-		return rbistats.Snapshot{}
-	}
-	if err := db.unavailableErr(); err != nil {
+	if err := c.collection.unavailableErr(); err != nil {
 		return rbistats.Snapshot{}
 	}
 
-	return db.index.SnapshotStats()
+	return c.rootSnapshotStats()
+}
+
+func (c *Collection[K, V]) rootSnapshotStats() rbistats.Snapshot {
+	rr := &c.root.registry
+	rr.mu.RLock()
+	ref := rr.currentRef.Load()
+	if ref == nil || ref.gen == nil || int(c.ordinal) >= len(ref.gen.entries) {
+		rr.mu.RUnlock()
+		return rbistats.Snapshot{}
+	}
+	entry := ref.gen.entries[c.ordinal]
+	if entry.collection != c.collection || entry.read == nil || entry.read.snap == nil {
+		rr.mu.RUnlock()
+		return rbistats.Snapshot{}
+	}
+	snap := entry.read.snap
+	out := rbistats.Snapshot{Sequence: snap.Seq}
+	if !snap.Universe.IsEmpty() {
+		out.UniverseCard = snap.Universe.Cardinality()
+	}
+	rr.mu.RUnlock()
+	return out
 }

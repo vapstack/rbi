@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/rbierrors"
-	"github.com/vapstack/rbi/rbistats"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -159,19 +158,19 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_reinsert_reopen.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path)
+	c, bolt := openBoltAndCollection[string, Rec](t, path)
 	closeCurrent := func() {
-		if db != nil {
-			if err := db.Close(); err != nil {
+		if c != nil {
+			if err := c.Close(); err != nil {
 				t.Fatalf("db close: %v", err)
 			}
-			db = nil
+			c = nil
 		}
-		if raw != nil {
-			if err := raw.Close(); err != nil {
+		if bolt != nil {
+			if err := bolt.Close(); err != nil {
 				t.Fatalf("raw close: %v", err)
 			}
-			raw = nil
+			bolt = nil
 		}
 	}
 	t.Cleanup(closeCurrent)
@@ -181,7 +180,7 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 		"k-03", "k-06", "k-04", "k-05",
 	}
 	for _, key := range order {
-		if err := db.Set(key, &Rec{Name: key, Age: 1}); err != nil {
+		if err := writeSet(c, key, &Rec{Name: key, Age: 1}); err != nil {
 			t.Fatalf("seed Set(%q): %v", key, err)
 		}
 	}
@@ -192,7 +191,7 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 		"k-04": {},
 	}
 	for key := range deleted {
-		if err := db.Delete(key); err != nil {
+		if err := writeDelete(c, key); err != nil {
 			t.Fatalf("Delete(%q): %v", key, err)
 		}
 	}
@@ -205,7 +204,7 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 		liveOrder = append(liveOrder, key)
 	}
 
-	gotLive, err := db.QueryKeys(qx.Query(qx.EQ("age", 1)))
+	gotLive, err := readQueryKeys(c, qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys(live before reopen): %v", err)
 	}
@@ -215,9 +214,9 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 
 	closeCurrent()
 
-	db, raw = openBoltAndNew[string, Rec](t, path)
+	c, bolt = openBoltAndCollection[string, Rec](t, path)
 
-	gotLive, err = db.QueryKeys(qx.Query(qx.EQ("age", 1)))
+	gotLive, err = readQueryKeys(c, qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys(live after reopen): %v", err)
 	}
@@ -226,7 +225,7 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 	}
 
 	for key := range deleted {
-		v, getErr := db.Get(key)
+		v, getErr := readGet(c, key)
 		if getErr != nil {
 			t.Fatalf("Get(%q) after reopen: %v", key, getErr)
 		}
@@ -237,13 +236,13 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 
 	reinsertOrder := []string{"k-02", "k-08", "k-04"}
 	for _, key := range reinsertOrder {
-		if err := db.Set(key, &Rec{Name: key, Age: 1}); err != nil {
+		if err := writeSet(c, key, &Rec{Name: key, Age: 1}); err != nil {
 			t.Fatalf("reinsert Set(%q): %v", key, err)
 		}
 	}
 
 	wantReinsert := append(slices.Clone(liveOrder), reinsertOrder...)
-	gotAll, err := db.QueryKeys(qx.Query(qx.EQ("age", 1)))
+	gotAll, err := readQueryKeys(c, qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys(all after reinsert): %v", err)
 	}
@@ -253,16 +252,18 @@ func TestStringExt_ReopenReinsertDeletedKeysUseNewInternalOrder(t *testing.T) {
 }
 
 func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *testing.T) {
+	enableStoreStatsForTest(t)
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_unique_hole.db")
 
-	db, raw := openBoltAndNew[string, StringUniqueTestRec](t, path)
+	c, raw := openBoltAndCollection[string, StringUniqueTestRec](t, path)
 	closeCurrent := func() {
-		if db != nil {
-			if err := db.Close(); err != nil {
+		if c != nil {
+			if err := c.Close(); err != nil {
 				t.Fatalf("db close: %v", err)
 			}
-			db = nil
+			c = nil
 		}
 		if raw != nil {
 			if err := raw.Close(); err != nil {
@@ -273,7 +274,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	}
 	t.Cleanup(closeCurrent)
 
-	if err := db.Set("seed", &StringUniqueTestRec{Email: "seed@x", Code: 1}); err != nil {
+	if err := writeSet(c, "seed", &StringUniqueTestRec{Email: "seed@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
@@ -286,7 +287,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 			close(release)
 		}
 	})
-	blockCommit := BeforeCommit(func(*bbolt.Tx, string, *StringUniqueTestRec, *StringUniqueTestRec) error {
+	blockCommit := OnChange(func(*Tx, string, *StringUniqueTestRec, *StringUniqueTestRec) error {
 		close(entered)
 		<-release
 		return nil
@@ -294,7 +295,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 
 	blockerDone := make(chan error, 1)
 	go func() {
-		blockerDone <- db.Set("blocker", &StringUniqueTestRec{Email: "blocker@x", Code: 2}, blockCommit)
+		blockerDone <- writeSet(c, "blocker", &StringUniqueTestRec{Email: "blocker@x", Code: 2}, blockCommit)
 	}()
 
 	select {
@@ -302,21 +303,21 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for blocked commit")
 	}
-	baseline := db.AutoBatchStats()
+	baseline := c.root.scheduler.snapshot()
 
 	badDone := make(chan error, 1)
 	go func() {
-		badDone <- db.Set("ghost-hole", &StringUniqueTestRec{Email: "seed@x", Code: 3})
+		badDone <- writeSet(c, "ghost-hole", &StringUniqueTestRec{Email: "seed@x", Code: 3})
 	}()
-	waitAutoBatchExtraStats(t, db, "queued rejected string set", func(st rbistats.AutoBatch) bool {
+	waitAutoBatchExtraStats(t, c.root, "queued rejected string set", func(st rootSchedulerSnapshot) bool {
 		return st.Submitted == baseline.Submitted+1 && st.QueueLen == 1
 	})
 
 	goodDone := make(chan error, 1)
 	go func() {
-		goodDone <- db.Set("real-hole", &StringUniqueTestRec{Email: "real@x", Code: 4})
+		goodDone <- writeSet(c, "real-hole", &StringUniqueTestRec{Email: "real@x", Code: 4})
 	}()
-	waitAutoBatchExtraStats(t, db, "queued rejected+accepted string sets", func(st rbistats.AutoBatch) bool {
+	waitAutoBatchExtraStats(t, c.root, "queued rejected+accepted string sets", func(st rootSchedulerSnapshot) bool {
 		return st.Submitted == baseline.Submitted+2 && st.QueueLen == 2
 	})
 
@@ -335,14 +336,14 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 	assertHole := func(label string) {
 		t.Helper()
 
-		v, getErr := db.Get("ghost-hole")
+		v, getErr := readGet(c, "ghost-hole")
 		if getErr != nil {
 			t.Fatalf("%s: Get(ghost-hole): %v", label, getErr)
 		}
 		if v != nil {
 			t.Fatalf("%s: rejected key persisted: %#v", label, v)
 		}
-		v, getErr = db.Get("blocker")
+		v, getErr = readGet(c, "blocker")
 		if getErr != nil {
 			t.Fatalf("%s: Get(blocker): %v", label, getErr)
 		}
@@ -350,7 +351,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 			t.Fatalf("%s: blocker payload mismatch: %#v", label, v)
 		}
 
-		v, getErr = db.Get("real-hole")
+		v, getErr = readGet(c, "real-hole")
 		if getErr != nil {
 			t.Fatalf("%s: Get(real-hole): %v", label, getErr)
 		}
@@ -359,7 +360,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 		}
 
 		allQ := qx.Query()
-		gotAll, queryErr := db.QueryKeys(allQ)
+		gotAll, queryErr := readQueryKeys(c, allQ)
 		if queryErr != nil {
 			t.Fatalf("%s: QueryKeys(NOOP): %v", label, queryErr)
 		}
@@ -367,7 +368,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 			t.Fatalf("%s: NOOP query mismatch: got=%v want=[seed blocker real-hole]", label, gotAll)
 		}
 
-		gotReal, queryErr := db.QueryKeys(qx.Query(qx.EQ("email", "real@x")))
+		gotReal, queryErr := readQueryKeys(c, qx.Query(qx.EQ("email", "real@x")))
 		if queryErr != nil {
 			t.Fatalf("%s: QueryKeys(real email): %v", label, queryErr)
 		}
@@ -380,7 +381,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectKeepsCommittedKeysAcrossReopen(t *
 
 	closeCurrent()
 
-	db, raw = openBoltAndNew[string, StringUniqueTestRec](t, path)
+	c, raw = openBoltAndCollection[string, StringUniqueTestRec](t, path)
 
 	assertHole("reopen")
 }
@@ -389,25 +390,25 @@ func TestStringExt_TruncateRecreatesEmptyStringMap(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_truncate_map.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path)
+	c, bolt := openBoltAndCollection[string, Rec](t, path)
 	defer func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	}()
 
-	if err := db.Set("a", &Rec{Name: "a"}); err != nil {
+	if err := writeSet(c, "a", &Rec{Name: "a"}); err != nil {
 		t.Fatalf("Set(a): %v", err)
 	}
-	if err := db.Set("b", &Rec{Name: "b"}); err != nil {
+	if err := writeSet(c, "b", &Rec{Name: "b"}); err != nil {
 		t.Fatalf("Set(b): %v", err)
 	}
 
-	if err := db.Truncate(); err != nil {
+	if err := c.Truncate(); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	if err := raw.View(func(tx *bbolt.Tx) error {
-		m := tx.Bucket(db.strmapBucket)
+	if err := bolt.View(func(tx *bbolt.Tx) error {
+		m := tx.Bucket(c.strmapBucket)
 		if m == nil {
 			return fmt.Errorf("string map bucket missing")
 		}
@@ -423,12 +424,12 @@ func TestStringExt_TruncateRecreatesEmptyStringMap(t *testing.T) {
 		t.Fatalf("verify empty string map: %v", err)
 	}
 
-	if err := db.Set("c", &Rec{Name: "c"}); err != nil {
+	if err := writeSet(c, "c", &Rec{Name: "c"}); err != nil {
 		t.Fatalf("Set(c): %v", err)
 	}
 
-	if err := raw.View(func(tx *bbolt.Tx) error {
-		m := tx.Bucket(db.strmapBucket)
+	if err := bolt.View(func(tx *bbolt.Tx) error {
+		m := tx.Bucket(c.strmapBucket)
 		if m == nil {
 			return fmt.Errorf("string map bucket missing")
 		}
@@ -436,7 +437,7 @@ func TestStringExt_TruncateRecreatesEmptyStringMap(t *testing.T) {
 		if got := m.Get(keycodec.U64BytesWithBuf(1, &mapKey)); !slices.Equal(got, []byte("c")) {
 			return fmt.Errorf("map[1]=%q want c", got)
 		}
-		v := tx.Bucket(db.dataBucket).Get([]byte("c"))
+		v := tx.Bucket(c.dataBucket).Get([]byte("c"))
 		idx := keycodec.U64FromBytes(v[:8])
 		if idx != 1 {
 			return fmt.Errorf("idx after truncate=%d want 1", idx)
@@ -448,7 +449,7 @@ func TestStringExt_TruncateRecreatesEmptyStringMap(t *testing.T) {
 }
 
 func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
-	db, _ := openTempDBStringUnique(t)
+	c, _ := openTempDBStringUnique(t)
 
 	seed := []struct {
 		key   string
@@ -460,24 +461,24 @@ func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 		{key: "seed-c", email: "c@x", code: 3},
 	}
 	for _, item := range seed {
-		if err := db.Set(item.key, &StringUniqueTestRec{Email: item.email, Code: item.code}); err != nil {
+		if err := writeSet(c, item.key, &StringUniqueTestRec{Email: item.email, Code: item.code}); err != nil {
 			t.Fatalf("seed Set(%q): %v", item.key, err)
 		}
 	}
 
-	err := db.Set("ghost-dup", &StringUniqueTestRec{Email: "a@x", Code: 99})
+	err := writeSet(c, "ghost-dup", &StringUniqueTestRec{Email: "a@x", Code: 99})
 	if !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("duplicate Set error = %v, want %v", err, rbierrors.ErrUniqueViolation)
 	}
-	if got, getErr := db.Get("ghost-dup"); getErr != nil || got != nil {
+	if got, getErr := readGet(c, "ghost-dup"); getErr != nil || got != nil {
 		t.Fatalf("rejected key lookup = %#v/%v, want nil/<nil>", got, getErr)
 	}
 
-	if err := db.Set("real-ok", &StringUniqueTestRec{Email: "real@x", Code: 100}); err != nil {
+	if err := writeSet(c, "real-ok", &StringUniqueTestRec{Email: "real@x", Code: 100}); err != nil {
 		t.Fatalf("good Set: %v", err)
 	}
 
-	gotAll, err := db.QueryKeys(qx.Query())
+	gotAll, err := readQueryKeys(c, qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -488,20 +489,20 @@ func TestStringExt_UniqueRejectDoesNotLeakRejectedStringKey(t *testing.T) {
 }
 
 func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanKeys(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	const n = 320
 	want := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("key-%03d", i)
 		want = append(want, key)
-		if err := db.Set(key, &Rec{Name: key, Age: i}); err != nil {
+		if err := writeSet(c, key, &Rec{Name: key, Age: i}); err != nil {
 			t.Fatalf("Set(%q): %v", key, err)
 		}
 	}
 
 	allQ := qx.Query()
-	gotKeys, err := db.QueryKeys(allQ)
+	gotKeys, err := readQueryKeys(c, allQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(NOOP): %v", err)
 	}
@@ -510,7 +511,7 @@ func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanKeys(t *testing.T) {
 	}
 
 	var scanned []string
-	err = db.ScanKeys("", func(id string) (bool, error) {
+	err = readScanKeys(c, "", func(id string) (bool, error) {
 		scanned = append(scanned, id)
 		return true, nil
 	})
@@ -523,7 +524,7 @@ func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanKeys(t *testing.T) {
 }
 
 func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	const (
 		keySpace  = 32
@@ -535,7 +536,7 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 
 	for i := 0; i < keySpace; i++ {
 		key := fmt.Sprintf("key-%02d", i)
-		if err := db.Set(key, &Rec{
+		if err := writeSet(c, key, &Rec{
 			Name:   key,
 			Age:    i,
 			Active: i%2 == 0,
@@ -555,11 +556,11 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < writerOps; i++ {
 				key := fmt.Sprintf("key-%02d", (worker*17+i*7+i*i)%keySpace)
-				if err := db.Delete(key); err != nil {
+				if err := writeDelete(c, key); err != nil {
 					errCh <- fmt.Errorf("writer=%d Delete(%q): %w", worker, key, err)
 					return
 				}
-				if err := db.Set(key, &Rec{
+				if err := writeSet(c, key, &Rec{
 					Name:   key,
 					Age:    1000 + worker*writerOps + i,
 					Active: (worker+i)%2 == 0,
@@ -582,7 +583,7 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 			defer wg.Done()
 
 			for i := 0; i < readerOps; i++ {
-				values, err := db.Query(qx.Query())
+				values, err := readQuery(c, qx.Query())
 				if err != nil {
 					errCh <- fmt.Errorf("reader=%d Query: %w", reader, err)
 					return
@@ -627,7 +628,7 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 		t.FailNow()
 	}
 
-	gotAll, err := db.QueryKeys(qx.Query())
+	gotAll, err := readQueryKeys(c, qx.Query())
 	if err != nil {
 		t.Fatalf("final QueryKeys(NOOP): %v", err)
 	}
@@ -635,7 +636,7 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 		t.Fatalf("final key count mismatch: got=%d want=%d", len(gotAll), keySpace)
 	}
 	for _, key := range gotAll {
-		v, getErr := db.Get(key)
+		v, getErr := readGet(c, key)
 		if getErr != nil {
 			t.Fatalf("final Get(%q): %v", key, getErr)
 		}
@@ -646,7 +647,7 @@ func TestStringExt_QueryStaysConsistentDuringDeleteReinsertChurn(t *testing.T) {
 }
 
 func TestStringKeys_ExoticCharacters(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	keys := []string{
 		"simple",
@@ -659,13 +660,13 @@ func TestStringKeys_ExoticCharacters(t *testing.T) {
 
 	for i, k := range keys {
 		rec := &Rec{Name: fmt.Sprintf("rec-%d", i), Age: i}
-		if err := db.Set(k, rec); err != nil {
+		if err := writeSet(c, k, rec); err != nil {
 			t.Fatalf("Set(%q) failed: %v", k, err)
 		}
 	}
 
 	for i, k := range keys {
-		v, err := db.Get(k)
+		v, err := readGet(c, k)
 		if err != nil {
 			t.Fatalf("Get(%q) failed: %v", k, err)
 		}
@@ -680,7 +681,7 @@ func TestStringKeys_ExoticCharacters(t *testing.T) {
 
 		// validate index lookup through durable string ids
 		q := qx.Query(qx.EQ("name", expectedName))
-		ids, err := db.QueryKeys(q)
+		ids, err := readQueryKeys(c, q)
 		if err != nil {
 			t.Fatalf("QueryKeys for %q failed: %v", k, err)
 		}
@@ -697,17 +698,17 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_keys_persist.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path)
+	c, raw := openBoltAndCollection[string, Rec](t, path)
 
-	if err := db.Set("alice", &Rec{Age: 20}); err != nil {
+	if err := writeSet(c, "alice", &Rec{Age: 20}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set("bob", &Rec{Age: 30}); err != nil {
+	if err := writeSet(c, "bob", &Rec{Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
 	// force index and string map persistence
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("db close: %v", err)
 	}
 	if err := raw.Close(); err != nil {
@@ -715,7 +716,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	}
 
 	// reopen
-	db2, raw2 := openBoltAndNew[string, Rec](t, path)
+	db2, raw2 := openBoltAndCollection[string, Rec](t, path)
 	defer func() {
 		if err := db2.Close(); err != nil {
 			t.Fatalf("db2 close: %v", err)
@@ -727,7 +728,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 
 	// validate correctness after reopen
 	q := qx.Query(qx.EQ("age", 20))
-	ids, err := db2.QueryKeys(q)
+	ids, err := readQueryKeys(db2, q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -740,11 +741,11 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	}
 
 	// validate ID counter restoration
-	if err = db2.Set("charlie", &Rec{Age: 40}); err != nil {
+	if err = writeSet(db2, "charlie", &Rec{Age: 40}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	ids, _ = db2.QueryKeys(qx.Query(qx.EQ("age", 40)))
+	ids, _ = readQueryKeys(db2, qx.Query(qx.EQ("age", 40)))
 	if len(ids) != 1 || ids[0] != "charlie" {
 		t.Errorf("Insert after reopen failed: %v", ids)
 	}
@@ -754,15 +755,15 @@ func TestStringKeys_StartupBuild_FromScratch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_keys_rebuild.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path)
+	c, raw := openBoltAndCollection[string, Rec](t, path)
 
 	keys := []string{"k1", "k2", "k3"}
 	for i, k := range keys {
-		if err := db.Set(k, &Rec{Age: i * 10}); err != nil {
+		if err := writeSet(c, k, &Rec{Age: i * 10}); err != nil {
 			t.Fatalf("Set (%q): %v", k, err)
 		}
 	}
-	if err := db.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("db close: %v", err)
 	}
 	if err := raw.Close(); err != nil {
@@ -776,7 +777,7 @@ func TestStringKeys_StartupBuild_FromScratch(t *testing.T) {
 	}
 
 	// Reopen and build the index from stored records.
-	db2, raw2 := openBoltAndNew[string, Rec](t, path)
+	db2, raw2 := openBoltAndCollection[string, Rec](t, path)
 	defer func() {
 		if err := db2.Close(); err != nil {
 			t.Fatalf("db2 close: %v", err)
@@ -789,7 +790,7 @@ func TestStringKeys_StartupBuild_FromScratch(t *testing.T) {
 	// validate rebuilt index
 	for i, k := range keys {
 		age := i * 10
-		ids, err := db2.QueryKeys(qx.Query(qx.EQ("age", age)))
+		ids, err := readQueryKeys(db2, qx.Query(qx.EQ("age", age)))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -800,7 +801,7 @@ func TestStringKeys_StartupBuild_FromScratch(t *testing.T) {
 }
 
 func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	var wg sync.WaitGroup
 	workers := 10
@@ -814,13 +815,13 @@ func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
 				key := fmt.Sprintf("w-%d-k-%d", workerID, j)
 				rec := &Rec{Name: "worker", Age: workerID}
 
-				if err := db.Set(key, rec); err != nil {
+				if err := writeSet(c, key, rec); err != nil {
 					t.Errorf("Set failed: %v", err)
 					return
 				}
 
 				// immediate read to stress RLock paths
-				v, err := db.Get(key)
+				v, err := readGet(c, key)
 				if err != nil || v == nil {
 					t.Errorf("Get failed: %v", err)
 				}
@@ -831,20 +832,20 @@ func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
 
 	// validate total count
 	totalExpected := workers * writes
-	count, _ := db.Count()
+	count, _ := readCount(c)
 	if int(count) != totalExpected {
 		t.Errorf("expected %d records, got %d", totalExpected, count)
 	}
 
 	// validate index query under load
-	ids, _ := db.QueryKeys(qx.Query(qx.EQ("name", "worker")))
+	ids, _ := readQueryKeys(c, qx.Query(qx.EQ("name", "worker")))
 	if len(ids) != totalExpected {
 		t.Errorf("expected %d keys, got %d", totalExpected, len(ids))
 	}
 }
 
 func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	type modelRec struct {
 		name   string
@@ -874,7 +875,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 
 	for i := 0; i < 220; i++ {
 		switch i % 3 {
-		case 0: // BatchSet
+		case 0: // MultiSet
 			keys := makeKeys(i*13+17, 2+(i%4))
 			vals := make([]*Rec, 0, len(keys))
 			for pos, key := range keys {
@@ -891,11 +892,11 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 				})
 				model[key] = modelRec{name: name, age: age, active: active}
 			}
-			if err := db.BatchSet(keys, vals); err != nil {
-				t.Fatalf("BatchSet(step=%d): %v", i, err)
+			if err := writeSets(c, keys, vals); err != nil {
+				t.Fatalf("MultiSet(step=%d): %v", i, err)
 			}
 
-		case 1: // BatchPatch
+		case 1: // MultiPatch
 			keys := makeKeys(i*7+31, 3+(i%3))
 			age := 900 + i
 			active := i%2 == 0
@@ -903,8 +904,8 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 				{Name: "age", Value: age},
 				{Name: "active", Value: active},
 			}
-			if err := db.BatchPatch(keys, patch); err != nil {
-				t.Fatalf("BatchPatch(step=%d): %v", i, err)
+			if err := writePatches(c, keys, patch); err != nil {
+				t.Fatalf("MultiPatch(step=%d): %v", i, err)
 			}
 			for _, key := range keys {
 				if cur, ok := model[key]; ok {
@@ -914,10 +915,10 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 				}
 			}
 
-		default: // BatchDelete
+		default: // MultiDelete
 			keys := makeKeys(i*5+19, 1+(i%4))
-			if err := db.BatchDelete(keys); err != nil {
-				t.Fatalf("BatchDelete(step=%d): %v", i, err)
+			if err := writeDeletes(c, keys); err != nil {
+				t.Fatalf("MultiDelete(step=%d): %v", i, err)
 			}
 			for _, key := range keys {
 				delete(model, key)
@@ -925,7 +926,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 		}
 	}
 
-	count, err := db.Count()
+	count, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -937,7 +938,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 	wantActive := make(map[string]struct{}, len(model))
 
 	for key, exp := range model {
-		v, err := db.Get(key)
+		v, err := readGet(c, key)
 		if err != nil {
 			t.Fatalf("Get(%q): %v", key, err)
 		}
@@ -949,7 +950,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 				key, v.Name, v.Age, v.Active, exp.name, exp.age, exp.active)
 		}
 
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", exp.name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", exp.name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(name=%q): %v", exp.name, err)
 		}
@@ -963,7 +964,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 		}
 	}
 
-	gotActive, err := db.QueryKeys(qx.Query(qx.EQ("active", true)))
+	gotActive, err := readQueryKeys(c, qx.Query(qx.EQ("active", true)))
 	if err != nil {
 		t.Fatalf("QueryKeys(active=true): %v", err)
 	}
@@ -986,7 +987,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 		if _, live := liveNames[name]; live {
 			continue
 		}
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(stale name=%q): %v", name, err)
 		}
@@ -1001,7 +1002,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 }
 
 func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	const (
 		keySpace     = 144
@@ -1015,7 +1016,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 	for i := 0; i < keySpace; i++ {
 		key := fmt.Sprintf("id-%03d", i)
 		name := fmt.Sprintf("seed-%03d", i)
-		if err := db.Set(key, &Rec{
+		if err := writeSet(c, key, &Rec{
 			Name:   name,
 			Age:    18 + (i % 40),
 			Active: i%2 == 0,
@@ -1053,15 +1054,15 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 				q := readQueries[(readerID+i)%len(readQueries)]
 				i++
 
-				if _, err := db.QueryKeys(q); err != nil {
+				if _, err := readQueryKeys(c, q); err != nil {
 					errCh <- fmt.Errorf("reader=%d QueryKeys: %w", readerID, err)
 					return
 				}
-				if _, err := db.Query(q); err != nil {
+				if _, err := readQuery(c, q); err != nil {
 					errCh <- fmt.Errorf("reader=%d Query: %w", readerID, err)
 					return
 				}
-				if _, err := db.Count(q.Filter); err != nil {
+				if _, err := readCount(c, q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader=%d Count: %w", readerID, err)
 					return
 				}
@@ -1081,7 +1082,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 				case 0:
 					name := fmt.Sprintf("live-w%02d-i%04d-%s", w, i, key)
 					historicNames.Store(name, struct{}{})
-					if err := db.Set(key, &Rec{
+					if err := writeSet(c, key, &Rec{
 						Name:   name,
 						Age:    30 + w + i,
 						Active: (w+i)%2 == 0,
@@ -1100,13 +1101,13 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 						{Name: "age", Value: 700 + w*10 + i},
 						{Name: "active", Value: i%2 == 0},
 					}
-					if err := db.BatchPatch([]string{key}, patch); err != nil {
-						errCh <- fmt.Errorf("writer=%d BatchPatch(%q): %w", w, key, err)
+					if err := writePatches(c, []string{key}, patch); err != nil {
+						errCh <- fmt.Errorf("writer=%d MultiPatch(%q): %w", w, key, err)
 						return
 					}
 
 				default:
-					if err := db.Delete(key); err != nil {
+					if err := writeDelete(c, key); err != nil {
 						errCh <- fmt.Errorf("writer=%d Delete(%q): %w", w, key, err)
 						return
 					}
@@ -1133,7 +1134,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 	}
 	live := make(map[string]liveRec, keySpace)
 
-	err := db.SeqScan("", func(key string, rec *Rec) (bool, error) {
+	err := readSeqScan(c, "", func(key string, rec *Rec) (bool, error) {
 		if rec == nil {
 			return false, fmt.Errorf("nil record for key=%q", key)
 		}
@@ -1147,7 +1148,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	count, err := db.Count()
+	count, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1157,7 +1158,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 
 	liveByName := make(map[string]string, len(live))
 	for _, rec := range live {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", rec.name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", rec.name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(name=%q): %v", rec.name, err)
 		}
@@ -1179,7 +1180,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 		if _, liveNow := liveByName[name]; liveNow {
 			return true
 		}
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
+		ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(stale name=%q): %v", name, err)
 		}
@@ -1192,18 +1193,18 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 }
 
 func TestStringKeys_QueryOrder_FollowsInternalIndex(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	inputs := []string{"b", "a", "d", "c"}
 	for _, k := range inputs {
-		err := db.Set(k, &Rec{Age: 1})
+		err := writeSet(c, k, &Rec{Age: 1})
 		if err != nil {
 			t.Fatalf("Set (%q): %v", k, err)
 		}
 	}
 
 	// returns results ordered by internal id (insertion order)
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 1)))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1221,16 +1222,16 @@ func TestStringKeys_QueryOrder_FollowsInternalIndex(t *testing.T) {
 }
 
 func TestStringKeys_VeryLongKey(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 
 	longKey := strings.Repeat("A", 4096)
 
-	err := db.Set(longKey, &Rec{Name: "long"})
+	err := writeSet(c, longKey, &Rec{Name: "long"})
 	if err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	v, err := db.Get(longKey)
+	v, err := readGet(c, longKey)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -1241,7 +1242,7 @@ func TestStringKeys_VeryLongKey(t *testing.T) {
 		t.Errorf("value mismatch: %v", v.Name)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "long")))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", "long")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -1251,20 +1252,20 @@ func TestStringKeys_VeryLongKey(t *testing.T) {
 }
 
 func TestStringKeys_QueryResultKey_RemainsValidAfterClose(t *testing.T) {
-	db, _ := openTempDBString(t)
+	c, _ := openTempStringCollection(t)
 	key := "my-key"
-	if err := db.Set(key, &Rec{}); err != nil {
+	if err := writeSet(c, key, &Rec{}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	ids, err := db.QueryKeys(qx.Query())
+	ids, err := readQueryKeys(c, qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	resultKey := ids[0]
 
 	// close to invalidate mmap regions
-	if err = db.Close(); err != nil {
+	if err = c.Close(); err != nil {
 		t.Fatalf("db close: %v", err)
 	}
 
@@ -1276,28 +1277,28 @@ func TestStringKeys_QueryResultKey_RemainsValidAfterClose(t *testing.T) {
 }
 
 func TestMissingIDs_DoNotCreateStringRecords(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
+	c, _ := openTempCollectionStringProduct(t)
 
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+	if err := writeSet(c, "p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
+	if err := writePatch(c, "missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
 		t.Fatalf("Patch(missing): %v", err)
 	}
-	if err := db.Delete("missing"); err != nil {
+	if err := writeDelete(c, "missing"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if err := db.BatchDelete([]string{"missing2", "missing3"}); err != nil {
-		t.Fatalf("BatchDelete: %v", err)
+	if err := writeDeletes(c, []string{"missing2", "missing3"}); err != nil {
+		t.Fatalf("MultiDelete: %v", err)
 	}
-	if err := db.BatchPatch([]string{"missing4"}, []Field{{Name: "price", Value: 2.0}}); err != nil {
-		t.Fatalf("BatchPatch: %v", err)
+	if err := writePatches(c, []string{"missing4"}, []Field{{Name: "price", Value: 2.0}}); err != nil {
+		t.Fatalf("MultiPatch: %v", err)
 	}
 
-	got, err := db.BatchGet("missing", "missing2", "missing3", "missing4")
+	got, err := readValues(c, "missing", "missing2", "missing3", "missing4")
 	if err != nil {
-		t.Fatalf("BatchGet(missing ids): %v", err)
+		t.Fatalf("readValues(missing ids): %v", err)
 	}
 	for i := range got {
 		if got[i] != nil {
@@ -1307,91 +1308,95 @@ func TestMissingIDs_DoNotCreateStringRecords(t *testing.T) {
 }
 
 func TestFailedSetPaths_DoNotPersistStringKeys(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
+	c, _ := openTempCollectionStringProduct(t)
 
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+	if err := writeSet(c, "p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	cbErr := errors.New("before commit fail")
-	cb := func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error { return cbErr }
+	cbErr := errors.New("on change fail")
+	cb := func(_ *Tx, _ string, _ *Product, _ *Product) error { return cbErr }
 
-	if err := db.Set("ghost-set", &Product{SKU: "ghost-set", Price: 11}, BeforeCommit(cb)); !errors.Is(err, cbErr) {
+	if err := writeSet(c, "ghost-set", &Product{SKU: "ghost-set", Price: 11}, OnChange(cb)); !errors.Is(err, cbErr) {
 		t.Fatalf("Set callback error mismatch: %v", err)
 	}
-	if v, err := db.Get("ghost-set"); err != nil {
+	if v, err := readGet(c, "ghost-set"); err != nil {
 		t.Fatalf("Get(ghost-set): %v", err)
 	} else if v != nil {
 		t.Fatalf("ghost-set should not persist after rollback, got %#v", v)
 	}
 
-	err := db.BatchSet(
+	err := writeSets(c,
 		[]string{"ghost-many-1", "ghost-many-2"},
 		[]*Product{
 			{SKU: "ghost-many-1", Price: 12},
 			{SKU: "ghost-many-2", Price: 13},
 		},
-		BeforeCommit(cb),
+		OnChange(cb),
 	)
 	if !errors.Is(err, cbErr) {
-		t.Fatalf("BatchSet callback error mismatch: %v", err)
+		t.Fatalf("MultiSet callback error mismatch: %v", err)
 	}
-	if v, err := db.Get("ghost-many-1"); err != nil {
+	if v, err := readGet(c, "ghost-many-1"); err != nil {
 		t.Fatalf("Get(ghost-many-1): %v", err)
 	} else if v != nil {
 		t.Fatalf("ghost-many-1 should not persist after rollback, got %#v", v)
 	}
-	if v, err := db.Get("ghost-many-2"); err != nil {
+	if v, err := readGet(c, "ghost-many-2"); err != nil {
 		t.Fatalf("Get(ghost-many-2): %v", err)
 	} else if v != nil {
 		t.Fatalf("ghost-many-2 should not persist after rollback, got %#v", v)
 	}
 }
 
-func TestBatchSet_CallbackError_DoesNotPersistStringKey(t *testing.T) {
-	db, _ := openTempDBStringProduct(t)
+func TestMultiSet_CallbackError_DoesNotPersistStringKey(t *testing.T) {
+	enableStoreStatsForTest(t)
 
-	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+	c, _ := openTempCollectionStringProduct(t)
+
+	if err := writeSet(c, "p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
 	cbErr := errors.New("cb fail")
-	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, BeforeCommit(func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
+	err := writeSet(c, "ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, OnChange(func(_ *Tx, _ string, _ *Product, _ *Product) error {
 		return cbErr
 	}))
 	if !errors.Is(err, cbErr) {
 		t.Fatalf("Set callback error mismatch: %v", err)
 	}
-	if v, err := db.Get("ghost-cb"); err != nil {
+	if v, err := readGet(c, "ghost-cb"); err != nil {
 		t.Fatalf("Get(ghost-cb): %v", err)
 	} else if v != nil {
 		t.Fatalf("ghost-cb should not persist after rollback, got %#v", v)
 	}
 
-	bs := db.AutoBatchStats()
+	bs := c.StoreStats()
 	if bs.CallbackOps == 0 || bs.CallbackErrors == 0 {
 		t.Fatalf("expected callback error via batch path, stats=%+v", bs)
 	}
 }
 
-func TestBatchSet_UniqueReject_DoesNotPersistStringKey(t *testing.T) {
-	db, _ := openTempDBStringUnique(t)
+func TestMultiSet_UniqueReject_DoesNotPersistStringKey(t *testing.T) {
+	enableStoreStatsForTest(t)
 
-	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+	c, _ := openTempDBStringUnique(t)
+
+	if err := writeSet(c, "u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	err := db.Set("u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
+	err := writeSet(c, "u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
 	if err == nil || !errors.Is(err, rbierrors.ErrUniqueViolation) {
 		t.Fatalf("expected rbierrors.ErrUniqueViolation, got: %v", err)
 	}
-	if v, err := db.Get("u-dup"); err != nil {
+	if v, err := readGet(c, "u-dup"); err != nil {
 		t.Fatalf("Get(u-dup): %v", err)
 	} else if v != nil {
 		t.Fatalf("u-dup should not persist after unique reject, got %#v", v)
 	}
 
-	bs := db.AutoBatchStats()
+	bs := c.StoreStats()
 	if bs.UniqueRejected == 0 {
 		t.Fatalf("expected unique rejection in batch stats, got %+v", bs)
 	}
@@ -1402,14 +1407,14 @@ type StringUniqueTestRec struct {
 	Code  int    `db:"code"  rbi:"unique"`
 }
 
-func openTempDBStringUnique(t *testing.T, options ...Options) (*DB[string, StringUniqueTestRec], string) {
+func openTempDBStringUnique(t *testing.T, options ...Options) (*Collection[string, StringUniqueTestRec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_string_unique.db")
-	db, raw := openBoltAndNew[string, StringUniqueTestRec](t, path, options...)
+	c, bolt := openBoltAndCollection[string, StringUniqueTestRec](t, path, options...)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db, path
+	return c, path
 }

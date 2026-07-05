@@ -1,12 +1,8 @@
 package main
 
-import (
-	"time"
+import "github.com/vapstack/rbi/rbistats"
 
-	"github.com/vapstack/rbi/rbistats"
-)
-
-const reportSchema = "rbi.stress_report/v9"
+const reportSchema = "rbi.stress_report/v13"
 
 type stressReport struct {
 	Schema      string `json:"schema"`
@@ -43,9 +39,9 @@ type stressReport struct {
 	SnapshotFinal    snapshotSample   `json:"snapshot_final"`
 	SnapshotSamples  []snapshotSample `json:"snapshot_samples,omitempty"`
 
-	BatchBaseline batchSample   `json:"batch_baseline"`
-	BatchFinal    batchSample   `json:"batch_final"`
-	BatchSamples  []batchSample `json:"batch_samples,omitempty"`
+	WriteBaseline writeSample   `json:"write_baseline"`
+	WriteFinal    writeSample   `json:"write_final"`
+	WriteSamples  []writeSample `json:"write_samples,omitempty"`
 
 	IndexStats rbistats.Index `json:"index_stats"`
 }
@@ -111,9 +107,9 @@ type phaseReport struct {
 	SnapshotFinal    snapshotSample   `json:"snapshot_final"`
 	SnapshotSamples  []snapshotSample `json:"snapshot_samples,omitempty"`
 
-	BatchBaseline batchSample   `json:"batch_baseline"`
-	BatchFinal    batchSample   `json:"batch_final"`
-	BatchSamples  []batchSample `json:"batch_samples,omitempty"`
+	WriteBaseline writeSample   `json:"write_baseline"`
+	WriteFinal    writeSample   `json:"write_final"`
+	WriteSamples  []writeSample `json:"write_samples,omitempty"`
 }
 
 type scopeReport struct {
@@ -130,35 +126,30 @@ type snapshotSample struct {
 	Stats      rbistats.Snapshot `json:"stats"`
 }
 
-type batchSample struct {
-	CapturedAt string             `json:"captured_at"`
-	Stats      rbistats.AutoBatch `json:"stats"`
-	Delta      batchDelta         `json:"delta"`
+type writeSample struct {
+	CapturedAt string         `json:"captured_at"`
+	Stats      rbistats.Store `json:"stats"`
+	Delta      writeDelta     `json:"delta"`
 }
 
-type batchDelta struct {
-	Submitted           uint64        `json:"submitted"`
-	Enqueued            uint64        `json:"enqueued"`
-	Dequeued            uint64        `json:"dequeued"`
-	QueueHighWater      uint64        `json:"queue_high_water"`
-	ExecutedBatches     uint64        `json:"executed_batches"`
-	MultiRequestBatches uint64        `json:"multi_request_batches"`
-	MultiRequestOps     uint64        `json:"multi_request_ops"`
-	BatchSize1          uint64        `json:"batch_size_1"`
-	BatchSize2To4       uint64        `json:"batch_size_2_4"`
-	BatchSize5To8       uint64        `json:"batch_size_5_8"`
-	BatchSize9Plus      uint64        `json:"batch_size_9_plus"`
-	MaxBatchSeen        uint64        `json:"max_batch_seen"`
-	CallbackOps         uint64        `json:"callback_ops"`
-	CoalescedSetDelete  uint64        `json:"coalesced_set_delete"`
-	CoalesceWaits       uint64        `json:"coalesce_waits"`
-	CoalesceWaitTime    time.Duration `json:"coalesce_wait_time"`
-	QueueWaitTime       time.Duration `json:"queue_wait_time"`
-	ExecuteTime         time.Duration `json:"execute_time"`
-	FallbackClosed      uint64        `json:"fallback_closed"`
-	UniqueRejected      uint64        `json:"unique_rejected"`
-	TxBeginErrors       uint64        `json:"tx_begin_errors"`
-	TxOpErrors          uint64        `json:"tx_op_errors"`
-	TxCommitErrors      uint64        `json:"tx_commit_errors"`
-	CallbackErrors      uint64        `json:"callback_errors"`
+type writeDelta struct {
+	LogicalUnitsSubmitted uint64 `json:"logical_units_submitted"`
+	LogicalUnitsEnqueued  uint64 `json:"logical_units_enqueued"`
+	LogicalUnitsDequeued  uint64 `json:"logical_units_dequeued"`
+	QueueHighWater        uint64 `json:"queue_high_water"`
+	ExecutedBatches       uint64 `json:"executed_batches"`
+	MultiUnitBatches      uint64 `json:"multi_unit_batches"`
+	MultiUnitOps          uint64 `json:"multi_unit_ops"`
+	BatchSize1            uint64 `json:"batch_size_1"`
+	BatchSize2To4         uint64 `json:"batch_size_2_4"`
+	BatchSize5To8         uint64 `json:"batch_size_5_8"`
+	BatchSize9Plus        uint64 `json:"batch_size_9_plus"`
+	MaxBatchSeen          uint64 `json:"max_batch_seen"`
+	CallbackOps           uint64 `json:"callback_ops"`
+	RejectedClosed        uint64 `json:"rejected_closed"`
+	UniqueRejected        uint64 `json:"unique_rejected"`
+	TxBeginErrors         uint64 `json:"tx_begin_errors"`
+	TxOpErrors            uint64 `json:"tx_op_errors"`
+	TxCommitErrors        uint64 `json:"tx_commit_errors"`
+	CallbackErrors        uint64 `json:"callback_errors"`
 }

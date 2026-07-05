@@ -47,8 +47,8 @@ type DBConfig struct {
 	TraceSampleEvery     int
 }
 
-type DBHandle struct {
-	DB           *rbi.DB[uint64, UserBench]
+type CollectionHandle struct {
+	Collection   *rbi.Collection[uint64, UserBench]
 	RawBolt      *bolt.DB
 	StartRecords uint64
 	MaxID        uint64
@@ -57,12 +57,9 @@ type DBHandle struct {
 }
 
 func buildRBIOptions(cfg DBConfig) rbi.Options {
-	dbOpts := rbi.Options{
-		EnableAutoBatchStats: true,
-		EnableSnapshotStats:  true,
-	}
+	var dbOpts rbi.Options
 	if cfg.DisableRuntimeCaches {
-		dbOpts.SnapshotMaterializedPredCacheMaxEntries = -1
+		dbOpts.MaterializedPredicateCacheMaxEntries = -1
 		dbOpts.NumericRangeBucketSize = -1
 		dbOpts.NumericRangeBucketMinFieldKeys = -1
 		dbOpts.NumericRangeBucketMinSpanKeys = -1
@@ -77,7 +74,7 @@ func buildRBIOptions(cfg DBConfig) rbi.Options {
 	return dbOpts
 }
 
-func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
+func OpenBenchDB(cfg DBConfig, emailSampleN int) (*CollectionHandle, error) {
 	if cfg.DBFile == "" {
 		cfg.DBFile = DefaultDBFilename
 	}
@@ -102,21 +99,22 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 		}
 		return nil, fmt.Errorf("open bolt db: %w", err)
 	}
-	db, err := rbi.New[uint64, UserBench](rawBolt, dbOpts)
+	rbi.EnableStoreStats = true
+	c, err := rbi.Open[uint64, UserBench](rawBolt, dbOpts)
 	if err != nil {
 		_ = rawBolt.Close()
 		return nil, fmt.Errorf("init rbi: %w", err)
 	}
 
-	startRecords, maxID, err := loadOrSeedDatabase(db, cfg.SeedRecords, cfg.SeedRecordsSet)
+	startRecords, maxID, err := loadOrSeedCollection(c, cfg.SeedRecords, cfg.SeedRecordsSet)
 	if err != nil {
-		_ = db.Close()
+		_ = c.Close()
 		_ = rawBolt.Close()
 		return nil, err
 	}
-	emailSamples := buildEmailSample(db, maxID, emailSampleN)
-	return &DBHandle{
-		DB:           db,
+	emailSamples := buildEmailSample(c, maxID, emailSampleN)
+	return &CollectionHandle{
+		Collection:   c,
 		RawBolt:      rawBolt,
 		StartRecords: startRecords,
 		MaxID:        maxID,
@@ -125,13 +123,13 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 	}, nil
 }
 
-func (h *DBHandle) Close() error {
+func (h *CollectionHandle) Close() error {
 	var err error
 	if h == nil {
 		return nil
 	}
-	if h.DB != nil {
-		err = h.DB.Close()
+	if h.Collection != nil {
+		err = h.Collection.Close()
 	}
 	if h.RawBolt != nil {
 		if closeErr := h.RawBolt.Close(); closeErr != nil && err == nil {
@@ -141,8 +139,8 @@ func (h *DBHandle) Close() error {
 	return err
 }
 
-func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedRecordsSet bool) (uint64, uint64, error) {
-	count, err := db.Count()
+func loadOrSeedCollection(c *rbi.Collection[uint64, UserBench], seedRecords int, seedRecordsSet bool) (uint64, uint64, error) {
+	count, err := stressReadCount(c)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count existing records: %w", err)
 	}
@@ -152,21 +150,21 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedReco
 	}
 	var maxID uint64
 	if count > 0 {
-		stats, err := db.Stats()
+		stats, err := c.Stats()
 		if err != nil {
 			return 0, 0, fmt.Errorf("stats: %w", err)
 		}
 		maxID = stats.LastKey
 		if maxID == 0 {
-			maxID = scanMaxID(db)
+			maxID = scanMaxID(c)
 		}
 		if count >= target {
 			return count, maxID, nil
 		}
 		missing := target - count
-		log.Printf("Database has %d records. Seeding %d more to reach %d...", count, missing, target)
-		seedData(db, &maxID, int(missing))
-		count, err = db.Count()
+		log.Printf("Collection has %d records. Seeding %d more to reach %d...", count, missing, target)
+		seedData(c, &maxID, int(missing))
+		count, err = stressReadCount(c)
 		if err != nil {
 			return 0, 0, fmt.Errorf("count after top-up seed: %w", err)
 		}
@@ -176,18 +174,18 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedReco
 	if target == 0 {
 		return 0, 0, nil
 	}
-	log.Printf("Database empty. Seeding %d records...", target)
-	seedData(db, &maxID, int(target))
-	count, err = db.Count()
+	log.Printf("Collection is empty. Seeding %d records...", target)
+	seedData(c, &maxID, int(target))
+	count, err = stressReadCount(c)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count after seed: %w", err)
 	}
 	return count, maxID, nil
 }
 
-func scanMaxID(db *rbi.DB[uint64, UserBench]) uint64 {
+func scanMaxID(c *rbi.Collection[uint64, UserBench]) uint64 {
 	var maxID uint64
-	_ = db.ScanKeys(0, func(k uint64) (bool, error) {
+	_ = stressReadScanKeys(c, 0, func(k uint64) (bool, error) {
 		if k > maxID {
 			maxID = k
 		}
@@ -196,7 +194,7 @@ func scanMaxID(db *rbi.DB[uint64, UserBench]) uint64 {
 	return maxID
 }
 
-func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []string {
+func buildEmailSample(c *rbi.Collection[uint64, UserBench], maxID uint64, size int) []string {
 	if maxID == 0 || size <= 0 {
 		return nil
 	}
@@ -212,16 +210,16 @@ func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []s
 
 	for i := 0; i < attempts && len(emails) < size; i++ {
 		id := pickUniformID(rng, maxID)
-		rec, err := db.Get(id)
+		rec, err := stressReadGet(c, id)
 		if err != nil {
-			db.ReleaseRecords(rec)
+			c.ReleaseRecords(rec)
 			continue
 		}
 		if rec == nil {
 			continue
 		}
 		email := rec.Email
-		db.ReleaseRecords(rec)
+		c.ReleaseRecords(rec)
 		if email == "" {
 			continue
 		}
@@ -235,7 +233,7 @@ func buildEmailSample(db *rbi.DB[uint64, UserBench], maxID uint64, size int) []s
 	return emails
 }
 
-func seedData(db *rbi.DB[uint64, UserBench], maxID *uint64, count int) {
+func seedData(c *rbi.Collection[uint64, UserBench], maxID *uint64, count int) {
 	rng := mathutil.NewRand(time.Now().UnixNano())
 
 	ids := make([]uint64, 0, seedBatchSize)
@@ -253,7 +251,7 @@ func seedData(db *rbi.DB[uint64, UserBench], maxID *uint64, count int) {
 			ids[j] = id
 			users[j] = generateUser(rng, id)
 		}
-		if err := db.BatchSet(ids, users); err != nil {
+		if err := stressWriteSets(c, ids, users); err != nil {
 			log.Fatalf("Seeding failed: %v", err)
 		}
 		clear(users)

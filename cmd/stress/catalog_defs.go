@@ -68,17 +68,17 @@ func defaultStressClassSpecs() []stressClassSpec {
 				Role:           RoleRead,
 				DefaultWorkers: 512,
 				Queries: []StressQueryInfo{
-					{Name: "read_profile_by_id_items", Weight: 0.65},
-					{Name: "read_account_by_email_items", Weight: 0.35},
+					{Name: "read_profile_by_id_items", Weight: 0.10},
+					{Name: "read_account_by_email_items", Weight: 0.90},
 				},
 			},
 			queries: []stressQuerySpec{
 				{
-					info: StressQueryInfo{Name: "read_profile_by_id_items", Weight: 0.65},
+					info: StressQueryInfo{Name: "read_profile_by_id_items", Weight: 0.10},
 					run:  runReadProfileByIDItems,
 				},
 				{
-					info: StressQueryInfo{Name: "read_account_by_email_items", Weight: 0.35},
+					info: StressQueryInfo{Name: "read_account_by_email_items", Weight: 0.90},
 					run:  runReadAccountByEmailItems,
 				},
 			},

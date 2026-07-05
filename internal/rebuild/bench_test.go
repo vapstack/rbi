@@ -123,13 +123,13 @@ var rebuildBenchRoles = [...]string{"owner", "admin", "editor", "viewer", "billi
 func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *bbolt.DB {
 	b.Helper()
 
-	db, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
+	bolt, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
 	if err != nil {
 		b.Fatalf("bbolt.Open: %v", err)
 	}
-	b.Cleanup(func() { _ = db.Close() })
+	b.Cleanup(func() { _ = bolt.Close() })
 
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err = bolt.Update(func(tx *bbolt.Tx) error {
 		bkt, e := tx.CreateBucketIfNotExists(bucket)
 		if e != nil {
 			return e
@@ -181,19 +181,19 @@ func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *b
 	if err != nil {
 		b.Fatalf("seed bolt: %v", err)
 	}
-	return db
+	return bolt
 }
 
 func seedRebuildBenchScalarBolt(b *testing.B, bucket []byte, rows int, shape rebuildBenchScalarShape) *bbolt.DB {
 	b.Helper()
 
-	db, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
+	bolt, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
 	if err != nil {
 		b.Fatalf("bbolt.Open: %v", err)
 	}
-	b.Cleanup(func() { _ = db.Close() })
+	b.Cleanup(func() { _ = bolt.Close() })
 
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err = bolt.Update(func(tx *bbolt.Tx) error {
 		bkt, e := tx.CreateBucketIfNotExists(bucket)
 		if e != nil {
 			return e
@@ -214,19 +214,19 @@ func seedRebuildBenchScalarBolt(b *testing.B, bucket []byte, rows int, shape reb
 	if err != nil {
 		b.Fatalf("seed bolt: %v", err)
 	}
-	return db
+	return bolt
 }
 
 func seedRebuildBenchWideBolt(b *testing.B, bucket []byte, rows int, shape rebuildBenchWideShape, strKey bool) *bbolt.DB {
 	b.Helper()
 
-	db, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
+	bolt, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
 	if err != nil {
 		b.Fatalf("bbolt.Open: %v", err)
 	}
-	b.Cleanup(func() { _ = db.Close() })
+	b.Cleanup(func() { _ = bolt.Close() })
 
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err = bolt.Update(func(tx *bbolt.Tx) error {
 		bkt, e := tx.CreateBucketIfNotExists(bucket)
 		if e != nil {
 			return e
@@ -251,19 +251,19 @@ func seedRebuildBenchWideBolt(b *testing.B, bucket []byte, rows int, shape rebui
 	if err != nil {
 		b.Fatalf("seed bolt: %v", err)
 	}
-	return db
+	return bolt
 }
 
 func seedRebuildBenchMeasureBolt(b *testing.B, bucket []byte, rows int) *bbolt.DB {
 	b.Helper()
 
-	db, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
+	bolt, err := bbolt.Open(filepath.Join(b.TempDir(), "rebuild_bench.db"), 0o600, nil)
 	if err != nil {
 		b.Fatalf("bbolt.Open: %v", err)
 	}
-	b.Cleanup(func() { _ = db.Close() })
+	b.Cleanup(func() { _ = bolt.Close() })
 
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err = bolt.Update(func(tx *bbolt.Tx) error {
 		bkt, e := tx.CreateBucketIfNotExists(bucket)
 		if e != nil {
 			return e
@@ -294,7 +294,7 @@ func seedRebuildBenchMeasureBolt(b *testing.B, bucket []byte, rows int) *bbolt.D
 	if err != nil {
 		b.Fatalf("seed bolt: %v", err)
 	}
-	return db
+	return bolt
 }
 
 func compileRebuildBenchSchema(b *testing.B) *schema.Schema {
@@ -317,9 +317,9 @@ func compileRebuildBenchSchemaFor[T any](b *testing.B) *schema.Schema {
 	return rt
 }
 
-func baseRebuildBenchConfig(db *bbolt.DB, bucket []byte, s *schema.Schema, decode DecodeFunc, release ReleaseFunc) Config {
+func baseRebuildBenchConfig(bolt *bbolt.DB, bucket []byte, s *schema.Schema, decode DecodeFunc, release ReleaseFunc) Config {
 	return Config{
-		Bolt:       db,
+		Bolt:       bolt,
 		DataBucket: bucket,
 		Schema:     s,
 		Decode:     decode,
@@ -510,9 +510,9 @@ func reportRebuildBenchMetrics(b *testing.B, rows int, metrics rebuildBenchStora
 func BenchmarkBuildUint64(b *testing.B) {
 	bucket := []byte("bench_uint64")
 	rows := rebuildBenchRows()
-	db := seedRebuildBenchBolt(b, bucket, rows, false)
+	bolt := seedRebuildBenchBolt(b, bucket, rows, false)
 	rt := compileRebuildBenchSchema(b)
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 
 	var metrics rebuildBenchStorageMetrics
 	b.ReportAllocs()
@@ -534,9 +534,9 @@ func BenchmarkBuildUint64(b *testing.B) {
 func BenchmarkBuildStringKeys(b *testing.B) {
 	bucket := []byte("bench_string")
 	rows := rebuildBenchRows()
-	db := seedRebuildBenchBolt(b, bucket, rows, true)
+	bolt := seedRebuildBenchBolt(b, bucket, rows, true)
 	rt := compileRebuildBenchSchema(b)
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.StrKey = true
 	cfg.StrMapBucket = rebuildStringMapBucket(bucket)
 
@@ -562,45 +562,45 @@ func BenchmarkBuildFullCoverage(b *testing.B) {
 
 	b.Run("LowCardinalityScalarOnly", func(b *testing.B) {
 		bucket := []byte("bench_scalar_low")
-		db := seedRebuildBenchScalarBolt(b, bucket, rows, rebuildBenchScalarLowCard)
+		bolt := seedRebuildBenchScalarBolt(b, bucket, rows, rebuildBenchScalarLowCard)
 		rt := compileRebuildBenchSchemaFor[rebuildBenchScalarRec](b)
-		cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchScalarRec, releaseRebuildBenchScalarRec)
+		cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchScalarRec, releaseRebuildBenchScalarRec)
 
 		runRebuildFullBench(b, rows, rt, cfg)
 	})
 
 	b.Run("LowCardinalityWide", func(b *testing.B) {
 		bucket := []byte("bench_wide_low")
-		db := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideLowCard, false)
+		bolt := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideLowCard, false)
 		rt := compileRebuildBenchSchemaFor[rebuildBenchWideRec](b)
-		cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
+		cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
 
 		runRebuildFullBench(b, rows, rt, cfg)
 	})
 
 	b.Run("HighCardinalityScalarOnly", func(b *testing.B) {
 		bucket := []byte("bench_scalar_high")
-		db := seedRebuildBenchScalarBolt(b, bucket, rows, rebuildBenchScalarHighCard)
+		bolt := seedRebuildBenchScalarBolt(b, bucket, rows, rebuildBenchScalarHighCard)
 		rt := compileRebuildBenchSchemaFor[rebuildBenchScalarRec](b)
-		cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchScalarRec, releaseRebuildBenchScalarRec)
+		cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchScalarRec, releaseRebuildBenchScalarRec)
 
 		runRebuildFullBench(b, rows, rt, cfg)
 	})
 
 	b.Run("HighCardinalityWide", func(b *testing.B) {
 		bucket := []byte("bench_wide_high")
-		db := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideHighCard, false)
+		bolt := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideHighCard, false)
 		rt := compileRebuildBenchSchemaFor[rebuildBenchWideRec](b)
-		cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
+		cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
 
 		runRebuildFullBench(b, rows, rt, cfg)
 	})
 
 	b.Run("SliceFanoutWide", func(b *testing.B) {
 		bucket := []byte("bench_wide_fanout")
-		db := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideSliceFanout, false)
+		bolt := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideSliceFanout, false)
 		rt := compileRebuildBenchSchemaFor[rebuildBenchWideRec](b)
-		cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
+		cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
 
 		runRebuildFullBench(b, rows, rt, cfg)
 	})
@@ -609,9 +609,9 @@ func BenchmarkBuildFullCoverage(b *testing.B) {
 func BenchmarkBuildMeasureHeavy(b *testing.B) {
 	bucket := []byte("bench_measure_heavy")
 	rows := rebuildBenchMeasureRows()
-	db := seedRebuildBenchMeasureBolt(b, bucket, rows)
+	bolt := seedRebuildBenchMeasureBolt(b, bucket, rows)
 	rt := compileRebuildBenchSchemaFor[rebuildBenchMeasureRec](b)
-	cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchMeasureRec, releaseRebuildBenchMeasureRec)
+	cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchMeasureRec, releaseRebuildBenchMeasureRec)
 
 	runRebuildFullBench(b, rows, rt, cfg)
 }
@@ -619,18 +619,16 @@ func BenchmarkBuildMeasureHeavy(b *testing.B) {
 func BenchmarkBuildPartialWideSkippedFields(b *testing.B) {
 	bucket := []byte("bench_partial_wide")
 	rows := rebuildBenchWideRows()
-	db := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideHighCard, false)
+	bolt := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideHighCard, false)
 	rt := compileRebuildBenchSchemaFor[rebuildBenchWideRec](b)
-	cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
+	cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
 
 	base, err := Build(cfg, newRebuildTestState(rt))
 	if err != nil {
 		b.Fatalf("base Build: %v", err)
 	}
 
-	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
-	manager.Publish(prev)
 
 	cfg.Current = prev
 	cfg.SkipFields = map[string]struct{}{
@@ -663,29 +661,28 @@ func BenchmarkBuildPartialWideSkippedFields(b *testing.B) {
 			metrics = collectRebuildBenchStorageMetrics(rt, result.Storage)
 		}
 		next := snapshot.NewView(uint64(i+2), prev, rt, snapshot.CacheConfig{}, result.Storage)
-		manager.Publish(next)
+		prev.Release()
 		prev = next
 		cfg.Current = prev
 	}
 	b.StopTimer()
+	prev.Release()
 	reportRebuildBenchMetrics(b, rows, metrics)
 }
 
 func BenchmarkBuildNoActiveLenRebuild(b *testing.B) {
 	bucket := []byte("bench_no_active_len")
 	rows := rebuildBenchWideRows()
-	db := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideSliceFanout, false)
+	bolt := seedRebuildBenchWideBolt(b, bucket, rows, rebuildBenchWideSliceFanout, false)
 	rt := compileRebuildBenchSchemaFor[rebuildBenchWideRec](b)
-	cfg := baseRebuildBenchConfig(db, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
+	cfg := baseRebuildBenchConfig(bolt, bucket, rt, decodeRebuildBenchWideRec, releaseRebuildBenchWideRec)
 
 	base, err := Build(cfg, newRebuildTestState(rt))
 	if err != nil {
 		b.Fatalf("base Build: %v", err)
 	}
 
-	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
-	manager.Publish(prev)
 
 	cfg = Config{
 		Schema: rt,
@@ -726,28 +723,27 @@ func BenchmarkBuildNoActiveLenRebuild(b *testing.B) {
 			metrics = collectRebuildBenchStorageMetrics(rt, result.Storage)
 		}
 		next := snapshot.NewView(uint64(i+2), prev, rt, snapshot.CacheConfig{}, result.Storage)
-		manager.Publish(next)
+		prev.Release()
 		prev = next
 	}
 	b.StopTimer()
+	prev.Release()
 	reportRebuildBenchMetrics(b, rows, metrics)
 }
 
 func BenchmarkBuildPartialSkippedFields(b *testing.B) {
 	bucket := []byte("bench_partial")
 	rows := rebuildBenchRows()
-	db := seedRebuildBenchBolt(b, bucket, rows, false)
+	bolt := seedRebuildBenchBolt(b, bucket, rows, false)
 	rt := compileRebuildBenchSchema(b)
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 
 	base, err := Build(cfg, newRebuildTestState(rt))
 	if err != nil {
 		b.Fatalf("base Build: %v", err)
 	}
 
-	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
-	manager.Publish(prev)
 
 	cfg.Current = prev
 	cfg.SkipFields = map[string]struct{}{"tags": {}}
@@ -772,10 +768,11 @@ func BenchmarkBuildPartialSkippedFields(b *testing.B) {
 			metrics = collectRebuildBenchStorageMetrics(rt, result.Storage)
 		}
 		next := snapshot.NewView(uint64(i+2), prev, rt, snapshot.CacheConfig{}, result.Storage)
-		manager.Publish(next)
+		prev.Release()
 		prev = next
 		cfg.Current = prev
 	}
 	b.StopTimer()
+	prev.Release()
 	reportRebuildBenchMetrics(b, rows, metrics)
 }

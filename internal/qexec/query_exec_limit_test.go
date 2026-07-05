@@ -1013,16 +1013,13 @@ func TestQuery_RangeNoOrderNegativeResidualLimit_PrefersLimitRoute(t *testing.T)
 		t.Fatalf("expected 16 ids, got %d", len(ids))
 	}
 
-	rows, err := db.BatchGet(ids...)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	for i, row := range rows {
+	for _, id := range ids {
+		row := db.values[id]
 		if row == nil {
-			t.Fatalf("missing row for id %d", ids[i])
+			t.Fatalf("missing row for id %d", id)
 		}
 		if row.Country == "DE" || row.Country == "PL" || row.Age < 20 || row.Age >= 40 {
-			t.Fatalf("row %d does not satisfy query: %+v", ids[i], row)
+			t.Fatalf("row %d does not satisfy query: %+v", id, row)
 		}
 	}
 
@@ -1054,16 +1051,13 @@ func TestQuery_RangeNoOrderNegativeResidualLimit_NoTrace(t *testing.T) {
 		t.Fatalf("expected 16 ids, got %d", len(ids))
 	}
 
-	rows, err := db.BatchGet(ids...)
-	if err != nil {
-		t.Fatalf("BatchGet: %v", err)
-	}
-	for i, row := range rows {
+	for _, id := range ids {
+		row := db.values[id]
 		if row == nil {
-			t.Fatalf("missing row for id %d", ids[i])
+			t.Fatalf("missing row for id %d", id)
 		}
 		if row.Country == "DE" || row.Country == "PL" || row.Age < 20 || row.Age >= 40 {
-			t.Fatalf("row %d does not satisfy query: %+v", ids[i], row)
+			t.Fatalf("row %d does not satisfy query: %+v", id, row)
 		}
 	}
 }
@@ -2087,9 +2081,9 @@ func TestQuery_OrderBasicLimit_BaseCoreRuntimeGuardNoTraceStopsAtCappedBaseNeed(
 func TestQuery_OrderBasicLimit_OffsetPromotionUsesFullWindow(t *testing.T) {
 	var events []rbitrace.Event
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		TraceSampleEvery:                        1,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		TraceSampleEvery:                1,
 		TraceSink: func(ev rbitrace.Event) {
 			events = append(events, ev)
 		},
@@ -2744,8 +2738,8 @@ func TestQuery_OrderBasicLimit_ValidatesResidualBeforeEmptyOrderRange(t *testing
 
 func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSiblings(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -2787,8 +2781,8 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 
 func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -2831,8 +2825,8 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 
 func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplementOnFirstSightWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -2914,8 +2908,8 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 
 func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWithMultipleExactSiblings(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -3002,8 +2996,8 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 
 func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_ForceMaterializesNonBroadNullableComplement(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	for i := 0; i < 64; i++ {
 		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
@@ -3210,8 +3204,8 @@ func TestQuery_OrderBasic_NullablePositiveRangeCheapFilterUsesRuntimeProbe(t *te
 
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -3257,8 +3251,8 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 
 func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
@@ -3313,11 +3307,11 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 
 func TestQuery_OrderBasic_EvalRawBaseOpMaterializesPlannedComplement(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 
 	seedGeneratedUint64Data(t, db, 1_000, func(i int) *Rec {
@@ -3357,11 +3351,11 @@ func TestQuery_OrderBasic_EvalRawBaseOpMaterializesPlannedComplement(t *testing.
 
 func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 0,
-		NumericRangeBucketSize:                  8,
-		NumericRangeBucketMinFieldKeys:          16,
-		NumericRangeBucketMinSpanKeys:           4,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 0,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
 	})
 
 	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
@@ -3453,8 +3447,8 @@ func mustFindCollapsedOrderBasicBaseCoreForTest(
 
 func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
@@ -3512,8 +3506,8 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 
 func TestQuery_OrderBasic_BaseCoreObservedWorkAccumulatesBeforePromotion(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 
 	const rows = 20_000
@@ -3563,7 +3557,7 @@ func TestQuery_OrderBasic_BaseCoreObservedWorkAccumulatesBeforePromotion(t *test
 func TestQuery_OrderBasic_BaseCoreOversizedPromotionStaysBounded(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                             -1,
-		SnapshotMaterializedPredCacheMaxEntries:     4,
+		MaterializedPredCacheMaxEntries:             4,
 		SnapshotMaterializedPredCacheMaxCardinality: 64,
 	})
 
@@ -3601,7 +3595,7 @@ func TestQuery_OrderBasic_BaseCoreOversizedPromotionStaysBounded(t *testing.T) {
 func TestQuery_OrderBasic_WarmComplementDoesNotPromoteSplitRangeHalves(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                             -1,
-		SnapshotMaterializedPredCacheMaxEntries:     16,
+		MaterializedPredCacheMaxEntries:             16,
 		SnapshotMaterializedPredCacheMaxCardinality: 64,
 	})
 

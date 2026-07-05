@@ -3,23 +3,11 @@ package rbistats
 
 import "time"
 
-// Mode identifies whether a DB instance maintains runtime indexes.
-type Mode uint8
-
-const (
-	// ModeUnknown is the zero-value mode used by empty stats payloads.
-	ModeUnknown Mode = iota
-	// ModeTransparent means writes and reads use bbolt without runtime indexes.
-	ModeTransparent
-	// ModeIndexed means runtime indexes and snapshots are maintained.
-	ModeIndexed
-)
-
-// DB is a lightweight database status snapshot.
-type DB[K ~uint64 | ~string] struct {
-	// Mode is the current DB indexing mode.
-	Mode Mode
-	// StringKeys reports whether DB keys are strings rather than uint64 values.
+// Collection is a lightweight collection status snapshot.
+type Collection[K ~uint64 | ~string] struct {
+	// Indexed reports whether Collection is running in an indexing mode.
+	Indexed bool
+	// StringKeys reports whether Collection keys are strings rather than uint64 values.
 	StringKeys bool
 
 	// BuildTime is the duration of the startup index build.
@@ -30,27 +18,18 @@ type DB[K ~uint64 | ~string] struct {
 	LoadTime time.Duration
 
 	// LastKey is the greatest live data bucket key.
-	// For string-key DB this is the lexicographically greatest key.
+	// For string-key Collection this is the lexicographically greatest key.
 	LastKey K
 	// KeyCount is the current indexed universe cardinality.
 	// In transparent mode it remains zero-valued.
 	KeyCount uint64
 
-	// IndexFieldCount is the total number of indexed fields configured for this DB.
+	// IndexFieldCount is the total number of indexed fields configured for this Collection.
 	IndexFieldCount int
 	// MeasureFieldCount is the number of aggregate-only measure fields.
 	MeasureFieldCount int
 	// UniqueFieldCount is the number of unique indexed fields.
 	UniqueFieldCount int
-
-	// AutoBatchQueueLen is the current pending request count.
-	AutoBatchQueueLen int
-	// AutoBatchQueueMax is the maximum observed queue length.
-	AutoBatchQueueMax uint64
-	// AutoBatchCount is the total executed auto-batcher transaction count.
-	AutoBatchCount uint64
-	// AutoBatchAvgSize is the average requests per executed batch.
-	AutoBatchAvgSize float64
 
 	// SnapshotSequence is the observed data bucket sequence for this stats read.
 	SnapshotSequence uint64
@@ -156,83 +135,6 @@ type StringKeyIndex struct {
 	ApproxHeapBytes uint64
 }
 
-// AutoBatch contains write-batcher queue, batch, and error diagnostics.
-type AutoBatch struct {
-	// Window is current coalescing window duration.
-	Window time.Duration
-	// MaxBatch is configured maximum auto-batch size.
-	MaxBatch int
-	// MaxQueue is effective maximum queue size (0 means unbounded).
-	MaxQueue int
-
-	// QueueLen is current pending requests in queue.
-	QueueLen int
-	// QueueCap is current allocated queue capacity.
-	QueueCap int
-	// WorkerRunning reports whether auto-batcher worker goroutine is active.
-	WorkerRunning bool
-	// HotWindowActive reports whether adaptive hot coalescing window is active.
-	HotWindowActive bool
-
-	// Submitted is number of submit attempts from eligible write calls.
-	Submitted uint64
-	// Enqueued is number of requests accepted into auto-batcher queue.
-	Enqueued uint64
-	// Dequeued is number of requests popped from queue for execution.
-	Dequeued uint64
-	// QueueHighWater is maximum observed queue length.
-	QueueHighWater uint64
-
-	// ExecutedBatches is total executed auto-batcher transactions.
-	ExecutedBatches uint64
-	// MultiRequestBatches is number of executed batches containing more than one request.
-	MultiRequestBatches uint64
-	// MultiRequestOps is total requests executed inside multi-request batches.
-	MultiRequestOps uint64
-	// BatchSize1 is number of executed single-request batches.
-	BatchSize1 uint64
-	// BatchSize2To4 is number of executed batches sized 2..4.
-	BatchSize2To4 uint64
-	// BatchSize5To8 is number of executed batches sized 5..8.
-	BatchSize5To8 uint64
-	// BatchSize9Plus is number of executed batches sized 9+.
-	BatchSize9Plus uint64
-	// AvgBatchSize is average requests per executed batch.
-	AvgBatchSize float64
-	// MaxBatchSeen is maximum observed executed batch size.
-	MaxBatchSeen uint64
-
-	// CallbackOps is number of requests with BeforeStore or BeforeCommit hooks
-	// executed by auto-batcher.
-	CallbackOps uint64
-	// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
-	CoalescedSetDelete uint64
-
-	// CoalesceWaits is number of coalescing sleeps performed by worker.
-	CoalesceWaits uint64
-	// CoalesceWaitTime is total time spent sleeping for coalescing.
-	CoalesceWaitTime time.Duration
-	// QueueWaitTime is aggregate request wait time from enqueue to dequeue.
-	QueueWaitTime time.Duration
-	// ExecuteTime is aggregate batch execution wall time after dequeue.
-	ExecuteTime time.Duration
-
-	// FallbackClosed is number of write calls rejected by auto-batcher because DB is closed.
-	FallbackClosed uint64
-
-	// UniqueRejected is number of queued requests rejected by unique checks before commit.
-	UniqueRejected uint64
-	// TxBeginErrors is number of write tx begin failures inside auto-batcher.
-	TxBeginErrors uint64
-	// TxOpErrors is number of write tx operation failures before commit.
-	TxOpErrors uint64
-	// TxCommitErrors is number of write tx commit failures.
-	TxCommitErrors uint64
-	// CallbackErrors is number of hook failures returned by BeforeStore or
-	// BeforeCommit hooks inside auto-batched execution.
-	CallbackErrors uint64
-}
-
 // Snapshot contains published snapshot diagnostics.
 type Snapshot struct {
 	// Sequence is the bucket sequence of the published snapshot.
@@ -240,11 +142,85 @@ type Snapshot struct {
 
 	// UniverseCard is cardinality of the published universe bitmap.
 	UniverseCard uint64
+}
 
-	// RegistrySize is number of snapshot entries tracked in registry map.
+// Store contains root-scoped generation and write-scheduler diagnostics.
+type Store struct {
+	// CurrentEpoch is the current published root epoch.
+	CurrentEpoch uint64
+
+	// OpenCollections is the number of currently open collections on the root.
+	OpenCollections int
+	// CollectionHighWater is the highest collection ordinal count reached by this root.
+	CollectionHighWater uint32
+
+	// Broken reports whether the root is in broken state.
+	Broken bool
+	// Reaped reports whether the root registry has no current generation.
+	Reaped bool
+
+	// RegistrySize is number of published/retired root refs tracked by epoch.
 	RegistrySize int
-	// PinnedRefs is number of registry snapshots with active pins.
+	// StagedGenerations is number of staged, not yet published root generations.
+	StagedGenerations int
+	// PinnedRefs is number of root refs with active external pins.
 	PinnedRefs int
+	// RetiredGenerations is number of same-epoch metadata generations waiting
+	// for active pins on their owning root ref to drain.
+	RetiredGenerations int
+	// OldestPinnedEpoch is the smallest epoch among currently pinned root refs.
+	OldestPinnedEpoch uint64
+
+	// QueueLen is current pending write logical units on this root.
+	QueueLen int
+	// QueueCap is current allocated write queue capacity on this root.
+	QueueCap int
+	// WorkerRunning reports whether a root write worker is active.
+	WorkerRunning bool
+	// QueueHighWater is maximum observed write queue length.
+	QueueHighWater uint64
+
+	// LogicalUnitsSubmitted is number of write logical unit submit attempts.
+	LogicalUnitsSubmitted uint64
+	// LogicalUnitsEnqueued is number of write logical units accepted into a queue.
+	LogicalUnitsEnqueued uint64
+	// LogicalUnitsDequeued is number of write logical units selected for execution.
+	LogicalUnitsDequeued uint64
+
+	// ExecutedBatches is total executed physical write batches.
+	ExecutedBatches uint64
+	// MultiUnitBatches is number of executed batches containing more than one logical unit.
+	MultiUnitBatches uint64
+	// MultiUnitOps is total logical units executed inside multi-unit batches.
+	MultiUnitOps uint64
+	// BatchSize1 is number of executed single-unit batches.
+	BatchSize1 uint64
+	// BatchSize2To4 is number of executed batches sized 2..4.
+	BatchSize2To4 uint64
+	// BatchSize5To8 is number of executed batches sized 5..8.
+	BatchSize5To8 uint64
+	// BatchSize9Plus is number of executed batches sized 9+.
+	BatchSize9Plus uint64
+	// AvgBatchSize is average logical units per executed physical batch.
+	AvgBatchSize float64
+	// MaxBatchSeen is maximum observed executed physical batch size.
+	MaxBatchSeen uint64
+
+	// CallbackOps is number of write logical units that executed callbacks.
+	CallbackOps uint64
+
+	// RejectedClosed is number of write logical units rejected because the root or collection was closed.
+	RejectedClosed uint64
+	// UniqueRejected is number of write logical units rejected by unique checks before commit.
+	UniqueRejected uint64
+	// TxBeginErrors is number of physical write tx begin failures.
+	TxBeginErrors uint64
+	// TxOpErrors is number of physical write operation failures before commit.
+	TxOpErrors uint64
+	// TxCommitErrors is number of physical write commit failures.
+	TxCommitErrors uint64
+	// CallbackErrors is number of callback failures returned by write hooks.
+	CallbackErrors uint64
 }
 
 // Planner contains planner snapshot metadata, per-field stats and sampling settings.

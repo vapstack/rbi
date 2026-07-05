@@ -29,6 +29,9 @@ type NumericRangeBucketCache struct {
 	fieldIndexLen int
 	count         int
 	maxCard       uint64
+	retiredDirty  atomic.Bool
+	retiredOwner  *atomic.Bool
+	retireEpoch   *atomic.Uint64
 }
 
 type NumericRangeBucketIndex struct {
@@ -44,13 +47,16 @@ type NumericRangeBucketEntry struct {
 	mu            sync.Mutex
 	fullSpanClock uint64
 	fullSpanCache [numericRangeFullSpanCacheMaxEntries]numericRangeFullSpanCacheSlot
-	retired       []posting.List
+	retired       []numericRangeRetiredPosting
+	retiredDirty  atomic.Bool
+	rootOwner     atomic.Pointer[atomic.Bool]
+	retireEpoch   atomic.Pointer[atomic.Uint64]
 }
 
 // NumericRangeBucketRetired carries detached retired full-span postings past
 // the caller's reader barrier so payload release can run outside cache locks.
 type NumericRangeBucketRetired struct {
-	chunks [][]posting.List
+	chunks [][]numericRangeRetiredPosting
 }
 
 type numericRangeBucketCacheSlot struct {
@@ -65,9 +71,18 @@ type numericRangeFullSpanCacheSlot struct {
 	used  bool
 }
 
+type numericRangeRetiredPosting struct {
+	ids   posting.List
+	epoch uint64
+}
+
 func GetNumericRangeBucketCache(fieldCount int, maxCard uint64) *NumericRangeBucketCache {
+	return GetNumericRangeBucketCacheWithRetireContext(fieldCount, maxCard, nil, nil)
+}
+
+func GetNumericRangeBucketCacheWithRetireContext(fieldCount int, maxCard uint64, owner *atomic.Bool, epoch *atomic.Uint64) *NumericRangeBucketCache {
 	c := numericRangeBucketCachePool.Get()
-	c.Init(fieldCount, maxCard)
+	c.InitWithRetireContext(fieldCount, maxCard, owner, epoch)
 	return c
 }
 
@@ -85,10 +100,17 @@ func GetNumericRangeBucketEntry(storage indexdata.FieldStorage, idx NumericRange
 }
 
 func (c *NumericRangeBucketCache) Init(fieldCount int, maxCard uint64) {
+	c.InitWithRetireContext(fieldCount, maxCard, nil, nil)
+}
+
+func (c *NumericRangeBucketCache) InitWithRetireContext(fieldCount int, maxCard uint64, owner *atomic.Bool, epoch *atomic.Uint64) {
 	c.mu.Lock()
 	c.maxCard = maxCard
 	c.count = 0
 	c.fieldIndexLen = 0
+	c.retiredDirty.Store(false)
+	c.retiredOwner = owner
+	c.retireEpoch = epoch
 	for i := range c.slots {
 		slot := c.slots[i]
 		if slot.entry != nil {
@@ -121,6 +143,7 @@ func (c *NumericRangeBucketCache) ClearEntries() {
 		}
 		c.fieldIndexLen = 0
 		c.count = 0
+		c.retiredDirty.Store(false)
 		return
 	}
 	c.mu.Lock()
@@ -139,6 +162,7 @@ func (c *NumericRangeBucketCache) ClearEntries() {
 	}
 	c.fieldIndexLen = 0
 	c.count = 0
+	c.retiredDirty.Store(false)
 }
 
 func (c *NumericRangeBucketCache) LoadSlot(field string, ordinal int) (*NumericRangeBucketEntry, bool) {
@@ -180,6 +204,9 @@ func (c *NumericRangeBucketCache) StoreSlot(field string, ordinal int, entry *Nu
 	}
 	slot.field = field
 	slot.entry = entry
+	if entry != nil {
+		c.bindEntryOwner(entry)
+	}
 	c.slots[ordinal] = slot
 	c.mu.Unlock()
 	if replaced != nil && replaced != entry {
@@ -213,6 +240,7 @@ func (c *NumericRangeBucketCache) LoadOrStoreSlot(field string, ordinal int, ent
 	}
 	slot.field = field
 	slot.entry = entry
+	c.bindEntryOwner(entry)
 	c.slots[ordinal] = slot
 	c.mu.Unlock()
 	if replaced != nil && replaced != entry {
@@ -269,39 +297,100 @@ func (c *NumericRangeBucketCache) DrainRetired() {
 }
 
 func (c *NumericRangeBucketCache) TakeRetired() NumericRangeBucketRetired {
+	return c.TakeRetiredBefore(^uint64(0))
+}
+
+func (c *NumericRangeBucketCache) TakeRetiredBefore(safeEpoch uint64) NumericRangeBucketRetired {
 	if len(c.slots) == 0 {
 		return NumericRangeBucketRetired{}
 	}
 
 	c.mu.Lock()
-	var chunks [][]posting.List
+	var chunks [][]numericRangeRetiredPosting
+	dirty := false
 	for i := range c.slots {
 		entry := c.slots[i].entry
-		// Shared entries may still protect borrowed views from inherited snapshots.
-		if entry == nil || entry.refs.Load() != 1 {
+		if entry == nil {
 			continue
 		}
-		retired := entry.takeRetired()
+		if safeEpoch == ^uint64(0) && entry.refs.Load() != 1 {
+			// A drain without a reader barrier is only safe for entries owned
+			// exclusively by this cache; inherited entries may still be visible.
+			if entry.hasRetired() {
+				dirty = true
+			}
+			continue
+		}
+		retired := entry.takeRetiredBefore(safeEpoch)
 		if retired == nil {
+			if entry.hasRetired() {
+				dirty = true
+			}
 			continue
 		}
 		if chunks == nil {
 			chunks = numericRangeBucketRetiredPool.Get(1)
 		}
 		chunks = append(chunks, retired)
+		if entry.hasRetired() {
+			dirty = true
+		}
 	}
+	c.retiredDirty.Store(dirty)
 	c.mu.Unlock()
 
 	return NumericRangeBucketRetired{chunks: chunks}
+}
+
+func (c *NumericRangeBucketCache) RetiredDirty() bool {
+	if c.retiredDirty.Load() {
+		return true
+	}
+	if len(c.slots) == 0 {
+		return false
+	}
+
+	c.mu.Lock()
+	dirty := false
+	for i := range c.slots {
+		entry := c.slots[i].entry
+		if entry != nil && entry.retiredDirty.Load() {
+			dirty = true
+			break
+		}
+	}
+	c.retiredDirty.Store(dirty)
+	owner := c.retiredOwner
+	c.mu.Unlock()
+	if dirty && owner != nil {
+		owner.CompareAndSwap(false, true)
+	}
+	return dirty
+}
+
+func (c *NumericRangeBucketCache) bindEntryOwner(entry *NumericRangeBucketEntry) {
+	// Shared entries keep the first root dirty/epoch pointers; CAS initializes
+	// standalone entries without rewriting inherited ones.
+	if c.retiredOwner != nil {
+		entry.rootOwner.CompareAndSwap(nil, c.retiredOwner)
+	}
+	if c.retireEpoch != nil {
+		entry.retireEpoch.CompareAndSwap(nil, c.retireEpoch)
+	}
 }
 
 func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nextIndex []indexdata.FieldStorage, fields schema.IndexedFieldMap) {
 	if len(c.slots) == 0 || nextIndex == nil || len(fields) == 0 {
 		return
 	}
+	// Reuse full-span caches only when the field storage object is unchanged;
+	// then bucket boundaries and cached postings still describe the same index.
+	var replacedFirst *NumericRangeBucketEntry
+	var replacedTail []*NumericRangeBucketEntry
 	prev.mu.Lock()
 	c.mu.Lock()
 
+	inheritedDirty := false
 	for i := range prev.slots {
 		slot := prev.slots[i]
 		if slot.field == "" || slot.entry == nil || slot.entry.storage.KeyCount() == 0 {
@@ -314,10 +403,37 @@ func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nex
 		if nextIndex[acc.Ordinal] != slot.entry.storage {
 			continue
 		}
-		slot.entry.Retain()
 		prevSlot := c.slots[acc.Ordinal]
+		if prevSlot.entry == slot.entry {
+			c.bindEntryOwner(slot.entry)
+			if slot.entry.retiredDirty.Load() {
+				inheritedDirty = true
+			}
+			if prevSlot.field != slot.field {
+				if c.fieldIndex != nil {
+					if prevSlot.field != "" {
+						delete(c.fieldIndex, prevSlot.field)
+					}
+					c.fieldIndex[slot.field] = slot.entry
+				}
+				prevSlot.field = slot.field
+				c.slots[acc.Ordinal] = prevSlot
+			}
+			continue
+		}
+		slot.entry.Retain()
+		c.bindEntryOwner(slot.entry)
+		if slot.entry.retiredDirty.Load() {
+			inheritedDirty = true
+		}
 		if prevSlot.entry == nil {
 			c.count++
+		} else {
+			if replacedFirst == nil {
+				replacedFirst = prevSlot.entry
+			} else {
+				replacedTail = append(replacedTail, prevSlot.entry)
+			}
 		}
 		if c.fieldIndex != nil {
 			if prevSlot.field != "" {
@@ -330,14 +446,29 @@ func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nex
 			entry: slot.entry,
 		}
 	}
+	owner := c.retiredOwner
+	if inheritedDirty {
+		c.retiredDirty.Store(true)
+	}
 	c.mu.Unlock()
 	prev.mu.Unlock()
+	if inheritedDirty && owner != nil {
+		owner.CompareAndSwap(false, true)
+	}
+	if replacedFirst != nil {
+		replacedFirst.Release()
+		for i := range replacedTail {
+			replacedTail[i].Release()
+		}
+	}
 }
 
 func (c *NumericRangeBucketCache) release() {
 	c.ClearEntries()
 	c.slots = c.slots[:0]
 	c.maxCard = 0
+	c.retiredOwner = nil
+	c.retireEpoch = nil
 }
 
 func (e *NumericRangeBucketEntry) Retain() {
@@ -382,24 +513,64 @@ func (e *NumericRangeBucketEntry) releaseFullSpanCache() {
 		e.fullSpanCache[i] = numericRangeFullSpanCacheSlot{}
 	}
 	if e.retired != nil {
-		posting.ReleaseAll(e.retired)
-		posting.ReleaseSlice(e.retired)
+		releaseNumericRangeRetiredPostings(e.retired)
 		e.retired = nil
 	}
 	e.fullSpanClock = 0
+	e.retiredDirty.Store(false)
+	e.rootOwner.Store(nil)
+	e.retireEpoch.Store(nil)
 }
 
 func (e *NumericRangeBucketEntry) retirePosting(ids posting.List) {
 	if e.retired == nil {
-		e.retired = posting.GetSlice(1)
+		e.retired = numericRangeRetiredPostingPool.Get(1)
 	}
-	e.retired = append(e.retired, ids)
+	epoch := uint64(0)
+	if source := e.retireEpoch.Load(); source != nil {
+		epoch = source.Load()
+	}
+	e.retired = append(e.retired, numericRangeRetiredPosting{ids: ids, epoch: epoch})
+	e.retiredDirty.CompareAndSwap(false, true)
+	if owner := e.rootOwner.Load(); owner != nil {
+		owner.CompareAndSwap(false, true)
+	}
 }
 
-func (e *NumericRangeBucketEntry) takeRetired() []posting.List {
+func (e *NumericRangeBucketEntry) hasRetired() bool {
+	return e.retiredDirty.Load()
+}
+
+func (e *NumericRangeBucketEntry) takeRetiredBefore(safeEpoch uint64) []numericRangeRetiredPosting {
 	e.mu.Lock()
 	retired := e.retired
-	e.retired = nil
+	if retired != nil {
+		eligible := 0
+		for i := range retired {
+			if retired[i].epoch < safeEpoch {
+				eligible++
+			}
+		}
+		switch eligible {
+		case 0:
+			retired = nil
+		case len(retired):
+			e.retired = nil
+			e.retiredDirty.Store(false)
+		default:
+			detached := numericRangeRetiredPostingPool.Get(eligible)
+			kept := retired[:0]
+			for i := range retired {
+				if retired[i].epoch < safeEpoch {
+					detached = append(detached, retired[i])
+				} else {
+					kept = append(kept, retired[i])
+				}
+			}
+			e.retired = kept
+			retired = detached
+		}
+	}
 	e.mu.Unlock()
 	return retired
 }
@@ -409,14 +580,20 @@ func (r NumericRangeBucketRetired) Release() {
 		return
 	}
 	for i := range r.chunks {
-		posting.ReleaseAll(r.chunks[i])
-		posting.ReleaseSlice(r.chunks[i])
+		releaseNumericRangeRetiredPostings(r.chunks[i])
 	}
 	numericRangeBucketRetiredPool.Put(r.chunks)
 }
 
 func (r NumericRangeBucketRetired) IsEmpty() bool {
 	return r.chunks == nil
+}
+
+func releaseNumericRangeRetiredPostings(retired []numericRangeRetiredPosting) {
+	for i := range retired {
+		retired[i].ids.Release()
+	}
+	numericRangeRetiredPostingPool.Put(retired)
 }
 
 func (e *NumericRangeBucketEntry) LoadFullSpan(start, end int) (posting.List, bool) {
@@ -490,10 +667,15 @@ func (e *NumericRangeBucketEntry) TryStoreFullSpan(start, end int, ids posting.L
 		return ids, false
 	}
 
+	free := false
 	e.mu.Lock()
 	for i := range e.fullSpanCache {
 		slot := &e.fullSpanCache[i]
-		if !slot.used || slot.key != key {
+		if !slot.used {
+			free = true
+			continue
+		}
+		if slot.key != key {
 			continue
 		}
 		e.fullSpanClock++
@@ -503,8 +685,14 @@ func (e *NumericRangeBucketEntry) TryStoreFullSpan(start, end int, ids posting.L
 		ids.Release()
 		return cached.Borrow(), true
 	}
+	if !free && len(e.retired) >= numericRangeFullSpanCacheMaxEntries {
+		e.mu.Unlock()
+		return ids, false
+	}
 	e.mu.Unlock()
 
+	// Clone outside the entry lock; another goroutine may insert the same span,
+	// so the key is checked again after reacquiring the lock.
 	stored := ids
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
@@ -545,6 +733,14 @@ func (e *NumericRangeBucketEntry) TryStoreFullSpan(start, end int, ids posting.L
 
 	e.fullSpanClock++
 	if replaced := e.fullSpanCache[slotIdx]; replaced.used {
+		if len(e.retired) >= numericRangeFullSpanCacheMaxEntries {
+			if !stored.SharesPayload(ids) {
+				stored.Release()
+			}
+			return ids, false
+		}
+		// Retire instead of releasing: readers may hold borrowed full-span
+		// postings until the root runtime epoch advances past this eviction.
 		e.retirePosting(replaced.ids)
 	}
 

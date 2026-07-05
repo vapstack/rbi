@@ -24,7 +24,7 @@ var (
 )
 
 type stressApp struct {
-	handle           *DBHandle
+	handle           *CollectionHandle
 	startMaxID       uint64
 	classes          []*classController
 	byID             map[int]*classController
@@ -84,16 +84,16 @@ type runEpoch struct {
 
 	memoryBaseline *MemorySnapshot
 	snapshotBase   snapshotSample
-	batchBase      batchSample
+	writeBase      writeSample
 	planner        *plannerTraceEpoch
 
 	mu              sync.Mutex
 	memorySamples   []MemorySnapshot
 	snapshotSamples []snapshotSample
-	batchSamples    []batchSample
+	writeSamples    []writeSample
 	lastMemory      *MemorySnapshot
 	lastSnapshot    snapshotSample
-	lastBatch       batchSample
+	lastWrite       writeSample
 	tps             map[string]*tpsState
 }
 
@@ -114,7 +114,7 @@ type viewSnapshot struct {
 	Planner    *plannerTraceReport
 	Memory     *MemorySnapshot
 	Snapshot   snapshotSample
-	Batch      batchSample
+	Write      writeSample
 }
 
 type classCapture struct {
@@ -167,7 +167,7 @@ func (e workerRunError) summary() string {
 }
 
 func newApp(
-	handle *DBHandle,
+	handle *CollectionHandle,
 	catalog []*classDescriptor,
 	refreshEvery, telemetryEvery time.Duration,
 	reportPath string,
@@ -176,7 +176,7 @@ func newApp(
 	traces *plannerTraceCollector,
 ) *stressApp {
 	workCtx := &WorkloadContext{
-		DB:           handle.DB,
+		Collection:   handle.Collection,
 		MaxIDPtr:     &handle.MaxID,
 		EmailSamples: handle.EmailSamples,
 	}
@@ -375,7 +375,7 @@ func (a *stressApp) buildReport(interrupted bool) stressReport {
 	a.sampleCountsForEpoch(epoch, now)
 	snap := a.buildSnapshotForEpoch(epoch, now, true)
 	phases := a.phaseReports(now)
-	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
+	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, writeBase, writeFinal, writeSamples := epoch.copyTelemetry()
 	return stressReport{
 		Schema:            reportSchema,
 		Timestamp:         now.Format(time.RFC3339Nano),
@@ -390,7 +390,7 @@ func (a *stressApp) buildReport(interrupted bool) stressReport {
 		ClassFilter:       append([]string(nil), a.classFilter...),
 		QueryFilter:       append([]string(nil), a.queryFilter...),
 		RecordsAtStart:    a.handle.StartRecords,
-		RecordsAtEnd:      currentRecordCount(a.handle.DB),
+		RecordsAtEnd:      currentRecordCount(a.handle.Collection),
 		MaxIDAtStart:      a.startMaxID,
 		MaxIDAtEnd:        a.handle.MaxID,
 		Classes:           snap.Classes,
@@ -404,10 +404,10 @@ func (a *stressApp) buildReport(interrupted bool) stressReport {
 		SnapshotBaseline:  snapshotBase,
 		SnapshotFinal:     snapshotFinal,
 		SnapshotSamples:   snapshotSamples,
-		BatchBaseline:     batchBase,
-		BatchFinal:        batchFinal,
-		BatchSamples:      batchSamples,
-		IndexStats:        a.handle.DB.IndexStats(),
+		WriteBaseline:     writeBase,
+		WriteFinal:        writeFinal,
+		WriteSamples:      writeSamples,
+		IndexStats:        a.handle.Collection.IndexStats(),
 	}
 }
 
@@ -518,7 +518,7 @@ func (a *stressApp) buildSnapshotForEpoch(epoch *runEpoch, now time.Time, includ
 	out.Totals.Write.CurrentTPS, out.Totals.Write.MinTPS = epoch.observeScope("role:write", writeCompleted, writePaused, writeWorkers, now)
 	out.Totals.Total.CurrentTPS, out.Totals.Total.MinTPS = epoch.observeScope("role:total", readCompleted+writeCompleted, readPaused+writePaused, readWorkers+writeWorkers, now)
 
-	out.Memory, out.Snapshot, out.Batch = epoch.latestTelemetry()
+	out.Memory, out.Snapshot, out.Write = epoch.latestTelemetry()
 	return out
 }
 
@@ -558,7 +558,7 @@ func (a *stressApp) buildPhaseReport(epoch *runEpoch, now time.Time, endedByComm
 		epoch = &runEpoch{startedAt: now}
 	}
 	snap := a.buildSnapshotForEpoch(epoch, now, false)
-	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
+	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, writeBase, writeFinal, writeSamples := epoch.copyTelemetry()
 	return phaseReport{
 		Index:            epoch.phaseIdx,
 		Kind:             epoch.phaseKind,
@@ -577,9 +577,9 @@ func (a *stressApp) buildPhaseReport(epoch *runEpoch, now time.Time, endedByComm
 		SnapshotBaseline: snapshotBase,
 		SnapshotFinal:    snapshotFinal,
 		SnapshotSamples:  snapshotSamples,
-		BatchBaseline:    batchBase,
-		BatchFinal:       batchFinal,
-		BatchSamples:     batchSamples,
+		WriteBaseline:    writeBase,
+		WriteFinal:       writeFinal,
+		WriteSamples:     writeSamples,
 	}
 }
 
@@ -610,15 +610,15 @@ func (a *stressApp) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
 	}
 	memory := CaptureMemorySnapshot(a.handle, a.forceGCTelemetry)
 	var snapRaw rbistats.Snapshot
-	var batchRaw rbistats.AutoBatch
-	if a.handle != nil && a.handle.DB != nil {
-		snapRaw = a.handle.DB.SnapshotStats()
-		batchRaw = a.handle.DB.AutoBatchStats()
+	var rootRaw rbistats.Store
+	if a.handle != nil && a.handle.Collection != nil {
+		snapRaw = a.handle.Collection.SnapshotStats()
+		rootRaw = a.handle.Collection.StoreStats()
 	}
 	epoch.recordTelemetry(
 		memory,
-		makeSnapshotSample(now, epoch.snapshotBase.Stats, snapRaw),
-		makeBatchSample(now, epoch.batchBase.Stats, batchRaw),
+		makeSnapshotSample(now, snapRaw),
+		makeWriteSample(now, epoch.writeBase.Stats, rootRaw),
 	)
 }
 
@@ -882,22 +882,22 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 	return time.Duration(500+rng.IntN(501)) * time.Microsecond
 }
 
-func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string, forceGCTelemetry bool) *runEpoch {
+func newRunEpoch(handle *CollectionHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string, forceGCTelemetry bool) *runEpoch {
 	now := time.Now()
 	memory := CaptureMemorySnapshot(handle, forceGCTelemetry)
 	var snapshotRaw rbistats.Snapshot
-	var batchRaw rbistats.AutoBatch
-	if handle != nil && handle.DB != nil {
-		snapshotRaw = handle.DB.SnapshotStats()
-		batchRaw = handle.DB.AutoBatchStats()
+	var rootRaw rbistats.Store
+	if handle != nil && handle.Collection != nil {
+		snapshotRaw = handle.Collection.SnapshotStats()
+		rootRaw = handle.Collection.StoreStats()
 	}
 	snapshot := snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      snapshotRaw,
 	}
-	batch := batchSample{
+	write := writeSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
-		Stats:      batchRaw,
+		Stats:      rootRaw,
 	}
 	var planner *plannerTraceEpoch
 	if traces != nil {
@@ -910,11 +910,11 @@ func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, 
 		startedByCommand: startedByCommand,
 		memoryBaseline:   memory,
 		snapshotBase:     snapshot,
-		batchBase:        batch,
+		writeBase:        write,
 		planner:          planner,
 		lastMemory:       memory,
 		lastSnapshot:     snapshot,
-		lastBatch:        batch,
+		lastWrite:        write,
 		tps:              make(map[string]*tpsState, 32),
 	}
 }
@@ -951,7 +951,7 @@ func (e *runEpoch) observeScope(key string, completed uint64, paused uint64, wor
 	return state.current, state.min
 }
 
-func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, snapshot snapshotSample, batch batchSample) {
+func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, snapshot snapshotSample, write writeSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if memory != nil {
@@ -959,24 +959,24 @@ func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, snapshot snapshotSamp
 		e.memorySamples = append(e.memorySamples, *memory)
 	}
 	e.lastSnapshot = snapshot
-	e.lastBatch = batch
+	e.lastWrite = write
 	e.snapshotSamples = append(e.snapshotSamples, snapshot)
-	e.batchSamples = append(e.batchSamples, batch)
+	e.writeSamples = append(e.writeSamples, write)
 }
 
-func (e *runEpoch) latestTelemetry() (*MemorySnapshot, snapshotSample, batchSample) {
+func (e *runEpoch) latestTelemetry() (*MemorySnapshot, snapshotSample, writeSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.lastMemory, e.lastSnapshot, e.lastBatch
+	return e.lastMemory, e.lastSnapshot, e.lastWrite
 }
 
-func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, snapshotSample, snapshotSample, []snapshotSample, batchSample, batchSample, []batchSample) {
+func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, snapshotSample, snapshotSample, []snapshotSample, writeSample, writeSample, []writeSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	memorySamples := append([]MemorySnapshot(nil), e.memorySamples...)
 	snapshotSamples := append([]snapshotSample(nil), e.snapshotSamples...)
-	batchSamples := append([]batchSample(nil), e.batchSamples...)
-	return e.memoryBaseline, e.lastMemory, memorySamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.batchBase, e.lastBatch, batchSamples
+	writeSamples := append([]writeSample(nil), e.writeSamples...)
+	return e.memoryBaseline, e.lastMemory, memorySamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.writeBase, e.lastWrite, writeSamples
 }
 
 func (e *runEpoch) plannerSnapshot() plannerTraceSnapshot {
@@ -1164,50 +1164,45 @@ func averageTPS(completed uint64, startedAt, now time.Time, paused uint64, worke
 	return float64(completed) / seconds
 }
 
-func currentRecordCount(db *rbi.DB[uint64, UserBench]) uint64 {
-	count, err := db.Count()
+func currentRecordCount(c *rbi.Collection[uint64, UserBench]) uint64 {
+	count, err := stressReadCount(c)
 	if err != nil {
 		return 0
 	}
 	return count
 }
 
-func makeSnapshotSample(now time.Time, baseline, current rbistats.Snapshot) snapshotSample {
+func makeSnapshotSample(now time.Time, current rbistats.Snapshot) snapshotSample {
 	return snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,
 	}
 }
 
-func makeBatchSample(now time.Time, baseline, current rbistats.AutoBatch) batchSample {
-	return batchSample{
+func makeWriteSample(now time.Time, baseline, current rbistats.Store) writeSample {
+	return writeSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,
-		Delta: batchDelta{
-			Submitted:           deltaUint64(current.Submitted, baseline.Submitted),
-			Enqueued:            deltaUint64(current.Enqueued, baseline.Enqueued),
-			Dequeued:            deltaUint64(current.Dequeued, baseline.Dequeued),
-			QueueHighWater:      deltaUint64(current.QueueHighWater, baseline.QueueHighWater),
-			ExecutedBatches:     deltaUint64(current.ExecutedBatches, baseline.ExecutedBatches),
-			MultiRequestBatches: deltaUint64(current.MultiRequestBatches, baseline.MultiRequestBatches),
-			MultiRequestOps:     deltaUint64(current.MultiRequestOps, baseline.MultiRequestOps),
-			BatchSize1:          deltaUint64(current.BatchSize1, baseline.BatchSize1),
-			BatchSize2To4:       deltaUint64(current.BatchSize2To4, baseline.BatchSize2To4),
-			BatchSize5To8:       deltaUint64(current.BatchSize5To8, baseline.BatchSize5To8),
-			BatchSize9Plus:      deltaUint64(current.BatchSize9Plus, baseline.BatchSize9Plus),
-			MaxBatchSeen:        deltaUint64(current.MaxBatchSeen, baseline.MaxBatchSeen),
-			CallbackOps:         deltaUint64(current.CallbackOps, baseline.CallbackOps),
-			CoalescedSetDelete:  deltaUint64(current.CoalescedSetDelete, baseline.CoalescedSetDelete),
-			CoalesceWaits:       deltaUint64(current.CoalesceWaits, baseline.CoalesceWaits),
-			CoalesceWaitTime:    current.CoalesceWaitTime - baseline.CoalesceWaitTime,
-			QueueWaitTime:       current.QueueWaitTime - baseline.QueueWaitTime,
-			ExecuteTime:         current.ExecuteTime - baseline.ExecuteTime,
-			FallbackClosed:      deltaUint64(current.FallbackClosed, baseline.FallbackClosed),
-			UniqueRejected:      deltaUint64(current.UniqueRejected, baseline.UniqueRejected),
-			TxBeginErrors:       deltaUint64(current.TxBeginErrors, baseline.TxBeginErrors),
-			TxOpErrors:          deltaUint64(current.TxOpErrors, baseline.TxOpErrors),
-			TxCommitErrors:      deltaUint64(current.TxCommitErrors, baseline.TxCommitErrors),
-			CallbackErrors:      deltaUint64(current.CallbackErrors, baseline.CallbackErrors),
+		Delta: writeDelta{
+			LogicalUnitsSubmitted: deltaUint64(current.LogicalUnitsSubmitted, baseline.LogicalUnitsSubmitted),
+			LogicalUnitsEnqueued:  deltaUint64(current.LogicalUnitsEnqueued, baseline.LogicalUnitsEnqueued),
+			LogicalUnitsDequeued:  deltaUint64(current.LogicalUnitsDequeued, baseline.LogicalUnitsDequeued),
+			QueueHighWater:        deltaUint64(current.QueueHighWater, baseline.QueueHighWater),
+			ExecutedBatches:       deltaUint64(current.ExecutedBatches, baseline.ExecutedBatches),
+			MultiUnitBatches:      deltaUint64(current.MultiUnitBatches, baseline.MultiUnitBatches),
+			MultiUnitOps:          deltaUint64(current.MultiUnitOps, baseline.MultiUnitOps),
+			BatchSize1:            deltaUint64(current.BatchSize1, baseline.BatchSize1),
+			BatchSize2To4:         deltaUint64(current.BatchSize2To4, baseline.BatchSize2To4),
+			BatchSize5To8:         deltaUint64(current.BatchSize5To8, baseline.BatchSize5To8),
+			BatchSize9Plus:        deltaUint64(current.BatchSize9Plus, baseline.BatchSize9Plus),
+			MaxBatchSeen:          deltaUint64(current.MaxBatchSeen, baseline.MaxBatchSeen),
+			CallbackOps:           deltaUint64(current.CallbackOps, baseline.CallbackOps),
+			RejectedClosed:        deltaUint64(current.RejectedClosed, baseline.RejectedClosed),
+			UniqueRejected:        deltaUint64(current.UniqueRejected, baseline.UniqueRejected),
+			TxBeginErrors:         deltaUint64(current.TxBeginErrors, baseline.TxBeginErrors),
+			TxOpErrors:            deltaUint64(current.TxOpErrors, baseline.TxOpErrors),
+			TxCommitErrors:        deltaUint64(current.TxCommitErrors, baseline.TxCommitErrors),
+			CallbackErrors:        deltaUint64(current.CallbackErrors, baseline.CallbackErrors),
 		},
 	}
 }

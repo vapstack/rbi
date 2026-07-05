@@ -29,7 +29,7 @@ type focusedAllocRunner struct {
 type focusedAllocTarget struct {
 	classInfo StressClassInfo
 	queryInfo StressQueryInfo
-	prepare   func(*DBHandle, options) (focusedAllocRunner, error)
+	prepare   func(*CollectionHandle, options) (focusedAllocRunner, error)
 }
 
 func selectFocusedAllocWorkloadTarget(classFilter, queryFilter []string) (focusedAllocTarget, error) {
@@ -48,9 +48,9 @@ func selectFocusedAllocWorkloadTarget(classFilter, queryFilter []string) (focuse
 	return focusedAllocTarget{
 		classInfo: spec.info,
 		queryInfo: query.info,
-		prepare: func(handle *DBHandle, _ options) (focusedAllocRunner, error) {
+		prepare: func(handle *CollectionHandle, _ options) (focusedAllocRunner, error) {
 			workCtx := &WorkloadContext{
-				DB:           handle.DB,
+				Collection:   handle.Collection,
 				MaxIDPtr:     &handle.MaxID,
 				EmailSamples: handle.EmailSamples,
 			}
@@ -83,11 +83,11 @@ func selectFocusedAllocPreparedTarget(classFilter, queryFilter []string) (focuse
 	return focusedAllocTarget{
 		classInfo: spec.classInfo,
 		queryInfo: spec.queryInfo,
-		prepare: func(handle *DBHandle, opts options) (focusedAllocRunner, error) {
+		prepare: func(handle *CollectionHandle, opts options) (focusedAllocRunner, error) {
 			q := spec.build(time.Now().Unix())
 			runner := focusedAllocRunner{
 				run: func() error {
-					return runResearchAllocQuery(handle.DB, spec.runKind, q)
+					return runResearchAllocQuery(handle.Collection, spec.runKind, q)
 				},
 			}
 			if opts.AllocMode == allocModeTurnover {
@@ -96,7 +96,7 @@ func selectFocusedAllocPreparedTarget(classFilter, queryFilter []string) (focuse
 					return focusedAllocRunner{}, ringErr
 				}
 				runner.before = func() error {
-					return ring.apply(handle.DB)
+					return ring.apply(handle.Collection)
 				}
 			}
 			return runner, nil
@@ -115,7 +115,7 @@ func selectFocusedAllocTarget(opts options) (focusedAllocTarget, error) {
 	}
 }
 
-func runFocusedAllocProfile(handle *DBHandle, opts options, collector *plannerTraceCollector) error {
+func runFocusedAllocProfile(handle *CollectionHandle, opts options, collector *plannerTraceCollector) error {
 	target, err := selectFocusedAllocTarget(opts)
 	if err != nil {
 		return err

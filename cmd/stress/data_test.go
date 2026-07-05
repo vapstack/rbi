@@ -42,14 +42,11 @@ func TestBuildRBIOptions(t *testing.T) {
 		TraceSampleEvery:     17,
 	})
 
-	if !opts.EnableAutoBatchStats || !opts.EnableSnapshotStats {
-		t.Fatalf("stats flags = autobatch:%t snapshot:%t, want both true", opts.EnableAutoBatchStats, opts.EnableSnapshotStats)
-	}
 	if opts.AnalyzeInterval != -1 {
 		t.Fatalf("AnalyzeInterval = %s, want -1", opts.AnalyzeInterval)
 	}
-	if opts.SnapshotMaterializedPredCacheMaxEntries != -1 {
-		t.Fatalf("SnapshotMaterializedPredCacheMaxEntries = %d, want -1", opts.SnapshotMaterializedPredCacheMaxEntries)
+	if opts.MaterializedPredicateCacheMaxEntries != -1 {
+		t.Fatalf("MaterializedPredCacheMaxEntries = %d, want -1", opts.MaterializedPredicateCacheMaxEntries)
 	}
 	if opts.NumericRangeBucketSize != -1 {
 		t.Fatalf("NumericRangeBucketSize = %d, want -1", opts.NumericRangeBucketSize)
@@ -87,7 +84,7 @@ func TestOpenBenchDBSeedsEmptyDBToExplicitTarget(t *testing.T) {
 	if got := handle.MaxID; got != 7 {
 		t.Fatalf("MaxID = %d, want 7", got)
 	}
-	if got, err := handle.DB.Count(); err != nil {
+	if got, err := stressReadCount(handle.Collection); err != nil {
 		t.Fatalf("Count(): %v", err)
 	} else if got != 7 {
 		t.Fatalf("Count() = %d, want 7", got)
@@ -129,7 +126,7 @@ func TestOpenBenchDBTopUpToExplicitTarget(t *testing.T) {
 	if got := handle.MaxID; got != 8 {
 		t.Fatalf("MaxID = %d, want 8", got)
 	}
-	if got, err := handle.DB.Count(); err != nil {
+	if got, err := stressReadCount(handle.Collection); err != nil {
 		t.Fatalf("Count(): %v", err)
 	} else if got != 8 {
 		t.Fatalf("Count() = %d, want 8", got)

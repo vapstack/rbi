@@ -400,65 +400,6 @@ func BenchmarkBuildPreparedInPlaceAggregatedRepeatedID(b *testing.B) {
 	}
 }
 
-func BenchmarkManagerPinUnpinRetired(b *testing.B) {
-	m := NewRegistry(true)
-	current := &View{Seq: 1}
-	m.Publish(current)
-	_, ref, ok := m.PinBySeq(current.Seq)
-	if !ok {
-		b.Fatal("pin current")
-	}
-	m.Publish(&View{Seq: 2})
-	defer m.Unpin(current.Seq, ref)
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		snap, ref, ok := m.PinBySeq(2)
-		if !ok || snap == nil {
-			b.Fatal("pin latest")
-		}
-		m.Unpin(2, ref)
-	}
-}
-
-func BenchmarkManagerPinCurrentStatsUnpin(b *testing.B) {
-	m := NewRegistry(true)
-	m.Publish(&View{Seq: 1})
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		snap, seq, ref := m.PinCurrent()
-		if snap == nil || seq != 1 || ref == nil {
-			b.Fatal("pin current")
-		}
-		if stats := m.Stats(snap, ref); stats.Sequence != 1 || stats.RegistrySize != 1 {
-			b.Fatalf("stats=%+v", stats)
-		}
-		m.Unpin(seq, ref)
-	}
-}
-
-func BenchmarkManagerStageDropStaged(b *testing.B) {
-	m := NewRegistry(true)
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		snap := &View{Seq: uint64(i + 1)}
-		m.Stage(snap)
-		m.DropStaged(snap.Seq)
-	}
-}
-
-func BenchmarkManagerPublishSameSeqReplace(b *testing.B) {
-	m := NewRegistry(true)
-	m.Publish(&View{Seq: 1})
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		m.Publish(&View{Seq: 1})
-	}
-}
-
 func BenchmarkMaterializedCacheInheritRelease(b *testing.B) {
 	prev := testMatPredView(128, 0)
 	for i := 0; i < 128; i++ {

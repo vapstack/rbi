@@ -15,6 +15,13 @@ import (
 	"go.etcd.io/bbolt"
 )
 
+func (c *Collection[K, V]) disableSync() { c.root.bolt.NoSync = true }
+
+func (c *Collection[K, V]) enableSync() {
+	c.root.bolt.NoSync = false
+	_ = c.root.bolt.Sync()
+}
+
 func newRand(seed int64) *rand.Rand {
 	return mathutil.NewRand(seed)
 }
@@ -28,22 +35,29 @@ func testOptions(opts Options) Options {
 	return opts
 }
 
+func enableStoreStatsForTest(tb testing.TB) {
+	tb.Helper()
+	old := EnableStoreStats
+	EnableStoreStats = true
+	tb.Cleanup(func() { EnableStoreStats = old })
+}
+
 type Product struct {
 	SKU   string   `db:"sku"   rbi:"index"`
 	Price float64  `db:"price" rbi:"index"`
 	Tags  []string `db:"tags"  rbi:"index"`
 }
 
-func openTempDBStringProduct(t *testing.T, options ...Options) (*DB[string, Product], string) {
+func openTempCollectionStringProduct(t *testing.T, options ...Options) (*Collection[string, Product], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_product.db")
-	db, raw := openBoltAndNew[string, Product](t, path, options...)
+	c, bolt := openBoltAndCollection[string, Product](t, path, options...)
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	return db, path
+	return c, path
 }
 
 func openRawBolt(t *testing.T) (*bbolt.DB, string) {
@@ -73,19 +87,157 @@ func readBucketSequence(tb testing.TB, raw *bbolt.DB, bucket []byte) uint64 {
 	return seq
 }
 
-func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *DB[K, V]) {
+func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, c *Collection[K, V]) {
 	tb.Helper()
 
-	stats := db.SnapshotStats()
+	stats := c.SnapshotStats()
 	if stats.Sequence == 0 {
 		return
 	}
-	if stats.RegistrySize != 1 {
-		tb.Fatalf("snapshot registry contains staged or retired refs: %+v", stats)
+	rr := &c.root.registry
+	rr.mu.RLock()
+	refs, staged := len(rr.byEpoch), len(rr.staged)
+	rr.mu.RUnlock()
+	if refs != 1 || staged != 0 {
+		tb.Fatalf("snapshot registry contains staged or retired refs: refs=%d staged=%d", refs, staged)
 	}
 }
-func releaseUniqueRecords[K ~string | ~uint64, V any](db *DB[K, V], vals ...*V) {
-	if db == nil || len(vals) == 0 {
+
+func readGet[K ~string | ~uint64, V any](c *Collection[K, V], id K) (*V, error) {
+	tx := BeginView()
+	defer tx.Release()
+	v, err := c.Get(tx, id)
+	return v, err
+}
+
+func readValues[K ~string | ~uint64, V any](c *Collection[K, V], ids ...K) ([]*V, error) {
+	tx := BeginView()
+	defer tx.Release()
+	vals := make([]*V, len(ids))
+	for i, id := range ids {
+		v, err := c.Get(tx, id)
+		if err != nil {
+			return vals, err
+		}
+		vals[i] = v
+	}
+	return vals, nil
+}
+
+func readScanKeys[K ~string | ~uint64, V any](c *Collection[K, V], seek K, fn func(K) (bool, error)) error {
+	tx := BeginView()
+	defer tx.Release()
+	err := c.ScanKeys(tx, seek, fn)
+	return err
+}
+
+func readSeqScan[K ~string | ~uint64, V any](c *Collection[K, V], seek K, fn func(K, *V) (bool, error)) error {
+	tx := BeginView()
+	defer tx.Release()
+	err := c.SeqScan(tx, seek, fn)
+	return err
+}
+
+func readQuery[K ~string | ~uint64, V any](c *Collection[K, V], q *qx.QX) ([]*V, error) {
+	tx := BeginView()
+	defer tx.Release()
+	vals, err := c.Query(tx, q)
+	return vals, err
+}
+
+func readQueryKeys[K ~string | ~uint64, V any](c *Collection[K, V], q *qx.QX) ([]K, error) {
+	tx := BeginView()
+	defer tx.Release()
+	keys, err := c.QueryKeys(tx, q)
+	return keys, err
+}
+
+func readIndexQueryKeys[V any](c *Collection[uint64, V], q *qx.QX) ([]uint64, error) {
+	tx := BeginIndexView()
+	defer tx.Release()
+	keys, err := c.QueryKeys(tx, q)
+	return keys, err
+}
+
+func readCount[K ~string | ~uint64, V any](c *Collection[K, V], exprs ...qx.Expr) (uint64, error) {
+	tx := BeginIndexView()
+	defer tx.Release()
+	count, err := c.Count(tx, exprs...)
+	return count, err
+}
+
+func readAggregate[K ~string | ~uint64, V any](c *Collection[K, V], q *qx.QX) (Result, error) {
+	tx := BeginIndexView()
+	defer tx.Release()
+	result, err := c.Aggregate(tx, q)
+	return result, err
+}
+
+func writeSet[K ~string | ~uint64, V any](c *Collection[K, V], id K, val *V, opts ...ExecOption[K, V]) error {
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Set(tx, id, val, opts...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func writeSets[K ~string | ~uint64, V any](c *Collection[K, V], ids []K, vals []*V, opts ...ExecOption[K, V]) error {
+	if len(ids) != len(vals) {
+		return fmt.Errorf("different slice lengths")
+	}
+	tx := BeginUpdate()
+	defer tx.Release()
+	for i := range ids {
+		if err := c.Set(tx, ids[i], vals[i], opts...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func writePatch[K ~string | ~uint64, V any](c *Collection[K, V], id K, patch []Field, opts ...ExecOption[K, V]) error {
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Patch(tx, id, patch, opts...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func writePatches[K ~string | ~uint64, V any](c *Collection[K, V], ids []K, patch []Field, opts ...ExecOption[K, V]) error {
+	tx := BeginUpdate()
+	defer tx.Release()
+	for i := range ids {
+		if err := c.Patch(tx, ids[i], patch, opts...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func writeDelete[K ~string | ~uint64, V any](c *Collection[K, V], id K, opts ...ExecOption[K, V]) error {
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Delete(tx, id, opts...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func writeDeletes[K ~string | ~uint64, V any](c *Collection[K, V], ids []K, opts ...ExecOption[K, V]) error {
+	tx := BeginUpdate()
+	defer tx.Release()
+	for i := range ids {
+		if err := c.Delete(tx, ids[i], opts...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func releaseUniqueRecords[K ~string | ~uint64, V any](c *Collection[K, V], vals ...*V) {
+	if c == nil || len(vals) == 0 {
 		return
 	}
 	seen := make(map[*V]struct{}, len(vals))
@@ -100,20 +252,20 @@ func releaseUniqueRecords[K ~string | ~uint64, V any](db *DB[K, V], vals ...*V) 
 		seen[v] = struct{}{}
 		unique = append(unique, v)
 	}
-	db.ReleaseRecords(unique...)
+	c.ReleaseRecords(unique...)
 }
 
-func mustSetAPIRec(tb testing.TB, db *DB[uint64, Rec], id uint64, rec *Rec) {
+func mustSetAPIRec(tb testing.TB, c *Collection[uint64, Rec], id uint64, rec *Rec) {
 	tb.Helper()
-	if err := db.Set(id, rec); err != nil {
+	if err := writeSet(c, id, rec); err != nil {
 		tb.Fatalf("Set(%d): %v", id, err)
 	}
 }
 
-func mustSetAPIRecs(tb testing.TB, db *DB[uint64, Rec], recs map[uint64]*Rec) {
+func mustSetAPIRecs(tb testing.TB, c *Collection[uint64, Rec], recs map[uint64]*Rec) {
 	tb.Helper()
 	for id, rec := range recs {
-		mustSetAPIRec(tb, db, id, rec)
+		mustSetAPIRec(tb, c, id, rec)
 	}
 }
 func ioExtCopyRec(v *Rec) Rec {
@@ -138,23 +290,23 @@ func ioExtCopyProduct(v *Product) Product {
 	return cp
 }
 
-func ioExtMustSetRec(t *testing.T, db *DB[uint64, Rec], id uint64, v *Rec) {
+func ioExtMustSetRec(t *testing.T, c *Collection[uint64, Rec], id uint64, v *Rec) {
 	t.Helper()
-	if err := db.Set(id, v); err != nil {
+	if err := writeSet(c, id, v); err != nil {
 		t.Fatalf("Set(%d): %v", id, err)
 	}
 }
 
-func ioExtMustSetProduct(t *testing.T, db *DB[string, Product], id string, v *Product) {
+func ioExtMustSetProduct(t *testing.T, c *Collection[string, Product], id string, v *Product) {
 	t.Helper()
-	if err := db.Set(id, v); err != nil {
+	if err := writeSet(c, id, v); err != nil {
 		t.Fatalf("Set(%q): %v", id, err)
 	}
 }
 
-func ioExtMustGetRec(t *testing.T, db *DB[uint64, Rec], id uint64) *Rec {
+func ioExtMustGetRec(t *testing.T, c *Collection[uint64, Rec], id uint64) *Rec {
 	t.Helper()
-	v, err := db.Get(id)
+	v, err := readGet(c, id)
 	if err != nil {
 		t.Fatalf("Get(%d): %v", id, err)
 	}
@@ -164,16 +316,16 @@ func ioExtMustGetRec(t *testing.T, db *DB[uint64, Rec], id uint64) *Rec {
 	return v
 }
 
-func ioExtMustReadUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64) []byte {
+func ioExtMustReadUint64Raw(t *testing.T, c *Collection[uint64, Rec], id uint64) []byte {
 	t.Helper()
 	var raw []byte
-	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 		var keyBuf [8]byte
-		v := b.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
+		v := b.Get(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=%d", id)
 		}
@@ -185,16 +337,16 @@ func ioExtMustReadUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64) []byte
 	return raw
 }
 
-func ioExtMustReadStringRaw(t *testing.T, db *DB[string, Product], id string) []byte {
+func ioExtMustReadStringRaw(t *testing.T, c *Collection[string, Product], id string) []byte {
 	t.Helper()
 	var raw []byte
-	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 		var keyBuf [8]byte
-		v := b.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
+		v := b.Get(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=%q", id)
 		}
@@ -206,31 +358,31 @@ func ioExtMustReadStringRaw(t *testing.T, db *DB[string, Product], id string) []
 	return raw
 }
 
-func ioExtMustCorruptUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64, raw []byte) {
+func ioExtMustCorruptUint64Raw(t *testing.T, c *Collection[uint64, Rec], id uint64, raw []byte) {
 	t.Helper()
-	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.dataBucket)
+	if err := c.root.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
 		var keyBuf [8]byte
-		return b.Put(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf), raw)
+		return b.Put(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf), raw)
 	}); err != nil {
 		t.Fatalf("corrupt raw(%d): %v", id, err)
 	}
 }
 
-func scanRawBolt[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], seek K, fn func(K, []byte) (bool, error)) error {
+func scanRawBolt[K ~string | ~uint64, V any](tb testing.TB, c *Collection[K, V], seek K, fn func(K, []byte) (bool, error)) error {
 	tb.Helper()
-	return db.Bolt().View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(db.BucketName())
+	return c.root.bolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(c.dataBucket)
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		c := b.Cursor()
+		cur := b.Cursor()
 		var keyBuf [8]byte
-		for key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf)); key != nil; key, value = c.Next() {
-			more, err := fn(keycodec.UserKeyFromBytes[K](key, db.strKey), value)
+		for key, value := cur.Seek(keycodec.UserKeyBytesWithBuf(seek, c.strKey, &keyBuf)); key != nil; key, value = cur.Next() {
+			more, err := fn(keycodec.UserKeyFromBytes[K](key, c.strKey), value)
 			if err != nil || !more {
 				return err
 			}
@@ -239,8 +391,8 @@ func scanRawBolt[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], seek K
 	})
 }
 
-func rawPayloadForTest[K ~string | ~uint64, V any](db *DB[K, V], raw []byte) ([]byte, error) {
-	if db.strKey {
+func rawPayloadForTest[K ~string | ~uint64, V any](c *Collection[K, V], raw []byte) ([]byte, error) {
+	if c.strKey {
 		if len(raw) < 8 {
 			return nil, fmt.Errorf("string storage format: value shorter than %d bytes", 8)
 		}
@@ -274,28 +426,28 @@ func ioExtReadBucketValue(t testing.TB, raw *bbolt.DB, bucketName, key string) (
 	return out, ok
 }
 
-func ioExtMustQueryName(t *testing.T, db *DB[uint64, Rec], name string) []uint64 {
+func ioExtMustQueryName(t *testing.T, c *Collection[uint64, Rec], name string) []uint64 {
 	t.Helper()
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
+	ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))
 	if err != nil {
 		t.Fatalf("QueryKeys(name=%q): %v", name, err)
 	}
 	return ids
 }
 
-func ioExtMustCountUint64(t *testing.T, db *DB[uint64, Rec]) uint64 {
+func ioExtMustCountUint64(t *testing.T, c *Collection[uint64, Rec]) uint64 {
 	t.Helper()
-	cnt, err := db.Count()
+	cnt, err := readCount(c)
 	if err != nil {
 		t.Fatalf("Count(): %v", err)
 	}
 	return cnt
 }
 
-func ioExtCollectSeqScanRec(t *testing.T, db *DB[uint64, Rec], seek uint64) map[uint64]Rec {
+func ioExtCollectSeqScanRec(t *testing.T, c *Collection[uint64, Rec], seek uint64) map[uint64]Rec {
 	t.Helper()
 	out := make(map[uint64]Rec)
-	if err := db.SeqScan(seek, func(id uint64, v *Rec) (bool, error) {
+	if err := readSeqScan(c, seek, func(id uint64, v *Rec) (bool, error) {
 		out[id] = ioExtCopyRec(v)
 		return true, nil
 	}); err != nil {
@@ -304,10 +456,10 @@ func ioExtCollectSeqScanRec(t *testing.T, db *DB[uint64, Rec], seek uint64) map[
 	return out
 }
 
-func ioExtCollectSeqScanProduct(t *testing.T, db *DB[string, Product], seek string) map[string]Product {
+func ioExtCollectSeqScanProduct(t *testing.T, c *Collection[string, Product], seek string) map[string]Product {
 	t.Helper()
 	out := make(map[string]Product)
-	if err := db.SeqScan(seek, func(id string, v *Product) (bool, error) {
+	if err := readSeqScan(c, seek, func(id string, v *Product) (bool, error) {
 		out[id] = ioExtCopyProduct(v)
 		return true, nil
 	}); err != nil {

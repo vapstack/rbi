@@ -20,7 +20,7 @@ type focusedReadBenchCase struct {
 	name       string
 	classAlias string
 	build      func(now int64) *qx.QX
-	run        func(db *rbi.DB[uint64, UserBench], q *qx.QX) error
+	run        func(c *rbi.Collection[uint64, UserBench], q *qx.QX) error
 }
 
 var focusedReadBenchWorkers = []int{1, 8, 32, 100}
@@ -285,7 +285,7 @@ func runFocusedReadBenchmarkCase(b *testing.B, desc *classDescriptor, benchCase 
 	}
 }
 
-func openFocusedBenchHandle(b *testing.B, withTrace bool) (*DBHandle, *plannerTraceCollector, *plannerTraceEpoch) {
+func openFocusedBenchHandle(b *testing.B, withTrace bool) (*CollectionHandle, *plannerTraceCollector, *plannerTraceEpoch) {
 	b.Helper()
 
 	var collector *plannerTraceCollector
@@ -336,18 +336,18 @@ func focusedBenchDBPath(b *testing.B) string {
 	return path
 }
 
-func warmFocusedReadBenchmarkCase(b *testing.B, handle *DBHandle, desc *classDescriptor, benchCase focusedReadBenchCase, now int64, withTrace bool) {
+func warmFocusedReadBenchmarkCase(b *testing.B, handle *CollectionHandle, desc *classDescriptor, benchCase focusedReadBenchCase, now int64, withTrace bool) {
 	b.Helper()
 
 	q := benchCase.build(now)
 	_ = desc
 	_ = withTrace
-	if err := benchCase.run(handle.DB, q); err != nil {
+	if err := benchCase.run(handle.Collection, q); err != nil {
 		b.Fatalf("warm %s: %v", benchCase.name, err)
 	}
 }
 
-func runFocusedReadWorkers(b *testing.B, handle *DBHandle, collector *plannerTraceCollector, desc *classDescriptor, benchCase focusedReadBenchCase, workers int, now int64, withTrace bool) {
+func runFocusedReadWorkers(b *testing.B, handle *CollectionHandle, collector *plannerTraceCollector, desc *classDescriptor, benchCase focusedReadBenchCase, workers int, now int64, withTrace bool) {
 	b.Helper()
 
 	var (
@@ -389,7 +389,7 @@ func runFocusedReadWorkers(b *testing.B, handle *DBHandle, collector *plannerTra
 						return
 					}
 					runErr := runFocusedReadTraceQuery(traceWorker, benchCase.name, func() error {
-						return benchCase.run(handle.DB, q)
+						return benchCase.run(handle.Collection, q)
 					})
 					if runErr != nil {
 						stop.Store(true)
@@ -425,19 +425,19 @@ func runFocusedReadTraceQuery(worker *plannerTraceWorker, query string, fn func(
 	return fn()
 }
 
-func runQueryItemsBench(db *rbi.DB[uint64, UserBench], q *qx.QX) error {
-	items, err := db.Query(q)
-	db.ReleaseRecords(items...)
+func runQueryItemsBench(c *rbi.Collection[uint64, UserBench], q *qx.QX) error {
+	items, err := stressReadQuery(c, q)
+	c.ReleaseRecords(items...)
 	return err
 }
 
-func runQueryKeysBenchQuery(db *rbi.DB[uint64, UserBench], q *qx.QX) error {
-	_, err := db.QueryKeys(q)
+func runQueryKeysBenchQuery(c *rbi.Collection[uint64, UserBench], q *qx.QX) error {
+	_, err := stressReadQueryKeys(c, q)
 	return err
 }
 
-func runCountBenchQuery(db *rbi.DB[uint64, UserBench], q *qx.QX) error {
-	_, err := db.Count(q.Filter)
+func runCountBenchQuery(c *rbi.Collection[uint64, UserBench], q *qx.QX) error {
+	_, err := stressReadCount(c, q.Filter)
 	return err
 }
 

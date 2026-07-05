@@ -14,120 +14,9 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vapstack/rbi/rbierrors"
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 )
-
-func TestAttemptCommitFailureDropsStagedSnapshotAndSkipsPublish(t *testing.T) {
-	commitErr := errors.New("commit failed")
-	var events []string
-	var ex *Batcher
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(*bbolt.Tx) error {
-		snap, ref, ok := ex.snapshotOps.Manager.PinBySeq(1)
-		if !ok || snap == nil || snap.Seq != 1 {
-			t.Fatalf("snapshot was not staged before commit: snap=%#v ok=%v", snap, ok)
-		}
-		ex.snapshotOps.Manager.Unpin(1, ref)
-		events = append(events, "commit")
-		return commitErr
-	})
-
-	req := setAttemptReq(1, 9)
-	defer encodePool.Put(req.setPayload)
-
-	retry, done, fatalErr := ex.attempt([]*request{req}, true)
-	if retry != nil || !done || fatalErr != nil {
-		t.Fatalf("attempt = retry %p done %v fatal %v", retry, done, fatalErr)
-	}
-	if !errors.Is(req.Err, commitErr) {
-		t.Fatalf("request error = %v, want %v", req.Err, commitErr)
-	}
-	want := []string{"commit"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("events = %v, want %v", events, want)
-	}
-	if snap, ref, ok := ex.snapshotOps.Manager.PinBySeq(1); ok {
-		ex.snapshotOps.Manager.Unpin(1, ref)
-		t.Fatalf("staged snapshot remained after failed commit: %#v", snap)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
-		t.Fatalf("payload persisted after failed commit: %v", got)
-	}
-	if st := ex.Stats(); st.TxCommitErrors == 0 {
-		t.Fatalf("TxCommitErrors = 0 after failed commit")
-	}
-}
-
-func TestAttemptPublishRunsAfterSuccessfulCommit(t *testing.T) {
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		events = append(events, "commit")
-		return tx.Commit()
-	})
-	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
-		if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
-			t.Fatalf("publish ran before committed payload was visible: %v", got)
-		}
-		ex.snapshotOps.Manager.Publish(snap)
-		events = append(events, "publish")
-		return nil
-	}
-
-	req := setAttemptReq(1, 9)
-	defer encodePool.Put(req.setPayload)
-
-	retry, done, fatalErr := ex.attempt([]*request{req}, true)
-	if retry != nil || !done || fatalErr != nil || req.Err != nil {
-		t.Fatalf("attempt = retry %p done %v fatal %v reqErr %v", retry, done, fatalErr, req.Err)
-	}
-	want := []string{"commit", "publish"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("events = %v, want %v", events, want)
-	}
-}
-
-func TestAttemptPublishBrokenDropsStagedAfterCommit(t *testing.T) {
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		events = append(events, "commit")
-		return tx.Commit()
-	})
-	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
-		if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
-			t.Fatalf("publish ran before committed payload was visible: %v", got)
-		}
-		staged, ref, ok := ex.snapshotOps.Manager.PinBySeq(seq)
-		if !ok || staged != snap {
-			t.Fatalf("snapshot was not staged before publish error: staged=%#v snap=%#v ok=%v", staged, snap, ok)
-		}
-		ex.snapshotOps.Manager.Unpin(seq, ref)
-		events = append(events, "publish")
-		return rbierrors.ErrBroken
-	}
-
-	req := setAttemptReq(1, 9)
-	defer encodePool.Put(req.setPayload)
-
-	retry, done, fatalErr := ex.attempt([]*request{req}, true)
-	if retry != nil || !done || fatalErr != nil {
-		t.Fatalf("attempt = retry %p done %v fatal %v", retry, done, fatalErr)
-	}
-	if !errors.Is(req.Err, rbierrors.ErrBroken) {
-		t.Fatalf("request error = %v, want %v", req.Err, rbierrors.ErrBroken)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{9}) {
-		t.Fatalf("committed payload after publish error = %v, want [9]", got)
-	}
-	if snap, ref, ok := ex.snapshotOps.Manager.PinBySeq(1); ok {
-		ex.snapshotOps.Manager.Unpin(1, ref)
-		t.Fatalf("staged snapshot remained after publish error: %#v", snap)
-	}
-	want := []string{"commit", "publish"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("events = %v, want %v", events, want)
-	}
-}
 
 func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 	var events []string
@@ -135,11 +24,11 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 		return tx.Commit()
 	})
 	rec := attemptRec{V: 9}
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey("new", true), unsafe.Pointer(&rec), nil, nil, nil)
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey("new", true), unsafe.Pointer(&rec), nil, nil, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest: %v", err)
 	}
-	defer requestPool.Put(req)
+	defer ex.releaseRequest(&req)
 
 	tx, err := raw.Begin(true)
 	if err != nil {
@@ -151,7 +40,7 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 	defer attemptStatePool.Put(att)
 	att.prepare(tx.Bucket(bucketName), false, ex.ops.Release, 1, true, true, len(ex.schema.Unique))
 	att.strmapBucket = tx.Bucket(mapBucketName)
-	ex.prepareSet(att, req)
+	ex.prepareSet(att, &req, nil)
 	if req.Err != nil {
 		t.Fatalf("prepareSet req error: %v", req.Err)
 	}
@@ -182,16 +71,16 @@ func TestStringKeyIndexDeleteThenReinsertUsesNewDurableID(t *testing.T) {
 	oldIdx := uint64(1)
 	keyMap := indexdata.GetPostingMap()
 	keyMap["user"] = (posting.List{}).BuildAdded(oldIdx)
-	ex.snapshotOps.Manager.Current().KeyIndex = indexdata.NewRegularFieldStorageFromPostingMapOwned(keyMap)
+	snapshotManagerForTest(ex).Current().KeyIndex = indexdata.NewRegularFieldStorageFromPostingMapOwned(keyMap)
 
-	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil)
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil, 0)
 	setReq := stringSetAttemptReq("user", 9)
-	executeBatchForTest(ex, []*request{delReq, setReq})
+	executeBatchForTest(ex, []*request{&delReq, setReq})
 
-	if err := <-delReq.Done; err != nil {
+	if err := delReq.Err; err != nil {
 		t.Fatalf("delete request error = %v", err)
 	}
-	if err := <-setReq.Done; err != nil {
+	if err := setReq.Err; err != nil {
 		t.Fatalf("set request error = %v", err)
 	}
 
@@ -215,7 +104,7 @@ func TestStringKeyIndexDeleteThenReinsertUsesNewDurableID(t *testing.T) {
 	if got := readStringAttemptMap(t, raw, mapBucketName, newIdx); got != "user" {
 		t.Fatalf("new string map entry=%q, want user", got)
 	}
-	ids := indexdata.NewFieldIndexViewFromStorage(ex.snapshotOps.Manager.Current().KeyIndex).LookupPostingRetained("user")
+	ids := indexdata.NewFieldIndexViewFromStorage(snapshotManagerForTest(ex).Current().KeyIndex).LookupPostingRetained("user")
 	if ids.Cardinality() != 1 || ids.Contains(oldIdx) || !ids.Contains(newIdx) {
 		t.Fatalf("key index cardinality=%d old=%v new=%v", ids.Cardinality(), ids.Contains(oldIdx), ids.Contains(newIdx))
 	}
@@ -230,13 +119,13 @@ func TestStringKeyIndexSetThenDeleteSameBatchLeavesNoKeyDelta(t *testing.T) {
 	ex.snapshotOps.StrKeyIndex = true
 
 	setReq := stringSetAttemptReq("ghost", 9)
-	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("ghost", true), nil)
-	executeBatchForTest(ex, []*request{setReq, delReq})
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("ghost", true), nil, 0)
+	executeBatchForTest(ex, []*request{setReq, &delReq})
 
-	if err := <-setReq.Done; err != nil {
+	if err := setReq.Err; err != nil {
 		t.Fatalf("set request error = %v", err)
 	}
-	if err := <-delReq.Done; err != nil {
+	if err := delReq.Err; err != nil {
 		t.Fatalf("delete request error = %v", err)
 	}
 
@@ -255,7 +144,7 @@ func TestStringKeyIndexSetThenDeleteSameBatchLeavesNoKeyDelta(t *testing.T) {
 		t.Fatalf("read committed state: %v", err)
 	}
 
-	ids := indexdata.NewFieldIndexViewFromStorage(ex.snapshotOps.Manager.Current().KeyIndex).LookupPostingRetained("ghost")
+	ids := indexdata.NewFieldIndexViewFromStorage(snapshotManagerForTest(ex).Current().KeyIndex).LookupPostingRetained("ghost")
 	if !ids.IsEmpty() {
 		t.Fatalf("ghost key index posting cardinality=%d", ids.Cardinality())
 	}
@@ -288,21 +177,22 @@ func TestStringKeyIndexKeyOnlyExistingSetThenDeleteRemovesSnapshotState(t *testi
 	current := snapshot.BuildWithKeyDeltas(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, []snapshot.BatchEntry{
 		{ID: oldIdx, New: unsafe.Pointer(&seed)},
 	}, []snapshot.KeyDelta{{ID: oldIdx, Key: "user", Add: true}})
-	ex.snapshotOps.Manager.Publish(current)
+	snapshotManagerForTest(ex).Publish(current)
 	ex.schema = rt
 	ex.unique = UniqueContext{}
 	ex.snapshotOps.Schema = rt
 	ex.snapshotOps.PatchFields = rt.Patch.Fields
+	ex.snapshotOps.Current = snapshotManagerForTest(ex).Current
 	ex.snapshotOps.StrKeyIndex = true
 
 	setReq := stringSetAttemptReq("user", 9)
-	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil)
-	executeBatchForTest(ex, []*request{setReq, delReq})
+	delReq := ex.buildDeleteRequest(keycodec.DataKeyFromUserKey("user", true), nil, 0)
+	executeBatchForTest(ex, []*request{setReq, &delReq})
 
-	if err := <-setReq.Done; err != nil {
+	if err := setReq.Err; err != nil {
 		t.Fatalf("set request error = %v", err)
 	}
-	if err := <-delReq.Done; err != nil {
+	if err := delReq.Err; err != nil {
 		t.Fatalf("delete request error = %v", err)
 	}
 
@@ -319,7 +209,7 @@ func TestStringKeyIndexKeyOnlyExistingSetThenDeleteRemovesSnapshotState(t *testi
 		t.Fatalf("read committed state: %v", err)
 	}
 
-	snap := ex.snapshotOps.Manager.Current()
+	snap := snapshotManagerForTest(ex).Current()
 	if got := snap.Universe.Cardinality(); got != 0 {
 		t.Fatalf("snapshot universe cardinality=%d want 0", got)
 	}
@@ -330,8 +220,8 @@ func TestStringKeyIndexKeyOnlyExistingSetThenDeleteRemovesSnapshotState(t *testi
 	ids.Release()
 }
 
-func TestSharedRetrySkipsBeforeCommitFailureAndCommitsRest(t *testing.T) {
-	callbackErr := errors.New("callback failed")
+func TestSharedSetOnChangeFailureCommitsRest(t *testing.T) {
+	hookErr := errors.New("on change failed")
 	var events []string
 	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
@@ -339,41 +229,8 @@ func TestSharedRetrySkipsBeforeCommitFailureAndCommitsRest(t *testing.T) {
 	ex.snapshotOps = SnapshotOps{}
 
 	badReq := setAttemptReq(1, 1)
-	badReq.beforeCommit = []BeforeCommitHook{
-		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return callbackErr
-		},
-	}
-
-	goodReq := setAttemptReq(2, 2)
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := <-badReq.Done; !errors.Is(err, callbackErr) {
-		t.Fatalf("bad request error = %v, want callback error", err)
-	}
-	if err := <-goodReq.Done; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
-		t.Fatalf("bad request payload persisted: %v", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
-		t.Fatalf("good request payload = %v, want [2]", got)
-	}
-}
-
-func TestSharedSetBeforeStoreFailureCommitsRest(t *testing.T) {
-	hookErr := errors.New("before store failed")
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.snapshotOps = SnapshotOps{}
-
-	badReq := setAttemptReq(1, 1)
-	badReq.beforeStore = []BeforeStoreHook{
-		func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
+	badReq.onChange = []OnChangeHook{
+		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
 			return hookErr
 		},
 	}
@@ -381,10 +238,10 @@ func TestSharedSetBeforeStoreFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, hookErr) {
-		t.Fatalf("bad request error = %v, want before store error", err)
+	if err := badReq.Err; !errors.Is(err, hookErr) {
+		t.Fatalf("bad request error = %v, want on change error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
@@ -392,115 +249,6 @@ func TestSharedSetBeforeStoreFailureCommitsRest(t *testing.T) {
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
 		t.Fatalf("good request payload = %v, want [2]", got)
-	}
-}
-
-func TestSharedSetBeforeStoreRestartsFromPayloadOnRetry(t *testing.T) {
-	callbackErr := errors.New("before commit failed")
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.snapshotOps = SnapshotOps{}
-
-	goodReq := setAttemptReq(1, 10)
-	beforeStoreCalls := 0
-	goodReq.beforeStore = []BeforeStoreHook{
-		func(_ keycodec.DataKey, _, newValue unsafe.Pointer) error {
-			beforeStoreCalls++
-			(*attemptRec)(newValue).V++
-			return nil
-		},
-	}
-	badReq := setAttemptReq(2, 20)
-	badReq.beforeCommit = []BeforeCommitHook{
-		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return callbackErr
-		},
-	}
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := <-badReq.Done; !errors.Is(err, callbackErr) {
-		t.Fatalf("bad request error = %v, want callback error", err)
-	}
-	if err := <-goodReq.Done; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if beforeStoreCalls != 2 {
-		t.Fatalf("BeforeStore calls = %d, want 2", beforeStoreCalls)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{11}) {
-		t.Fatalf("good request payload = %v, want [11]", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); got != nil {
-		t.Fatalf("bad request payload persisted: %v", got)
-	}
-}
-
-func TestSharedSetCloneValueRestartsFromBaselineOnRetry(t *testing.T) {
-	callbackErr := errors.New("before commit failed")
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.snapshotOps = SnapshotOps{}
-	released := 0
-	ex.ops.Release = func(ptr unsafe.Pointer) {
-		released++
-		(*attemptRec)(ptr).V = 0
-	}
-
-	goodBaseline := &attemptRec{V: 10}
-	goodReq := cloneSetAttemptReq(1, goodBaseline)
-	goodBeforeStoreCalls := 0
-	goodReq.beforeStore = []BeforeStoreHook{
-		func(_ keycodec.DataKey, _, newValue unsafe.Pointer) error {
-			goodBeforeStoreCalls++
-			(*attemptRec)(newValue).V++
-			return nil
-		},
-	}
-
-	badBaseline := &attemptRec{V: 20}
-	badReq := cloneSetAttemptReq(2, badBaseline)
-	badReq.beforeStore = []BeforeStoreHook{
-		func(_ keycodec.DataKey, _, newValue unsafe.Pointer) error {
-			(*attemptRec)(newValue).V++
-			return nil
-		},
-	}
-	badReq.beforeCommit = []BeforeCommitHook{
-		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return callbackErr
-		},
-	}
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := <-badReq.Done; !errors.Is(err, callbackErr) {
-		t.Fatalf("bad request error = %v, want callback error", err)
-	}
-	if err := <-goodReq.Done; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if goodBeforeStoreCalls != 2 {
-		t.Fatalf("good BeforeStore calls = %d, want 2", goodBeforeStoreCalls)
-	}
-	if released != 3 {
-		t.Fatalf("released clone values = %d, want 3", released)
-	}
-	if goodBaseline.V != 10 {
-		t.Fatalf("good baseline mutated: %v", goodBaseline.V)
-	}
-	if badBaseline.V != 20 {
-		t.Fatalf("bad baseline mutated: %v", badBaseline.V)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{11}) {
-		t.Fatalf("good request payload = %v, want [11]", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); got != nil {
-		t.Fatalf("bad request payload persisted: %v", got)
 	}
 }
 
@@ -520,8 +268,8 @@ func TestSharedSetDecodePreparedValueFailureCommitsRest(t *testing.T) {
 	}
 
 	badReq := setAttemptReq(1, 1)
-	badReq.beforeStore = []BeforeStoreHook{
-		func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
+	badReq.onChange = []OnChangeHook{
+		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
 			return nil
 		},
 	}
@@ -531,10 +279,10 @@ func TestSharedSetDecodePreparedValueFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+	if err := badReq.Err; !errors.Is(err, decodeErr) {
 		t.Fatalf("bad request error = %v, want decode error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
@@ -558,10 +306,10 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
 		t.Fatalf("bad request error = %v, want empty payload error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
@@ -569,6 +317,69 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
 		t.Fatalf("good request payload = %v, want [2]", got)
+	}
+}
+
+func TestSharedTransparentSetFailureDoesNotHideExistingPatchTarget(t *testing.T) {
+	var events []string
+	ex, raw, bucket := newTransparentPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	putAttemptPayload(t, raw, bucket, 1, []byte{10})
+
+	badReq := setAttemptReq(1, 1)
+	badReq.setPayload.Reset()
+	patchReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(77)}}, true)
+
+	executeBatchForTest(ex, []*request{badReq, patchReq})
+
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+		t.Fatalf("bad request error = %v, want empty payload error", err)
+	}
+	if err := patchReq.Err; err != nil {
+		t.Fatalf("patch request error = %v", err)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{77}) {
+		t.Fatalf("payload after failed set and patch = %v, want [77]", got)
+	}
+}
+
+func TestSharedTransparentSetFailureDoesNotClearOldValueForLaterOnChange(t *testing.T) {
+	var events []string
+	ex, raw, bucket := newTransparentPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+	putAttemptPayload(t, raw, bucket, 1, []byte{10})
+
+	badReq := setAttemptReq(1, 1)
+	badReq.setPayload.Reset()
+	setReq := setAttemptReq(1, 20)
+	var oldNil bool
+	var oldSeen byte
+	setReq.onChange = []OnChangeHook{
+		func(_ unsafe.Pointer, _ uint8, _ keycodec.DataKey, oldValue, _ unsafe.Pointer) error {
+			if oldValue == nil {
+				oldNil = true
+				return nil
+			}
+			oldSeen = (*attemptRec)(oldValue).V
+			return nil
+		},
+	}
+
+	executeBatchForTest(ex, []*request{badReq, setReq})
+
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+		t.Fatalf("bad request error = %v, want empty payload error", err)
+	}
+	if err := setReq.Err; err != nil {
+		t.Fatalf("set request error = %v", err)
+	}
+	if oldNil || oldSeen != 10 {
+		t.Fatalf("OnChange old value nil=%v seen=%d, want 10", oldNil, oldSeen)
+	}
+	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{20}) {
+		t.Fatalf("payload after failed set and set = %v, want [20]", got)
 	}
 }
 
@@ -583,10 +394,10 @@ func TestSharedStringSetKeyTooLargeCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, berrors.ErrKeyTooLarge) {
+	if err := badReq.Err; !errors.Is(err, berrors.ErrKeyTooLarge) {
 		t.Fatalf("bad request error = %v, want key too large", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readStringAttemptPayload(t, raw, bucket, "good"); !reflect.DeepEqual(got, []byte{2}) {
@@ -615,16 +426,16 @@ func TestAtomicSetEmptyPayloadThenPatchSameBatch(t *testing.T) {
 	}
 
 	rec := attemptRec{}
-	setReq, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&rec), nil, nil, nil)
+	setReq, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&rec), nil, nil, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest: %v", err)
 	}
-	defer ex.releaseRequest(setReq)
+	defer ex.releaseRequest(&setReq)
 	// A pooled empty buffer may keep capacity; this forces the nil-backed empty payload path.
 	*setReq.setPayload = bytes.Buffer{}
 	patchReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(7)}}, true)
 
-	ex.runAtomic([]*request{setReq, patchReq})
+	executeAtomicRequestsForTest(ex, []*request{&setReq, patchReq})
 
 	if setReq.Err != nil {
 		t.Fatalf("set request error = %v", setReq.Err)
@@ -656,10 +467,10 @@ func TestSharedSetValidateIndexFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, validateErr) {
+	if err := badReq.Err; !errors.Is(err, validateErr) {
 		t.Fatalf("bad request error = %v, want validate error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
@@ -691,10 +502,10 @@ func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+	if err := badReq.Err; !errors.Is(err, decodeErr) {
 		t.Fatalf("bad request error = %v, want decode error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
@@ -705,7 +516,7 @@ func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
 	}
 }
 
-func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
+func TestSharedSetOnChangeEncodeFailureCommitsRest(t *testing.T) {
 	encodeErr := errors.New("encode failed")
 	var events []string
 	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
@@ -721,8 +532,8 @@ func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
 	}
 
 	badReq := setAttemptReq(1, 1)
-	badReq.beforeStore = []BeforeStoreHook{
-		func(_ keycodec.DataKey, _, newValue unsafe.Pointer) error {
+	badReq.onChange = []OnChangeHook{
+		func(_ unsafe.Pointer, _ uint8, _ keycodec.DataKey, _ unsafe.Pointer, newValue unsafe.Pointer) error {
 			(*attemptRec)(newValue).V = 99
 			return nil
 		},
@@ -731,10 +542,10 @@ func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, encodeErr) {
+	if err := badReq.Err; !errors.Is(err, encodeErr) {
 		t.Fatalf("bad request error = %v, want encode error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
@@ -745,8 +556,8 @@ func TestSharedSetBeforeStoreEncodeFailureCommitsRest(t *testing.T) {
 	}
 }
 
-func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
-	callbackErr := errors.New("before commit failed")
+func TestSharedDeleteOnChangeFailureCommitsRest(t *testing.T) {
+	callbackErr := errors.New("on change failed")
 	var events []string
 	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
@@ -756,8 +567,8 @@ func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
 	putAttemptPayload(t, raw, bucket, 2, []byte{2})
 
 	badReq := deleteAttemptReq(1)
-	badReq.beforeCommit = []BeforeCommitHook{
-		func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
+	badReq.onChange = []OnChangeHook{
+		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
 			return callbackErr
 		},
 	}
@@ -765,10 +576,10 @@ func TestSharedDeleteBeforeCommitFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, callbackErr) {
+	if err := badReq.Err; !errors.Is(err, callbackErr) {
 		t.Fatalf("bad request error = %v, want callback error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{1}) {
@@ -801,10 +612,10 @@ func TestSharedDeleteDecodeFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+	if err := badReq.Err; !errors.Is(err, decodeErr) {
 		t.Fatalf("bad request error = %v, want decode error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
@@ -815,8 +626,8 @@ func TestSharedDeleteDecodeFailureCommitsRest(t *testing.T) {
 	}
 }
 
-func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
-	hookErr := errors.New("before process failed")
+func TestSharedPatchOnChangeFailureCommitsRest(t *testing.T) {
+	hookErr := errors.New("on change failed")
 	var events []string
 	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
@@ -825,8 +636,8 @@ func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
 	putAttemptPayload(t, raw, bucket, 2, []byte{20})
 
 	badReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(55)}}, true)
-	badReq.beforeProcess = []BeforeProcessHook{
-		func(keycodec.DataKey, unsafe.Pointer) error {
+	badReq.onChange = []OnChangeHook{
+		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
 			return hookErr
 		},
 	}
@@ -834,10 +645,10 @@ func TestSharedPatchBeforeProcessFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, hookErr) {
-		t.Fatalf("bad request error = %v, want before process error", err)
+	if err := badReq.Err; !errors.Is(err, hookErr) {
+		t.Fatalf("bad request error = %v, want on change error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{10}) {
@@ -868,10 +679,10 @@ func TestSharedPatchExistingDecodeFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; !errors.Is(err, decodeErr) {
+	if err := badReq.Err; !errors.Is(err, decodeErr) {
 		t.Fatalf("bad request error = %v, want decode error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
@@ -902,7 +713,7 @@ func TestLoadStateDecodeErrorClearsDiscardedStateSlot(t *testing.T) {
 			states:     make([]recordState, 0, 1),
 		}
 		req := request{id: keycodec.DataKeyFromUserKey("bad", true)}
-		if _, err := ex.loadState(&st, &req, true, true); !errors.Is(err, decodeErr) {
+		if _, _, err := ex.loadState(&st, &req, true, true); !errors.Is(err, decodeErr) {
 			return fmt.Errorf("loadState error = %v, want decode error", err)
 		}
 		if len(st.states) != 0 {
@@ -922,39 +733,6 @@ func TestLoadStateDecodeErrorClearsDiscardedStateSlot(t *testing.T) {
 	}
 }
 
-func TestSharedPatchBeforeStoreFailureCommitsRest(t *testing.T) {
-	hookErr := errors.New("before store failed")
-	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	putAttemptPayload(t, raw, bucket, 1, []byte{10})
-	putAttemptPayload(t, raw, bucket, 2, []byte{20})
-
-	badReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(55)}}, true)
-	badReq.beforeStore = []BeforeStoreHook{
-		func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return hookErr
-		},
-	}
-	goodReq := patchAttemptReq(2, []schema.PatchItem{{Name: "v", Value: byte(66)}}, true)
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := <-badReq.Done; !errors.Is(err, hookErr) {
-		t.Fatalf("bad request error = %v, want before store error", err)
-	}
-	if err := <-goodReq.Done; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{10}) {
-		t.Fatalf("bad request payload = %v, want [10]", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{66}) {
-		t.Fatalf("good request payload = %v, want [66]", got)
-	}
-}
-
 func TestSharedPatchStrictUnknownFieldFailureCommitsRest(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
@@ -968,10 +746,10 @@ func TestSharedPatchStrictUnknownFieldFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; err == nil || !strings.Contains(err.Error(), "cannot patch field") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "cannot patch field") {
 		t.Fatalf("bad request error = %v, want strict patch error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{10}) {
@@ -993,10 +771,10 @@ func TestSharedPatchMissingTargetCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{missingReq, goodReq})
 
-	if err := <-missingReq.Done; err != nil {
+	if err := missingReq.Err; err != nil {
 		t.Fatalf("missing request error = %v", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 999); got != nil {
@@ -1019,10 +797,10 @@ func TestSharedPatchApplyFailureCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := <-badReq.Done; err == nil || !strings.Contains(err.Error(), "failed to apply patch") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "failed to apply patch") {
 		t.Fatalf("bad request error = %v, want apply patch error", err)
 	}
-	if err := <-goodReq.Done; err != nil {
+	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{10}) {
@@ -1033,7 +811,7 @@ func TestSharedPatchApplyFailureCommitsRest(t *testing.T) {
 	}
 }
 
-func TestSharedPatchMissingTargetSkipsBeforeCommit(t *testing.T) {
+func TestSharedPatchMissingTargetSkipsOnChange(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
@@ -1041,32 +819,32 @@ func TestSharedPatchMissingTargetSkipsBeforeCommit(t *testing.T) {
 	putAttemptPayload(t, raw, bucket, 2, []byte{20})
 
 	var calls []uint64
-	hook := func(_ *bbolt.Tx, key keycodec.DataKey, _, _ unsafe.Pointer) error {
+	hook := func(_ unsafe.Pointer, _ uint8, key keycodec.DataKey, _, _ unsafe.Pointer) error {
 		calls = append(calls, key.Uint())
 		return nil
 	}
 	missingReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(55)}}, true)
-	missingReq.beforeCommit = []BeforeCommitHook{hook}
+	missingReq.onChange = []OnChangeHook{hook}
 	presentReq := patchAttemptReq(2, []schema.PatchItem{{Name: "v", Value: byte(99)}}, true)
-	presentReq.beforeCommit = []BeforeCommitHook{hook}
+	presentReq.onChange = []OnChangeHook{hook}
 
 	executeBatchForTest(ex, []*request{missingReq, presentReq})
 
-	if err := <-missingReq.Done; err != nil {
+	if err := missingReq.Err; err != nil {
 		t.Fatalf("missing request error = %v", err)
 	}
-	if err := <-presentReq.Done; err != nil {
+	if err := presentReq.Err; err != nil {
 		t.Fatalf("present request error = %v", err)
 	}
 	if !reflect.DeepEqual(calls, []uint64{2}) {
-		t.Fatalf("BeforeCommit keys = %v, want [2]", calls)
+		t.Fatalf("OnChange keys = %v, want [2]", calls)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{99}) {
 		t.Fatalf("present request payload = %v, want [99]", got)
 	}
 }
 
-func TestSharedDeleteMissingTargetSkipsBeforeCommit(t *testing.T) {
+func TestSharedDeleteMissingTargetSkipsOnChange(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
 		return tx.Commit()
@@ -1074,25 +852,25 @@ func TestSharedDeleteMissingTargetSkipsBeforeCommit(t *testing.T) {
 	putAttemptPayload(t, raw, bucket, 2, []byte{20})
 
 	var calls []uint64
-	hook := func(_ *bbolt.Tx, key keycodec.DataKey, _, _ unsafe.Pointer) error {
+	hook := func(_ unsafe.Pointer, _ uint8, key keycodec.DataKey, _, _ unsafe.Pointer) error {
 		calls = append(calls, key.Uint())
 		return nil
 	}
 	missingReq := deleteAttemptReq(1)
-	missingReq.beforeCommit = []BeforeCommitHook{hook}
+	missingReq.onChange = []OnChangeHook{hook}
 	presentReq := deleteAttemptReq(2)
-	presentReq.beforeCommit = []BeforeCommitHook{hook}
+	presentReq.onChange = []OnChangeHook{hook}
 
 	executeBatchForTest(ex, []*request{missingReq, presentReq})
 
-	if err := <-missingReq.Done; err != nil {
+	if err := missingReq.Err; err != nil {
 		t.Fatalf("missing request error = %v", err)
 	}
-	if err := <-presentReq.Done; err != nil {
+	if err := presentReq.Err; err != nil {
 		t.Fatalf("present request error = %v", err)
 	}
 	if !reflect.DeepEqual(calls, []uint64{2}) {
-		t.Fatalf("BeforeCommit keys = %v, want [2]", calls)
+		t.Fatalf("OnChange keys = %v, want [2]", calls)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); got != nil {
 		t.Fatalf("present request payload = %v, want nil", got)

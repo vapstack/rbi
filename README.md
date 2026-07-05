@@ -15,7 +15,7 @@ RBI is not a replacement for a relational or analytical database.
 
 ### Features
 
-* ACID – data durability is delegated to bbolt.
+* ACID – bbolt under the hood.
 * Fast index-only filtering/sorting – disk is never touched.
 * Document-oriented – queries return whole records, not individual fields.
 * Strong typing – generic API with user-defined key and value types.
@@ -28,11 +28,11 @@ RBI is not a replacement for a relational or analytical database.
   - logical: `AND`, `OR`, `NOT`
 * Index-based ordering with offset/limit, including sorting by array position/count
 * Simple index-backed aggregations: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `DISTINCT`
-* Partial updates (`Patch*`) with minimal index churn
-* Batch and auto-batched writes
+* Partial updates (`Patch`) with minimal index churn
+* Transactional automatically batched writes
 * Uniqueness constraints
 * Optional transparent mode for typed/generic work with plain bbolt db when index is not needed
-* Optional runtime diagnostics: query tracing and planner/snapshot/auto-batch stats
+* Optional runtime diagnostics: query tracing, planner and snapshot stats
 
 ### LLM notice
 Starting from v0.7, parts of the code, documentation and tests were created 
@@ -56,7 +56,7 @@ type User struct {
     ID      uint64   `db:"id"` // not indexed
 
     Name    string   `db:"name"   rbi:"index"`
-    Email   string   `db:"email"  rbi:"unique"` // with unique constraint
+    Email   string   `db:"email"  rbi:"unique"` // unique constraint
     Age     int      `db:"age"    rbi:"index"`
     Active  bool     `db:"active" rbi:"index"`
     Tags    []string `db:"tags"   rbi:"index"`
@@ -73,57 +73,59 @@ func main() {
         panic(err)
     }
     defer bolt.Close()
-	
-    db, err := rbi.New[uint64, User](bolt, rbi.Options{})
+
+    users, err := rbi.Open[uint64, User](bolt, rbi.Options{})
     if err != nil {
         panic(err)
     }
-    defer db.Close()
+    defer users.Close()
 
-    err = db.Set(1, &User{
-        ID:     1,
-        Name:   "Alice",
-        Email:  "alice@example.com",
-        Age:    30,
-        Active: true,
-        Tags:   []string{"admin", "dev"},
-        Spent:  120,
+    err = rbi.Update(func(tx *rbi.Tx) error {
+        if err := users.Set(tx, 1, &User{
+            ID:     1,
+            Name:   "Alice",
+            Email:  "alice@example.com",
+            Age:    30,
+            Active: true,
+            Tags:   []string{"admin", "dev"},
+            Spent:  120,
+        }); err != nil {
+            return err
+        }
+        return users.Set(tx, 2, &User{
+            ID:     2,
+            Name:   "Bob",
+            Email:  "bob@example.com",
+            Age:    40,
+            Active: false,
+            Tags:   []string{"dev"},
+            Spent:  80,
+        })
     })
     if err != nil {
         panic(err)
     }
 
-    err = db.Set(2, &User{
-        ID:     2,
-        Name:   "Bob",
-        Email:  "bob@example.com",
-        Age:    40,
-        Active: false,
-        Tags:   []string{"dev"},
-        Spent:  80,
-    })
-    if err != nil {
-        panic(err)
-    }
+    tx := rbi.BeginView()
+    defer tx.Close()
 
-    q := qx.Query(
-        qx.EQ("active", true),
-        qx.HASALL("tags", []string{"dev"}),
-        qx.GT("age", 25),
-    ).
+    result, err := users.Query(tx,
+        qx.Where(
+            qx.EQ("active", true),
+            qx.HASALL("tags", []string{"dev"}),
+            qx.GT("age", 25),
+        ).
         Sort("age", qx.ASC).
-        Limit(10)
-
-    users, err := db.Query(q)
+        Limit(10),
+    )
     if err != nil {
         panic(err)
     }
-
-    for _, u := range users {
+    for _, u := range result {
         fmt.Printf("%v (%v)\n", u.Name, u.Age)
     }
 
-    totals, err := db.Aggregate(
+    totals, err := users.Aggregate(tx,
         qx.Metrics(
             qx.ROWCOUNT().AS("users"),
             qx.SUM("spent").AS("spent"),
@@ -145,28 +147,29 @@ func main() {
 For the full API reference see
 [GoDoc](https://pkg.go.dev/github.com/vapstack/rbi).
 
+### Transactions
+
+- `View`/`BeginView` create a read transaction.
+- `IndexView`/`BeginIndexView` create an index-only transaction.
+- `Update`/`BeginUpdate` create a write transaction.
+  Writes queued in one `Tx` are committed as one atomic logical write.
+
 ### Writing data
 
-* `Set` – insert or replace a record and update affected indexes
-* `BatchSet` – batch variant of `Set`, significantly faster for bulk inserts
-* `Patch` – apply partial updates and update only changed indexes
-* `BatchPatch` – batch patch variant
-* `Delete` – remove a record and its index entries
-* `BatchDelete` – batch variant of `Delete`
+* `Set(tx, id, value)` – insert or replace a record and update affected indexes
+* `Patch(tx, id, patch)` – apply partial updates and update only changed indexes
+* `Delete(tx, id)` – remove a record and its index entries
 
 Do not write directly to buckets managed by RBI through raw Bolt APIs.
 
 ### Automatic batching
 
-Single-record writes always go through internal auto-batcher.
-It cannot be disabled; `AutoBatchMax` and `AutoBatchWindow` only tune its
-behavior.
+All writes go through the internal write scheduler.
+It cannot be disabled; `BatchSoftLimit` controls the soft batch size limit.
 
-The batcher groups concurrent writes, can isolate requests that fail from the
-rest of the batch, and retries operations where the write contract allows it.
+The scheduler groups compatible concurrent logical writes and can isolate
+request-level failures where the write contract allows it.
 This significantly improves throughput under active parallel write load.
-For synchronous bulk operations where the caller already has many rows ready,
-prefer explicit `BatchSet`, `BatchPatch` or `BatchDelete`.
 
 ### Querying
 
@@ -195,31 +198,37 @@ q := qx.Query(
 
 **Query methods:**
 
-* `Query` - return matching records
-* `QueryKeys` - return matching IDs
-* `Count` - return result cardinality
-* `SeqScan` - performs a sequential scan over all records starting at the given key
-* `ScanKeys` - traverse live keys starting at the given key
-* `Aggregate` - evaluate grouped or ungrouped reductions over indexed and measure fields
+* `Query(tx, q)` - return matching records
+* `QueryKeys(tx, q)` - return matching IDs
+* `SeqScan(tx, seek, fn)` - perform a sequential scan over all records starting at the given key
+* `ScanKeys(tx, seek, fn)` - traverse live keys starting at the given key
+* `Aggregate(tx, q)` - evaluate grouped or ungrouped reductions over indexed and measure fields
+* `Count(tx, exprs...)` - return result cardinality; it is a reduced non-allocating version of `Aggregate`
 
 ### Supported `qx` subset:
+
+- Predicate left-hand side must always be a source field reference.
+- Predicate right-hand side must always be a literal value.
+- No computed expressions on any side.
+
 
 - Supported predicate helpers:\
   `AND`, `OR`, `NOT`, `EQ`, `NE`/`NOTEQ`, `GT`, `GTE`, `LT`, `LTE`, `IN`,
   `NOTIN`, `HAS`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
   `PREFIX`, `SUFFIX`, and `CONTAINS`.
-- Predicate left-hand side must always be a source field reference.
-- Predicate right-hand side must always be a literal value.
-- No computed expressions on any side.
+
+
 - Outside aggregation, ordering supports exactly one expression, and only these forms:
   - By field:\
     `Sort("field", ASC|DESC)` or `SortBy(REF("field"), ASC)`
   - By slice-field length:\
     `SortBy(qx.LEN(qx.REF("field")), ASC|DESC)`
   - By field value position in the provided slice:\
-    `SortBy(qx.POS(qx.REF("field"), []T{...}), ASC|DESC)`
-- `qx.POS` ordering requires a literal priority list/array value.\
-  Scalar-string `POS(field, "alice bob")` is not supported.
+    `SortBy(qx.POS(qx.REF("field"), []T{...}), ASC|DESC)`\
+    It requires a literal priority list/array value.\
+    Scalar-string `POS(field, "alice bob")` is not supported.
+
+
 - Projection is not supported, queries return whole records.
 
 ### Primary-key queries
@@ -228,20 +237,26 @@ q := qx.Query(
 queries. It is not a struct field and cannot be declared with tags.
 `Options.Index["$key"]` is also invalid.
 
-For numeric-key databases, `$key` becomes available automatically in indexed mode.
+For convenience, `rbi.Key` constant can be used.
+
+For numeric-key collections, `$key` becomes available automatically in indexed mode.
 It uses the runtime key universe and does not need separate key storage.
 
-For string-key DB, support is opt-in using `EnableStringKeyIndex` option.
+For string-key collections, support is opt-in using `EnableStringKeyIndex` option.
 A separate in-memory unique string index is maintained when enabled.
 
 ### Aggregation
 
 `Aggregate` method evaluates simple reductions against the same in-memory
 snapshot model as queries. Filters use the same predicate subset and must
-reference indexed fields or `$key`.
+reference indexed fields.
 
 ```go
-res, err := db.Aggregate(
+tx := rbi.BeginIndexView()
+defer tx.Close()
+
+res, err := users.Aggregate(
+    tx,
     qx.Where(qx.HAS("tags", "dev")).
         Group("active").
         Metrics(
@@ -256,13 +271,14 @@ res, err := db.Aggregate(
 ```
 
 Currently supported:
+
 - `SUM`, `AVG`, `MIN`, `MAX` (`SUM`/`AVG` require numeric fields)
 - `ROWCOUNT()`, `COUNT(field)`, `COUNT(DISTINCT field)`
-- Standalone ungrouped `DISTINCT(field)` as the only metric, e.g. `qx.Aggregate(qx.DISTINCT("country"))`;
-  it returns one row per distinct value and includes `NULL` when present
 - Grouping by regular indexed scalar fields
 - `HAVING` with simple predicates over aggregate outputs
 - Ordering by one or more aggregate outputs
+- Standalone ungrouped `DISTINCT(field)` as the only metric, e.g. `qx.Aggregate(qx.DISTINCT("country"))`;
+  it returns one row per distinct value and includes `NULL` when present
 
 Metric fields may be regular scalar indexes or numeric measure indexes.
 
@@ -280,10 +296,9 @@ standalone `DISTINCT(field)` combined with grouping or other metrics.
 
 Non-aggregate queries support ordering by **a single indexed field only**.
 
-Queries that specify more than one non-aggregate ordering expression are
-rejected with an error. This restriction allows ordered queries to execute
-directly via index traversal without materializing or re-sorting intermediate 
-result sets.
+Queries that specify more than one ordering expression are rejected with an error.
+This restriction allows ordered queries to execute directly via index traversal
+without materializing or re-sorting intermediate result sets.
 
 If multi-column ordering is required, it must be implemented at the application level.
 
@@ -302,7 +317,7 @@ reuses bounded materialized range/predicate state on warm snapshots.
 
 ## Transparent mode
 
-If a DB has no indexed fields and no enabled string key index, RBI
+If a `Collection` has no indexed fields and no enabled string key index, RBI
 automatically switches to transparent mode. This can be useful as a
 strongly-typed generic API over a bbolt bucket without maintaining secondary
 indexes.
@@ -320,8 +335,8 @@ Index operations run entirely in-memory; stored records are never scanned.
 come from the same committed bucket sequence, record values are read only after
 filtering, ordering and windowing have selected the final record IDs.
 
-`QueryKeys`, `Count` and `Aggregate` operate on the current published index
-snapshot and do not read record values from bbolt.
+`QueryKeys`, `Count` and `Aggregate` operate on the index snapshot pinned by
+the provided transaction and do not read record values from bbolt.
 
 ## Configuration
 
@@ -329,16 +344,15 @@ All runtime controls are configured through `Options`.
 Recommended pattern is to set only the required fields.
 
 ```go
-db, err := rbi.New[uint64, User](bolt, rbi.Options{
+users, err := rbi.New[uint64, User](bolt, rbi.Options{
 
     // Planner/trace settings
     AnalyzeInterval: 30 * time.Minute, // < 0 disables periodic analyze loop
     TraceSink: func(ev rbitrace.Event) { /* log/collect trace */ },
     TraceSampleEvery: 1000, // 0 uses default (1), < 0 disables tracing    
 
-    // Single-op auto-batcher settings
-    AutoBatchWindow: 100 * time.Microsecond, // < 0 disables coalescing window
-    AutoBatchMax: 128,
+    // Write scheduler settings
+    BatchSoftLimit: 128,
     
     // ...
 })
@@ -347,58 +361,37 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
 ### Hooks
 
 Write methods accept `ExecOption` values, and the same options may also be
-passed to `New` to become defaults for the whole DB instance.
+passed to `New` to become defaults for the whole Collection instance.
 
 **Available hooks/options:**
 
-- `BeforeProcess` - cheap mutable pre-processing hook.
-  For `Set`/`BatchSet` it runs on the caller-owned value before RBI starts
-  encoding or batching; for `Patch`/`BatchPatch` it runs on the mutable
-  post-patch value before `BeforeStore`.
+- `OnChange` - runs for inserted, updated, and deleted records. For inserts
+  and updates it receives an RBI-owned mutable `newValue`; for deletes it
+  receives `oldValue != nil` and `newValue == nil`.
+  The hook may modify `newValue` when it is non-nil, but must not modify
+  `oldValue`.
+  Writes issued through the hook `*Tx` passed to the callback are generated
+  writes and commit atomically with the owner write. Do not start independent
+  writes or use another `*Tx` from inside `OnChange`.
 
-* `BeforeStore` - runs for inserts and updates before RBI encodes the final value.
-  It may modify `newValue`.
-
-- `BeforeCommit` - runs inside the Bolt write transaction after the record
-  has been written, but before commit. Useful for audit records and other
-  writes to neighboring non-RBI buckets.
-
-* `NoBatch` - forces a write call to execute in its own internal batch. For
-  `Batch*` methods this is redundant because they are already isolated.
-
-- `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
+- `CloneFunc` - optional helper for cloning `*V` values.
   It can be used when the value becomes encodable only after normalization, or
   simply as a faster cloning path than RBI's fallback encode/decode snapshotting.
-  If `CloneFunc` is omitted and `*V` implements `Clone() *V`, RBI uses that
-  method automatically.
 
-* `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
+* `PatchStrict` - makes `Patch` reject unknown fields.
 
 **Important notes:**
 
-- `BeforeProcess` may run at different stages depending on the write method.
-  Do not retain the value pointer after the hook returns. With `Set`/`BatchSet`,
-  it mutates the caller-owned value directly. RBI does not protect against
-  aliasing and does not restore the value if the later write fails.
+- `OnChange` receives RBI-owned record pointers for decoded old values and
+  mutable working copies. Do not modify `oldValue`, and do not retain
+  `oldValue` or `newValue` after the callback returns.
 
-* `BeforeStore` and `BeforeCommit` receive RBI-owned record pointers for 
-  decoded old values and mutable working copies.
-  Do not retain `oldValue` or `newValue` after the hook returns;
-  copy the data you need instead.
+- All writes go through the root write scheduler. After `Commit`, the scheduler
+  may physically co-batch compatible logical writes from neighboring
+  transactions.
 
-- All writes go through the internal batcher. `Batch*` methods keep their
-  explicit per-call isolation and are never merged with neighboring writes.
-
-* Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
-  `BeforeStore`, and `BeforeCommit` may run more than once for the same
-  logical write, so external side effects should be idempotent.
-
-- `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
-  methods on the same `DB` instance. Depending on execution mode, RBI may hold
-  internal locks while running `BeforeCommit`, so re-entering the same `DB`
-  can deadlock or become mode-dependent.
-
-* `BeforeCommit` must not modify any buckets managed by RBI.
+- `OnChange` runs before commit. Avoid external side effects because the owner
+  write may still roll back.
 
 ## Struct tags and indexing
 
@@ -421,7 +414,7 @@ type User struct {
 The same declaration can be made from `Options`:
 
 ```go
-db, err := rbi.New[uint64, User](bolt, rbi.Options{
+users, err := rbi.Open[uint64, User](bolt, rbi.Options{
     Index: map[string]rbi.IndexKind{
         "email": rbi.IndexUnique,
         "Age":   rbi.IndexDefault,
@@ -466,7 +459,7 @@ Tagging a field with:
 enforces a uniqueness constraint for that field.
 
 * Only scalar (non-slice) fields can be unique.
-* Uniqueness is enforced across single and batch writes (`Set`, `Patch*`, `BatchSet`, `BatchPatch*`).
+* Uniqueness is enforced across queued writes in one transaction.
 * Violations return `ErrUniqueViolation` before committing the transaction.
 
 ## Measure indexes
@@ -501,16 +494,18 @@ The returned value is used as the indexed representation.
 - Must return a stable, deterministic value.
 - Equal values must produce equal indexing values.
 - The returned string must not exceed 65535 bytes.
+- Indexed fields must have concrete declared types. Interface-declared indexed
+  fields are not supported, including `any`, `ValueIndexer`, and custom
+  interfaces embedding `ValueIndexer`.
 - For a type `T` that implements `ValueIndexer` with a value receiver,
   nil `*T` scalar values are indexed as null.
-- The same nil `*T` value-receiver rule applies when the value is stored
-  in a `ValueIndexer` interface.
-- In slice indexes, nil interface elements and nil `*T` elements for 
-  value-receiver `T` do not emit index keys.
+- In slice indexes, nil `*T` elements for value-receiver `T` do not emit
+  index keys.
 - Nil pointer-receiver values are passed to `IndexingValue`;
   nil handling is the responsibility of the implementation.
 - If the field is used in range queries, lexicographic ordering of indexing
   strings must match the intended value ordering.
+- `ValueIndexer` defines only index key projection, not a storage override.
 
 > Incorrect implementations may cause panics or undefined query behavior.
 
@@ -665,8 +660,12 @@ unchanged storage is shared by reference, so this overhead is usually modest.
 
 RBI is designed to keep allocations as close to zero as practical, but some
 allocations are unavoidable: bbolt operations and value encoding/decoding.
-To reduce allocations further, call `ReleaseRecords` when you are done
-with records so they can be returned to the internal pool.
+
+To reduce allocations further:
+- use `ReleaseRecords` when you are done with records so they can be returned to the internal pool.
+- use `tx.Release` instead of `tx.Close` to return `*Tx` object to the internal pool.
+
+However, these options require strict lifecycle and ownership rules.
 
 RBI uses semi-manual memory management to minimize GC pressure.
 Most internal and intermediate structures are pooled and reused.
@@ -674,12 +673,21 @@ Index structures use arenas and ownership-aware copy-on-write behaviour.
 
 ## Multiple instances
 
-Multiple different `DB` instances may safely operate on the same bbolt database.\
-Each instance maintains its own in-memory index.
+Multiple different collections may safely operate on the same bbolt database.
+Collections opened on one `*bbolt.DB` share one write scheduler,
+snapshot generations and read visibility.
+Each collection is one typed participant with its own bucket,
+schema and in-memory index.
+
+Prefer long-lived `Collection` instances.
+Repeated open/close of buckets on one root is allowed, but collection ordinals
+are not reused while the root is alive, so the root participant high-watermark
+can grow until every collection on that `*bbolt.DB` has closed and the root
+is reaped. High-churn open/close on a single root is not the target use case.
 
 ## Bucket name
 
-`DB` stores all records in a single top-level bbolt bucket.
+Each collection stores all records in a single top-level bbolt bucket.
 
 By default, the bucket name is derived from the value type.
 A custom bucket name can be provided via `Options` 
@@ -729,12 +737,13 @@ Fallback decoding, if required, is the responsibility of the implementation.
 RBI stores records in the configured bbolt bucket using a key layout that
 depends on `K`.
 
-For `DB[uint64, V]`, bbolt keys are 8-byte big-endian `uint64` values.
+For `Collection[uint64, V]`, bbolt keys are 8-byte big-endian `uint64` values.
 
-For `DB[string, V]`, bbolt keys are the string keys themselves as raw bytes.
+For `Collection[string, V]`, bbolt keys are the string keys themselves as raw bytes.
 The stored value has an 8-byte prefix with the internal numeric id,
-followed by the encoded record payload. String-key DB also maintains a reverse
-mapping bucket, which has the same name as data bucket but with `.rbimap` suffix.
+followed by the encoded record payload. String-key collections also maintains
+a reverse mapping bucket, which has the same name as data bucket but with 
+`.rbimap` suffix.
 
 ## Limitations
 
@@ -749,8 +758,7 @@ This package does not aim to be a relational database or a SQL engine.
 - Package is read-optimized.
 - Prefer batch writes over single inserts, if possible.
 - Always use limits when the whole result set is not needed.
-- Complex logical and ordered shapes are data-dependent; benchmark important
-  production queries on representative data.
+- Complex logical and ordered shapes are data-dependent.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
@@ -759,7 +767,7 @@ suitable for many workloads.
 
 Query performance is shape-dependent. Current code has many specialized
 fast paths, but broader shapes depend on data distribution, chosen execution
-path, and whether snapshot-local runtime caches are already warm.
+path, and snapshot-local runtime caches.
 
 #### 1. Usually fast
 
@@ -770,9 +778,9 @@ These classes have dedicated execution paths or strong early-stop behavior.
 - Small top-N on an indexed scalar field or slice length.
   - Ordered scan can stop as soon as enough rows are found.
 - Narrow `PREFIX ... LIMIT` without extra ordering, or `PREFIX` on the order field.
-  - Binary-search into the matching key span, then scan until limit.
+  - Binary search into the matching key span, then scan until limit.
 - Selective conjunctions of `EQ` / `IN` / `HASALL` / `HASANY` with small `LIMIT`.
-  - Usually lead-posting iteration plus candidate checks.
+  - Lead posting iteration plus candidate checks.
 - Narrow `POS` ordering over a small literal priority list.
   - Best when the filter and requested window are both tight.
 
@@ -833,11 +841,10 @@ Write speed depends on how many index entries are touched per operation
 (changed fields, slice fan-out, uniqueness checks), and on bbolt fsync/IO.
 Insertions are typically more expensive than updates.
 
-Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-record overhead.
+Queueing multiple writes in one transaction reduces per-record overhead and
+keeps the group atomic.
 
-Throughput of many parallel single operations can be increased
-using `AutoBatchMax` and `AutoBatchWindow`. 
-
+Throughput of many parallel single operations can be increased using `BatchSoftLimit`.
 
 ## Contributing
 

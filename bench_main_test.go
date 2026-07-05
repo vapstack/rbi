@@ -70,7 +70,7 @@ type benchTurnoverRing[K ~string | ~uint64] struct {
 	entries []benchTurnoverEntry[K]
 }
 
-type benchReadRunner[K ~string | ~uint64, V any] func(*testing.B, *DB[K, V], *qx.QX)
+type benchReadRunner[K ~string | ~uint64, V any] func(*testing.B, *Collection[K, V], *qx.QX)
 
 type benchReadModeState[K ~string | ~uint64, V any] struct {
 	mode benchCacheMode
@@ -108,21 +108,20 @@ func newBenchReadModeState[K ~string | ~uint64, V any](
 	}
 }
 
-func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, db *DB[K, V]) {
+func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, c *Collection[K, V]) {
 	if s == nil || s.mode.kind == benchCacheModeHot {
 		return
 	}
 	b.StopTimer()
 	if s.mode.kind == benchCacheModeCold {
-		s.applyTurnover(b, db)
+		s.applyTurnover(b, c)
 	}
 	b.StartTimer()
 }
 
-func (s *benchReadModeState[K, V]) close(tb testing.TB, db *DB[K, V]) {
-}
+func (s *benchReadModeState[K, V]) close(tb testing.TB, c *Collection[K, V]) {}
 
-func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
+func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, c *Collection[K, V]) {
 	tb.Helper()
 	if s == nil || s.ring == nil || len(s.ring.entries) == 0 {
 		return
@@ -132,7 +131,7 @@ func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
 	if entry.altActive {
 		patch = entry.basePatch
 	}
-	if err := db.Patch(entry.id, patch); err != nil {
+	if err := writePatch(c, entry.id, patch); err != nil {
 		tb.Fatalf("Patch(turnover %v): %v", entry.id, err)
 	}
 	entry.altActive = !entry.altActive
@@ -140,7 +139,7 @@ func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
 
 func (s *benchReadModeState[K, V]) warmPools(
 	b *testing.B,
-	db *DB[K, V],
+	c *Collection[K, V],
 	q *qx.QX,
 	run benchReadRunner[K, V],
 ) {
@@ -148,14 +147,14 @@ func (s *benchReadModeState[K, V]) warmPools(
 		return
 	}
 	for i := 0; i < benchColdPoolWarmCycles; i++ {
-		s.beforeQuery(b, db)
-		run(b, db, q)
+		s.beforeQuery(b, c)
+		run(b, c, q)
 	}
 }
 
 func warmBenchReadHotSteady[K ~string | ~uint64, V any](
 	b *testing.B,
-	db *DB[K, V],
+	c *Collection[K, V],
 	q *qx.QX,
 	run benchReadRunner[K, V],
 ) {
@@ -163,7 +162,7 @@ func warmBenchReadHotSteady[K ~string | ~uint64, V any](
 		return
 	}
 	for i := 0; i < benchHotWarmMaxCycles; i++ {
-		run(b, db, q)
+		run(b, c, q)
 	}
 }
 
@@ -314,9 +313,9 @@ func stressBenchAltPatch(rec *StressBenchUser) []Field {
 	}
 }
 
-func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) *benchTurnoverRing[uint64] {
+func buildUserBenchTurnoverRingUint64(tb testing.TB, c *Collection[uint64, UserBench]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	stats, err := db.Stats()
+	stats, err := c.Stats()
 	if err != nil {
 		tb.Fatalf("Stats: %v", err)
 	}
@@ -325,7 +324,7 @@ func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) 
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
 		id := uint64(ord)
-		rec, err := db.Get(id)
+		rec, err := readGet(c, id)
 		if err != nil {
 			tb.Fatalf("Get(turnover %d): %v", ord, err)
 		}
@@ -337,14 +336,14 @@ func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) 
 			basePatch: userBenchBasePatch(rec),
 			altPatch:  userBenchAltPatch(rec),
 		})
-		db.ReleaseRecords(rec)
+		c.ReleaseRecords(rec)
 	}
 	return &benchTurnoverRing[uint64]{entries: entries}
 }
 
-func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) *benchTurnoverRing[string] {
+func buildUserBenchTurnoverRingString(tb testing.TB, c *Collection[string, UserBench]) *benchTurnoverRing[string] {
 	tb.Helper()
-	stats, err := db.Stats()
+	stats, err := c.Stats()
 	if err != nil {
 		tb.Fatalf("Stats: %v", err)
 	}
@@ -353,7 +352,7 @@ func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) 
 	entries := make([]benchTurnoverEntry[string], 0, len(ords))
 	for _, ord := range ords {
 		id := "id-" + strconv.Itoa(ord)
-		rec, err := db.Get(id)
+		rec, err := readGet(c, id)
 		if err != nil {
 			tb.Fatalf("Get(turnover %s): %v", id, err)
 		}
@@ -365,14 +364,14 @@ func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) 
 			basePatch: userBenchBasePatch(rec),
 			altPatch:  userBenchAltPatch(rec),
 		})
-		db.ReleaseRecords(rec)
+		c.ReleaseRecords(rec)
 	}
 	return &benchTurnoverRing[string]{entries: entries}
 }
 
-func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]) *benchTurnoverRing[uint64] {
+func buildStressBenchTurnoverRing(tb testing.TB, c *Collection[uint64, StressBenchUser]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	stats, err := db.Stats()
+	stats, err := c.Stats()
 	if err != nil {
 		tb.Fatalf("Stats: %v", err)
 	}
@@ -381,7 +380,7 @@ func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
 		id := uint64(ord)
-		rec, err := db.Get(id)
+		rec, err := readGet(c, id)
 		if err != nil {
 			tb.Fatalf("Get(turnover %d): %v", ord, err)
 		}
@@ -393,59 +392,59 @@ func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]
 			basePatch: stressBenchBasePatch(rec),
 			altPatch:  stressBenchAltPatch(rec),
 		})
-		db.ReleaseRecords(rec)
+		c.ReleaseRecords(rec)
 	}
 	return &benchTurnoverRing[uint64]{entries: entries}
 }
 
 func prepareReadBenchWithMode[K ~string | ~uint64, V any](
 	b *testing.B,
-	db *DB[K, V],
+	c *Collection[K, V],
 	q *qx.QX,
 	mode benchCacheMode,
-	warm func(*testing.B, *DB[K, V], *qx.QX),
+	warm func(*testing.B, *Collection[K, V], *qx.QX),
 	run benchReadRunner[K, V],
-	buildRing func(testing.TB, *DB[K, V]) *benchTurnoverRing[K],
+	buildRing func(testing.TB, *Collection[K, V]) *benchTurnoverRing[K],
 ) *benchReadModeState[K, V] {
 	b.Helper()
-	prepareReadBenchSnapshot(b, db)
+	prepareReadBenchSnapshot(b, c)
 	var ring *benchTurnoverRing[K]
 	if mode.kind != benchCacheModeHot && buildRing != nil {
-		ring = buildRing(b, db)
+		ring = buildRing(b, c)
 	}
 	state := newBenchReadModeState[K, V](b, mode, ring)
-	b.Cleanup(func() { state.close(b, db) })
-	warm(b, db, q)
+	b.Cleanup(func() { state.close(b, c) })
+	warm(b, c, q)
 	if mode.kind == benchCacheModeHot {
-		warmBenchReadHotSteady(b, db, q, run)
+		warmBenchReadHotSteady(b, c, q, run)
 	} else {
-		state.warmPools(b, db, q, run)
+		state.warmPools(b, c, q, run)
 	}
 	b.ResetTimer()
 	return state
 }
 
-func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], state *benchReadModeState[K, V]) {
+func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, c *Collection[K, V], state *benchReadModeState[K, V]) {
 	tb.Helper()
 	if state.mode.kind == benchCacheModeCold {
-		state.applyTurnover(tb, db)
+		state.applyTurnover(tb, c)
 	}
 }
 
 func TestBenchTurnoverRingIsReversible(t *testing.T) {
 	path := t.TempDir() + "/bench.db"
-	db, raw := openBoltAndNew[uint64, UserBench](t, path, benchOptions())
+	c, bolt := openBoltAndCollection[uint64, UserBench](t, path, benchOptions())
 	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 	})
-	seedBenchData(t, db, 1_000)
-	ring := buildUserBenchTurnoverRingUint64(t, db)
+	seedBenchData(t, c, 1_000)
+	ring := buildUserBenchTurnoverRingUint64(t, c)
 	if len(ring.entries) == 0 {
 		t.Fatalf("expected non-empty turnover ring")
 	}
 	id := ring.entries[0].id
-	before, err := db.Get(id)
+	before, err := readGet(c, id)
 	if err != nil {
 		t.Fatalf("Get(before): %v", err)
 	}
@@ -453,17 +452,17 @@ func TestBenchTurnoverRingIsReversible(t *testing.T) {
 		t.Fatalf("missing record before turnover")
 	}
 	base := fmt.Sprintf("%s|%s|%s|%d|%.2f|%v|%v", before.Country, before.Plan, before.Status, before.Age, before.Score, before.Tags, before.Roles)
-	db.ReleaseRecords(before)
+	c.ReleaseRecords(before)
 
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
 		benchCacheMode{suffix: "Cold", kind: benchCacheModeCold},
 		&benchTurnoverRing[uint64]{entries: []benchTurnoverEntry[uint64]{ring.entries[0]}},
 	)
-	runBenchModeBeforeQueryForTest(t, db, state)
-	runBenchModeBeforeQueryForTest(t, db, state)
+	runBenchModeBeforeQueryForTest(t, c, state)
+	runBenchModeBeforeQueryForTest(t, c, state)
 
-	after, err := db.Get(id)
+	after, err := readGet(c, id)
 	if err != nil {
 		t.Fatalf("Get(after): %v", err)
 	}
@@ -471,7 +470,7 @@ func TestBenchTurnoverRingIsReversible(t *testing.T) {
 		t.Fatalf("missing record after turnover")
 	}
 	got := fmt.Sprintf("%s|%s|%s|%d|%.2f|%v|%v", after.Country, after.Plan, after.Status, after.Age, after.Score, after.Tags, after.Roles)
-	db.ReleaseRecords(after)
+	c.ReleaseRecords(after)
 	if got != base {
 		t.Fatalf("expected reversible turnover, got=%s want=%s", got, base)
 	}

@@ -131,7 +131,7 @@ type StressClassInfo struct {
 }
 
 type WorkloadContext struct {
-	DB           *rbi.DB[uint64, UserBench]
+	Collection   *rbi.Collection[uint64, UserBench]
 	MaxIDPtr     *uint64
 	EmailSamples []string
 	Trace        *plannerTraceWorker

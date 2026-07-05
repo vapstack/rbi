@@ -33,29 +33,29 @@ type rebuildNoIndexRec struct {
 func openRebuildTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
 	t.Helper()
 
-	db, err := bbolt.Open(filepath.Join(t.TempDir(), "rebuild.db"), 0o600, nil)
+	bolt, err := bbolt.Open(filepath.Join(t.TempDir(), "rebuild.db"), 0o600, nil)
 	if err != nil {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = bolt.Close() })
 
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	if err = bolt.Update(func(tx *bbolt.Tx) error {
 		_, e := tx.CreateBucketIfNotExists(bucket)
 		return e
 	}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	return db
+	return bolt
 }
 
-func putRebuildTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec rebuildTestRec) {
+func putRebuildTestRec(t *testing.T, bolt *bbolt.DB, bucket []byte, id uint64, rec rebuildTestRec) {
 	t.Helper()
 
 	data, err := msgpack.Marshal(&rec)
 	if err != nil {
 		t.Fatalf("msgpack.Marshal: %v", err)
 	}
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	if err = bolt.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucket)
 		var key [8]byte
 		return b.Put(keycodec.U64BytesWithBuf(id, &key), data)
@@ -64,7 +64,7 @@ func putRebuildTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec
 	}
 }
 
-func putRebuildTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec rebuildTestRec) uint64 {
+func putRebuildTestStringRec(t *testing.T, bolt *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec rebuildTestRec) uint64 {
 	t.Helper()
 
 	data, err := msgpack.Marshal(&rec)
@@ -72,9 +72,8 @@ func putRebuildTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucke
 		t.Fatalf("msgpack.Marshal: %v", err)
 	}
 	var idx uint64
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	if err = bolt.Update(func(tx *bbolt.Tx) error {
 		m := tx.Bucket(mapBucket)
-		var err error
 		idx, err = m.NextSequence()
 		if err != nil {
 			return err
@@ -92,11 +91,11 @@ func putRebuildTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucke
 	return idx
 }
 
-func createRebuildStringMap(t testing.TB, db *bbolt.DB, bucket []byte) []byte {
+func createRebuildStringMap(t testing.TB, bolt *bbolt.DB, bucket []byte) []byte {
 	t.Helper()
 
 	mapBucket := rebuildStringMapBucket(bucket)
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucket(mapBucket)
 		return err
 	}); err != nil {
@@ -155,9 +154,9 @@ func releaseRebuildTestRec(ptr unsafe.Pointer) {
 	*(*rebuildTestRec)(ptr) = rebuildTestRec{}
 }
 
-func baseRebuildTestConfig(db *bbolt.DB, bucket []byte, s *schema.Schema) Config {
+func baseRebuildTestConfig(bolt *bbolt.DB, bucket []byte, s *schema.Schema) Config {
 	return Config{
-		Bolt:       db,
+		Bolt:       bolt,
 		DataBucket: bucket,
 		Schema:     s,
 		Decode:     decodeRebuildTestRec,
@@ -167,13 +166,13 @@ func baseRebuildTestConfig(db *bbolt.DB, bucket []byte, s *schema.Schema) Config
 
 func TestBuildMaterializesUint64FieldsLenAndMeasure(t *testing.T) {
 	bucket := []byte("rebuild_full")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go", "db"}, Score: 10})
-	putRebuildTestRec(t, db, bucket, 2, rebuildTestRec{Name: "bob", Score: 20})
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go", "db"}, Score: 10})
+	putRebuildTestRec(t, bolt, bucket, 2, rebuildTestRec{Name: "bob", Score: 20})
 
-	result, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	result, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -206,12 +205,12 @@ func TestBuildMaterializesUint64FieldsLenAndMeasure(t *testing.T) {
 
 func TestBuildRejectsTooLongIndexedString(t *testing.T) {
 	bucket := []byte("rebuild_string_limit")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: strings.Repeat("x", indexdata.FieldStringRefMax+1)})
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: strings.Repeat("x", indexdata.FieldStringRefMax+1)})
 
-	_, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	_, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err == nil {
 		t.Fatalf("expected indexed string limit error")
 	}
@@ -225,17 +224,17 @@ func TestBuildRejectsTooLongIndexedString(t *testing.T) {
 
 func TestBuildDecodeReleaseCallbackContract(t *testing.T) {
 	bucket := []byte("rebuild_callbacks")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
 	const rows = 16
 	for i := uint64(1); i <= rows; i++ {
-		putRebuildTestRec(t, db, bucket, i, rebuildTestRec{Name: fmt.Sprintf("user_%d", i), Score: i})
+		putRebuildTestRec(t, bolt, bucket, i, rebuildTestRec{Name: fmt.Sprintf("user_%d", i), Score: i})
 	}
 
 	var decodes atomic.Int64
 	var releases atomic.Int64
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Decode = func(data []byte) (unsafe.Pointer, error) {
 		decodes.Add(1)
 		return decodeRebuildTestRec(data)
@@ -258,10 +257,10 @@ func TestBuildDecodeReleaseCallbackContract(t *testing.T) {
 
 func TestBuildStorageSurvivesDecodedRecordReleaseAndPoison(t *testing.T) {
 	bucket := []byte("rebuild_decode_release_poison")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		var key [8]byte
 		return tx.Bucket(bucket).Put(keycodec.U64BytesWithBuf(1, &key), []byte{1})
 	}); err != nil {
@@ -269,7 +268,7 @@ func TestBuildStorageSurvivesDecodedRecordReleaseAndPoison(t *testing.T) {
 	}
 
 	var bufs [][]byte
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Decode = func([]byte) (unsafe.Pointer, error) {
 		name := []byte("release-owned-name")
 		tag := []byte("release-owned-tag")
@@ -324,11 +323,11 @@ func TestBuildStorageSurvivesDecodedRecordReleaseAndPoison(t *testing.T) {
 
 func TestBuildPartialPreservesSkippedFieldAndMeasureSlots(t *testing.T) {
 	bucket := []byte("rebuild_partial")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
-	full, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+	full, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("full Build: %v", err)
 	}
@@ -341,7 +340,7 @@ func TestBuildPartialPreservesSkippedFieldAndMeasureSlots(t *testing.T) {
 		Measure:           full.Storage.Measure,
 		Universe:          full.Storage.Universe,
 	}
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Current = &snapshot.View{}
 	cfg.SkipFields = map[string]struct{}{"name": {}}
 	cfg.SkipMeasureFields = map[string]struct{}{"score": {}}
@@ -362,20 +361,18 @@ func TestBuildPartialPreservesSkippedFieldAndMeasureSlots(t *testing.T) {
 
 func TestBuildPartialPublishRetainsSkippedStorage(t *testing.T) {
 	bucket := []byte("rebuild_partial_publish")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
-	base, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+	base, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("base Build: %v", err)
 	}
-	manager := snapshot.NewRegistry(false)
 	prev := snapshot.NewView(1, nil, rt, snapshot.CacheConfig{}, base.Storage)
-	manager.Publish(prev)
 
-	putRebuildTestRec(t, db, bucket, 2, rebuildTestRec{Name: "bob", Tags: []string{"db"}, Score: 20})
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	putRebuildTestRec(t, bolt, bucket, 2, rebuildTestRec{Name: "bob", Tags: []string{"db"}, Score: 20})
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Current = prev
 	cfg.SkipFields = map[string]struct{}{"name": {}}
 	cfg.SkipMeasureFields = map[string]struct{}{"score": {}}
@@ -395,7 +392,8 @@ func TestBuildPartialPublishRetainsSkippedStorage(t *testing.T) {
 	scoreOrd := rt.MeasuresByName["score"].Ordinal
 	prevScoreStorage := prev.Measure[scoreOrd]
 	next := snapshot.NewView(2, prev, rt, snapshot.CacheConfig{}, partial.Storage)
-	manager.Publish(next)
+	prev.Release()
+	defer next.Release()
 
 	if next.Index[nameOrd] != prevNameStorage {
 		t.Fatalf("skipped name storage was not shared into next snapshot")
@@ -415,7 +413,7 @@ func TestBuildPartialPublishRetainsSkippedStorage(t *testing.T) {
 
 func TestBuildPartialPreservesSkippedLenStorageAndComplementFlag(t *testing.T) {
 	bucket := []byte("rebuild_partial_len_preserve")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
 	for i := uint64(1); i <= 90; i++ {
@@ -423,9 +421,9 @@ func TestBuildPartialPreservesSkippedLenStorageAndComplementFlag(t *testing.T) {
 		if i%5 == 0 {
 			rec.Tags = []string{"go"}
 		}
-		putRebuildTestRec(t, db, bucket, i, rec)
+		putRebuildTestRec(t, bolt, bucket, i, rec)
 	}
-	full, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	full, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("full Build: %v", err)
 	}
@@ -442,7 +440,7 @@ func TestBuildPartialPreservesSkippedLenStorageAndComplementFlag(t *testing.T) {
 		Measure:           full.Storage.Measure,
 		Universe:          full.Storage.Universe,
 	}
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Current = &snapshot.View{}
 	cfg.SkipFields = map[string]struct{}{"tags": {}}
 	cfg.SkipMeasureFields = map[string]struct{}{"score": {}}
@@ -461,15 +459,15 @@ func TestBuildPartialPreservesSkippedLenStorageAndComplementFlag(t *testing.T) {
 
 func TestBuildPartialClearsStaleLenZeroComplementFlagForRebuiltField(t *testing.T) {
 	bucket := []byte("rebuild_partial_len_clear")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
 	state := newRebuildTestState(rt)
 	tagsOrd := rt.IndexedByName["tags"].Ordinal
 	state.LenZeroComplement[tagsOrd] = true
 
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.Current = &snapshot.View{}
 	cfg.SkipFields = map[string]struct{}{"name": {}}
 	cfg.SkipMeasureFields = map[string]struct{}{"score": {}}
@@ -506,9 +504,9 @@ func TestBuildNoActivePaths(t *testing.T) {
 	}
 
 	bucket := []byte("rebuild_no_active")
-	db := openRebuildTestBolt(t, bucket)
-	putRebuildTestRec(t, db, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go", "db"}, Score: 10})
-	full, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	bolt := openRebuildTestBolt(t, bucket)
+	putRebuildTestRec(t, bolt, bucket, 1, rebuildTestRec{Name: "alice", Tags: []string{"go", "db"}, Score: 10})
+	full, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err != nil {
 		t.Fatalf("full Build: %v", err)
 	}
@@ -544,10 +542,10 @@ func TestBuildNoActivePaths(t *testing.T) {
 
 func TestBuildScanErrorDiagnostics(t *testing.T) {
 	bucket := []byte("rebuild_error")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucket)
 		var key [8]byte
 		return b.Put(keycodec.U64BytesWithBuf(1, &key), []byte{0xff})
@@ -555,7 +553,7 @@ func TestBuildScanErrorDiagnostics(t *testing.T) {
 		t.Fatalf("put corrupt record: %v", err)
 	}
 
-	_, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	_, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err == nil {
 		t.Fatalf("expected decode error")
 	}
@@ -569,17 +567,17 @@ func TestBuildScanErrorDiagnostics(t *testing.T) {
 
 func TestBuildRejectsInvalidUint64KeySize(t *testing.T) {
 	bucket := []byte("rebuild_bad_key")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucket)
 		return b.Put([]byte{1, 2, 3}, []byte{0xff})
 	}); err != nil {
 		t.Fatalf("put bad key: %v", err)
 	}
 
-	_, err := Build(baseRebuildTestConfig(db, bucket, rt), newRebuildTestState(rt))
+	_, err := Build(baseRebuildTestConfig(bolt, bucket, rt), newRebuildTestState(rt))
 	if err == nil {
 		t.Fatalf("expected invalid key error")
 	}
@@ -590,13 +588,13 @@ func TestBuildRejectsInvalidUint64KeySize(t *testing.T) {
 
 func TestBuildStringKeysUseDurableIDs(t *testing.T) {
 	bucket := []byte("rebuild_strings")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	putRebuildTestStringRec(t, db, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+	putRebuildTestStringRec(t, bolt, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
 
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.StrKey = true
 	cfg.StrMapBucket = mapBucket
 	cfg.StrKeyIndex = true
@@ -620,16 +618,16 @@ func TestBuildStringKeysUseDurableIDs(t *testing.T) {
 
 func TestBuildStringKeyOnlyIndexScansKeysWithoutDecode(t *testing.T) {
 	bucket := []byte("rebuild_key_only")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildNoIndexSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	bID := putRebuildTestStringRec(t, db, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
-	aaID := putRebuildTestStringRec(t, db, bucket, mapBucket, "aa", rebuildTestRec{Name: "ignored-aa"})
-	cID := putRebuildTestStringRec(t, db, bucket, mapBucket, "c", rebuildTestRec{Name: "ignored-c"})
+	bID := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
+	aaID := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "aa", rebuildTestRec{Name: "ignored-aa"})
+	cID := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "c", rebuildTestRec{Name: "ignored-c"})
 
 	result, err := Build(Config{
-		Bolt:         db,
+		Bolt:         bolt,
 		DataBucket:   bucket,
 		StrMapBucket: mapBucket,
 		Schema:       rt,
@@ -676,18 +674,18 @@ func TestBuildStringKeyOnlyIndexScansKeysWithoutDecode(t *testing.T) {
 
 func TestBuildStringKeyOnlyPreservesLoadedUniverse(t *testing.T) {
 	bucket := []byte("rebuild_key_only_preserve_universe")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildNoIndexSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	aID := putRebuildTestStringRec(t, db, bucket, mapBucket, "a", rebuildTestRec{Name: "ignored-a"})
-	bID := putRebuildTestStringRec(t, db, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
+	aID := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "a", rebuildTestRec{Name: "ignored-a"})
+	bID := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "b", rebuildTestRec{Name: "ignored-b"})
 	loadedUniverse := posting.BuildFromSorted([]uint64{aID, bID})
 	state := newRebuildTestState(rt)
 	state.Universe = loadedUniverse
 
 	result, err := Build(Config{
-		Bolt:         db,
+		Bolt:         bolt,
 		DataBucket:   bucket,
 		StrMapBucket: mapBucket,
 		Schema:       rt,
@@ -720,18 +718,18 @@ func TestBuildStringKeyOnlyPreservesLoadedUniverse(t *testing.T) {
 
 func TestBuildStringKeyOnlyRejectsMalformedValuePrefix(t *testing.T) {
 	bucket := []byte("rebuild_key_only_bad_prefix")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildNoIndexSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucket).Put(keycodec.StringBytes("bad-key"), []byte{0xff})
 	}); err != nil {
 		t.Fatalf("put malformed string record: %v", err)
 	}
 
 	_, err := Build(Config{
-		Bolt:         db,
+		Bolt:         bolt,
 		DataBucket:   bucket,
 		StrMapBucket: mapBucket,
 		Schema:       rt,
@@ -755,18 +753,18 @@ func TestBuildStringKeyOnlyRejectsMalformedValuePrefix(t *testing.T) {
 
 func TestBuildStringKeyOnlyRejectsZeroStringID(t *testing.T) {
 	bucket := []byte("rebuild_key_only_zero_idx")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildNoIndexSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucket).Put(keycodec.StringBytes("zero-key"), make([]byte, 8))
 	}); err != nil {
 		t.Fatalf("put zero-id string record: %v", err)
 	}
 
 	_, err := Build(Config{
-		Bolt:         db,
+		Bolt:         bolt,
 		DataBucket:   bucket,
 		StrMapBucket: mapBucket,
 		Schema:       rt,
@@ -787,18 +785,18 @@ func TestBuildStringKeyOnlyRejectsZeroStringID(t *testing.T) {
 
 func TestBuildStringKeyOnlyRejectsStringMapSequenceBelowLiveID(t *testing.T) {
 	bucket := []byte("rebuild_key_only_bad_sequence")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildNoIndexSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucket).Put(keycodec.StringBytes("orphan-key"), keycodec.AppendU64Bytes(nil, 7))
 	}); err != nil {
 		t.Fatalf("put orphan string record: %v", err)
 	}
 
 	_, err := Build(Config{
-		Bolt:         db,
+		Bolt:         bolt,
 		DataBucket:   bucket,
 		StrMapBucket: mapBucket,
 		Schema:       rt,
@@ -819,13 +817,13 @@ func TestBuildStringKeyOnlyRejectsStringMapSequenceBelowLiveID(t *testing.T) {
 
 func TestBuildStringNoActiveRejectsStringMapSequenceBelowLiveID(t *testing.T) {
 	bucket := []byte("rebuild_no_active_bad_sequence")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	id := putRebuildTestStringRec(t, db, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
+	id := putRebuildTestStringRec(t, bolt, bucket, mapBucket, "user-1", rebuildTestRec{Name: "alice", Tags: []string{"go"}, Score: 10})
 
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.StrKey = true
 	cfg.StrMapBucket = mapBucket
 	cfg.StrKeyIndex = true
@@ -835,14 +833,14 @@ func TestBuildStringNoActiveRejectsStringMapSequenceBelowLiveID(t *testing.T) {
 	}
 	defer full.Storage.Release()
 
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	if err = bolt.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(mapBucket).SetSequence(id - 1)
 	}); err != nil {
 		t.Fatalf("lower string map sequence: %v", err)
 	}
 
 	_, err = Build(Config{
-		Bolt:              db,
+		Bolt:              bolt,
 		StrMapBucket:      mapBucket,
 		Schema:            rt,
 		StrKey:            true,
@@ -901,11 +899,11 @@ func TestMaterializeStringKeyMeasureRunsSortByNumericID(t *testing.T) {
 
 func TestBuildStringKeyScanFailureDoesNotMutateMappings(t *testing.T) {
 	bucket := []byte("rebuild_string_error")
-	db := openRebuildTestBolt(t, bucket)
+	bolt := openRebuildTestBolt(t, bucket)
 	rt := compileRebuildTestSchema(t)
-	mapBucket := createRebuildStringMap(t, db, bucket)
+	mapBucket := createRebuildStringMap(t, bolt, bucket)
 
-	if err := db.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		m := tx.Bucket(mapBucket)
 		idx, err := m.NextSequence()
 		if err != nil {
@@ -922,7 +920,7 @@ func TestBuildStringKeyScanFailureDoesNotMutateMappings(t *testing.T) {
 		t.Fatalf("put corrupt string record: %v", err)
 	}
 
-	cfg := baseRebuildTestConfig(db, bucket, rt)
+	cfg := baseRebuildTestConfig(bolt, bucket, rt)
 	cfg.StrKey = true
 	cfg.StrMapBucket = mapBucket
 	_, err := Build(cfg, newRebuildTestState(rt))
@@ -932,16 +930,16 @@ func TestBuildStringKeyScanFailureDoesNotMutateMappings(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, "scan error") || !strings.Contains(msg, `id="bad-key"`) {
 		t.Fatalf("unexpected string-key scan error: %v", err)
 	}
-	if seq := readRebuildStringMapSequence(t, db, mapBucket); seq != 1 {
+	if seq := readRebuildStringMapSequence(t, bolt, mapBucket); seq != 1 {
 		t.Fatalf("string map sequence = %d, want 1", seq)
 	}
 }
 
-func readRebuildStringMapSequence(t testing.TB, db *bbolt.DB, mapBucket []byte) uint64 {
+func readRebuildStringMapSequence(t testing.TB, bolt *bbolt.DB, mapBucket []byte) uint64 {
 	t.Helper()
 
 	var seq uint64
-	if err := db.View(func(tx *bbolt.Tx) error {
+	if err := bolt.View(func(tx *bbolt.Tx) error {
 		seq = tx.Bucket(mapBucket).Sequence()
 		return nil
 	}); err != nil {

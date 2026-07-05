@@ -1238,18 +1238,18 @@ func (qv *View) orderDataValues(v any, fm *schema.Field) ([]keycodec.IndexLookup
 		return nil, orderDataNilRankNone, nil
 	}
 
-	collection := rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array
-	if collection && fm != nil && fm.UseVI && !fm.Slice {
+	sliceOrArray := rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array
+	if sliceOrArray && fm != nil && fm.UseVI && !fm.Slice {
 		if _, ok := v.(schema.ValueIndexer); ok {
-			collection = false
+			sliceOrArray = false
 		} else if rv.CanInterface() {
-			if _, ok := rv.Interface().(schema.ValueIndexer); ok {
-				collection = false
+			if _, ok = rv.Interface().(schema.ValueIndexer); ok {
+				sliceOrArray = false
 			}
 		}
 	}
 
-	if collection {
+	if sliceOrArray {
 		if rv.Len() == 0 {
 			return nil, orderDataNilRankNone, nil
 		}

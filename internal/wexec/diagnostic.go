@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+var (
+	ErrBucketMissing            = errors.New("bucket does not exist")
+	ErrStringMapBucketMissing   = errors.New("string map bucket does not exist")
+	ErrAdvanceBucketSequence    = errors.New("advance bucket sequence")
+	ErrAdvanceStringMapSequence = errors.New("advance string map sequence")
+)
+
 type prepareErr uint8
 
 const (
@@ -50,9 +57,6 @@ func formatBoltWriteErr(err error, op Op, id string, idx uint64, key, payload []
 			len(key),
 		)
 
-	case errors.Is(err, errUnknownOp):
-		return fmt.Errorf("unknown auto-batch op: %v", op)
-
 	case op == opSet || op == opPatch:
 		return fmt.Errorf(
 			"put op=%s id=%s idx=%d key_len=%d payload_len=%d payload_prefix_hex=%s: %w",
@@ -76,7 +80,7 @@ func formatBoltWriteErr(err error, op Op, id string, idx uint64, key, payload []
 		)
 
 	default:
-		return fmt.Errorf("unknown auto-batch op: %v", op)
+		return fmt.Errorf("unknown write op: %v", op)
 	}
 }
 

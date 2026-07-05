@@ -10,12 +10,18 @@ import (
 const (
 	stringSetPoolMaxLen = 4 << 10
 	u64SetPoolMaxCap    = 16 << 10
+	patchItemPoolMaxCap = 1024
 )
 
 var stringSetPool = pooled.Maps[string, struct{}]{
 	NewCap: 64,
 	MaxLen: stringSetPoolMaxLen,
 }
+
+var patchItemPool = pooled.Slices[PatchItem]{MaxCap: patchItemPoolMaxCap, Clear: pooled.ClearCap}
+
+func GetPatchItemSlice(capHint int) []PatchItem { return patchItemPool.Get(capHint) }
+func ReleasePatchItemSlice(buf []PatchItem)     { patchItemPool.Put(buf) }
 
 type u64setPoolBuf struct {
 	keys []uint64

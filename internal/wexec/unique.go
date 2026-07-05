@@ -2,7 +2,6 @@ package wexec
 
 import (
 	"fmt"
-	"slices"
 	"unsafe"
 
 	"github.com/vapstack/pooled"
@@ -33,18 +32,9 @@ type UniqueContext struct {
 type uniqueBatchCheckState struct {
 	leaving      []map[keycodec.IndexLookupKey]posting.List
 	seen         []map[keycodec.IndexLookupKey]uint64
+	base         *uniqueBatchCheckState
 	leavingReady bool
-}
-
-type uniqueLeavingTouch struct {
-	pos   int
-	key   keycodec.IndexLookupKey
-	added bool
-}
-
-type uniqueSeenWrite struct {
-	pos int
-	key keycodec.IndexLookupKey
+	leavingAny   bool
 }
 
 func (state *uniqueBatchCheckState) prepare(n int) {
@@ -63,6 +53,8 @@ func (state *uniqueBatchCheckState) prepare(n int) {
 		state.seen = state.seen[:n]
 	}
 	state.leavingReady = false
+	state.leavingAny = false
+	state.base = nil
 }
 
 func (state *uniqueBatchCheckState) cleanup() {
@@ -102,6 +94,47 @@ func (state *uniqueBatchCheckState) cleanup() {
 		state.seen = state.seen[:0]
 	}
 	state.leavingReady = false
+	state.leavingAny = false
+	state.base = nil
+}
+
+func (state *uniqueBatchCheckState) hasLeaving(pos int, key keycodec.IndexLookupKey, idx uint64) bool {
+	if fm := state.leaving[pos]; fm != nil {
+		if ids := fm[key]; !ids.IsEmpty() && ids.Contains(idx) {
+			return true
+		}
+	}
+	if state.base != nil {
+		return state.base.hasLeaving(pos, key, idx)
+	}
+	return false
+}
+
+func (state *uniqueBatchCheckState) seenOwner(pos int, key keycodec.IndexLookupKey) (uint64, bool, bool) {
+	if sm := state.seen[pos]; sm != nil {
+		prev, ok := sm[key]
+		if ok {
+			return prev, true, false
+		}
+	}
+	if state.base != nil {
+		prev, ok, needLeaving := state.base.seenOwner(pos, key)
+		if ok {
+			if fm := state.leaving[pos]; fm != nil {
+				if ids := fm[key]; !ids.IsEmpty() && ids.Contains(prev) {
+					// Current departures shadow base arrivals so a frame can
+					// replace a unique value accepted by an earlier unit.
+					return 0, false, false
+				}
+			}
+			return prev, true, needLeaving || !state.leavingReady
+		}
+	}
+	return 0, false, false
+}
+
+func (state *uniqueBatchCheckState) hasDepartures() bool {
+	return state.leavingAny || state.base != nil && state.base.hasDepartures()
 }
 
 func (state *uniqueBatchCheckState) ensureLeaving(pos int) map[keycodec.IndexLookupKey]posting.List {
@@ -134,160 +167,141 @@ func markUniqueBatchLeaving(state *uniqueBatchCheckState, pos int, key keycodec.
 	return true
 }
 
-func appendUniqueBatchLeavingTouch(state *uniqueBatchCheckState, touched []uniqueLeavingTouch, pos int, key keycodec.IndexLookupKey, idx uint64) []uniqueLeavingTouch {
-	added := markUniqueBatchLeaving(state, pos, key, idx)
-	return append(touched, uniqueLeavingTouch{pos: pos, key: key, added: added})
-}
-
-func rollbackUniqueBatchLeaving(state *uniqueBatchCheckState, touched []uniqueLeavingTouch, idx uint64) {
-	for i := len(touched) - 1; i >= 0; i-- {
-		t := touched[i]
-		if !t.added {
-			continue
-		}
-		fm := state.leaving[t.pos]
-		if fm == nil {
-			continue
-		}
-		ids := fm[t.key]
-		if ids.IsEmpty() {
-			continue
-		}
-		ids = ids.BuildRemoved(idx)
-		if ids.IsEmpty() {
-			delete(fm, t.key)
-		} else {
-			fm[t.key] = ids
-		}
-	}
-}
-
-func (ctx UniqueContext) checkBatchCandidateAndCollectSeen(
-	state *uniqueBatchCheckState,
-	pos int,
-	idx uint64,
-	acc schema.IndexedFieldAccessor,
-	ptr unsafe.Pointer,
-	seenWrites []uniqueSeenWrite,
-) ([]uniqueSeenWrite, error) {
-	single, ok, isNil := acc.UniqueGetter(ptr)
-	if !ok || isNil {
-		return seenWrites, nil
-	}
-
+func markUniqueBatchDeparture(state *uniqueBatchCheckState, pos int, key keycodec.IndexLookupKey, idx uint64) {
 	if sm := state.seen[pos]; sm != nil {
-		if prev, ok := sm[single]; ok && prev != idx {
-			return seenWrites, fmt.Errorf("%w: duplicate value for field %v within batch", rbierrors.ErrUniqueViolation, acc.Name)
+		if prev, ok := sm[key]; ok && prev == idx {
+			delete(sm, key)
 		}
 	}
-
-	ids := ctx.Current().FieldLookupPostingRetainedKey(acc.Name, single)
-	if ids.IsEmpty() {
-		return append(seenWrites, uniqueSeenWrite{pos: pos, key: single}), nil
-	}
-
-	var lv posting.List
-	if fm := state.leaving[pos]; fm != nil {
-		lv = fm[single]
-	}
-
-	if lv.IsEmpty() {
-		if ids.Cardinality() == 1 && ids.Contains(idx) {
-			return append(seenWrites, uniqueSeenWrite{pos: pos, key: single}), nil
-		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
-	}
-
-	iter := ids.Iter()
-	defer iter.Release()
-
-	for iter.HasNext() {
-		other := iter.Next()
-		if other == idx {
-			continue
-		}
-		if lv.Contains(other) {
-			continue
-		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
-	}
-
-	return append(seenWrites, uniqueSeenWrite{pos: pos, key: single}), nil
+	markUniqueBatchLeaving(state, pos, key, idx)
+	state.leavingAny = true
 }
 
-func (ctx UniqueContext) checkBatchAppend(state *uniqueBatchCheckState, idx uint64, oldVal, newVal unsafe.Pointer) error {
-	unique := ctx.Schema.Unique
-	if len(unique) == 0 {
-		return nil
-	}
-	var (
-		touchedInline [8]uniqueLeavingTouch
-		touched       = touchedInline[:0]
-	)
-	if oldVal != nil {
-		if newVal == nil {
-			for pos := range unique {
-				acc := unique[pos]
-				single, ok, isNil := acc.UniqueGetter(oldVal)
-				if !ok || isNil {
-					continue
-				}
-				touched = appendUniqueBatchLeavingTouch(state, touched, pos, single, idx)
-			}
-		} else {
-			for pos := range unique {
-				acc := unique[pos]
-				if !acc.Modified(oldVal, newVal) {
-					continue
-				}
-				single, ok, isNil := acc.UniqueGetter(oldVal)
-				if !ok || isNil {
-					continue
-				}
-				touched = appendUniqueBatchLeavingTouch(state, touched, pos, single, idx)
+func removeUniqueBatchLeaving(state *uniqueBatchCheckState, pos int, key keycodec.IndexLookupKey, idx uint64) {
+	if fm := state.leaving[pos]; fm != nil {
+		if bm := fm[key]; !bm.IsEmpty() {
+			bm = bm.BuildRemoved(idx)
+			if bm.IsEmpty() {
+				delete(fm, key)
+			} else {
+				fm[key] = bm
 			}
 		}
 	}
+}
 
-	if newVal == nil {
-		return nil
+func markUniqueBatchArrival(state *uniqueBatchCheckState, pos int, key keycodec.IndexLookupKey, idx uint64) {
+	removeUniqueBatchLeaving(state, pos, key, idx)
+	state.ensureSeen(pos)[key] = idx
+}
+
+func (state *uniqueBatchCheckState) mergeFrom(src *uniqueBatchCheckState) {
+	if src.leavingReady {
+		state.leavingReady = true
 	}
-
-	var (
-		seenWritesInline [8]uniqueSeenWrite
-		seenWrites       = seenWritesInline[:0]
-	)
-
-	if oldVal == nil {
-		for pos := range unique {
-			acc := unique[pos]
-			var err error
-			seenWrites, err = ctx.checkBatchCandidateAndCollectSeen(state, pos, idx, acc, newVal, seenWrites)
-			if err != nil {
-				rollbackUniqueBatchLeaving(state, touched, idx)
-				return err
+	if src.leavingAny {
+		state.leavingAny = true
+	}
+	for pos, leaving := range src.leaving {
+		if leaving == nil {
+			continue
+		}
+		if sm := state.seen[pos]; sm != nil {
+			for key, ids := range leaving {
+				if prev, ok := sm[key]; ok && ids.Contains(prev) {
+					delete(sm, key)
+				}
 			}
 		}
-	} else {
-		for pos := range unique {
-			acc := unique[pos]
-			if !acc.Modified(oldVal, newVal) {
+		dst := state.leaving[pos]
+		if dst == nil {
+			// Move the map whole; its posting.List values must stay owned by one
+			// cleanup path.
+			state.leaving[pos] = leaving
+			src.leaving[pos] = nil
+			continue
+		}
+		for key, ids := range leaving {
+			bm := dst[key]
+			if bm.IsEmpty() {
+				dst[key] = ids
+				delete(leaving, key)
 				continue
 			}
-			var err error
-			seenWrites, err = ctx.checkBatchCandidateAndCollectSeen(state, pos, idx, acc, newVal, seenWrites)
-			if err != nil {
-				rollbackUniqueBatchLeaving(state, touched, idx)
-				return err
+			iter := ids.Iter()
+			for iter.HasNext() {
+				bm, _ = bm.BuildAddedChecked(iter.Next())
 			}
+			iter.Release()
+			ids.Release()
+			dst[key] = bm
+			delete(leaving, key)
 		}
 	}
-
-	for _, w := range seenWrites {
-		sm := state.ensureSeen(w.pos)
-		sm[w.key] = idx
+	for pos, seen := range src.seen {
+		if seen == nil {
+			continue
+		}
+		if fm := state.leaving[pos]; fm != nil {
+			for key, idx := range seen {
+				if bm := fm[key]; !bm.IsEmpty() {
+					bm = bm.BuildRemoved(idx)
+					if bm.IsEmpty() {
+						delete(fm, key)
+					} else {
+						fm[key] = bm
+					}
+				}
+			}
+		}
+		dst := state.seen[pos]
+		if dst == nil {
+			// Move the map whole for the same reason as leaving: no split owner
+			// for entries that survive into the accepted state.
+			state.seen[pos] = seen
+			src.seen[pos] = nil
+			continue
+		}
+		for key, idx := range seen {
+			dst[key] = idx
+		}
 	}
-	return nil
+}
+
+func (ctx UniqueContext) collectUniqueBatchDepartures(state *uniqueBatchCheckState, idxs []uint64, oldVals, newVals []unsafe.Pointer) {
+	if state.leavingReady {
+		return
+	}
+	unique := ctx.Schema.Unique
+	for j, old := range oldVals {
+		if old == nil {
+			continue
+		}
+		next := newVals[j]
+		if next == nil {
+			for pos := range unique {
+				acc := unique[pos]
+				single, ok, isNil := acc.UniqueGetter(old)
+				if !ok || isNil {
+					continue
+				}
+				markUniqueBatchDeparture(state, pos, single, idxs[j])
+			}
+			continue
+		}
+		for pos := range unique {
+			acc := unique[pos]
+			if !acc.Modified(old, next) {
+				continue
+			}
+			single, ok, isNil := acc.UniqueGetter(old)
+			if !ok || isNil {
+				continue
+			}
+			markUniqueBatchDeparture(state, pos, single, idxs[j])
+		}
+	}
+	state.leavingReady = true
 }
 
 func collapseUniqueWriteMulti(idxs []uint64, oldVals, newVals []unsafe.Pointer, pos map[uint64]int) ([]uint64, []unsafe.Pointer, []unsafe.Pointer) {
@@ -361,41 +375,9 @@ func (ctx UniqueContext) checkOnWriteMulti(state *uniqueBatchCheckState, idxs []
 			if !needLeaving {
 				continue
 			}
-			state.leavingReady = true
-			for j, old := range oldVals {
-				if old == nil {
-					continue
-				}
-				next := newVals[j]
-				if next == nil {
-					for leavingPos := range unique {
-						leavingAcc := unique[leavingPos]
-						single, ok, isNil := leavingAcc.UniqueGetter(old)
-						if !ok || isNil {
-							continue
-						}
-						m := state.ensureLeaving(leavingPos)
-						ids := m[single]
-						ids = ids.BuildAdded(idxs[j])
-						m[single] = ids
-					}
-					continue
-				}
-				for leavingPos := range unique {
-					leavingAcc := unique[leavingPos]
-					if !leavingAcc.Modified(old, next) {
-						continue
-					}
-					single, ok, isNil := leavingAcc.UniqueGetter(old)
-					if !ok || isNil {
-						continue
-					}
-					m := state.ensureLeaving(leavingPos)
-					ids := m[single]
-					ids = ids.BuildAdded(idxs[j])
-					m[single] = ids
-				}
-			}
+			// The no-departure fast path uses cardinality only. If it reports a
+			// possible collision, pay for the leaving-aware posting scan once.
+			ctx.collectUniqueBatchDepartures(state, idxs, oldVals, newVals)
 			_, err = ctx.checkBatchCandidateMulti(current, state, pos, idx, newVal, acc)
 			if err != nil {
 				return err
@@ -419,34 +401,27 @@ func (ctx UniqueContext) checkBatchCandidateMulti(
 		return false, nil
 	}
 
-	sm := state.ensureSeen(pos)
-	if prev, ok := sm[single]; ok && prev != idx {
+	if prev, ok, needLeaving := state.seenOwner(pos, single); ok && prev != idx {
+		if needLeaving {
+			return true, nil
+		}
 		return false, fmt.Errorf("%w: duplicate value for field %v within batch", rbierrors.ErrUniqueViolation, acc.Name)
 	}
-	sm[single] = idx
+	markUniqueBatchArrival(state, pos, single, idx)
 
 	ids := current.FieldLookupPostingRetainedKey(acc.Name, single)
 	if ids.IsEmpty() {
 		return false, nil
 	}
 
-	if !state.leavingReady {
+	if !state.hasDepartures() {
 		if ids.Cardinality() == 1 && ids.Contains(idx) {
 			return false, nil
+		}
+		if state.leavingReady {
+			return false, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 		}
 		return true, nil
-	}
-
-	var lv posting.List
-	if fm := state.leaving[pos]; fm != nil {
-		lv = fm[single]
-	}
-
-	if lv.IsEmpty() {
-		if ids.Cardinality() == 1 && ids.Contains(idx) {
-			return false, nil
-		}
-		return false, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 
 	iter := ids.Iter()
@@ -457,64 +432,39 @@ func (ctx UniqueContext) checkBatchCandidateMulti(
 		if other == idx {
 			continue
 		}
-		if lv.Contains(other) {
+		if state.hasLeaving(pos, single, other) {
 			continue
+		}
+		if !state.leavingReady {
+			return true, nil
 		}
 		return false, fmt.Errorf("%w: value for field %v already exists", rbierrors.ErrUniqueViolation, acc.Name)
 	}
 	return false, nil
 }
 
-func (b *Batcher) filterAccepted(att *attemptState, atomicAll bool) error {
+func (b *Executor) filterAccepted(att *attemptState) error {
 	att.accepted = att.prepared
 	att.acceptedSnapshots = att.preparedSnapshots
 	if b.unique.Schema == nil || len(b.unique.Schema.Unique) == 0 {
 		return nil
 	}
 
-	if atomicAll {
-		att.uniqueIdxs = att.uniqueIdxs[:len(att.prepared)]
-		att.uniqueOldVals = att.uniqueOldVals[:len(att.prepared)]
-		att.uniqueNewVals = att.uniqueNewVals[:len(att.prepared)]
-		for i := range att.prepared {
-			op := att.prepared[i]
-			att.uniqueIdxs[i] = op.idx
-			att.uniqueOldVals[i] = op.oldVal
-			att.uniqueNewVals[i] = op.newVal
-		}
-		if err := b.unique.checkOnWriteMulti(&att.uniqueState, att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
-			if b.sched.stats.Enabled {
-				b.sched.stats.UniqueRejected.Add(1)
-			}
-			for _, op := range att.prepared {
-				op.req.Err = err
-			}
-			return err
-		}
-		return nil
-	}
-
-	if cap(att.accepted) < len(att.prepared) {
-		att.accepted = slices.Grow(att.accepted, len(att.prepared))
-	}
-	if cap(att.acceptedSnapshots) < len(att.preparedSnapshots) {
-		att.acceptedSnapshots = slices.Grow(att.acceptedSnapshots, len(att.preparedSnapshots))
-	}
-	att.accepted = att.accepted[:0]
-	att.acceptedSnapshots = att.acceptedSnapshots[:0]
-	uniqueState := &att.uniqueState
-
+	att.uniqueIdxs = att.uniqueIdxs[:len(att.prepared)]
+	att.uniqueOldVals = att.uniqueOldVals[:len(att.prepared)]
+	att.uniqueNewVals = att.uniqueNewVals[:len(att.prepared)]
 	for i := range att.prepared {
 		op := att.prepared[i]
-		if err := b.unique.checkBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal); err != nil {
-			if b.sched.stats.Enabled {
-				b.sched.stats.UniqueRejected.Add(1)
-			}
-			op.req.Err = err
-			continue
+		att.uniqueIdxs[i] = op.idx
+		att.uniqueOldVals[i] = op.oldVal
+		att.uniqueNewVals[i] = op.newVal
+	}
+	if err := b.unique.checkOnWriteMulti(&att.uniqueState, att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
+		if b.stats.Enabled {
+			b.stats.UniqueRejected.Add(1)
 		}
-		att.accepted = append(att.accepted, op)
-		att.acceptedSnapshots = append(att.acceptedSnapshots, att.preparedSnapshots[i])
+		assignPreparedErr(att.prepared, err)
+		return err
 	}
 	return nil
 }

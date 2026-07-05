@@ -9,7 +9,7 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func openBenchAggMeasureDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openBenchAggMeasureCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-agg-*")
 	if err != nil {
@@ -24,11 +24,11 @@ func openBenchAggMeasureDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, str
 		"score":   IndexMeasure,
 	}
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench_agg.db"), opts)
-	return db, raw, dir
+	c, bolt := openBoltAndCollection[uint64, UserBench](b, filepath.Join(dir, "bench_agg.db"), opts)
+	return c, bolt, dir
 }
 
-func openBenchAggHybridDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openBenchAggHybridCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-agg-hybrid-*")
 	if err != nil {
@@ -44,70 +44,70 @@ func openBenchAggHybridDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, stri
 		"score":   IndexMeasure,
 	}
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench_agg_hybrid.db"), opts)
-	return db, raw, dir
+	c, bolt := openBoltAndCollection[uint64, UserBench](b, filepath.Join(dir, "bench_agg_hybrid.db"), opts)
+	return c, bolt, dir
 }
 
-func buildBenchAggMeasureDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
+func buildBenchAggMeasureCollectionWithMode(b *testing.B, n int, mode benchCacheMode) *Collection[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
 
 	key := "agg_measure/" + benchDBFamilyKey(n)
-	if cached := benchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
-		return cached.db
+	if cached := benchDBs[key]; cached != nil && cached.clc != nil && cached.clc.state.Load()&collectionClosed == 0 {
+		return cached.clc
 	}
 
-	db, raw, dir := openBenchAggMeasureDB(b)
+	c, bolt, dir := openBenchAggMeasureCollection(b)
 
 	b.StopTimer()
-	seedBenchData(b, db, n)
+	seedBenchData(b, c, n)
 	b.StartTimer()
 
-	benchDBs[key] = &cachedBenchUserDB{db: db, raw: raw, dir: dir}
+	benchDBs[key] = &cachedBenchUserDB{clc: c, raw: bolt, dir: dir}
 	registerBenchSuiteCleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		_ = os.RemoveAll(dir)
 	})
-	return db
+	return c
 }
 
-func buildBenchAggHybridDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
+func buildBenchAggHybridCollectionWithMode(b *testing.B, n int, mode benchCacheMode) *Collection[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
 
 	key := "agg_hybrid/" + benchDBFamilyKey(n)
-	if cached := benchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
-		return cached.db
+	if cached := benchDBs[key]; cached != nil && cached.clc != nil && cached.clc.state.Load()&collectionClosed == 0 {
+		return cached.clc
 	}
 
-	db, raw, dir := openBenchAggHybridDB(b)
+	c, bolt, dir := openBenchAggHybridCollection(b)
 
 	b.StopTimer()
-	seedBenchData(b, db, n)
+	seedBenchData(b, c, n)
 	b.StartTimer()
 
-	benchDBs[key] = &cachedBenchUserDB{db: db, raw: raw, dir: dir}
+	benchDBs[key] = &cachedBenchUserDB{clc: c, raw: bolt, dir: dir}
 	registerBenchSuiteCleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
+		_ = c.Close()
+		_ = bolt.Close()
 		_ = os.RemoveAll(dir)
 	})
-	return db
+	return c
 }
 
-func warmBenchAggregateOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func warmBenchAggregateOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	runBenchAggregateOnceUint64(b, db, q)
+	runBenchAggregateOnceUint64(b, c, q)
 }
 
-func runBenchAggregateOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+func runBenchAggregateOnceUint64(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX) {
 	b.Helper()
-	result, err := db.Aggregate(q)
+	result, err := readAggregate(c, q)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -116,12 +116,12 @@ func runBenchAggregateOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.
 	}
 }
 
-func runAggregateBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
+func runAggregateBenchWithMode(b *testing.B, c *Collection[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
 	state := prepareReadBenchWithMode(
 		b,
-		db,
+		c,
 		q,
 		mode,
 		warmBenchAggregateOnceUint64,
@@ -129,32 +129,32 @@ func runAggregateBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX
 		buildUserBenchTurnoverRingUint64,
 	)
 	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchAggregateOnceUint64(b, db, q)
+		state.beforeQuery(b, c)
+		runBenchAggregateOnceUint64(b, c, q)
 	}
 }
 
 func runAggregateBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchAggMeasureDBWithMode(b, benchN, mode)
-		runAggregateBenchWithMode(b, db, qf(), mode)
+		c := buildBenchAggMeasureCollectionWithMode(b, benchN, mode)
+		runAggregateBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func runAggregateHybridBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchAggHybridDBWithMode(b, benchN, mode)
-		runAggregateBenchWithMode(b, db, qf(), mode)
+		c := buildBenchAggHybridCollectionWithMode(b, benchN, mode)
+		runAggregateBenchWithMode(b, c, qf(), mode)
 	})
 }
 
 func runAggregateOrdinaryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithMode(b, benchN, mode)
-		runAggregateBenchWithMode(b, db, qf(), mode)
+		c := buildBenchCollectionWithMode(b, benchN, mode)
+		runAggregateBenchWithMode(b, c, qf(), mode)
 	})
 }
 

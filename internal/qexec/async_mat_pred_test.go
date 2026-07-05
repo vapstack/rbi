@@ -9,6 +9,12 @@ import (
 	"github.com/vapstack/rbi/internal/snapshot"
 )
 
+type asyncSnapshotPinFunc func()
+
+func (fn asyncSnapshotPinFunc) Unpin() {
+	fn()
+}
+
 func asyncMaterializedPredPlanForTest(t testing.TB, db *DB[uint64, Rec], expr qx.Expr) (*View, asyncMaterializedPredPlan) {
 	t.Helper()
 	view := db.engine.currentQueryViewForTests()
@@ -31,7 +37,7 @@ func asyncMaterializedPredPlanForTest(t testing.TB, db *DB[uint64, Rec], expr qx
 
 func TestAsyncMaterializedPredWarmupStoresWhileSnapshotCurrent(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 2_000, func(i int) *Rec {
 		return &Rec{
@@ -63,26 +69,21 @@ func TestAsyncMaterializedPredFinishHoldsWorkerSlotUntilUnpin(t *testing.T) {
 	scheduler.inFlightCount.Store(1)
 
 	unpinned := false
-	scheduler.finish(AsyncMaterializedPredSnapshotOps{
-		Unpin: func(seq uint64, ref *snapshot.Ref) {
-			if seq != taskKey.seq {
-				t.Fatalf("Unpin seq=%d want %d", seq, taskKey.seq)
-			}
-			if got := len(scheduler.slots); got != 1 {
-				t.Fatalf("worker slot released before Unpin: len=%d", got)
-			}
-			if got := scheduler.inFlightCount.Load(); got != 1 {
-				t.Fatalf("in-flight count released before Unpin: got=%d", got)
-			}
-			scheduler.mu.Lock()
-			_, ok := scheduler.inFlight[taskKey]
-			scheduler.mu.Unlock()
-			if !ok {
-				t.Fatal("in-flight key released before Unpin")
-			}
-			unpinned = true
-		},
-	}, taskKey.seq, nil, taskKey)
+	scheduler.finish(asyncSnapshotPinFunc(func() {
+		if got := len(scheduler.slots); got != 1 {
+			t.Fatalf("worker slot released before Unpin: len=%d", got)
+		}
+		if got := scheduler.inFlightCount.Load(); got != 1 {
+			t.Fatalf("in-flight count released before Unpin: got=%d", got)
+		}
+		scheduler.mu.Lock()
+		_, ok := scheduler.inFlight[taskKey]
+		scheduler.mu.Unlock()
+		if !ok {
+			t.Fatal("in-flight key released before Unpin")
+		}
+		unpinned = true
+	}), taskKey)
 
 	if !unpinned {
 		t.Fatal("Unpin was not called")
@@ -97,7 +98,7 @@ func TestAsyncMaterializedPredFinishHoldsWorkerSlotUntilUnpin(t *testing.T) {
 
 func TestBuildAsyncRangeMaterializedPredUsesNumericBuckets(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -124,7 +125,7 @@ func TestBuildAsyncRangeMaterializedPredUsesNumericBuckets(t *testing.T) {
 
 func TestBuildAsyncRangeMaterializedPredCancelsNumericBucketBuild(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -160,7 +161,7 @@ func TestBuildAsyncRangeMaterializedPredCancelsNumericBucketBuild(t *testing.T) 
 
 func TestBuildAsyncRangeComplementMaterializedPredCancelsBeforeNilTailClone(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	optA := "a"
 	optB := "b"
@@ -206,7 +207,7 @@ func TestBuildAsyncRangeComplementMaterializedPredCancelsBeforeNilTailClone(t *t
 
 func TestBuildAsyncRangeComplementMaterializedPredUsesNumericBuckets(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -234,7 +235,7 @@ func TestBuildAsyncRangeComplementMaterializedPredUsesNumericBuckets(t *testing.
 
 func TestAsyncMaterializedPredWarmupStoresStringRangeComplement(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
 		if i <= 2 {
@@ -280,7 +281,7 @@ func TestAsyncMaterializedPredWarmupStoresStringRangeComplement(t *testing.T) {
 
 func TestBuildAsyncMaterializedPredCancelsBeforeUnionFinish(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -305,7 +306,7 @@ func TestBuildAsyncMaterializedPredCancelsBeforeUnionFinish(t *testing.T) {
 
 func TestAsyncMaterializedPredWarmupDropsDuplicateInFlight(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -317,9 +318,9 @@ func TestAsyncMaterializedPredWarmupDropsDuplicateInFlight(t *testing.T) {
 	taskKey := asyncMaterializedPredTaskKey{seq: plan.seq, key: plan.key}
 	origOps := scheduler.ops
 	pinCalls := 0
-	scheduler.ops.PinBySeq = func(seq uint64) (*snapshot.View, *snapshot.Ref, bool) {
+	scheduler.ops.PinCurrentBySeq = func(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {
 		pinCalls++
-		return origOps.PinBySeq(seq)
+		return origOps.PinCurrentBySeq(seq)
 	}
 	defer func() {
 		scheduler.ops = origOps
@@ -349,7 +350,7 @@ func TestAsyncMaterializedPredWarmupDropsDuplicateInFlight(t *testing.T) {
 
 func TestAsyncMaterializedPredWarmupDropsWhenWorkerCapacityFull(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -359,9 +360,9 @@ func TestAsyncMaterializedPredWarmupDropsWhenWorkerCapacityFull(t *testing.T) {
 	scheduler := db.engine.exec.asyncMaterializedPredWarm
 	origOps := scheduler.ops
 	pinCalls := 0
-	scheduler.ops.PinBySeq = func(seq uint64) (*snapshot.View, *snapshot.Ref, bool) {
+	scheduler.ops.PinCurrentBySeq = func(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {
 		pinCalls++
-		return origOps.PinBySeq(seq)
+		return origOps.PinCurrentBySeq(seq)
 	}
 	defer func() {
 		scheduler.ops = origOps
@@ -390,7 +391,7 @@ func TestAsyncMaterializedPredWarmupDropsWhenWorkerCapacityFull(t *testing.T) {
 
 func TestAsyncMaterializedPredWarmupCancelsStaleSnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	seedGeneratedUint64Data(t, db, 128, func(i int) *Rec {
 		return &Rec{Age: i}
@@ -416,7 +417,7 @@ func TestAsyncMaterializedPredWarmupCancelsStaleSnapshot(t *testing.T) {
 
 func TestAsyncMaterializedPredPlanDetachesMutableScalarBound(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		SnapshotMaterializedPredCacheMaxEntries: 16,
+		MaterializedPredCacheMaxEntries: 16,
 	})
 	if err := db.Set(1, &Rec{Name: "aa-1"}); err != nil {
 		t.Fatalf("Set 1: %v", err)

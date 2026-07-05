@@ -413,7 +413,7 @@ func TestViewInheritMaterializedPredCacheKeepsOversizedCount(t *testing.T) {
 	}
 }
 
-func TestViewInheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
+func TestViewInheritMaterializedPredCachePreservesSecondChanceState(t *testing.T) {
 	prev := testMatPredView(8, 0)
 	emailKey := testScalarMatPredKey("email", "a")
 	nameKey := testScalarMatPredKey("name", "b")
@@ -426,15 +426,15 @@ func TestViewInheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
 	next := testMatPredView(8, 0)
 	inheritMaterializedPredCache(next, prev, qcache.FieldChangeSet{})
 
-	inheritedClock := next.matPredCache.Clock()
+	for i := 0; i < 7; i++ {
+		testStoreMaterializedPred(next, testScalarMatPredKey("email", fmt.Sprintf("churn-%d", i)), testPosting(uint64(i+10)))
+	}
 	if _, ok := testLoadMaterializedPred(next, emailKey); !ok {
-		t.Fatalf("expected first cache entry to be inherited")
+		t.Fatalf("expected inherited hit entry to survive turnover")
 	}
-	if _, ok := testLoadMaterializedPred(next, nameKey); !ok {
-		t.Fatalf("expected second cache entry to be inherited")
-	}
-	if want, got := prev.matPredCache.Clock(), inheritedClock; got != want {
-		t.Fatalf("expected next snapshot clock to continue from inherited entries, got=%d want=%d", got, want)
+	if ids, ok := testLoadMaterializedPred(next, nameKey); ok {
+		ids.Release()
+		t.Fatalf("expected inherited cold entry to be evicted before inherited hit entry")
 	}
 }
 
@@ -1369,181 +1369,36 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 	}
 }
 
-func TestManagerStageReplaceUnpinnedStagedReleasesOldSnapshot(t *testing.T) {
-	m := NewRegistry(true)
+func TestViewRuntimeCachesDirtyAndTakeRetiredRuntimeCaches(t *testing.T) {
+	v := testMatPredView(1, 0)
+	defer v.releaseRuntimeCaches()
 
-	first := testMatPredView(2, 0)
-	first.Seq = 21
-	first.KeyIndex = testStorage("old")
-	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("stage-old"), testPosting(1))
-	m.Stage(first)
+	v.StoreMaterializedPredKey(qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a"), testPosting(1))
+	v.StoreMaterializedPredKey(qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "b"), testPosting(2))
 
-	second := &View{Seq: first.Seq}
-	m.Stage(second)
-
-	if first.KeyIndex.KeyCount() != 0 || first.matPredCache != nil {
-		t.Fatal("expected replaced unpinned staged snapshot to be released")
-	}
-
-	m.DropStaged(second.Seq)
-}
-
-func TestManagerStageReplacePinnedStagedReleasesOldSnapshotAfterLastUnpin(t *testing.T) {
-	m := NewRegistry(true)
-
-	first := testMatPredView(2, 0)
-	first.Seq = 22
-	first.KeyIndex = testStorage("old")
-	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("stage-pinned-old"), testPosting(1))
-	m.Stage(first)
-
-	pinned, ref, ok := m.PinBySeq(first.Seq)
-	if !ok || pinned != first {
-		t.Fatal("expected first staged snapshot to be pinnable")
-	}
-
-	second := &View{Seq: first.Seq}
-	m.Stage(second)
-	if first.KeyIndex.KeyCount() == 0 || first.matPredCache == nil {
-		t.Fatal("expected replaced pinned staged snapshot to survive until unpin")
-	}
-
-	m.Unpin(first.Seq, ref)
-	if first.KeyIndex.KeyCount() != 0 || first.matPredCache != nil {
-		t.Fatal("expected replaced pinned staged snapshot to be released after last unpin")
-	}
-
-	m.DropStaged(second.Seq)
-}
-
-func TestManagerPublishReplaceStagedReleasesOldSnapshotAfterLastUnpin(t *testing.T) {
-	m := NewRegistry(true)
-
-	m.Publish(&View{Seq: 1})
-	staged := testMatPredView(2, 0)
-	staged.Seq = 23
-	staged.KeyIndex = testStorage("old")
-	staged.StoreMaterializedPredKey(qcache.MaterializedPredKeyFromOpaque("publish-staged-old"), testPosting(1))
-	m.Stage(staged)
-
-	pinned, ref, ok := m.PinBySeq(staged.Seq)
-	if !ok || pinned != staged {
-		t.Fatal("expected staged snapshot to be pinnable")
-	}
-
-	current := &View{Seq: staged.Seq}
-	m.Publish(current)
-	if staged.KeyIndex.KeyCount() == 0 || staged.matPredCache == nil {
-		t.Fatal("expected replaced pinned staged snapshot to survive until unpin")
-	}
-
-	m.Unpin(staged.Seq, ref)
-	if staged.KeyIndex.KeyCount() != 0 || staged.matPredCache != nil {
-		t.Fatal("expected replaced pinned staged snapshot to be released after last unpin")
-	}
-	if m.Current() != current {
-		t.Fatal("expected published replacement to remain current")
-	}
-}
-
-func TestManagerSameSeqPinnedOldSnapshotReleasesRetiredRuntimeCachesAfterLastUnpin(t *testing.T) {
-	m := NewRegistry(true)
-
-	first := testMatPredView(4, 0)
-	first.Seq = 7
-	first.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	first.StoreMaterializedPredKey(qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user"), testPosting(1))
-	m.Publish(first)
-
-	pinned, ref, ok := m.PinBySeq(first.Seq)
-	if !ok || pinned != first {
-		t.Fatal("expected first snapshot to be pinnable")
-	}
-
-	second := testMatPredView(4, 0)
-	second.Seq = first.Seq
-	second.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	m.Publish(second)
-
-	if first.matPredCache == nil || first.NumericRangeBucketCache() == nil {
-		t.Fatal("expected pinned retired same-seq snapshot to retain runtime caches before unpin")
-	}
-
-	m.Unpin(first.Seq, ref)
-	if first.matPredCache != nil || first.NumericRangeBucketCache() != nil {
-		t.Fatal("expected retired same-seq snapshot runtime caches to be released after last unpin")
-	}
-	if m.Current() != second {
-		t.Fatal("expected same-seq replacement to remain current after old unpin")
-	}
-
-	second.releaseRuntimeCaches()
-}
-
-func TestManagerReDrainsNumericRetiredAfterSharedSnapshotRelease(t *testing.T) {
-	m := NewRegistry(true)
-
-	shared := testStorage("10", "20")
-	defer shared.Release()
-
-	first := testView(map[string]indexdata.FieldStorage{"age": shared})
-	first.Seq = 17
-	first.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{}, 0)
-	first.numericRangeBucketCache.StoreSlot("age", 0, entry)
-	m.Publish(first)
-
-	pinnedOld, oldRef, ok := m.PinBySeq(first.Seq)
-	if !ok || pinnedOld != first {
-		t.Fatal("expected first snapshot to be pinned")
-	}
-
-	second := testView(map[string]indexdata.FieldStorage{"age": shared})
-	second.Seq = 18
-	second.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	inheritNumericRangeBucketCache(second, first)
-	m.Publish(second)
-
-	pinnedCurrent, currentSeq, currentRef := m.PinCurrent()
-	if pinnedCurrent != second || currentRef == nil {
-		t.Fatal("expected second snapshot to be current")
-	}
-
-	evicted := false
-	count := entry.FullSpanEntryCount()
-	for i := 0; !evicted && i < 64; i++ {
-		ids := testPosting(uint64(i+1), 1<<32|uint64(i+1))
-		cached, ok := entry.TryStoreFullSpan(i, i, ids)
+	storage := testStorage("10", "20")
+	defer storage.Release()
+	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	entry := qcache.GetNumericRangeBucketEntry(storage, qcache.NumericRangeBucketIndex{}, 0)
+	v.numericRangeBucketCache.StoreSlot("age", 0, entry)
+	for i := 0; i < 5; i++ {
+		cached, ok := entry.TryStoreFullSpan(i, i, testPosting(uint64(i+1)))
 		if !ok {
-			t.Fatalf("expected full-span store %d to succeed", i)
+			t.Fatalf("TryStoreFullSpan(%d): not stored", i)
 		}
 		cached.Release()
-		nextCount := entry.FullSpanEntryCount()
-		evicted = nextCount == count
-		count = nextCount
-	}
-	if !evicted {
-		t.Fatal("expected shared numeric entry to have retired full-span postings")
 	}
 
-	m.Unpin(currentSeq, currentRef)
-	retained := second.numericRangeBucketCache.TakeRetired()
-	if !retained.IsEmpty() {
-		retained.Release()
-		t.Fatal("expected current unpin to keep retired postings while entry is shared")
+	if !v.RuntimeCachesDirty() {
+		t.Fatal("expected retired runtime caches to mark view dirty")
 	}
-	retained.Release()
-	if entry.FullSpanEntryCount() == 0 {
-		t.Fatal("expected current unpin to keep retired postings while entry is shared")
+	retired := v.TakeRetiredRuntimeCaches()
+	if retired.Empty() {
+		t.Fatal("expected detached retired runtime caches")
 	}
-
-	m.Unpin(first.Seq, oldRef)
-	redrained := second.numericRangeBucketCache.TakeRetired()
-	if !redrained.IsEmpty() {
-		redrained.Release()
-		t.Fatal("expected old snapshot release to re-drain current numeric retired postings")
+	if v.RuntimeCachesDirty() {
+		retired.Release()
+		t.Fatal("expected dirty flag to clear after retired runtime caches are detached")
 	}
-	redrained.Release()
-
-	second.releaseRuntimeCaches()
+	retired.Release()
 }

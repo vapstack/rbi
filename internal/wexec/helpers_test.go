@@ -3,11 +3,11 @@ package wexec
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -25,55 +25,216 @@ type attemptPairRec struct {
 	B byte `db:"b"`
 }
 
-func executeBatchForTest(ex *Batcher, batch []*request) {
-	ex.sched.stats.recordExecuted(len(batch))
-	stats := ex.sched.stats.Enabled
-	var started time.Time
-	if stats {
-		started = time.Now()
+var testSnapshotManagers sync.Map
+var testCommitFns sync.Map
+var testPublishFns sync.Map
+var testBoltDBs sync.Map
+
+type testSnapshotManager struct {
+	mu      sync.RWMutex
+	current *snapshot.View
+}
+
+func newTestSnapshotManager() *testSnapshotManager {
+	return &testSnapshotManager{}
+}
+
+func (m *testSnapshotManager) Current() *snapshot.View {
+	m.mu.RLock()
+	current := m.current
+	m.mu.RUnlock()
+	return current
+}
+
+func (m *testSnapshotManager) Publish(snap *snapshot.View) {
+	m.mu.Lock()
+	m.current = snap
+	m.mu.Unlock()
+}
+
+func setSnapshotManagerForTest(ex *Executor, manager *testSnapshotManager) {
+	testSnapshotManagers.Store(ex, manager)
+}
+
+func snapshotManagerForTest(ex *Executor) *testSnapshotManager {
+	v, _ := testSnapshotManagers.Load(ex)
+	return v.(*testSnapshotManager)
+}
+
+func executeBatchForTest(ex *Executor, batch []*request) {
+	for i := 0; i < len(batch); i++ {
+		batch[i].Err = nil
 	}
-	reqScratch := requestScratchPool.Get(len(batch))
-	reqScratch = append(reqScratch, batch...)
-	ex.runShared(reqScratch)
-	requestScratchPool.Put(reqScratch)
-	finishRequestsForTest(batch)
-	if stats {
-		ex.sched.stats.ExecuteNanos.Add(uint64(time.Since(started)))
+
+	tx, err := boltForTest(ex).Begin(true)
+	if err != nil {
+		assignRequestErr(batch, fmt.Errorf("tx error: %w", err))
+		finishRequestsForTest(ex, batch)
+		return
+	}
+	attempt, err := ex.NewFrameAttempt(tx, len(batch))
+	if err != nil {
+		_ = tx.Rollback()
+		assignRequestErr(batch, err)
+		finishRequestsForTest(ex, batch)
+		return
+	}
+
+	var fatal error
+	for i := range batch {
+		reqs := requestScratchPool.Get(1)
+		reqs = append(reqs, *batch[i])
+		batch[i].setBaseline = nil
+		batch[i].setPayload = nil
+		batch[i].patch = nil
+		ops := Batch{ex: ex, reqs: reqs}
+		if _, err = attempt.Prepare(&ops, nil, nil); err != nil {
+			attempt.DiscardCurrent()
+			batch[i].Err = err
+			if rootWriteBatchWideErrForTest(err) {
+				assignRequestErr(batch, err)
+				fatal = err
+				break
+			}
+			continue
+		}
+		if err = attempt.ValidateCurrent(); err != nil {
+			attempt.DiscardCurrent()
+			batch[i].Err = err
+			continue
+		}
+		attempt.AcceptValidatedCurrent()
+	}
+	if fatal != nil {
+		_ = tx.Rollback()
+		attempt.Cancel()
+		finishRequestsForTest(ex, batch)
+		return
+	}
+
+	applied, err := attempt.Apply()
+	if err != nil {
+		_ = tx.Rollback()
+		attempt.Cancel()
+		assignRequestErr(batch, err)
+		finishRequestsForTest(ex, batch)
+		return
+	}
+	if applied.Seq == 0 {
+		_ = tx.Rollback()
+		attempt.Cancel()
+		finishRequestsForTest(ex, batch)
+		return
+	}
+	if err = finishAppliedForTest(ex, tx, applied); err != nil {
+		assignRequestErr(batch, err)
+	}
+	finishRequestsForTest(ex, batch)
+}
+
+func executeAtomicRequestsForTest(ex *Executor, batch []*request) {
+	for i := 0; i < len(batch); i++ {
+		batch[i].Err = nil
+	}
+	tx, err := boltForTest(ex).Begin(true)
+	if err != nil {
+		assignRequestErr(batch, fmt.Errorf("tx error: %w", err))
+		return
+	}
+	active := requestScratchPool.Get(len(batch))[:len(batch)]
+	for i := range batch {
+		active[i] = *batch[i]
+	}
+	applied, err := ex.applyAtomic(tx, active)
+	if err != nil {
+		_ = tx.Rollback()
+		for i := range active {
+			batch[i].Err = active[i].Err
+		}
+		requestScratchPool.Put(active)
+		assignRequestErr(batch, err)
+		return
+	}
+	if applied.Seq == 0 {
+		_ = tx.Rollback()
+		for i := range active {
+			batch[i].Err = active[i].Err
+		}
+		requestScratchPool.Put(active)
+		return
+	}
+	_ = finishAppliedForTest(ex, tx, applied)
+	for i := range active {
+		batch[i].Err = active[i].Err
+	}
+	requestScratchPool.Put(active)
+}
+
+func finishAppliedForTest(ex *Executor, tx *bbolt.Tx, applied AppliedBatch) error {
+	if err := commitForTest(ex, tx); err != nil {
+		_ = tx.Rollback()
+		assignPreparedErr(applied.cleanup.att.accepted, err)
+		if applied.Snapshot != nil {
+			applied.Snapshot.Release()
+		}
+		applied.Release()
+		return err
+	}
+	if err := publishForTest(ex, applied.Snapshot); err != nil {
+		assignPreparedErr(applied.cleanup.att.accepted, err)
+		applied.Release()
+		return err
+	}
+	applied.Release()
+	return nil
+}
+
+func publishForTest(ex *Executor, snap *snapshot.View) error {
+	v, _ := testPublishFns.Load(ex)
+	return v.(func(*snapshot.View) error)(snap)
+}
+
+func commitForTest(ex *Executor, tx *bbolt.Tx) error {
+	v, _ := testCommitFns.Load(ex)
+	return v.(func(*bbolt.Tx) error)(tx)
+}
+
+func boltForTest(ex *Executor) *bbolt.DB {
+	v, _ := testBoltDBs.Load(ex)
+	return v.(*bbolt.DB)
+}
+
+func finishRequestsForTest(ex *Executor, batch []*request) {
+	for _, req := range batch {
+		err := req.Err
+		ex.releaseRequest(req)
+		req.Err = err
 	}
 }
 
-func finishRequestsForTest(batch []*request) {
-	resolveRequestErrs(batch)
-	for _, req := range batch {
-		if req.setPayload != nil {
-			encodePool.Put(req.setPayload)
-			req.setPayload = nil
+func rootWriteBatchWideErrForTest(err error) bool {
+	return errors.Is(err, ErrBucketMissing) ||
+		errors.Is(err, ErrStringMapBucketMissing) ||
+		errors.Is(err, ErrAdvanceBucketSequence) ||
+		errors.Is(err, ErrAdvanceStringMapSequence)
+}
+
+func assignRequestErr(reqs []*request, err error) {
+	for i := 0; i < len(reqs); i++ {
+		req := reqs[i]
+		if req.Err == nil {
+			req.Err = err
 		}
-		req.setValue = nil
-		req.setBaseline = nil
-		clear(req.patch)
-		req.patch = req.patch[:0]
-		req.patchIgnoreUnknown = false
-		req.beforeProcess = nil
-		req.beforeStore = nil
-		req.beforeCommit = nil
-		req.cloneValue = nil
-		req.policy = 0
-		req.replacedBy = nil
-		req.Done <- req.Err
 	}
 }
 
 func setAttemptReq(id uint64, v byte) *request {
-	rec := &attemptRec{V: v}
 	payload := encodePool.Get()
 	_ = payload.WriteByte(v)
 	return &request{
 		op:         opSet,
 		id:         keycodec.DataKeyFromUserKey(id, false),
-		setValue:   unsafe.Pointer(rec),
 		setPayload: payload,
-		Done:       make(chan error, 1),
 	}
 }
 
@@ -95,15 +256,13 @@ func cloneSetAttemptReq(id uint64, baseline *attemptRec) *request {
 			cp := *(*attemptRec)(value)
 			return unsafe.Pointer(&cp), nil
 		},
-		Done: make(chan error, 1),
 	}
 }
 
 func deleteAttemptReq(id uint64) *request {
 	return &request{
-		op:   opDelete,
-		id:   keycodec.DataKeyFromUserKey(id, false),
-		Done: make(chan error, 1),
+		op: opDelete,
+		id: keycodec.DataKeyFromUserKey(id, false),
 	}
 }
 
@@ -113,11 +272,10 @@ func patchAttemptReq(id uint64, patch []schema.PatchItem, ignoreUnknown bool) *r
 		id:                 keycodec.DataKeyFromUserKey(id, false),
 		patch:              patch,
 		patchIgnoreUnknown: ignoreUnknown,
-		Done:               make(chan error, 1),
 	}
 }
 
-func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
+func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -131,7 +289,22 @@ func newPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bb
 	return ex, raw, bucket
 }
 
-func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
+func newTransparentPatchAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
+	t.Helper()
+
+	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
+	rt, err := schema.Compile(reflect.TypeFor[attemptRec](), schema.Config{Index: map[string]schema.IndexKind{}})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	ex.schema = rt
+	ex.indexed = false
+	ex.unique = UniqueContext{}
+	ex.snapshotOps = SnapshotOps{}
+	return ex, raw, bucket
+}
+
+func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -159,7 +332,7 @@ func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbo
 	return ex, raw, bucket
 }
 
-func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, seed []snapshot.BatchEntry, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
+func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, seed []snapshot.BatchEntry, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -171,7 +344,7 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, seed []snapsho
 	if len(seed) != 0 {
 		current = snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, seed)
 	}
-	manager := snapshot.NewRegistry(false)
+	manager := newTestSnapshotManager()
 	manager.Publish(current)
 	ex.schema = rt
 	ex.indexed = true
@@ -180,19 +353,16 @@ func newUniqueAttemptTestExecutor(t *testing.T, events *[]string, seed []snapsho
 		Current: manager.Current,
 	}
 	ex.snapshotOps = SnapshotOps{
-		Manager:     manager,
+		Current:     manager.Current,
 		Schema:      rt,
 		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
-		manager.Publish(snap)
-		return nil
-	}
+	setSnapshotManagerForTest(ex, manager)
 	return ex, raw, bucket
 }
 
-func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string, seedValue byte, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte, []byte) {
+func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string, seedValue byte, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte, []byte) {
 	t.Helper()
 
 	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
@@ -206,7 +376,7 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 	current := snapshot.Build(1, nil, rt, snapshot.CacheConfig{}, rt.Patch.Fields, []snapshot.BatchEntry{
 		{ID: seedIdx, New: unsafe.Pointer(&seed)},
 	})
-	manager := snapshot.NewRegistry(false)
+	manager := newTestSnapshotManager()
 	manager.Publish(current)
 
 	ex.strKey = true
@@ -218,19 +388,16 @@ func newStringAttemptTestExecutor(t *testing.T, events *[]string, seedKey string
 		Current: manager.Current,
 	}
 	ex.snapshotOps = SnapshotOps{
-		Manager:     manager,
+		Current:     manager.Current,
 		Schema:      rt,
 		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	ex.publishCommitted = func(seq uint64, op string, snap *snapshot.View) error {
-		manager.Publish(snap)
-		return nil
-	}
+	setSnapshotManagerForTest(ex, manager)
 	return ex, raw, bucket, mapBucket
 }
 
-func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Batcher, *bbolt.DB, []byte) {
+func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "wexec.db")
@@ -265,36 +432,39 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	manager := snapshot.NewRegistry(false)
-	var mu sync.RWMutex
+	manager := newTestSnapshotManager()
 	snapOps := SnapshotOps{
-		Manager:     manager,
+		Current:     manager.Current,
 		Schema:      rt,
 		CacheConfig: snapshot.CacheConfig{},
 		PatchFields: rt.Patch.Fields,
 	}
-	publishCommitted := func(seq uint64, op string, snap *snapshot.View) error {
-		manager.Publish(snap)
+	var ex *Executor
+	publish := func(snap *snapshot.View) error {
+		snapshotManagerForTest(ex).Publish(snap)
 		*events = append(*events, "publish")
 		return nil
 	}
-	ex := NewBatcher(Config{
-		MaxOps:       8,
+	ex = NewExecutor(Config{
 		StatsEnabled: true,
-		Unavailable:  func() error { return nil },
 
-		Bolt:               raw,
 		DataBucket:         bucket,
 		BucketFillPercent:  0.8,
 		RejectEmptyPayload: true,
-		PublishMu:          &mu,
 		Indexed:            true,
 		Ops:                &ops,
 		Schema:             rt,
 		SnapshotOps:        snapOps,
-		PublishCommitted:   publishCommitted,
 	})
-	ex.commit = commit
+	setSnapshotManagerForTest(ex, manager)
+	testCommitFns.Store(ex, commit)
+	testPublishFns.Store(ex, publish)
+	testBoltDBs.Store(ex, raw)
+	t.Cleanup(func() {
+		testCommitFns.Delete(ex)
+		testPublishFns.Delete(ex)
+		testBoltDBs.Delete(ex)
+	})
 	return ex, raw, bucket
 }
 
