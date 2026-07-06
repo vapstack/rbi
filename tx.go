@@ -307,6 +307,22 @@ func (tx *Tx) useWrite() error {
 	return nil
 }
 
+func (tx *Tx) usableWrite() error {
+	if tx.state == writeTxHook {
+		return tx.err
+	}
+	if err := tx.useWrite(); err != nil {
+		return err
+	}
+	if tx.state != writeTxOpen {
+		if tx.err != nil {
+			return tx.err
+		}
+		return rbierrors.ErrTxDone
+	}
+	return nil
+}
+
 func (tx *Tx) commit() error {
 	if err := tx.useWrite(); err != nil {
 		return err
@@ -402,11 +418,11 @@ func (tx *Tx) bindCollection(c *collection) error {
 	if err != nil || bound {
 		return err
 	}
+	if err = c.retain(); err != nil {
+		return err
+	}
 	if tx.root == nil {
 		tx.root = c.root
-	}
-	if err = c.retain(); err != nil {
-		return tx.terminal(err)
 	}
 	tx.collections = append(tx.collections, c)
 	return nil
@@ -432,25 +448,13 @@ func (tx *Tx) usableCollection(p *collection) (bool, error) {
 			}
 		}
 		if tx.root != p.root {
-			return false, tx.terminal(rbierrors.ErrStoreMismatch)
+			return false, rbierrors.ErrStoreMismatch
 		}
 	}
 	if err := p.unavailableErr(); err != nil {
-		return false, tx.terminal(err)
+		return false, err
 	}
 	return false, nil
-}
-
-func (tx *Tx) terminal(err error) error {
-	if tx.state == writeTxHook {
-		tx.err = err
-		return err
-	}
-	tx.err = err
-	tx.state = writeTxTerminal
-	tx.cancelBatches()
-	tx.releaseCollections()
-	return err
 }
 
 func (tx *Tx) generatedDepth() uint8 {
@@ -465,8 +469,7 @@ func (tx *Tx) checkGeneratedCollection(c *collection) error {
 		return tx.err
 	}
 	if tx.root != c.root {
-		tx.err = rbierrors.ErrStoreMismatch
-		return tx.err
+		return rbierrors.ErrStoreMismatch
 	}
 	return nil
 }
@@ -476,8 +479,7 @@ func (tx *Tx) generatedCollectionSegment(c *collection) (*writeSegment, error) {
 		return nil, err
 	}
 	if tx.hookDepth >= maxGeneratedWriteDepth {
-		tx.err = rbierrors.ErrGeneratedWriteDepth
-		return nil, tx.err
+		return nil, rbierrors.ErrGeneratedWriteDepth
 	}
 	unit := tx.hookUnit
 
@@ -492,7 +494,6 @@ func (tx *Tx) generatedCollectionSegment(c *collection) (*writeSegment, error) {
 	}
 	if !found {
 		if err := c.retain(); err != nil {
-			tx.err = err
 			return nil, err
 		}
 		unit.generatedCollections = append(unit.generatedCollections, c)

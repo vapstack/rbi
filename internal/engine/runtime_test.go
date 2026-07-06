@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -18,7 +19,6 @@ import (
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
@@ -32,6 +32,14 @@ type runtimeTestRec struct {
 type runtimeTestNoIndexRec struct {
 	Name string
 }
+
+var runtimeTestCodec = func() *schema.Schema {
+	rt, err := schema.Compile(reflect.TypeFor[runtimeTestRec](), schema.Config{})
+	if err != nil {
+		panic(err)
+	}
+	return rt
+}()
 
 func openRuntimeTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
 	t.Helper()
@@ -54,11 +62,8 @@ func openRuntimeTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
 func putRuntimeTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec runtimeTestRec) {
 	t.Helper()
 
-	data, err := msgpack.Marshal(&rec)
-	if err != nil {
-		t.Fatalf("msgpack.Marshal: %v", err)
-	}
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	data := encodeRuntimeTestRec(&rec)
+	if err := db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucket)
 		var key [8]byte
 		return b.Put(keycodec.U64BytesWithBuf(id, &key), data)
@@ -70,12 +75,9 @@ func putRuntimeTestRec(t *testing.T, db *bbolt.DB, bucket []byte, id uint64, rec
 func putRuntimeTestStringRec(t *testing.T, db *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec runtimeTestRec) uint64 {
 	t.Helper()
 
-	data, err := msgpack.Marshal(&rec)
-	if err != nil {
-		t.Fatalf("msgpack.Marshal: %v", err)
-	}
+	data := encodeRuntimeTestRec(&rec)
 	var idx uint64
-	if err = db.Update(func(tx *bbolt.Tx) error {
+	if err := db.Update(func(tx *bbolt.Tx) error {
 		m := tx.Bucket(mapBucket)
 		var err error
 		idx, err = m.NextSequence()
@@ -161,10 +163,16 @@ func newRuntimeTestRuntime(t *testing.T, strKey bool) *Index {
 
 func decodeRuntimeTestRec(data []byte) (unsafe.Pointer, error) {
 	rec := new(runtimeTestRec)
-	if err := msgpack.Unmarshal(data, rec); err != nil {
+	if err := runtimeTestCodec.Codec.Decode(data, unsafe.Pointer(rec)); err != nil {
 		return nil, err
 	}
 	return unsafe.Pointer(rec), nil
+}
+
+func encodeRuntimeTestRec(rec *runtimeTestRec) []byte {
+	var buf bytes.Buffer
+	runtimeTestCodec.Codec.Encode(unsafe.Pointer(rec), &buf)
+	return slices.Clone(buf.Bytes())
 }
 
 func releaseRuntimeTestRec(ptr unsafe.Pointer) {
@@ -962,7 +970,7 @@ func TestRuntimeStoreLoadRoundTrip(t *testing.T) {
 	r := newRuntimeTestRuntime(t, false)
 	buildRuntimeTestIndex(t, r, db, bucket)
 	snap := r.CurrentSnapshot()
-	r.RefreshPlannerStatsOnSnapshot(snap, func() error { return nil })
+	_ = r.RefreshPlannerStatsOnSnapshot(snap, func() error { return nil })
 
 	file := filepath.Join(t.TempDir(), "runtime.rbi")
 	if err := r.StoreIndexSnapshot(file, snap.Seq, [persist.UIDLen]byte{}, snap); err != nil {

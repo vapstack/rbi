@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vapstack/rbi/rbierrors"
 	berrors "go.etcd.io/bbolt/errors"
@@ -70,37 +71,6 @@ func OnChange[K ~string | ~uint64, V any](fn func(tx *Tx, key K, oldValue, newVa
 	}
 }
 
-// CloneFunc registers a value cloning function.
-//
-// The function receives the write key and source value, and must return a full
-// independent copy. The copy must not share mutable state with the input, and
-// must be non-nil when the input is non-nil.
-//
-// A custom clone function is useful when values only become encodable after
-// OnChange normalizes them, or when the caller can clone value more cheaply
-// than RBI's fallback snapshotting.
-//
-// The function must not mutate the input, must be deterministic, must not have
-// external side effects, and must not call methods on the Collection.
-//
-// When passed to Open, CloneFunc becomes the default for writes.
-// If CloneFunc is passed more than once, the last non-nil function is used.
-func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K, V] {
-	if fn == nil {
-		return nil
-	}
-
-	strKey := reflect.TypeFor[K]().Kind() == reflect.String
-	f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-		cloned := fn(keycodec.UserKeyFromDataKey[K](key, strKey), (*V)(value))
-		if cloned == nil {
-			return nil, rbierrors.ErrCloneNil
-		}
-		return unsafe.Pointer(cloned), nil
-	}
-	return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
-}
-
 // PatchStrict configures Patch to return an error if the patch contains
 // unknown field names.
 //
@@ -115,35 +85,10 @@ func PatchStrict[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
 type execOptions[K ~string | ~uint64, V any] struct {
 	onChange       []wexec.OnChangeHook
 	onChangeInline [1]wexec.OnChangeHook
-	cloneValue     wexec.CloneFunc
 	patchStrict    bool
 }
 
-func defaultCloneValue[V any]() func(*V) *V {
-	method, ok := reflect.TypeFor[*V]().MethodByName("Clone")
-	if !ok {
-		return nil
-	}
-	clone, ok := method.Func.Interface().(func(*V) *V)
-	if !ok {
-		return nil
-	}
-	return clone
-}
-
 func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOptions[K, V] {
-	if cfg.cloneValue == nil {
-		clone := defaultCloneValue[V]()
-		if clone != nil {
-			cfg.cloneValue = func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-				cloned := clone((*V)(value))
-				if cloned == nil {
-					return nil, rbierrors.ErrCloneNil
-				}
-				return unsafe.Pointer(cloned), nil
-			}
-		}
-	}
 	if len(cfg.onChange) > 0 {
 		cfg.onChange = append([]wexec.OnChangeHook(nil), cfg.onChange...)
 		cfg.onChange = cfg.onChange[:len(cfg.onChange):len(cfg.onChange)]
@@ -163,19 +108,15 @@ func (c *Collection[K, V]) resolveExecOptions(opts []ExecOption[K, V]) execOptio
 }
 
 // Set queues newVal to be stored under the given id.
-//
-// If value type implements Codec, that codec is used for encoding;
-// otherwise msgpack is used.
 func (c *Collection[K, V]) Set(tx *Tx, id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if tx == nil {
 		return rbierrors.ErrNilTx
 	}
-	seg, err := tx.collectionSegment(c.collection)
-	if err != nil {
+	if err := tx.usableWrite(); err != nil {
 		return err
 	}
 	if newVal == nil {
-		return tx.terminal(rbierrors.ErrNilValue)
+		return rbierrors.ErrNilValue
 	}
 
 	cfg := c.execOptions
@@ -185,10 +126,30 @@ func (c *Collection[K, V]) Set(tx *Tx, id K, newVal *V, execOpts ...ExecOption[K
 
 	key := keycodec.DataKeyFromUserKey(id, c.strKey)
 	if c.strKey && key.String() == "" {
-		return tx.terminal(berrors.ErrKeyRequired)
+		return berrors.ErrKeyRequired
 	}
-	if err = seg.ops.AddSet(key, unsafe.Pointer(newVal), cfg.onChange, cfg.cloneValue, tx.generatedDepth()); err != nil {
-		return tx.terminal(err)
+	segmentCount := len(tx.unit.segments)
+	collectionCount := len(tx.collections)
+	rootWasNil := tx.root == nil
+	seg, err := tx.collectionSegment(c.collection)
+	if err != nil {
+		return err
+	}
+	if err = seg.ops.AddSet(key, unsafe.Pointer(newVal), cfg.onChange, tx.generatedDepth()); err != nil {
+		if tx.state == writeTxOpen && len(tx.unit.segments) > segmentCount && tx.unit.segments[segmentCount].work == 0 {
+			tx.unit.segments[segmentCount].ops.Cancel()
+			clear(tx.unit.segments[segmentCount:])
+			tx.unit.segments = tx.unit.segments[:segmentCount]
+			for i := len(tx.collections) - 1; i >= collectionCount; i-- {
+				tx.collections[i].releaseRetain()
+			}
+			clear(tx.collections[collectionCount:])
+			tx.collections = tx.collections[:collectionCount]
+			if rootWasNil {
+				tx.root = nil
+			}
+		}
+		return err
 	}
 	seg.work++
 	return nil
@@ -196,29 +157,24 @@ func (c *Collection[K, V]) Set(tx *Tx, id K, newVal *V, execOpts ...ExecOption[K
 
 // Patch queues a partial update for the value stored under the given id.
 //
-// Only fields listed in patch are updated.
+// Only fields listed in the patch are updated.
 // Unknown field names are ignored unless PatchStrict is passed,
 // in which case Patch returns an error.
 //
 // Patch may update indexed and non-indexed fields.
 // Each patch value is converted to the target field type when possible.
-// If any conversion fails, Commit/Update returns an error
-// and the write is not committed.
+// If any conversion fails, Patch returns an error.
 //
 // If the provided id does not exist, Patch is a no-op.
 func (c *Collection[K, V]) Patch(tx *Tx, id K, patch []Field, execOpts ...ExecOption[K, V]) error {
 	if tx == nil {
 		return rbierrors.ErrNilTx
 	}
-	if len(patch) == 0 {
-		if _, err := tx.usableCollection(c.collection); err != nil {
-			return err
-		}
-		return nil
-	}
-	seg, err := tx.collectionSegment(c.collection)
-	if err != nil {
+	if err := tx.usableWrite(); err != nil {
 		return err
+	}
+	if len(patch) == 0 {
+		return nil
 	}
 	cfg := c.execOptions
 	if len(execOpts) != 0 {
@@ -226,16 +182,23 @@ func (c *Collection[K, V]) Patch(tx *Tx, id K, patch []Field, execOpts ...ExecOp
 	}
 	ignoreUnknown := !cfg.patchStrict
 
-	if !ignoreUnknown {
-		if err := c.validatePatchFieldNames(patch); err != nil {
-			return tx.terminal(err)
-		}
-	}
 	key := keycodec.DataKeyFromUserKey(id, c.strKey)
 	if c.strKey && key.String() == "" {
-		return tx.terminal(berrors.ErrKeyRequired)
+		return berrors.ErrKeyRequired
 	}
-	patchItems := patchItemsForWrite(patch)
+	patchItems, err := c.patchItemsForWrite(patch, ignoreUnknown)
+	if err != nil {
+		return err
+	}
+	if len(patchItems) == 0 {
+		schema.ReleasePatchItemSlice(patchItems)
+		return nil
+	}
+	seg, err := tx.collectionSegment(c.collection)
+	if err != nil {
+		schema.ReleasePatchItemSlice(patchItems)
+		return err
+	}
 	seg.ops.AddPatch(key, patchItems, ignoreUnknown, cfg.onChange, tx.generatedDepth())
 	seg.work++
 	return nil
@@ -248,8 +211,7 @@ func (c *Collection[K, V]) Delete(tx *Tx, id K, execOpts ...ExecOption[K, V]) er
 	if tx == nil {
 		return rbierrors.ErrNilTx
 	}
-	seg, err := tx.collectionSegment(c.collection)
-	if err != nil {
+	if err := tx.usableWrite(); err != nil {
 		return err
 	}
 	cfg := c.execOptions
@@ -259,7 +221,11 @@ func (c *Collection[K, V]) Delete(tx *Tx, id K, execOpts ...ExecOption[K, V]) er
 
 	key := keycodec.DataKeyFromUserKey(id, c.strKey)
 	if c.strKey && key.String() == "" {
-		return tx.terminal(berrors.ErrKeyRequired)
+		return berrors.ErrKeyRequired
+	}
+	seg, err := tx.collectionSegment(c.collection)
+	if err != nil {
+		return err
 	}
 	seg.ops.AddDelete(key, cfg.onChange, tx.generatedDepth())
 	seg.work++

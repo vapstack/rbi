@@ -212,8 +212,7 @@ type fieldCollector struct {
 }
 
 type Config struct {
-	Index       map[string]IndexKind
-	CustomCodec bool
+	Index map[string]IndexKind
 }
 
 type Schema struct {
@@ -226,6 +225,8 @@ type Schema struct {
 	Measures         []MeasureFieldAccessor
 	MeasuresByName   MeasureFieldMap
 	Patch            PatchRuntime
+	Clone            CloneRuntime
+	Codec            CodecRuntime
 	HasUnique        bool
 }
 
@@ -275,9 +276,12 @@ type MeasureFieldAccessor struct {
 }
 
 type PatchFieldAccessor struct {
-	Field      *Field
-	ValueEqual PatchValueEqualFn
-	CopyValue  PatchValueCopyFn
+	Field              *Field
+	Type               reflect.Type
+	ValueEqual         PatchValueEqualFn
+	CopyValue          PatchValueCopyFn
+	CopyFieldValue     PatchValueCopyFn
+	CopyConvertedValue PatchValueCopyFn
 }
 
 type PatchItem struct {
@@ -286,12 +290,19 @@ type PatchItem struct {
 }
 
 type PatchRuntime struct {
-	Fields map[string]*Field
-	Access []PatchFieldAccessor
-	typ    reflect.Type
+	Fields       map[string]*Field
+	AccessByName map[string]PatchFieldAccessor
+	Access       []PatchFieldAccessor
+	Flat         bool
+	typ          reflect.Type
 }
 
 func Compile(vtype reflect.Type, config Config) (*Schema, error) {
+	clone, err := compileClone(vtype)
+	if err != nil {
+		return nil, err
+	}
+
 	collector := fieldCollector{config: config}
 	if err := collector.populateFields(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
@@ -369,6 +380,11 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		}
 	}
 
+	codec, err := compileCodec(vtype)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Schema{
 		Fields:           collector.indexFields,
 		MeasureFields:    collector.measureFields,
@@ -379,6 +395,8 @@ func Compile(vtype reflect.Type, config Config) (*Schema, error) {
 		Measures:         measureAccess,
 		MeasuresByName:   measureMap,
 		Patch:            patch,
+		Clone:            clone,
+		Codec:            codec,
 		HasUnique:        collector.hasUnique,
 	}, nil
 }
@@ -670,7 +688,7 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 	if err := ValidateIndexKind(indexKind); err != nil {
 		return fmt.Errorf("field %v: %w", sf.Name, err)
 	}
-	f, err := buildFieldDefinition(sf, index, indexKind, collector.config.CustomCodec)
+	f, err := buildFieldDefinition(sf, index, indexKind)
 	if err != nil {
 		return err
 	}
@@ -697,7 +715,7 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 	return nil
 }
 
-func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind, customCodec bool) (*Field, error) {
+func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind) (*Field, error) {
 	dbname := sf.Name
 	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 		dbname = dbTag
@@ -716,25 +734,23 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 	)
 
 	useVI = sf.Type.Implements(viType)
-	if !customCodec && isNativeTimeWrapperType(sf.Type) {
+	if isNativeTimeWrapperType(sf.Type) {
 		// ValueIndexer only defines index-key projection.
-		// Record snapshotting depends on the value codec,
-		// and msgpack supports only exact time.Time.
-		return nil, fmt.Errorf("field %v has unsupported named type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, sf.Type)
+		// Record snapshotting depends on the value codec, which supports only exact time.Time.
+		return nil, fmt.Errorf("field %v has unsupported named time type %v, use time.Time directly", sf.Name, sf.Type)
 	}
+
 	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
 	if useVI {
 		if kind == reflect.Interface {
 			return nil, fmt.Errorf("field %v has unsupported ValueIndexer interface type %v, use a concrete ValueIndexer type", sf.Name, sf.Type)
 		}
-		if !customCodec {
-			valueType := sf.Type
-			if valueType.Kind() == reflect.Pointer {
-				valueType = valueType.Elem()
-			}
-			if valueType.Kind() == reflect.Slice && isNativeTimeWrapperType(valueType.Elem()) {
-				return nil, fmt.Errorf("field %v has unsupported named element type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, valueType.Elem())
-			}
+		valueType := sf.Type
+		if valueType.Kind() == reflect.Pointer {
+			valueType = valueType.Elem()
+		}
+		if valueType.Kind() == reflect.Slice && isNativeTimeWrapperType(valueType.Elem()) {
+			return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, valueType.Elem())
 		}
 		if kind == reflect.Pointer && sf.Type.Elem().Implements(viType) {
 			ptr = true
@@ -775,9 +791,9 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		elem := sf.Type.Elem()
 
 		// ValueIndexer only defines index-key projection. Record snapshotting still
-		// depends on the value codec, and msgpack preserves only exact time.Time.
-		if !customCodec && isNativeTimeWrapperType(elem) {
-			return nil, fmt.Errorf("field %v has unsupported named element type %v which cannot be encoded by msgpack, use time.Time directly, or wrap it in a struct with an exported field", sf.Name, elem)
+		// depends on the value codec, which supports only exact time.Time.
+		if isNativeTimeWrapperType(elem) {
+			return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, elem)
 		}
 
 		kind = elem.Kind()
@@ -1080,10 +1096,28 @@ func makePatchRuntime(vtype reflect.Type, patchIndexed map[string]struct{}) (Pat
 		}
 	}
 	access := makePatchFieldAccessors(vtype, patchFields)
+	accessByName := make(map[string]PatchFieldAccessor, len(patchMap))
+	for name, f := range patchMap {
+		for i := range access {
+			if access[i].Field == f {
+				accessByName[name] = access[i]
+				break
+			}
+		}
+	}
+	flat := true
+	for i := range access {
+		if len(access[i].Field.Index) != 1 {
+			flat = false
+			break
+		}
+	}
 	return PatchRuntime{
-		Fields: patchMap,
-		Access: access,
-		typ:    vtype,
+		Fields:       patchMap,
+		AccessByName: accessByName,
+		Access:       access,
+		Flat:         flat,
+		typ:          vtype,
 	}, nil
 }
 
@@ -1106,10 +1140,15 @@ func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) []PatchFieldAc
 		}
 		prev = f
 
-		acc := PatchFieldAccessor{Field: f}
 		fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
+		acc := PatchFieldAccessor{Field: f, Type: fieldType}
 		acc.ValueEqual = buildPatchValueEqualFn(f, fieldType, offset)
 		acc.CopyValue = buildPatchValueCopyFn(f, fieldType, offset)
+		acc.CopyFieldValue = buildPatchValueCopyFn(f, fieldType, 0)
+		acc.CopyConvertedValue = acc.CopyFieldValue
+		if patchCanReturnConvertedValue(fieldType) {
+			acc.CopyConvertedValue = reflectPatchValueCopy(fieldType, 0)
+		}
 
 		access = append(access, acc)
 	}

@@ -25,15 +25,13 @@ func (patch *PatchRuntime) Apply(ptr unsafe.Pointer, items []PatchItem, ignoreUn
 		}
 
 		if p.Value == nil {
-			switch fv.Kind() {
-			case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface, reflect.Func, reflect.Chan:
+			if isReflectNillableKind(fv.Kind()) {
 				if !fv.IsNil() {
 					fv.Set(reflect.Zero(fv.Type()))
 				}
-			default:
-				return fmt.Errorf("field %v: cannot assign nil to non-nillable field", p.Name)
+				continue
 			}
-			continue
+			return fmt.Errorf("field %v: cannot assign nil to non-nillable field", p.Name)
 		}
 
 		if err := setReflectValue(fv, p.Value); err != nil {
@@ -41,6 +39,84 @@ func (patch *PatchRuntime) Apply(ptr unsafe.Pointer, items []PatchItem, ignoreUn
 		}
 	}
 	return nil
+}
+
+func (patch *PatchRuntime) ApplyCopied(ptr unsafe.Pointer, items []PatchItem, ignoreUnknown bool) error {
+	rv := reflect.NewAt(patch.typ, ptr).Elem()
+
+	for _, p := range items {
+		acc, ok := patch.AccessByName[p.Name]
+		if !ok {
+			if ignoreUnknown {
+				continue
+			}
+			return fmt.Errorf("cannot patch field %v: field information is missing", p.Name)
+		}
+
+		fv := rv.FieldByIndex(acc.Field.Index)
+		if !fv.CanSet() {
+			continue
+		}
+
+		if p.Value == nil {
+			if isReflectNillableKind(fv.Kind()) {
+				if !fv.IsNil() {
+					fv.Set(reflect.Zero(fv.Type()))
+				}
+				continue
+			}
+			return fmt.Errorf("field %v: cannot assign nil to non-nillable field", p.Name)
+		}
+
+		sv := reflect.ValueOf(p.Value)
+		if !sv.Type().AssignableTo(acc.Type) {
+			return fmt.Errorf("field %v: copied value type %v is not assignable to %v", p.Name, sv.Type(), acc.Type)
+		}
+		fv.Set(sv)
+	}
+	return nil
+}
+
+func (patch *PatchRuntime) CopyItemValue(name string, value any, ignoreUnknown bool) (any, bool, error) {
+	acc, ok := patch.AccessByName[name]
+	if !ok {
+		if ignoreUnknown {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("cannot patch field %v: field information is missing", name)
+	}
+
+	if value == nil {
+		if !isReflectNillableKind(acc.Type.Kind()) {
+			return nil, true, fmt.Errorf("field %v: cannot assign nil to non-nillable field", name)
+		}
+		return nil, true, nil
+	}
+
+	if sv := reflect.ValueOf(value); sv.Type().AssignableTo(acc.Type) {
+		switch acc.Type.Kind() {
+		case reflect.Bool,
+			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64,
+			reflect.String:
+			return value, true, nil
+
+		case reflect.Struct:
+			if isNativeTimeScalarType(acc.Type) {
+				return value, true, nil
+			}
+		}
+		fv := reflect.New(acc.Type).Elem()
+		fv.Set(sv)
+		return acc.CopyFieldValue(unsafe.Pointer(fv.UnsafeAddr())), true, nil
+	}
+
+	fv := reflect.New(acc.Type).Elem()
+	if err := setReflectValue(fv, value); err != nil {
+		return nil, true, fmt.Errorf("field %v: %w", name, err)
+	}
+	return acc.CopyConvertedValue(unsafe.Pointer(fv.UnsafeAddr())), true, nil
 }
 
 func (patch *PatchRuntime) ValidateNames(items []PatchItem) error {
@@ -150,6 +226,15 @@ func setReflectValue(fv reflect.Value, val any) error {
 	}
 
 	return fmt.Errorf("type mismatch: cannot convert %v to %v", sv.Type(), fv.Type())
+}
+
+func isReflectNillableKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface, reflect.Func, reflect.Chan:
+		return true
+	default:
+		return false
+	}
 }
 
 func setReflectNumericValue(fv, sv reflect.Value, srcKind, dstKind reflect.Kind) (bool, error) {

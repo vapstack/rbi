@@ -49,6 +49,35 @@ func TestStringWritesRejectEmptyKey(t *testing.T) {
 	}
 }
 
+func TestStringWriteEmptyKeyDoesNotTerminalTx(t *testing.T) {
+	c, _ := openTempStringCollection(t)
+
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Set(tx, "", &Rec{Name: "bad"}); !errors.Is(err, berrors.ErrKeyRequired) {
+		t.Fatalf("Set empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := c.Patch(tx, "", []Field{{Name: "name", Value: "bad"}}); !errors.Is(err, berrors.ErrKeyRequired) {
+		t.Fatalf("Patch empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := c.Delete(tx, ""); !errors.Is(err, berrors.ErrKeyRequired) {
+		t.Fatalf("Delete empty key error = %v, want ErrKeyRequired", err)
+	}
+	if err := c.Set(tx, "ok", &Rec{Name: "ok"}); err != nil {
+		t.Fatalf("Set after empty key: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after empty key: %v", err)
+	}
+	got, err := readGet(c, "ok")
+	if err != nil {
+		t.Fatalf("Get ok: %v", err)
+	}
+	if got == nil || got.Name != "ok" {
+		t.Fatalf("stored record after empty key error: %#v", got)
+	}
+}
+
 func TestCloseWaitsForSubmittedWrite(t *testing.T) {
 	c, _ := openTempUint64Collection(t, Options{BatchSoftLimit: 1})
 
@@ -332,6 +361,29 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 	}
 
 	assertNoFutureSnapshotRefs(t, c)
+}
+
+func TestSetNilValueDoesNotTerminalTx(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Set(tx, 1, nil); !errors.Is(err, rbierrors.ErrNilValue) {
+		t.Fatalf("Set nil value error = %v, want ErrNilValue", err)
+	}
+	if err := c.Set(tx, 1, &Rec{Name: "ok", Age: 1}); err != nil {
+		t.Fatalf("Set after nil value: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after nil value: %v", err)
+	}
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "ok" || got.Age != 1 {
+		t.Fatalf("stored record after nil value error: %#v", got)
+	}
 }
 
 func TestMultiSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {

@@ -1,10 +1,12 @@
 package schema
 
 import (
+	"reflect"
 	"testing"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -263,5 +265,68 @@ func TestBuildFieldStateReleaseClearsLenMap(t *testing.T) {
 	state.Release()
 	if state.lenMap != nil {
 		t.Fatalf("expected len map to be cleared")
+	}
+}
+
+func TestBuildFieldStateHotPaths(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	rec := schemaTestAccessorRec{
+		Name:   "alice",
+		Scores: []int64{5, 7, 5},
+	}
+	ptr := unsafe.Pointer(&rec)
+
+	stringLocal := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
+	rt.IndexedByName["name"].WriteBuild(ptr, BuildSink{State: &stringLocal, Idx: 1})
+	stringState := NewBuildFieldState(false)
+	stringLocal.FlushRegularInto(stringState)
+	stringStorage := stringState.MaterializeStorage()
+	defer stringStorage.Release()
+	if !schemaTestIndexViewContains(stringStorage, "alice", 1) {
+		t.Fatal("string build materialization lost posting")
+	}
+
+	fixedLocal := NewBuildFieldLocalState(true, true, BuildFieldRunTargetEntries)
+	rt.IndexedByName["scores"].WriteBuild(ptr, BuildSink{State: &fixedLocal, Idx: 2})
+	fixedState := NewBuildFieldState(true)
+	fixedLocal.FlushAllInto(fixedState)
+	fixedStorage := fixedState.MaterializeStorage()
+	defer fixedStorage.Release()
+	if !schemaTestIndexViewContainsKey(fixedStorage, keycodec.OrderedInt64Key(5), 2) {
+		t.Fatal("fixed build materialization lost posting")
+	}
+	universe := (posting.List{}).BuildAdded(2)
+	lenStorage, _ := fixedState.MaterializeLenStorage(universe)
+	defer lenStorage.Release()
+	if !schemaTestIndexViewContainsKey(lenStorage, 2, 2) {
+		t.Fatal("len build materialization lost posting")
+	}
+
+	nilLocal := NewBuildFieldLocalState(true, false, BuildFieldRunTargetEntries)
+	rt.IndexedByName["maybe"].WriteBuild(ptr, BuildSink{State: &nilLocal, Idx: 3})
+	nilState := NewBuildFieldState(false)
+	nilLocal.FlushAllInto(nilState)
+	nilStorage := nilState.MaterializeNilStorage()
+	defer nilStorage.Release()
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 3) {
+		t.Fatal("nil build materialization lost posting")
+	}
+
+	flushLocal := NewBuildFieldLocalState(false, false, BuildFieldRunTargetEntries)
+	for i := 0; i < BuildFieldRunTargetEntries; i++ {
+		flushLocal.addValue(keycodec.U64ByteString(uint64(i)), uint64(i+10))
+	}
+	if !flushLocal.ShouldFlushRegular() {
+		t.Fatal("string local state should be ready to flush")
+	}
+	flushFixed := NewBuildFieldLocalState(true, false, BuildFieldRunTargetEntries)
+	for i := 0; i < BuildFieldRunTargetEntries; i++ {
+		flushFixed.addFixedValue(uint64(i), uint64(i+10))
+	}
+	if !flushFixed.ShouldFlushRegular() {
+		t.Fatal("fixed local state should be ready to flush")
 	}
 }

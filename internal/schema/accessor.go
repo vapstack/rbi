@@ -211,6 +211,41 @@ func floatPatchValueEqual[T floatFieldValue](offset uintptr, ptr bool) PatchValu
 	}
 }
 
+func timePatchValueEqual(offset uintptr, ptr bool) PatchValueEqualFn {
+	if ptr {
+		return func(v1, v2 unsafe.Pointer) bool {
+			p1 := ptrFieldValue[time.Time](v1, offset)
+			p2 := ptrFieldValue[time.Time](v2, offset)
+			if p1 == nil || p2 == nil {
+				return p1 == p2
+			}
+			return p1.Equal(*p2)
+		}
+	}
+	return func(v1, v2 unsafe.Pointer) bool {
+		return scalarFieldValue[time.Time](v1, offset).Equal(scalarFieldValue[time.Time](v2, offset))
+	}
+}
+
+func timeSlicePatchValueEqual(offset uintptr) PatchValueEqualFn {
+	return func(v1, v2 unsafe.Pointer) bool {
+		lhs := sliceFieldValue[time.Time](v1, offset)
+		rhs := sliceFieldValue[time.Time](v2, offset)
+		if (lhs == nil) != (rhs == nil) {
+			return false
+		}
+		if len(lhs) != len(rhs) {
+			return false
+		}
+		for i := range lhs {
+			if !lhs[i].Equal(rhs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
 func slicePatchValueEqual[T comparable](offset uintptr) PatchValueEqualFn {
 	return func(v1, v2 unsafe.Pointer) bool {
 		return slicesEqualExact(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
@@ -257,26 +292,54 @@ func reflectSlicePatchValueCopy(fieldType reflect.Type, offset uintptr) PatchVal
 	}
 }
 
+func reflectPatchValueCopy(fieldType reflect.Type, offset uintptr) PatchValueCopyFn {
+	return func(root unsafe.Pointer) any {
+		return reflect.NewAt(fieldType, unsafe.Add(root, offset)).Elem().Interface()
+	}
+}
+
 func scalarPatchValueCopy[T any](offset uintptr) PatchValueCopyFn {
 	return func(root unsafe.Pointer) any {
 		return scalarFieldValue[T](root, offset)
 	}
 }
 
-func typeHasMutableReferencePayload(t reflect.Type) bool {
+func patchCanReturnConvertedValue(t reflect.Type) bool {
 	switch t.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+	case reflect.Pointer, reflect.Slice:
+		return patchWholeValueCopySafe(t.Elem())
+	default:
+		return false
+	}
+}
+
+func patchWholeValueCopySafe(t reflect.Type) bool {
+	if t == nativeTimeType {
 		return true
+	}
+	switch t.Kind() {
+
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64, reflect.String:
+		return true
+
 	case reflect.Array:
-		return typeHasMutableReferencePayload(t.Elem())
+		return patchWholeValueCopySafe(t.Elem())
+
 	case reflect.Struct:
 		for i := 0; i < t.NumField(); i++ {
-			if typeHasMutableReferencePayload(t.Field(i).Type) {
-				return true
+			sf := t.Field(i)
+			if !sf.IsExported() || !patchWholeValueCopySafe(sf.Type) {
+				return false
 			}
 		}
+		return true
+
+	default:
+		return false
 	}
-	return false
 }
 
 func typeSupportsPatchFloatEqual(t reflect.Type) bool {
@@ -285,6 +348,9 @@ func typeSupportsPatchFloatEqual(t reflect.Type) bool {
 }
 
 func patchFloatEqualType(t reflect.Type) (bool, bool) {
+	if t == nativeTimeType {
+		return true, false
+	}
 	switch t.Kind() {
 	case reflect.Bool,
 		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -306,7 +372,11 @@ func patchFloatEqualType(t reflect.Type) (bool, bool) {
 	case reflect.Struct:
 		needs := false
 		for i := 0; i < t.NumField(); i++ {
-			ok, fieldNeeds := patchFloatEqualType(t.Field(i).Type)
+			sf := t.Field(i)
+			if !sf.IsExported() {
+				continue
+			}
+			ok, fieldNeeds := patchFloatEqualType(sf.Type)
 			if !ok {
 				return false, false
 			}
@@ -327,6 +397,9 @@ func reflectPatchValueEqual(fieldType reflect.Type, offset uintptr) PatchValueEq
 }
 
 func reflectPatchValuesEqual(v1, v2 reflect.Value) bool {
+	if v1.Type() == nativeTimeType {
+		return v1.Interface().(time.Time).Equal(v2.Interface().(time.Time))
+	}
 	switch v1.Kind() {
 	case reflect.Bool:
 		return v1.Bool() == v2.Bool()
@@ -351,11 +424,104 @@ func reflectPatchValuesEqual(v1, v2 reflect.Value) bool {
 		return reflectPatchFloatSlicesEqual(v1, v2)
 	case reflect.Struct:
 		for i := 0; i < v1.NumField(); i++ {
+			if !v1.Type().Field(i).IsExported() {
+				continue
+			}
 			if !reflectPatchValuesEqual(v1.Field(i), v2.Field(i)) {
 				return false
 			}
 		}
 		return true
+	default:
+		return false
+	}
+}
+
+func reflectPatchCloneValueEqual(fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
+	return func(v1, v2 unsafe.Pointer) bool {
+		return reflectPatchCloneValuesEqual(
+			reflect.NewAt(fieldType, unsafe.Add(v1, offset)).Elem(),
+			reflect.NewAt(fieldType, unsafe.Add(v2, offset)).Elem(),
+		)
+	}
+}
+
+func reflectPatchCloneValuesEqual(v1, v2 reflect.Value) bool {
+	if v1.Type() == nativeTimeType {
+		return v1.Interface().(time.Time).Equal(v2.Interface().(time.Time))
+	}
+	switch v1.Kind() {
+
+	case reflect.Bool:
+		return v1.Bool() == v2.Bool()
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v1.Int() == v2.Int()
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v1.Uint() == v2.Uint()
+
+	case reflect.String:
+		return v1.String() == v2.String()
+
+	case reflect.Float32, reflect.Float64:
+		return floatsEqualForIndex(v1.Float(), v2.Float())
+
+	case reflect.Array:
+		for i := 0; i < v1.Len(); i++ {
+			if !reflectPatchCloneValuesEqual(v1.Index(i), v2.Index(i)) {
+				return false
+			}
+		}
+		return true
+
+	case reflect.Struct:
+		for i := 0; i < v1.NumField(); i++ {
+			if !v1.Type().Field(i).IsExported() {
+				continue
+			}
+			if !reflectPatchCloneValuesEqual(v1.Field(i), v2.Field(i)) {
+				return false
+			}
+		}
+		return true
+
+	case reflect.Pointer:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() == v2.IsNil()
+		}
+		return reflectPatchCloneValuesEqual(v1.Elem(), v2.Elem())
+
+	case reflect.Slice:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() == v2.IsNil()
+		}
+		if v1.Len() != v2.Len() {
+			return false
+		}
+		for i := 0; i < v1.Len(); i++ {
+			if !reflectPatchCloneValuesEqual(v1.Index(i), v2.Index(i)) {
+				return false
+			}
+		}
+		return true
+
+	case reflect.Map:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() == v2.IsNil()
+		}
+		if v1.Len() != v2.Len() {
+			return false
+		}
+		iter := v1.MapRange()
+		for iter.Next() {
+			rv := v2.MapIndex(iter.Key())
+			if !rv.IsValid() || !reflectPatchCloneValuesEqual(iter.Value(), rv) {
+				return false
+			}
+		}
+		return true
+
 	default:
 		return false
 	}
@@ -1696,9 +1862,16 @@ func floatSliceAccessorBundle[T floatFieldValue](offset uintptr) fieldAccessorBu
 }
 
 func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
+	if fieldType == nativeTimeType {
+		return timePatchValueEqual(offset, false)
+	}
+	if fieldType == nativeTimePtrType {
+		return timePatchValueEqual(offset, true)
+	}
+
 	if f.UseVI {
 		if f.Slice {
-			return nil
+			return reflectPatchCloneValueEqual(fieldType, offset)
 		}
 		switch f.Kind {
 		case reflect.String:
@@ -1730,10 +1903,13 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 		case reflect.Float64:
 			return floatPatchValueEqual[float64](offset, f.Ptr)
 		}
-		return nil
+		return reflectPatchCloneValueEqual(fieldType, offset)
 	}
 
 	if f.Slice && fieldType.Kind() == reflect.Slice {
+		if fieldType == reflect.TypeFor[[]time.Time]() {
+			return timeSlicePatchValueEqual(offset)
+		}
 		switch f.Kind {
 		case reflect.String:
 			return slicePatchValueEqual[string](offset)
@@ -1770,7 +1946,7 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 			}
 			return reflectFloatSlicePatchValueEqual(fieldType, offset)
 		}
-		return nil
+		return reflectPatchCloneValueEqual(fieldType, offset)
 	}
 
 	switch f.Kind {
@@ -1806,17 +1982,15 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 		if typeSupportsPatchFloatEqual(fieldType) {
 			return reflectPatchValueEqual(fieldType, offset)
 		}
-		return nil
+		return reflectPatchCloneValueEqual(fieldType, offset)
 	}
 }
 
 func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueCopyFn {
-	if f.UseVI {
-		return nil
-	}
-
 	if !f.Ptr && !f.Slice {
 		switch fieldType {
+		case nativeTimeType:
+			return scalarPatchValueCopy[time.Time](offset)
 		case reflect.TypeFor[string]():
 			return scalarPatchValueCopy[string](offset)
 		case reflect.TypeFor[bool]():
@@ -1848,8 +2022,24 @@ func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) Pat
 		}
 	}
 
+	if fieldType == nativeTimePtrType {
+		return func(root unsafe.Pointer) any {
+			src := ptrFieldValue[time.Time](root, offset)
+			if src == nil {
+				return (*time.Time)(nil)
+			}
+			dst := new(time.Time)
+			*dst = *src
+			return dst
+		}
+	}
+
 	if f.Slice && fieldType.Kind() == reflect.Slice {
 		switch fieldType {
+		case reflect.TypeFor[[]time.Time]():
+			return func(root unsafe.Pointer) any {
+				return slices.Clone(sliceFieldValue[time.Time](root, offset))
+			}
 		case reflect.TypeFor[[]string]():
 			return func(root unsafe.Pointer) any {
 				return slices.Clone(sliceFieldValue[string](root, offset))
@@ -1907,13 +2097,24 @@ func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) Pat
 				return slices.Clone(sliceFieldValue[float64](root, offset))
 			}
 		default:
-			if typeHasMutableReferencePayload(fieldType.Elem()) {
-				return nil
+			if patchWholeValueCopySafe(fieldType.Elem()) {
+				return reflectSlicePatchValueCopy(fieldType, offset)
 			}
-			return reflectSlicePatchValueCopy(fieldType, offset)
 		}
 	}
-	return nil
+
+	c := cloneCompiler{stack: make(map[reflect.Type]bool, 8)}
+	step, err := c.buildValueStep(fieldType, fieldType.String())
+	if err != nil {
+		return nil
+	}
+	return func(root unsafe.Pointer) any {
+		dst := reflect.New(fieldType).Elem()
+		if step != nil {
+			step(unsafe.Add(root, offset), unsafe.Pointer(dst.UnsafeAddr()))
+		}
+		return dst.Interface()
+	}
 }
 
 func buildFieldAccessorBundle(f *Field, fieldType reflect.Type, offset uintptr) (fieldAccessorBundle, error) {

@@ -237,7 +237,7 @@ func TestFrameAttemptValidateCurrentAllowsPriorUniqueDeparture(t *testing.T) {
 
 	setBatch := ex.NewBatch()
 	next := attemptRec{V: 1}
-	if err = setBatch.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&next), nil, nil, 0); err != nil {
+	if err = setBatch.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&next), nil, 0); err != nil {
 		t.Fatalf("AddSet: %v", err)
 	}
 	if _, err = attempt.Prepare(&setBatch, nil, nil); err != nil {
@@ -274,7 +274,7 @@ func TestFrameAttemptValidateCurrentMasksAcceptedSeenWhenCurrentLeavesSameID(t *
 
 	first := ex.NewBatch()
 	v2 := attemptRec{V: 2}
-	if err = first.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v2), nil, nil, 0); err != nil {
+	if err = first.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v2), nil, 0); err != nil {
 		t.Fatalf("AddSet first: %v", err)
 	}
 	if _, err = attempt.Prepare(&first, nil, nil); err != nil {
@@ -287,10 +287,10 @@ func TestFrameAttemptValidateCurrentMasksAcceptedSeenWhenCurrentLeavesSameID(t *
 
 	second := ex.NewBatch()
 	v4 := attemptRec{V: 4}
-	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v4), nil, nil, 0); err != nil {
+	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v4), nil, 0); err != nil {
 		t.Fatalf("AddSet id1: %v", err)
 	}
-	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v2), nil, nil, 0); err != nil {
+	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v2), nil, 0); err != nil {
 		t.Fatalf("AddSet id2: %v", err)
 	}
 	if _, err = attempt.Prepare(&second, nil, nil); err != nil {
@@ -327,7 +327,7 @@ func TestFrameAttemptValidateCurrentRejectsReoccupiedBaseUniqueOwner(t *testing.
 
 	first := ex.NewBatch()
 	v2 := attemptRec{V: 2}
-	if err = first.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v2), nil, nil, 0); err != nil {
+	if err = first.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v2), nil, 0); err != nil {
 		t.Fatalf("AddSet first: %v", err)
 	}
 	if _, err = attempt.Prepare(&first, nil, nil); err != nil {
@@ -340,7 +340,7 @@ func TestFrameAttemptValidateCurrentRejectsReoccupiedBaseUniqueOwner(t *testing.
 
 	second := ex.NewBatch()
 	v1 := attemptRec{V: 1}
-	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v1), nil, nil, 0); err != nil {
+	if err = second.AddSet(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v1), nil, 0); err != nil {
 		t.Fatalf("AddSet second: %v", err)
 	}
 	if _, err = attempt.Prepare(&second, nil, nil); err != nil {
@@ -352,7 +352,7 @@ func TestFrameAttemptValidateCurrentRejectsReoccupiedBaseUniqueOwner(t *testing.
 	attempt.AcceptValidatedCurrent()
 
 	third := ex.NewBatch()
-	if err = third.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v1), nil, nil, 0); err != nil {
+	if err = third.AddSet(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v1), nil, 0); err != nil {
 		t.Fatalf("AddSet third: %v", err)
 	}
 	if _, err = attempt.Prepare(&third, nil, nil); err != nil {
@@ -505,7 +505,7 @@ func TestSharedStringDeleteSurvivesRejectedSetSameKey(t *testing.T) {
 	key := keycodec.DataKeyFromUserKey("victim", true)
 	deleteReq := ex.buildDeleteRequest(key, nil, 0)
 	setValue := attemptRec{V: 2}
-	setReq, err := ex.buildSetRequest(key, unsafe.Pointer(&setValue), nil, nil, 0)
+	setReq, err := ex.buildSetRequest(key, unsafe.Pointer(&setValue), nil, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest: %v", err)
 	}
@@ -551,54 +551,6 @@ func TestSharedStringSetOnChangeFailureDoesNotCreateStringKey(t *testing.T) {
 
 	if err := badReq.Err; !errors.Is(err, hookErr) {
 		t.Fatalf("bad request error = %v, want on change error", err)
-	}
-	if err := goodReq.Err; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if got := readStringAttemptPayload(t, raw, bucket, "ghost"); got != nil {
-		t.Fatalf("ghost payload persisted: %v", got)
-	}
-	if got := readStringAttemptPayload(t, raw, bucket, "real"); !reflect.DeepEqual(got, []byte{3}) {
-		t.Fatalf("real payload = %v, want [3]", got)
-	}
-
-	mapBucket := bucketMapName(bucket)
-	if seq := stringAttemptMapSequence(t, raw, mapBucket); seq != 2 {
-		t.Fatalf("string map sequence = %d, want 2", seq)
-	}
-	if got := readStringAttemptMap(t, raw, mapBucket, 2); got != "real" {
-		t.Fatalf("map[2] = %q, want real", got)
-	}
-}
-
-func TestSharedStringSetDecodePreparedValueFailureDoesNotCreateStringKey(t *testing.T) {
-	decodeErr := errors.New("decode marker")
-	var events []string
-	ex, raw, bucket, _ := newStringAttemptTestExecutor(t, &events, "seed", 1, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
-		if len(data) == 1 && data[0] == 0xc1 {
-			return nil, decodeErr
-		}
-		return unsafe.Pointer(&attemptRec{V: data[0]}), nil
-	}
-
-	badReq := stringSetAttemptReq("ghost", 2)
-	badReq.setPayload.Reset()
-	badReq.payloadOff = reserveStringValuePrefix(badReq.setPayload, true)
-	_ = badReq.setPayload.WriteByte(0xc1)
-	badReq.onChange = []OnChangeHook{
-		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return nil
-		},
-	}
-	goodReq := stringSetAttemptReq("real", 3)
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := badReq.Err; !errors.Is(err, decodeErr) {
-		t.Fatalf("bad request error = %v, want decode error", err)
 	}
 	if err := goodReq.Err; err != nil {
 		t.Fatalf("good request error = %v", err)

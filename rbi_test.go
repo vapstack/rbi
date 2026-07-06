@@ -126,7 +126,7 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		// Invalid msgpack payload to force buildIndex decode error in Wrap.
+		// Invalid codec payload to force buildIndex decode error in Wrap.
 		var key [8]byte
 		return b.Put(keycodec.U64BytesWithBuf(1, &key), []byte{0xc1})
 	}); err != nil {

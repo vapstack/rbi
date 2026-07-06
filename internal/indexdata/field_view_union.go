@@ -129,7 +129,7 @@ func (b *fieldIndexPostingUnionBuilder) flushSinglesUntil(cancel *RangePostingsU
 }
 
 func (b *fieldIndexPostingUnionBuilder) addSingle(idx uint64) {
-	if b.inlineLen != 0 || (b.singles != nil && len(b.singles) != 0) {
+	if b.inlineLen != 0 || len(b.singles) != 0 {
 		b.singlesUnsorted = b.singlesUnsorted || idx < b.lastSingle
 	}
 	b.lastSingle = idx

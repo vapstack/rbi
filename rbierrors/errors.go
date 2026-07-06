@@ -16,7 +16,6 @@ var (
 	ErrInvalidStringStorageFormat = errors.New("invalid string storage format")
 	ErrPersistedIndexStale        = errors.New("persisted index is stale")
 	ErrPersistedIndexInvalid      = errors.New("persisted index is invalid")
-	ErrCloneNil                   = errors.New("clone returned nil")
 	ErrNilTx                      = errors.New("nil transaction")
 	ErrStoreMismatch              = errors.New("transaction root store mismatch")
 	ErrWrongTx                    = errors.New("wrong transaction type")

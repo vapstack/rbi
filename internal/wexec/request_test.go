@@ -10,17 +10,13 @@ import (
 )
 
 func TestBuildSetRequestRejectEmptyPayloadBeforeReturningRequest(t *testing.T) {
-	ex := NewExecutor(Config{
-		RejectEmptyPayload: true,
-	})
+	ex := NewExecutor(Config{})
 	ex.ops = &RecordOps{
-		Encode: func(unsafe.Pointer, *bytes.Buffer) error {
-			return nil
-		},
+		Encode: func(unsafe.Pointer, *bytes.Buffer) {},
 	}
 
 	v := attemptRec{V: 1}
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), nil, nil, 0)
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), nil, 0)
 	if req.op != 0 {
 		t.Fatalf("buildSetRequest returned request for empty payload: %#v", req)
 	}
@@ -28,71 +24,54 @@ func TestBuildSetRequestRejectEmptyPayloadBeforeReturningRequest(t *testing.T) {
 		t.Fatalf("buildSetRequest error = %v, want empty payload", err)
 	}
 
-	ex.ops.Encode = func(unsafe.Pointer, *bytes.Buffer) error {
-		return nil
-	}
-	ex.rejectEmptyPayload = false
-	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(2), false), unsafe.Pointer(&v), nil, nil, 0)
-	if err != nil {
-		t.Fatalf("buildSetRequest without reject-empty: %v", err)
-	}
-	ex.releaseRequest(&req)
-
-	ex.ops.Encode = func(_ unsafe.Pointer, buf *bytes.Buffer) error {
+	ex.ops.Encode = func(_ unsafe.Pointer, buf *bytes.Buffer) {
 		_ = buf.WriteByte(1)
-		return nil
 	}
-	ex.rejectEmptyPayload = true
-	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(3), false), unsafe.Pointer(&v), nil, nil, 0)
+	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(3), false), unsafe.Pointer(&v), nil, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest with non-empty payload: %v", err)
 	}
 	ex.releaseRequest(&req)
 }
 
-func TestBuildSetRequestEncodeFailureReturnsError(t *testing.T) {
-	encodeErr := errors.New("encode failed")
+func TestBuildSetRequestOnChangeDetachesValue(t *testing.T) {
 	ex := NewExecutor(Config{})
 	ex.ops = &RecordOps{
-		Encode: func(unsafe.Pointer, *bytes.Buffer) error {
-			return encodeErr
+		Acquire: func() unsafe.Pointer {
+			return unsafe.Pointer(&attemptRec{})
 		},
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+			*(*attemptRec)(dst) = *(*attemptRec)(src)
+		},
+		Release: func(unsafe.Pointer) {},
 	}
-
-	v := attemptRec{V: 1}
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), nil, nil, 0)
-	if req.op != 0 {
-		t.Fatalf("buildSetRequest returned request on encode failure: %#v", req)
-	}
-	if !errors.Is(err, encodeErr) {
-		t.Fatalf("buildSetRequest error = %v, want encode error", err)
-	}
-}
-
-func TestBuildSetRequestCloneFailureReturnsError(t *testing.T) {
-	cloneErr := errors.New("clone failed")
-	ex := NewExecutor(Config{})
 
 	v := attemptRec{V: 1}
 	onChange := []OnChangeHook{func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error { return nil }}
-	cloneValue := func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error) {
-		return nil, cloneErr
-	}
 
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), onChange, cloneValue, 0)
-	if req.op != 0 {
-		t.Fatalf("buildSetRequest returned request on clone failure: %#v", req)
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), onChange, 0)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
 	}
-	if !errors.Is(err, cloneErr) {
-		t.Fatalf("buildSetRequest error = %v, want clone error", err)
+	defer ex.releaseRequest(&req)
+	v.V = 9
+	if got := (*attemptRec)(req.setValue).V; got != 1 {
+		t.Fatalf("detached value=%d want 1", got)
 	}
 }
 
-func TestBuildSetRequestCloneBaselineReleasedOnRequestCleanup(t *testing.T) {
+func TestBuildSetRequestDetachedValueReleasedOnRequestCleanup(t *testing.T) {
 	ex := NewExecutor(Config{})
 	released := 0
 	var releasedPtr unsafe.Pointer
+	baseline := &attemptRec{}
 	ex.ops = &RecordOps{
+		Acquire: func() unsafe.Pointer {
+			return unsafe.Pointer(baseline)
+		},
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+			*(*attemptRec)(dst) = *(*attemptRec)(src)
+		},
 		Release: func(ptr unsafe.Pointer) {
 			released++
 			releasedPtr = ptr
@@ -101,25 +80,19 @@ func TestBuildSetRequestCloneBaselineReleasedOnRequestCleanup(t *testing.T) {
 	}
 
 	v := attemptRec{V: 7}
-	var baseline *attemptRec
 	onChange := []OnChangeHook{func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error { return nil }}
-	cloneValue := func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-		cp := *(*attemptRec)(value)
-		baseline = &cp
-		return unsafe.Pointer(baseline), nil
-	}
 
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), onChange, cloneValue, 0)
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&v), onChange, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest: %v", err)
 	}
-	if req.setBaseline != unsafe.Pointer(baseline) {
-		t.Fatalf("baseline pointer = %p, want %p", req.setBaseline, baseline)
+	if req.setValue != unsafe.Pointer(baseline) {
+		t.Fatalf("detached value pointer = %p, want %p", req.setValue, baseline)
 	}
 
 	ex.releaseRequest(&req)
 
 	if released != 1 || releasedPtr != unsafe.Pointer(baseline) || baseline.V != 0 {
-		t.Fatalf("baseline release count=%d ptr=%p value=%d", released, releasedPtr, baseline.V)
+		t.Fatalf("detached value release count=%d ptr=%p value=%d", released, releasedPtr, baseline.V)
 	}
 }

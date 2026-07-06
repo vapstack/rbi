@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"reflect"
@@ -24,7 +23,7 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 		return tx.Commit()
 	})
 	rec := attemptRec{V: 9}
-	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey("new", true), unsafe.Pointer(&rec), nil, nil, 0)
+	req, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey("new", true), unsafe.Pointer(&rec), nil, 0)
 	if err != nil {
 		t.Fatalf("buildSetRequest: %v", err)
 	}
@@ -60,6 +59,70 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 	if &op.payload[0] != &op.physical[stringValuePrefixLen] {
 		t.Fatalf("logical payload does not share physical buffer")
 	}
+}
+
+func TestSetOnChangePrepareTransfersRequestValue(t *testing.T) {
+	var events []string
+	ex, raw, bucketName := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
+		return tx.Commit()
+	})
+
+	clones := 0
+	cloneInto := ex.ops.CloneInto
+	ex.ops.CloneInto = func(src unsafe.Pointer, dst unsafe.Pointer) {
+		clones++
+		cloneInto(src, dst)
+	}
+
+	rec := attemptRec{V: 7}
+	req, err := ex.buildSetRequest(
+		keycodec.DataKeyFromUserKey(uint64(1), false),
+		unsafe.Pointer(&rec),
+		[]OnChangeHook{
+			func(_ unsafe.Pointer, _ uint8, _ keycodec.DataKey, _ unsafe.Pointer, newVal unsafe.Pointer) error {
+				(*attemptRec)(newVal).V = 9
+				return nil
+			},
+		},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("buildSetRequest: %v", err)
+	}
+	if clones != 1 {
+		t.Fatalf("buildSetRequest clones=%d want 1", clones)
+	}
+	reqVal := req.setValue
+
+	tx, err := raw.Begin(true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	att := attemptStatePool.Get()
+	defer attemptStatePool.Put(att)
+	att.prepare(tx.Bucket(bucketName), false, ex.ops.Release, 1, true, false, len(ex.schema.Unique))
+	ex.prepareSet(att, &req, nil)
+	if req.Err != nil {
+		t.Fatalf("prepareSet req error: %v", req.Err)
+	}
+	if clones != 1 {
+		t.Fatalf("prepareSet cloned request value again: clones=%d", clones)
+	}
+	if req.setValue != nil {
+		t.Fatal("prepareSet kept request-owned setValue after transfer")
+	}
+	if len(att.releaseValues) != 1 || att.releaseValues[0] != reqVal {
+		t.Fatalf("releaseValues=%v want transferred value %p", att.releaseValues, reqVal)
+	}
+	if len(att.prepared) != 1 || att.prepared[0].newVal != reqVal {
+		t.Fatalf("prepared newVal=%p want %p", att.prepared[0].newVal, reqVal)
+	}
+	if got := (*attemptRec)(att.prepared[0].newVal).V; got != 9 {
+		t.Fatalf("hook-mutated value=%d want 9", got)
+	}
+	ex.releaseRequest(&req)
 }
 
 func TestStringKeyIndexDeleteThenReinsertUsesNewDurableID(t *testing.T) {
@@ -252,47 +315,6 @@ func TestSharedSetOnChangeFailureCommitsRest(t *testing.T) {
 	}
 }
 
-func TestSharedSetDecodePreparedValueFailureCommitsRest(t *testing.T) {
-	decodeErr := errors.New("decode failed")
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.snapshotOps = SnapshotOps{}
-	origDecode := ex.ops.Decode
-	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
-		if len(data) == 1 && data[0] == 0xc1 {
-			return nil, decodeErr
-		}
-		return origDecode(data)
-	}
-
-	badReq := setAttemptReq(1, 1)
-	badReq.onChange = []OnChangeHook{
-		func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error {
-			return nil
-		},
-	}
-	badReq.setPayload.Reset()
-	_ = badReq.setPayload.WriteByte(0xc1)
-	goodReq := setAttemptReq(2, 2)
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := badReq.Err; !errors.Is(err, decodeErr) {
-		t.Fatalf("bad request error = %v, want decode error", err)
-	}
-	if err := goodReq.Err; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
-		t.Fatalf("bad request payload persisted: %v", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
-		t.Fatalf("good request payload = %v, want [2]", got)
-	}
-}
-
 func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	var events []string
 	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
@@ -306,7 +328,7 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
 
-	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty record payload") {
 		t.Fatalf("bad request error = %v, want empty payload error", err)
 	}
 	if err := goodReq.Err; err != nil {
@@ -333,7 +355,7 @@ func TestSharedTransparentSetFailureDoesNotHideExistingPatchTarget(t *testing.T)
 
 	executeBatchForTest(ex, []*request{badReq, patchReq})
 
-	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty record payload") {
 		t.Fatalf("bad request error = %v, want empty payload error", err)
 	}
 	if err := patchReq.Err; err != nil {
@@ -369,7 +391,7 @@ func TestSharedTransparentSetFailureDoesNotClearOldValueForLaterOnChange(t *test
 
 	executeBatchForTest(ex, []*request{badReq, setReq})
 
-	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+	if err := badReq.Err; err == nil || !strings.Contains(err.Error(), "empty record payload") {
 		t.Fatalf("bad request error = %v, want empty payload error", err)
 	}
 	if err := setReq.Err; err != nil {
@@ -402,49 +424,6 @@ func TestSharedStringSetKeyTooLargeCommitsRest(t *testing.T) {
 	}
 	if got := readStringAttemptPayload(t, raw, bucket, "good"); !reflect.DeepEqual(got, []byte{2}) {
 		t.Fatalf("good request payload = %v, want [2]", got)
-	}
-}
-
-func TestAtomicSetEmptyPayloadThenPatchSameBatch(t *testing.T) {
-	var events []string
-	ex, raw, bucket := newPatchAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.rejectEmptyPayload = false
-	ex.ops.Encode = func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-		v := (*attemptRec)(ptr).V
-		if v != 0 {
-			_ = buf.WriteByte(v)
-		}
-		return nil
-	}
-	ex.ops.Decode = func(data []byte) (unsafe.Pointer, error) {
-		if len(data) == 0 {
-			return unsafe.Pointer(&attemptRec{}), nil
-		}
-		return unsafe.Pointer(&attemptRec{V: data[0]}), nil
-	}
-
-	rec := attemptRec{}
-	setReq, err := ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(1), false), unsafe.Pointer(&rec), nil, nil, 0)
-	if err != nil {
-		t.Fatalf("buildSetRequest: %v", err)
-	}
-	defer ex.releaseRequest(&setReq)
-	// A pooled empty buffer may keep capacity; this forces the nil-backed empty payload path.
-	*setReq.setPayload = bytes.Buffer{}
-	patchReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(7)}}, true)
-
-	executeAtomicRequestsForTest(ex, []*request{&setReq, patchReq})
-
-	if setReq.Err != nil {
-		t.Fatalf("set request error = %v", setReq.Err)
-	}
-	if patchReq.Err != nil {
-		t.Fatalf("patch request error = %v", patchReq.Err)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{7}) {
-		t.Fatalf("payload after set+patch = %v, want [7]", got)
 	}
 }
 
@@ -510,46 +489,6 @@ func TestSharedSetExistingDecodeFailureCommitsRest(t *testing.T) {
 	}
 	if got := readAttemptPayload(t, raw, bucket, 1); !reflect.DeepEqual(got, []byte{0xc1}) {
 		t.Fatalf("bad request payload = %v, want [193]", got)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
-		t.Fatalf("good request payload = %v, want [2]", got)
-	}
-}
-
-func TestSharedSetOnChangeEncodeFailureCommitsRest(t *testing.T) {
-	encodeErr := errors.New("encode failed")
-	var events []string
-	ex, raw, bucket := newAttemptTestExecutor(t, &events, func(tx *bbolt.Tx) error {
-		return tx.Commit()
-	})
-	ex.snapshotOps = SnapshotOps{}
-	origEncode := ex.ops.Encode
-	ex.ops.Encode = func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-		if (*attemptRec)(ptr).V == 99 {
-			return encodeErr
-		}
-		return origEncode(ptr, buf)
-	}
-
-	badReq := setAttemptReq(1, 1)
-	badReq.onChange = []OnChangeHook{
-		func(_ unsafe.Pointer, _ uint8, _ keycodec.DataKey, _ unsafe.Pointer, newValue unsafe.Pointer) error {
-			(*attemptRec)(newValue).V = 99
-			return nil
-		},
-	}
-	goodReq := setAttemptReq(2, 2)
-
-	executeBatchForTest(ex, []*request{badReq, goodReq})
-
-	if err := badReq.Err; !errors.Is(err, encodeErr) {
-		t.Fatalf("bad request error = %v, want encode error", err)
-	}
-	if err := goodReq.Err; err != nil {
-		t.Fatalf("good request error = %v", err)
-	}
-	if got := readAttemptPayload(t, raw, bucket, 1); got != nil {
-		t.Fatalf("bad request payload persisted: %v", got)
 	}
 	if got := readAttemptPayload(t, raw, bucket, 2); !reflect.DeepEqual(got, []byte{2}) {
 		t.Fatalf("good request payload = %v, want [2]", got)

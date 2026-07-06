@@ -31,7 +31,7 @@ func (op Op) String() string {
 	}
 }
 
-var errEmptyPayload = errors.New("empty msgpack payload")
+var errEmptyPayload = errors.New("empty record payload")
 
 const stringValuePrefixLen = 8
 
@@ -39,17 +39,16 @@ type request struct {
 	op Op
 	id keycodec.DataKey
 
-	setBaseline unsafe.Pointer
-	setPayload  *bytes.Buffer
-	payloadOff  uint8
+	setValue   unsafe.Pointer
+	setPayload *bytes.Buffer
+	payloadOff uint8
 
 	patch []schema.PatchItem
 
 	patchIgnoreUnknown bool
 	generationDepth    uint8
 
-	onChange   []OnChangeHook
-	cloneValue CloneFunc
+	onChange []OnChangeHook
 
 	Err error
 }
@@ -68,8 +67,8 @@ func (b *Executor) NewBatch() Batch {
 	}
 }
 
-func (batch *Batch) AddSet(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, cloneValue CloneFunc, depth uint8) error {
-	req, err := batch.ex.buildSetRequest(key, newVal, onChange, cloneValue, depth)
+func (batch *Batch) AddSet(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, depth uint8) error {
+	req, err := batch.ex.buildSetRequest(key, newVal, onChange, depth)
 	if err != nil {
 		return err
 	}
@@ -109,32 +108,36 @@ func (batch *Batch) Cancel() {
 	requestScratchPool.Put(reqs)
 }
 
-func (b *Executor) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, cloneValue CloneFunc, depth uint8) (request, error) {
+func (b *Executor) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, onChange []OnChangeHook, depth uint8) (request, error) {
 	var req request
 	req.op = opSet
 	req.id = key
 	req.onChange = onChange
-	req.cloneValue = cloneValue
 	req.generationDepth = depth
-	if len(onChange) != 0 && cloneValue != nil {
-		var err error
-		if req.setBaseline, err = cloneValue(req.id, newVal); err != nil {
-			return request{}, err
-		}
-	} else {
+	if b.setNeedsValue(onChange) {
+		req.setValue = b.ops.Acquire()
+		b.ops.CloneInto(newVal, req.setValue)
+	}
+	if len(onChange) == 0 {
 		buf := encodePool.Get()
 		req.payloadOff = reserveStringValuePrefix(buf, b.strKey)
-		if err := b.ops.Encode(newVal, buf); err != nil {
+		b.ops.Encode(newVal, buf)
+		if buf.Len() == int(req.payloadOff) {
 			encodePool.Put(buf)
-			return request{}, formatPrepareErr(prepareErrEncode, err)
-		}
-		if b.rejectEmptyPayload && buf.Len() == int(req.payloadOff) {
-			encodePool.Put(buf)
-			return request{}, formatPrepareErr(prepareErrEncode, errEmptyPayload)
+			if req.setValue != nil {
+				b.ops.Release(req.setValue)
+			}
+			return request{}, errEmptyPayload
 		}
 		req.setPayload = buf
 	}
 	return req, nil
+}
+
+func (b *Executor) setNeedsValue(onChange []OnChangeHook) bool {
+	return len(onChange) != 0 ||
+		b.indexed && b.schema.HasQueryFields() ||
+		b.unique.Schema != nil && len(b.unique.Schema.Unique) != 0
 }
 
 // buildPatchRequest takes ownership of patch until releaseRequest.
@@ -167,9 +170,9 @@ func (req *request) payloadBytes() []byte {
 }
 
 func (b *Executor) releaseRequest(req *request) {
-	if req.setBaseline != nil {
-		b.ops.Release(req.setBaseline)
-		req.setBaseline = nil
+	if req.setValue != nil {
+		b.ops.Release(req.setValue)
+		req.setValue = nil
 	}
 	if req.setPayload != nil {
 		encodePool.Put(req.setPayload)
@@ -181,7 +184,6 @@ func (b *Executor) releaseRequest(req *request) {
 	req.patchIgnoreUnknown = false
 	req.generationDepth = 0
 	req.onChange = nil
-	req.cloneValue = nil
 	req.op = 0
 	req.id = keycodec.DataKey{}
 	req.Err = nil

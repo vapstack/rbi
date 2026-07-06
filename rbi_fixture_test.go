@@ -404,28 +404,6 @@ func rawPayloadForTest[K ~string | ~uint64, V any](c *Collection[K, V], raw []by
 	return raw, nil
 }
 
-func ioExtReadBucketValue(t testing.TB, raw *bbolt.DB, bucketName, key string) ([]byte, bool) {
-	t.Helper()
-	var out []byte
-	var ok bool
-	if err := raw.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(bucketName))
-		if b == nil {
-			return nil
-		}
-		v := b.Get([]byte(key))
-		if v == nil {
-			return nil
-		}
-		out = append([]byte(nil), v...)
-		ok = true
-		return nil
-	}); err != nil {
-		t.Fatalf("read bucket %q key %q: %v", bucketName, key, err)
-	}
-	return out, ok
-}
-
 func ioExtMustQueryName(t *testing.T, c *Collection[uint64, Rec], name string) []uint64 {
 	t.Helper()
 	ids, err := readQueryKeys(c, qx.Query(qx.EQ("name", name)))

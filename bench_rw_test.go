@@ -207,9 +207,7 @@ func rawSetBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, rec
 	b := writeBenchEncodePool.Get()
 	defer writeBenchEncodePool.Put(b)
 
-	if err := c.encode(rec, b); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
+	c.encode(rec, b)
 
 	return raw.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(c.dataBucket)
@@ -256,9 +254,7 @@ func rawPatchBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, p
 
 		b := writeBenchEncodePool.Get()
 		defer writeBenchEncodePool.Put(b)
-		if err = c.encode(newVal, b); err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
+		c.encode(newVal, b)
 
 		bucket.FillPercent = c.options.BucketFillPercent
 		if err = bucket.Put(key, b.Bytes()); err != nil {
@@ -1009,6 +1005,46 @@ func prepareWriteBenchHighChurn[K ~string | ~uint64, V any](b *testing.B, c *Col
 	churn(b, c)
 	requireBenchSnapshotPublished(b, c.SnapshotStats())
 	b.StartTimer()
+}
+
+func Benchmark_Write_Helper_CloneUserBench(b *testing.B) {
+	c := buildBenchCollection(b, benchN)
+	src := &UserBench{
+		Country: "ES",
+		Plan:    "basic",
+		Status:  "active",
+		Age:     20,
+		Score:   0.8,
+		Name:    "Test",
+		Email:   "test@example.com",
+		Tags:    []string{"go", "java"},
+		Roles:   []string{"user", "admin"},
+	}
+
+	b.Run("CloneInto", func(b *testing.B) {
+		var dst UserBench
+		var sink uint64
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			c.schema.Clone.CloneInto(unsafe.Pointer(src), unsafe.Pointer(&dst))
+			sink += uint64(len(dst.Tags) + len(dst.Roles))
+		}
+		writeBenchHookSink = sink
+	})
+
+	b.Run("AcquireCloneRelease", func(b *testing.B) {
+		var sink uint64
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			dst := c.recPool.Get()
+			c.schema.Clone.CloneInto(unsafe.Pointer(src), unsafe.Pointer(dst))
+			sink += uint64(len(dst.Tags) + len(dst.Roles))
+			c.ReleaseRecords(dst)
+		}
+		writeBenchHookSink = sink
+	})
 }
 
 func Benchmark_Write_Helper_MakePatch(b *testing.B) {

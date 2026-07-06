@@ -1,7 +1,6 @@
 package schema
 
 import (
-	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -22,6 +21,18 @@ func (v benchmarkSchemaValue) IndexingValue() string {
 }
 
 type benchmarkSchemaNamedStrings []string
+
+type benchmarkSchemaCloneNamedTags []string
+
+type benchmarkSchemaCloneNamedCounters map[uint64]int
+
+type benchmarkSchemaCloneScalarContainers struct {
+	Tags          benchmarkSchemaCloneNamedTags
+	Times         []time.Time
+	Counters      map[uint64]int
+	NamedCounters benchmarkSchemaCloneNamedCounters
+	Labels        map[string]string
+}
 
 type benchmarkSchemaNested struct {
 	IDs   []int
@@ -525,21 +536,15 @@ func BenchmarkPatchValueCopy(b *testing.B) {
 	rt := benchmarkSchemaMustCompile(b)
 	rec := benchmarkSchemaRecordValue()
 	ptr := unsafe.Pointer(&rec)
-	value := reflect.ValueOf(&rec).Elem()
 	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
 
 	for _, name := range cases {
 		acc := benchmarkSchemaPatchAccess(b, rt, name)
-		fieldIndex := acc.Field.Index
 		b.Run(name, func(b *testing.B) {
 			var copied any
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if acc.CopyValue != nil {
-					copied = acc.CopyValue(ptr)
-				} else {
-					copied = benchmarkSchemaDeepCopyValue(value.FieldByIndex(fieldIndex).Interface())
-				}
+				copied = acc.CopyValue(ptr)
 			}
 			benchmarkSchemaAnySink = copied
 		})
@@ -567,6 +572,29 @@ func BenchmarkPatchApply(b *testing.B) {
 	benchmarkSchemaAnySink = rec.Tags
 }
 
+func BenchmarkCloneRuntimeScalarContainers(b *testing.B) {
+	rt, err := Compile(reflect.TypeFor[benchmarkSchemaCloneScalarContainers](), Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	src := benchmarkSchemaCloneScalarContainers{
+		Tags:          benchmarkSchemaCloneNamedTags{"go", "db", "hot"},
+		Times:         []time.Time{time.Unix(10, 0).UTC(), time.Unix(20, 0).UTC()},
+		Counters:      map[uint64]int{1: 10, 2: 20},
+		NamedCounters: benchmarkSchemaCloneNamedCounters{3: 30, 4: 40},
+		Labels:        map[string]string{"a": "one", "b": "two"},
+	}
+
+	var dst benchmarkSchemaCloneScalarContainers
+	sink := 0
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rt.Clone.CloneInto(unsafe.Pointer(&src), unsafe.Pointer(&dst))
+		sink += len(dst.Tags) + len(dst.Times) + len(dst.Counters) + len(dst.NamedCounters) + len(dst.Labels)
+	}
+	benchmarkSchemaIntSink = sink
+}
+
 func benchmarkSchemaPatchAccess(b *testing.B, rt *Schema, name string) PatchFieldAccessor {
 	b.Helper()
 	for i := range rt.Patch.Access {
@@ -577,115 +605,4 @@ func benchmarkSchemaPatchAccess(b *testing.B, rt *Schema, name string) PatchFiel
 	}
 	b.Fatalf("missing patch accessor %q", name)
 	return PatchFieldAccessor{}
-}
-
-func benchmarkSchemaDeepCopyValue(src any) any {
-	if src == nil {
-		return nil
-	}
-	origin := reflect.ValueOf(src)
-
-	for origin.Kind() == reflect.Interface {
-		if origin.IsNil() {
-			return nil
-		}
-		origin = origin.Elem()
-	}
-
-	switch origin.Kind() {
-	case reflect.Bool, reflect.String,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64,
-		reflect.Complex64, reflect.Complex128:
-		return origin.Interface()
-	}
-
-	visited := make(map[uintptr]reflect.Value)
-	clone := benchmarkSchemaDeepCopy(origin, visited)
-	return clone.Interface()
-}
-
-func benchmarkSchemaDeepCopy(origin reflect.Value, visited map[uintptr]reflect.Value) reflect.Value {
-	if !origin.IsValid() {
-		return origin
-	}
-
-	kind := origin.Kind()
-
-	switch kind {
-	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface:
-		if origin.IsNil() {
-			return origin
-		}
-	}
-
-	switch kind {
-	case reflect.Ptr, reflect.Map, reflect.Slice:
-		addr := origin.Pointer()
-		if clone, ok := visited[addr]; ok {
-			return clone
-		}
-	}
-
-	switch kind {
-	case reflect.Bool, reflect.String,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64,
-		reflect.Complex64, reflect.Complex128:
-		return origin
-	case reflect.Struct:
-		s := reflect.New(origin.Type()).Elem()
-		s.Set(origin)
-		for i := 0; i < origin.NumField(); i++ {
-			sf := s.Field(i)
-			if !sf.CanSet() {
-				continue
-			}
-			clone := benchmarkSchemaDeepCopy(origin.Field(i), visited)
-			sf.Set(clone)
-		}
-		return s
-	case reflect.Ptr:
-		ptr := reflect.New(origin.Elem().Type())
-		visited[origin.Pointer()] = ptr
-		clone := benchmarkSchemaDeepCopy(origin.Elem(), visited)
-		ptr.Elem().Set(clone)
-		return ptr
-	case reflect.Slice:
-		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Cap())
-		visited[origin.Pointer()] = s
-		for i := 0; i < origin.Len(); i++ {
-			clone := benchmarkSchemaDeepCopy(origin.Index(i), visited)
-			s.Index(i).Set(clone)
-		}
-		return s
-	case reflect.Map:
-		m := reflect.MakeMap(origin.Type())
-		visited[origin.Pointer()] = m
-		for _, key := range origin.MapKeys() {
-			keyClone := benchmarkSchemaDeepCopy(key, visited)
-			valClone := benchmarkSchemaDeepCopy(origin.MapIndex(key), visited)
-			m.SetMapIndex(keyClone, valClone)
-		}
-		return m
-	case reflect.Array:
-		a := reflect.New(origin.Type()).Elem()
-		for i := 0; i < origin.Len(); i++ {
-			clone := benchmarkSchemaDeepCopy(origin.Index(i), visited)
-			a.Index(i).Set(clone)
-		}
-		return a
-	case reflect.Interface:
-		clone := benchmarkSchemaDeepCopy(origin.Elem(), visited)
-		if !clone.IsValid() {
-			return reflect.Zero(origin.Type())
-		}
-		return clone.Convert(origin.Type())
-	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return reflect.Zero(origin.Type())
-	default:
-		panic(fmt.Errorf("rbi: benchmarkSchemaDeepCopy: unsupported value kind: %v", kind))
-	}
 }

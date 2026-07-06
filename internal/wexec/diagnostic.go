@@ -21,7 +21,6 @@ const (
 	prepareErrRedecodeEmpty
 	prepareErrRedecodeValue
 	prepareErrApplyPatch
-	prepareErrEncode
 )
 
 func formatPrepareErr(kind prepareErr, err error) error {
@@ -38,8 +37,6 @@ func formatPrepareErr(kind prepareErr, err error) error {
 		return fmt.Errorf("failed to re-decode value for patching: %w", err)
 	case prepareErrApplyPatch:
 		return fmt.Errorf("failed to apply patch: %w", err)
-	case prepareErrEncode:
-		return fmt.Errorf("encode: %w", err)
 	default:
 		return err
 	}
@@ -50,7 +47,7 @@ func formatBoltWriteErr(err error, op Op, id string, idx uint64, key, payload []
 
 	case errors.Is(err, errEmptyPayload):
 		return fmt.Errorf(
-			"invalid write payload op=%s id=%s idx=%d key_len=%d payload_len=0: empty msgpack payload",
+			"invalid write payload op=%s id=%s idx=%d key_len=%d payload_len=0: empty record payload",
 			op.String(),
 			id,
 			idx,

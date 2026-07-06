@@ -208,21 +208,9 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 		if att.statsEnabled {
 			b.stats.CallbackOps.Add(1)
 		}
-		if req.cloneValue != nil {
-			newVal, err = req.cloneValue(req.id, req.setBaseline)
-			if err != nil {
-				req.Err = err
-				return
-			}
-			att.releaseValues = append(att.releaseValues, newVal)
-		} else {
-			newVal, err = b.ops.Decode(req.payloadBytes())
-			if err != nil {
-				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, err)
-				return
-			}
-			att.releaseValues = append(att.releaseValues, newVal)
-		}
+		newVal = req.setValue
+		req.setValue = nil
+		att.releaseValues = append(att.releaseValues, newVal)
 		if err = runOnChangeHooks(hookTx, req.generationDepth, req.id, oldVal, newVal, req.onChange); err != nil {
 			req.Err = err
 			if att.statsEnabled {
@@ -238,11 +226,7 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 
 		buf := encodePool.Get()
 		payloadOff = reserveStringValuePrefix(buf, b.strKey)
-		if err = b.ops.Encode(newVal, buf); err != nil {
-			encodePool.Put(buf)
-			req.Err = formatPrepareErr(prepareErrEncode, err)
-			return
-		}
+		b.ops.Encode(newVal, buf)
 		ownedPayload = buf
 		att.ownedPayloads = append(att.ownedPayloads, buf)
 		physical = buf.Bytes()
@@ -255,16 +239,7 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 			needPreparedValue = true
 		}
 		if needPreparedValue {
-			if b.rejectEmptyPayload && len(payload) == 0 {
-				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, errEmptyPayload)
-				return
-			}
-			newVal, err = b.ops.Decode(payload)
-			if err != nil {
-				req.Err = formatPrepareErr(prepareErrDecodePreparedValue, err)
-				return
-			}
-			att.releaseValues = append(att.releaseValues, newVal)
+			newVal = req.setValue
 		}
 		if newVal != nil {
 			if err = b.ops.ValidateIndex(newVal); err != nil {
@@ -274,7 +249,7 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 		}
 	}
 
-	if b.rejectEmptyPayload && len(payload) == 0 {
+	if len(payload) == 0 {
 		req.Err = formatBoltWriteErr(errEmptyPayload, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
 		return
 	}
@@ -353,13 +328,10 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 
 	oldVal := state.value
 	snapOld := oldVal
-	newVal, err := b.ops.Decode(state.payloadBytes())
-	if err != nil {
-		req.Err = formatPrepareErr(prepareErrRedecodeValue, err)
-		return
-	}
+	newVal := b.ops.Acquire()
+	b.ops.CloneInto(oldVal, newVal)
 	att.releaseValues = append(att.releaseValues, newVal)
-	if err = b.schema.Patch.Apply(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
+	if err = b.schema.Patch.ApplyCopied(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.Err = formatPrepareErr(prepareErrApplyPatch, err)
 		return
 	}
@@ -383,11 +355,7 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 
 	buf := encodePool.Get()
 	payloadOff := reserveStringValuePrefix(buf, b.strKey)
-	if err = b.ops.Encode(newVal, buf); err != nil {
-		encodePool.Put(buf)
-		req.Err = formatPrepareErr(prepareErrEncode, err)
-		return
-	}
+	b.ops.Encode(newVal, buf)
 	att.ownedPayloads = append(att.ownedPayloads, buf)
 
 	payload := buf.Bytes()[payloadOff:]
@@ -396,7 +364,7 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 		req.Err = formatBoltWriteErr(berrors.ErrKeyTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
 		return
 	}
-	if b.rejectEmptyPayload && len(payload) == 0 {
+	if len(payload) == 0 {
 		req.Err = formatBoltWriteErr(errEmptyPayload, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
 		return
 	}

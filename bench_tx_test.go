@@ -15,8 +15,6 @@ import (
 )
 
 var (
-	benchTxReadSink   *Tx
-	benchTxIndexSink  *Tx
 	benchTxUserSink   *UserBench
 	benchTxUintSink   uint64
 	benchTxResultSink Result

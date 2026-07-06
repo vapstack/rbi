@@ -64,7 +64,7 @@ func TestReadTxBindsOnceAcrossCollections(t *testing.T) {
 
 	other, _ := openTempUint64Collection(t)
 	if _, err = other.Get(tx, 1); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("other root err=%v, want ErrRootMismatch", err)
+		t.Fatalf("other root err=%v, want ErrStoreMismatch", err)
 	}
 
 	tx.Close()
@@ -98,7 +98,7 @@ func TestIndexTxBindsCurrentAndRejectsOtherRoot(t *testing.T) {
 
 	other, _ := openTempUint64Collection(t)
 	if _, err = tx.collectionSnapshot(other.collection); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("other root err=%v, want ErrRootMismatch", err)
+		t.Fatalf("other root err=%v, want ErrStoreMismatch", err)
 	}
 	tx.Close()
 	tx.Close()
@@ -372,18 +372,26 @@ func TestTxClosedDBHandleKeepsPinnedReadState(t *testing.T) {
 	mustSetAPIRec(t, c, 1, &Rec{Name: "one", Age: 1})
 
 	readTx := BeginView()
+	defer func() {
+		if readTx != nil {
+			readTx.Release()
+		}
+	}()
 	rec, err := c.Get(readTx, 1)
 	if err != nil {
 		t.Fatalf("bind read tx: %v", err)
 	}
-	defer readTx.Release()
 	releaseUniqueRecords(c, rec)
 
 	indexTx := BeginIndexView()
+	defer func() {
+		if indexTx != nil {
+			indexTx.Release()
+		}
+	}()
 	if _, err = indexTx.collectionSnapshot(c.collection); err != nil {
 		t.Fatalf("bind index tx: %v", err)
 	}
-	defer indexTx.Release()
 
 	if err = c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -440,16 +448,25 @@ func TestTxRootMismatchPrecedesOtherRootClosed(t *testing.T) {
 	}
 
 	if _, err = other.Get(readTx, 1); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("closed other root read err=%v, want ErrRootMismatch", err)
+		t.Fatalf("closed other root read err=%v, want ErrStoreMismatch", err)
 	}
 	if _, err = indexTx.collectionSnapshot(other.collection); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("closed other root index err=%v, want ErrRootMismatch", err)
+		t.Fatalf("closed other root index err=%v, want ErrStoreMismatch", err)
 	}
 	if err = other.Set(writeTx, 1, &Rec{Name: "other", Age: 1}); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("closed other root write err=%v, want ErrRootMismatch", err)
+		t.Fatalf("closed other root write err=%v, want ErrStoreMismatch", err)
 	}
-	if err = writeTx.Commit(); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("Commit err=%v, want ErrRootMismatch", err)
+	readTx.Release()
+	readTx = nil
+	indexTx.Release()
+	indexTx = nil
+	if err = writeTx.Commit(); err != nil {
+		t.Fatalf("Commit after write root mismatch: %v", err)
+	}
+	if got, err := readGet(c, 2); err != nil {
+		t.Fatalf("Get committed write: %v", err)
+	} else if got == nil || got.Name != "two" {
+		t.Fatalf("write before root mismatch was not committed: %#v", got)
 	}
 }
 
@@ -1246,7 +1263,7 @@ func TestWriteTxCommitErrorRollsBackQueuedBatch(t *testing.T) {
 	}
 }
 
-func TestWriteTxRootMismatchReleasesRetains(t *testing.T) {
+func TestWriteTxRootMismatchDoesNotTerminalTx(t *testing.T) {
 	db1, _ := openTempUint64Collection(t)
 	db2, _ := openTempUint64Collection(t)
 
@@ -1256,16 +1273,19 @@ func TestWriteTxRootMismatchReleasesRetains(t *testing.T) {
 		t.Fatalf("bind db1: %v", err)
 	}
 	if err := tx.bindCollection(db2.collection); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("bind db2 err=%v, want ErrRootMismatch", err)
+		t.Fatalf("bind db2 err=%v, want ErrStoreMismatch", err)
 	}
-	if got := collectionRetainedForTest(db1.collection); got != 0 {
-		t.Fatalf("db1 retained after mismatch=%d want 0", got)
+	if got := collectionRetainedForTest(db1.collection); got != 1 {
+		t.Fatalf("db1 retained after mismatch=%d want 1", got)
 	}
 	if got := collectionRetainedForTest(db2.collection); got != 0 {
 		t.Fatalf("db2 retained after mismatch=%d want 0", got)
 	}
-	if err := tx.Commit(); !errors.Is(err, rbierrors.ErrStoreMismatch) {
-		t.Fatalf("Commit err=%v, want ErrRootMismatch", err)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after mismatch: %v", err)
+	}
+	if got := collectionRetainedForTest(db1.collection); got != 0 {
+		t.Fatalf("db1 retained after commit=%d want 0", got)
 	}
 }
 
@@ -1320,6 +1340,7 @@ func TestDBCloseWaitsForRetainedWriteTx(t *testing.T) {
 
 func TestWriteTxBindClosedCollection(t *testing.T) {
 	c, _ := openTempUint64Collection(t)
+	other, _ := openTempUint64Collection(t)
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1329,8 +1350,16 @@ func TestWriteTxBindClosedCollection(t *testing.T) {
 	if err := tx.bindCollection(c.collection); !errors.Is(err, rbierrors.ErrClosed) {
 		t.Fatalf("bind closed collection err=%v, want ErrClosed", err)
 	}
-	if err := tx.Commit(); !errors.Is(err, rbierrors.ErrClosed) {
-		t.Fatalf("Commit err=%v, want ErrClosed", err)
+	if err := other.Set(tx, 1, &Rec{Name: "open"}); err != nil {
+		t.Fatalf("Set after closed bind: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after closed bind: %v", err)
+	}
+	if got, err := readGet(other, 1); err != nil {
+		t.Fatalf("Get other: %v", err)
+	} else if got == nil || got.Name != "open" {
+		t.Fatalf("write after closed bind was not committed: %#v", got)
 	}
 }
 

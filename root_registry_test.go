@@ -31,7 +31,7 @@ func TestReserveCollectionInstallsLoggerBeforeNew(t *testing.T) {
 	defer logger.SetOutput(out)
 
 	raw, path := openRawBolt(t)
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	r, p, err := reserveCollection(raw, path, "users", logger)
 	if err != nil {

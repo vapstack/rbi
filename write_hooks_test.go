@@ -13,7 +13,6 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/rbierrors"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
@@ -380,6 +379,43 @@ func TestOnChange_GeneratedWriteClosedCollectionRollsBackOwner(t *testing.T) {
 	}
 }
 
+func TestOnChange_IgnoredGeneratedWriteErrorDoesNotAbortOwner(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	recDB, err := Open[uint64, Rec](raw, testOptions(Options{}))
+	if err != nil {
+		t.Fatalf("New Rec: %v", err)
+	}
+	productDB, err := Open[string, Product](raw, testOptions(Options{}))
+	if err != nil {
+		t.Fatalf("New Product: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = recDB.Close()
+		_ = raw.Close()
+	})
+	if err = productDB.Close(); err != nil {
+		t.Fatalf("Close product: %v", err)
+	}
+
+	err = writeSet(recDB, 1, &Rec{Name: "owner"}, OnChange(func(tx *Tx, key uint64, _, _ *Rec) error {
+		if key != 1 {
+			t.Fatalf("owner hook key=%d want 1", key)
+		}
+		if err := productDB.Set(tx, "closed", &Product{SKU: "closed"}); !errors.Is(err, rbierrors.ErrClosed) {
+			t.Fatalf("generated closed write err=%v want ErrClosed", err)
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Set owner after ignored generated error: %v", err)
+	}
+	if got, err := readGet(recDB, 1); err != nil {
+		t.Fatalf("Get rec: %v", err)
+	} else if got == nil || got.Name != "owner" {
+		t.Fatalf("owner was not persisted after ignored generated error: %#v", got)
+	}
+}
+
 func TestOnChange_GeneratedWriteDepthLimit(t *testing.T) {
 	c, _ := openTempUint64Collection(t)
 
@@ -565,50 +601,6 @@ func TestOnChange_MultiSetDetachesCallerValuesAcrossDeferredCommit(t *testing.T)
 	}
 }
 
-func TestOnChange_SetCloneFuncDetachesCallerValueAcrossDeferredCommit(t *testing.T) {
-	c, _ := openTempUint64Collection(t)
-
-	input := &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}
-	cloneCalls := 0
-	var seen Rec
-	tx := BeginUpdate()
-	defer tx.Release()
-	if err := c.Set(tx, 1, input,
-		CloneFunc(func(_ uint64, src *Rec) *Rec {
-			cloneCalls++
-			cp := *src
-			cp.Tags = slices.Clone(src.Tags)
-			return &cp
-		}),
-		OnChange(func(_ *Tx, _ uint64, _ *Rec, newValue *Rec) error {
-			seen = *newValue
-			seen.Tags = slices.Clone(newValue.Tags)
-			newValue.Name = "hooked"
-			return nil
-		}),
-	); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	input.Name = "mutated"
-	input.Tags[0] = "mutated"
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if cloneCalls != 2 {
-		t.Fatalf("CloneFunc calls=%d want 2", cloneCalls)
-	}
-	if seen.Name != "alice" || !slices.Equal(seen.Tags, []string{"go"}) {
-		t.Fatalf("OnChange saw caller mutation: %#v", seen)
-	}
-	got, err := readGet(c, 1)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got == nil || got.Name != "hooked" || !slices.Equal(got.Tags, []string{"go"}) {
-		t.Fatalf("stored record aliased caller mutation: %#v", got)
-	}
-}
-
 func TestOnChange_Patch_MutatesFinalStoredValue(t *testing.T) {
 	c, _ := openTempUint64Collection(t)
 
@@ -789,51 +781,7 @@ func TestOnChange_MultiPatch_ReferencePatchValuesArePerTarget(t *testing.T) {
 	}
 }
 
-func TestOnChange_CloneFunc_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
-	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
-
-	calls := 0
-	input := &onChangeCloneRec{}
-	err := writeSet(c,
-		1,
-		input,
-		CloneFunc(func(_ uint64, v *onChangeCloneRec) *onChangeCloneRec {
-			cp := *v
-			return &cp
-		}),
-		OnChange(func(_ *Tx, key uint64, oldValue, newValue *onChangeCloneRec) error {
-			calls++
-			if key != 1 {
-				t.Fatalf("unexpected key: %d", key)
-			}
-			if oldValue != nil {
-				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
-			}
-			newValue.Name = "normalized"
-			newValue.Ready = true
-			return nil
-		}),
-	)
-	if err != nil {
-		t.Fatalf("Set with CloneFunc: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected OnChange to run once, got %d", calls)
-	}
-	if input.Name != "" || input.Ready {
-		t.Fatalf("caller-owned input was mutated: %#v", input)
-	}
-
-	got, err := readGet(c, 1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if got == nil || got.Name != "normalized" || !got.Ready {
-		t.Fatalf("unexpected stored value: %#v", got)
-	}
-}
-
-func TestOnChange_AutoCloneMethod_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
+func TestOnChange_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
 	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
 
 	calls := 0
@@ -855,7 +803,7 @@ func TestOnChange_AutoCloneMethod_Set_AllowsNormalizationBeforeEncode(t *testing
 		}),
 	)
 	if err != nil {
-		t.Fatalf("Set with Clone() method: %v", err)
+		t.Fatalf("Set with OnChange: %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("expected OnChange to run once, got %d", calls)
@@ -873,7 +821,47 @@ func TestOnChange_AutoCloneMethod_Set_AllowsNormalizationBeforeEncode(t *testing
 	}
 }
 
-func TestOnChange_CloneFunc_MultiSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+func TestOnChange_Set_WithCloneMethod_AllowsNormalizationBeforeEncode(t *testing.T) {
+	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
+
+	calls := 0
+	input := &onChangeCloneRec{}
+	err := writeSet(c,
+		1,
+		input,
+		OnChange(func(_ *Tx, key uint64, oldValue, newValue *onChangeCloneRec) error {
+			calls++
+			if key != 1 {
+				t.Fatalf("unexpected key: %d", key)
+			}
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = "normalized"
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with ignored Clone() method: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected OnChange to run once, got %d", calls)
+	}
+	if input.Name != "" || input.Ready {
+		t.Fatalf("caller-owned input was mutated: %#v", input)
+	}
+
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "normalized" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+}
+
+func TestOnChange_MultiSet_AllowsNormalizationBeforeEncode(t *testing.T) {
 	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
 
 	inputA := &onChangeCloneRec{}
@@ -881,10 +869,6 @@ func TestOnChange_CloneFunc_MultiSet_AllowsNormalizationBeforeEncode(t *testing.
 	err := writeSets(c,
 		[]uint64{1, 2},
 		[]*onChangeCloneRec{inputA, inputB},
-		CloneFunc(func(_ uint64, v *onChangeCloneRec) *onChangeCloneRec {
-			cp := *v
-			return &cp
-		}),
 		OnChange(func(_ *Tx, key uint64, oldValue, newValue *onChangeCloneRec) error {
 			if oldValue != nil {
 				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
@@ -895,7 +879,7 @@ func TestOnChange_CloneFunc_MultiSet_AllowsNormalizationBeforeEncode(t *testing.
 		}),
 	)
 	if err != nil {
-		t.Fatalf("MultiSet with CloneFunc: %v", err)
+		t.Fatalf("MultiSet with OnChange: %v", err)
 	}
 	if inputA.Name != "" || inputA.Ready || inputB.Name != "" || inputB.Ready {
 		t.Fatalf("caller-owned inputs were mutated: %#v %#v", inputA, inputB)
@@ -917,7 +901,7 @@ func TestOnChange_CloneFunc_MultiSet_AllowsNormalizationBeforeEncode(t *testing.
 	}
 }
 
-func TestOnChange_AutoCloneMethod_MultiSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+func TestOnChange_MultiSet_WithCloneMethod_AllowsNormalizationBeforeEncode(t *testing.T) {
 	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
 
 	inputA := &onChangeCloneRec{}
@@ -935,7 +919,7 @@ func TestOnChange_AutoCloneMethod_MultiSet_AllowsNormalizationBeforeEncode(t *te
 		}),
 	)
 	if err != nil {
-		t.Fatalf("MultiSet with Clone() method: %v", err)
+		t.Fatalf("MultiSet with ignored Clone() method: %v", err)
 	}
 	if inputA.Name != "" || inputA.Ready || inputB.Name != "" || inputB.Ready {
 		t.Fatalf("caller-owned inputs were mutated: %#v %#v", inputA, inputB)
@@ -957,46 +941,7 @@ func TestOnChange_AutoCloneMethod_MultiSet_AllowsNormalizationBeforeEncode(t *te
 	}
 }
 
-func TestOnChange_CloneFunc_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
-	enableStoreStatsForTest(t)
-	c := openTempUint64CollectionOnChangeCloneRec(t)
-
-	calls := 0
-	err := writeSet(c,
-		1,
-		&onChangeCloneRec{},
-		CloneFunc(func(_ uint64, v *onChangeCloneRec) *onChangeCloneRec {
-			cp := *v
-			return &cp
-		}),
-		OnChange(func(_ *Tx, _ uint64, _ *onChangeCloneRec, newValue *onChangeCloneRec) error {
-			calls++
-			newValue.Name = "combined"
-			newValue.Ready = true
-			return nil
-		}),
-	)
-	if err != nil {
-		t.Fatalf("Set with CloneFunc via root scheduler: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected OnChange to run once, got %d", calls)
-	}
-
-	got, err := readGet(c, 1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	if got == nil || got.Name != "combined" || !got.Ready {
-		t.Fatalf("unexpected stored value: %#v", got)
-	}
-
-	if st := c.StoreStats(); st.LogicalUnitsEnqueued == 0 {
-		t.Fatalf("expected Set with CloneFunc to use root scheduler path, stats=%+v", st)
-	}
-}
-
-func TestOnChange_AutoCloneMethod_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
+func TestOnChange_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
 	enableStoreStatsForTest(t)
 	c := openTempUint64CollectionOnChangeCloneRec(t)
 
@@ -1012,7 +957,7 @@ func TestOnChange_AutoCloneMethod_AutoBatch_AllowsNormalizationBeforeEncode(t *t
 		}),
 	)
 	if err != nil {
-		t.Fatalf("Set with Clone() method via root scheduler: %v", err)
+		t.Fatalf("Set with OnChange via root scheduler: %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("expected OnChange to run once, got %d", calls)
@@ -1027,31 +972,42 @@ func TestOnChange_AutoCloneMethod_AutoBatch_AllowsNormalizationBeforeEncode(t *t
 	}
 
 	if st := c.StoreStats(); st.LogicalUnitsEnqueued == 0 {
-		t.Fatalf("expected Set with Clone() method to use root scheduler path, stats=%+v", st)
+		t.Fatalf("expected Set with OnChange to use root scheduler path, stats=%+v", st)
 	}
 }
 
-func TestOnChange_CloneFunc_OverridesAutoCloneMethod(t *testing.T) {
-	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
+func TestOnChange_AutoBatch_WithCloneMethod_AllowsNormalizationBeforeEncode(t *testing.T) {
+	enableStoreStatsForTest(t)
+	c := openTempUint64CollectionOnChangeCloneRec(t)
 
+	calls := 0
 	err := writeSet(c,
 		1,
 		&onChangeCloneRec{},
-		CloneFunc(func(_ uint64, v *onChangeCloneRec) *onChangeCloneRec {
-			cp := *v
-			cp.Name = "clone-func"
-			return &cp
-		}),
 		OnChange(func(_ *Tx, _ uint64, _ *onChangeCloneRec, newValue *onChangeCloneRec) error {
-			if newValue.Name != "clone-func" {
-				t.Fatalf("expected explicit CloneFunc to win, got name=%q", newValue.Name)
-			}
+			calls++
+			newValue.Name = "combined"
 			newValue.Ready = true
 			return nil
 		}),
 	)
 	if err != nil {
-		t.Fatalf("Set with explicit CloneFunc override: %v", err)
+		t.Fatalf("Set with ignored Clone() method via root scheduler: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected OnChange to run once, got %d", calls)
+	}
+
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "combined" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+
+	if st := c.StoreStats(); st.LogicalUnitsEnqueued == 0 {
+		t.Fatalf("expected Set with ignored Clone() method to use root scheduler path, stats=%+v", st)
 	}
 }
 
@@ -1721,24 +1677,6 @@ func (r *onChangeCloneRec) Clone() *onChangeCloneRec {
 	return &cp
 }
 
-func (r *onChangeCloneRec) MarshalMsgpack() ([]byte, error) {
-	if !r.Ready {
-		return nil, errors.New("onChangeCloneRec: not ready")
-	}
-	type alias onChangeCloneRec
-	return msgpack.Marshal((*alias)(r))
-}
-
-func (r *onChangeCloneRec) UnmarshalMsgpack(b []byte) error {
-	type alias onChangeCloneRec
-	var tmp alias
-	if err := msgpack.Unmarshal(b, &tmp); err != nil {
-		return err
-	}
-	*r = onChangeCloneRec(tmp)
-	return nil
-}
-
 func openTempUint64CollectionOnChangeCloneRec(t *testing.T, options ...Options) *Collection[uint64, onChangeCloneRec] {
 	t.Helper()
 	dir := t.TempDir()
@@ -1753,16 +1691,17 @@ func openTempUint64CollectionOnChangeCloneRec(t *testing.T, options ...Options) 
 
 func TestMultiSet_BuildErrorDoesNotAffectFollowingWrite(t *testing.T) {
 	c := openTempUint64CollectionOnChangeCloneRec(t, Options{BatchSoftLimit: 1})
+	badName := strings.Repeat("x", 70000)
 
 	err := writeSets(c,
 		[]uint64{1, 2},
 		[]*onChangeCloneRec{
 			{Name: "ok", Ready: true},
-			{Name: "bad", Ready: false},
+			{Name: badName, Ready: true},
 		},
 	)
-	if err == nil || !strings.Contains(err.Error(), "encode") {
-		t.Fatalf("MultiSet build error = %v, want encode failure", err)
+	if err == nil || !strings.Contains(err.Error(), "indexed string value") {
+		t.Fatalf("MultiSet build error = %v, want indexed string validation failure", err)
 	}
 
 	calls := 0

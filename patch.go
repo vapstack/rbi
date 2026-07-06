@@ -2,9 +2,7 @@ package rbi
 
 import (
 	"fmt"
-	"reflect"
 	"slices"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/pooled"
@@ -28,25 +26,17 @@ const (
 //
 // The patch includes both indexed and non-indexed fields. For every modified
 // field it adds a Field entry whose Name uses the db tag when present.
-// Fields without a db tag use Go struct field name only when that name
-// is an unambiguous patch identifier for the field. If a modified field cannot
+// Fields without a db tag use Go struct field name when that name is
+// an unambiguous patch identifier for the field. If a modified field cannot
 // be represented by a safe patch name, MakePatch returns an error.
 //
 // When PatchJSON is passed, Name uses the json tag when present.
 // Fields without an explicit json name use their Go struct field name
-// only if that name is an unambiguous patch identifier for the field.
+// if that name is an unambiguous patch identifier for the field.
 // If a modified field cannot be represented by a safe JSON patch name,
 // including fields tagged json:"-", MakePatch returns an error.
-// PatchJSON still builds a full patch,
-// it does not silently drop changes outside the JSON representation.
 //
-// Value is a deep copy taken from newVal, including nested unexported fields.
-// MakePatch supports normal record data graphs: scalars, structs, slices,
-// maps, pointers, and interfaces containing data values.
-// It is not a general object cloner. Runtime state such as sync/atomic values,
-// locks, channels, functions, and other unsafe resources are not supported
-// and are not diagnosed. MakePatch does not return errors for such values
-// and copy safety is provided on a best-effort basis.
+// Values are copied from newVal. Unexported fields are ignored.
 //
 // If newVal is nil, it returns an empty slice.
 func (c *Collection[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) ([]Field, error) {
@@ -96,14 +86,41 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 		return target, nil
 	}
 
-	var rvOld, rvNew reflect.Value
-	if oldVal != nil {
-		rvOld = reflect.ValueOf(oldVal).Elem()
+	patchAccess := c.schema.Patch.Access
+	if c.schema.Patch.Flat {
+		newPtr := unsafe.Pointer(newVal)
+		oldPtr := unsafe.Pointer(nil)
+		if oldVal != nil {
+			oldPtr = unsafe.Pointer(oldVal)
+		}
+
+		for i := range patchAccess {
+			patchAcc := &patchAccess[i]
+			if oldVal != nil {
+				if patchAcc.ValueEqual(oldPtr, newPtr) {
+					continue
+				}
+			}
+
+			name := patchFieldName(patchAcc.Field, useJSON)
+			if useJSON {
+				if name == "" {
+					return target[:0], fmt.Errorf("field %v with db name %q cannot be emitted with PatchJSON: add an explicit non-empty json tag", patchAcc.Field.Name, patchAcc.Field.DBName)
+				}
+			} else if name == "" {
+				return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
+			}
+
+			target = append(target, Field{
+				Name:  name,
+				Value: patchAcc.CopyValue(newPtr),
+			})
+		}
+
+		return target, nil
 	}
-	rvNew = reflect.ValueOf(newVal).Elem()
 
 	scratch := patchScratchPool.Get()
-	patchAccess := c.schema.Patch.Access
 	scratch.seen = slices.Grow(scratch.seen[:0], len(patchAccess))[:len(patchAccess)]
 	defer patchScratchPool.Put(scratch)
 
@@ -134,12 +151,7 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 			} else if name == "" {
 				return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
 			}
-			var value any
-			if patchAcc.CopyValue != nil {
-				value = patchAcc.CopyValue(newPtr)
-			} else {
-				value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
-			}
+			value := patchAcc.CopyValue(newPtr)
 			markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 			target = append(target, Field{
 				Name:  name,
@@ -153,18 +165,9 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 			continue
 		}
 
-		var newValue any
-		if rvOld.IsValid() {
-			if patchAcc.ValueEqual != nil {
-				if patchAcc.ValueEqual(oldPtr, newPtr) {
-					continue
-				}
-			} else {
-				oldValue := rvOld.FieldByIndex(patchAcc.Field.Index).Interface()
-				newValue = rvNew.FieldByIndex(patchAcc.Field.Index).Interface()
-				if reflect.DeepEqual(oldValue, newValue) {
-					continue
-				}
+		if oldVal != nil {
+			if patchAcc.ValueEqual(oldPtr, newPtr) {
+				continue
 			}
 		}
 
@@ -177,17 +180,9 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 			return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
 		}
 
-		if patchAcc.CopyValue != nil {
-			newValue = patchAcc.CopyValue(newPtr)
-		} else if newValue == nil {
-			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
-		} else {
-			newValue = deepCopyValue(newValue)
-		}
-
 		target = append(target, Field{
 			Name:  name,
-			Value: newValue,
+			Value: patchAcc.CopyValue(newPtr),
 		})
 		markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 	}
@@ -239,204 +234,21 @@ func markPatchSubtreeSeen(seen []bool, access []schema.PatchFieldAccessor, ordin
 
 // patchItemsForWrite returns request-owned storage; callers must transfer it to
 // wexec or release it with schema.ReleasePatchItemSlice.
-func patchItemsForWrite(fields []Field) []schema.PatchItem {
-	items := schema.GetPatchItemSlice(len(fields))[:len(fields)]
+func (c *Collection[K, V]) patchItemsForWrite(fields []Field, ignoreUnknown bool) ([]schema.PatchItem, error) {
+	items := schema.GetPatchItemSlice(len(fields))[:0]
 	for i := range fields {
-		items[i] = schema.PatchItem{
+		value, ok, err := c.schema.Patch.CopyItemValue(fields[i].Name, fields[i].Value, ignoreUnknown)
+		if err != nil {
+			schema.ReleasePatchItemSlice(items)
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		items = append(items, schema.PatchItem{
 			Name:  fields[i].Name,
-			Value: deepCopyValue(fields[i].Value),
-		}
+			Value: value,
+		})
 	}
-	return items
-}
-
-func (c *Collection[K, V]) validatePatchFieldNames(fields []Field) error {
-	for i := range fields {
-		if _, ok := c.schema.Patch.Fields[fields[i].Name]; !ok {
-			return fmt.Errorf("cannot patch field %v: field information is missing", fields[i].Name)
-		}
-	}
-	return nil
-}
-
-func deepCopyValue(src any) any {
-	if src == nil {
-		return nil
-	}
-	origin := reflect.ValueOf(src)
-
-	for origin.Kind() == reflect.Interface {
-		if origin.IsNil() {
-			return nil
-		}
-		origin = origin.Elem()
-	}
-
-	switch origin.Kind() {
-	case reflect.Bool, reflect.String,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64,
-		reflect.Complex64, reflect.Complex128:
-		return origin.Interface()
-	}
-
-	var state deepCopyState
-	clone := deepCopy(origin, &state)
-	return clone.Interface()
-}
-
-type deepCopyState struct {
-	refs   map[refCopyKey]reflect.Value
-	slices map[sliceCopyKey]reflect.Value
-}
-
-type refCopyKey struct {
-	ptr uintptr
-	typ reflect.Type
-}
-
-type sliceCopyKey struct {
-	ptr uintptr
-	typ reflect.Type
-	len int
-}
-
-var timeTimeType = reflect.TypeFor[time.Time]()
-
-func deepCopy(origin reflect.Value, state *deepCopyState) reflect.Value {
-	if !origin.IsValid() {
-		return origin
-	}
-
-	kind := origin.Kind()
-
-	switch kind {
-	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface:
-		if origin.IsNil() {
-			return origin
-		}
-	}
-
-	var refKey refCopyKey
-	switch kind {
-	case reflect.Ptr:
-		typ := origin.Type()
-		if typ.Name() != "" {
-			typ = reflect.PointerTo(typ.Elem())
-		}
-		refKey = refCopyKey{ptr: origin.Pointer(), typ: typ}
-	case reflect.Map:
-		typ := origin.Type()
-		if typ.Name() != "" {
-			typ = reflect.MapOf(typ.Key(), typ.Elem())
-		}
-		refKey = refCopyKey{ptr: origin.Pointer(), typ: typ}
-	}
-	if refKey.typ != nil {
-		if state.refs != nil {
-			if clone, ok := state.refs[refKey]; ok {
-				if clone.Type() != origin.Type() {
-					clone = clone.Convert(origin.Type())
-				}
-				return clone
-			}
-		}
-	}
-	if kind == reflect.Slice {
-		if origin.Len() != 0 && state.slices != nil {
-			key := sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len()}
-			if clone, ok := state.slices[key]; ok {
-				return clone
-			}
-		}
-	}
-
-	switch kind {
-	case reflect.Bool, reflect.String,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64,
-		reflect.Complex64, reflect.Complex128:
-		return origin
-
-	case reflect.Struct:
-		typ := origin.Type()
-		if typ == timeTimeType ||
-			typ.NumField() == timeTimeType.NumField() && typ.ConvertibleTo(timeTimeType) && timeTimeType.ConvertibleTo(typ) {
-			return origin
-		}
-		s := reflect.New(origin.Type()).Elem()
-		s.Set(origin)
-		for i := 0; i < origin.NumField(); i++ {
-			sf := s.Field(i)
-			if !sf.CanSet() {
-				sf = reflect.NewAt(sf.Type(), unsafe.Pointer(sf.UnsafeAddr())).Elem()
-			}
-			clone := deepCopy(sf, state)
-			sf.Set(clone)
-		}
-		return s
-
-	case reflect.Ptr:
-		ptr := reflect.New(origin.Type().Elem())
-		if state.refs == nil {
-			state.refs = make(map[refCopyKey]reflect.Value)
-		}
-		state.refs[refKey] = ptr
-		clone := deepCopy(origin.Elem(), state)
-		ptr.Elem().Set(clone)
-		if ptr.Type() != origin.Type() {
-			return ptr.Convert(origin.Type())
-		}
-		return ptr
-
-	case reflect.Slice:
-		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Len())
-		if origin.Len() != 0 {
-			if state.slices == nil {
-				state.slices = make(map[sliceCopyKey]reflect.Value)
-			}
-			state.slices[sliceCopyKey{ptr: origin.Pointer(), typ: origin.Type(), len: origin.Len()}] = s
-		}
-		for i := 0; i < origin.Len(); i++ {
-			clone := deepCopy(origin.Index(i), state)
-			s.Index(i).Set(clone)
-		}
-		return s
-
-	case reflect.Map:
-		m := reflect.MakeMap(origin.Type())
-		if state.refs == nil {
-			state.refs = make(map[refCopyKey]reflect.Value)
-		}
-		state.refs[refKey] = m
-		for _, key := range origin.MapKeys() {
-			keyClone := deepCopy(key, state)
-			valClone := deepCopy(origin.MapIndex(key), state)
-			m.SetMapIndex(keyClone, valClone)
-		}
-		return m
-
-	case reflect.Array:
-		a := reflect.New(origin.Type()).Elem()
-		for i := 0; i < origin.Len(); i++ {
-			clone := deepCopy(origin.Index(i), state)
-			a.Index(i).Set(clone)
-		}
-		return a
-
-	case reflect.Interface:
-		clone := deepCopy(origin.Elem(), state)
-		if !clone.IsValid() {
-			return reflect.Zero(origin.Type())
-		}
-		return clone.Convert(origin.Type())
-
-	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return reflect.Zero(origin.Type())
-
-	default:
-		panic(fmt.Errorf("rbi: deepCopy: unsupported value kind: %v", kind))
-	}
+	return items, nil
 }

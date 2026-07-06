@@ -1,9 +1,11 @@
 package rebuild
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,7 +18,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
@@ -29,6 +30,14 @@ type rebuildTestRec struct {
 type rebuildNoIndexRec struct {
 	Name string
 }
+
+var rebuildTestCodec = func() *schema.Schema {
+	rt, err := schema.Compile(reflect.TypeFor[rebuildTestRec](), schema.Config{})
+	if err != nil {
+		panic(err)
+	}
+	return rt
+}()
 
 func openRebuildTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
 	t.Helper()
@@ -51,11 +60,8 @@ func openRebuildTestBolt(t *testing.T, bucket []byte) *bbolt.DB {
 func putRebuildTestRec(t *testing.T, bolt *bbolt.DB, bucket []byte, id uint64, rec rebuildTestRec) {
 	t.Helper()
 
-	data, err := msgpack.Marshal(&rec)
-	if err != nil {
-		t.Fatalf("msgpack.Marshal: %v", err)
-	}
-	if err = bolt.Update(func(tx *bbolt.Tx) error {
+	data := encodeRebuildTestRec(&rec)
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucket)
 		var key [8]byte
 		return b.Put(keycodec.U64BytesWithBuf(id, &key), data)
@@ -67,13 +73,11 @@ func putRebuildTestRec(t *testing.T, bolt *bbolt.DB, bucket []byte, id uint64, r
 func putRebuildTestStringRec(t *testing.T, bolt *bbolt.DB, bucket []byte, mapBucket []byte, key string, rec rebuildTestRec) uint64 {
 	t.Helper()
 
-	data, err := msgpack.Marshal(&rec)
-	if err != nil {
-		t.Fatalf("msgpack.Marshal: %v", err)
-	}
+	data := encodeRebuildTestRec(&rec)
 	var idx uint64
-	if err = bolt.Update(func(tx *bbolt.Tx) error {
+	if err := bolt.Update(func(tx *bbolt.Tx) error {
 		m := tx.Bucket(mapBucket)
+		var err error
 		idx, err = m.NextSequence()
 		if err != nil {
 			return err
@@ -144,10 +148,16 @@ func newRebuildTestState(s *schema.Schema) State {
 
 func decodeRebuildTestRec(data []byte) (unsafe.Pointer, error) {
 	rec := new(rebuildTestRec)
-	if err := msgpack.Unmarshal(data, rec); err != nil {
+	if err := rebuildTestCodec.Codec.Decode(data, unsafe.Pointer(rec)); err != nil {
 		return nil, err
 	}
 	return unsafe.Pointer(rec), nil
+}
+
+func encodeRebuildTestRec(rec *rebuildTestRec) []byte {
+	var buf bytes.Buffer
+	rebuildTestCodec.Codec.Encode(unsafe.Pointer(rec), &buf)
+	return slices.Clone(buf.Bytes())
 }
 
 func releaseRebuildTestRec(ptr unsafe.Pointer) {

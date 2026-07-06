@@ -226,7 +226,7 @@ func (c *Collection[K, V]) stringMap(tx *bbolt.Tx) (*bbolt.Bucket, error) {
 // In transparent mode planner stats are disabled because no runtime index
 // exists; the method returns rbierrors.ErrNoIndex.
 func (c *Collection[K, V]) RefreshPlannerStats() error {
-	if err := c.collection.unavailableErr(); err != nil {
+	if err := c.unavailableErr(); err != nil {
 		return err
 	}
 
@@ -241,7 +241,7 @@ func (c *Collection[K, V]) RefreshPlannerStats() error {
 		return err
 	}
 
-	return c.index.RefreshPlannerStatsOnSnapshot(snap, c.collection.unavailableErr)
+	return c.index.RefreshPlannerStatsOnSnapshot(snap, c.unavailableErr)
 }
 
 func plannerAnalyzeInterval(v time.Duration) time.Duration {
@@ -286,7 +286,7 @@ func (c *Collection[K, V]) SnapshotStats() rbistats.Snapshot {
 	if c.index == nil {
 		return rbistats.Snapshot{}
 	}
-	if err := c.collection.unavailableErr(); err != nil {
+	if err := c.unavailableErr(); err != nil {
 		return rbistats.Snapshot{}
 	}
 

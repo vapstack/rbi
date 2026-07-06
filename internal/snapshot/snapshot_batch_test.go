@@ -25,12 +25,12 @@ type snapshotBatchStorageRec struct {
 }
 
 type SnapshotBatchShadowedIndexedEmbedded struct {
-	ID string `json:"inner" rbi:"index"`
+	ID string `db:"inner_id" json:"inner" rbi:"index"`
 }
 
 type snapshotBatchShadowedIndexedRec struct {
 	SnapshotBatchShadowedIndexedEmbedded
-	ID string
+	ID string `db:"outer_id"`
 }
 
 func snapshotBatchStorageRuntime(t *testing.T) *schema.Schema {
@@ -409,7 +409,7 @@ func TestBuildPreparedPatchOnlyShadowedJSONAliasUpdatesIndex(t *testing.T) {
 	defer prev.releaseRuntimeCaches()
 	defer prev.releaseStorage()
 
-	if !snapshotBatchFieldContains(prev, "ID", "old", 1) {
+	if !snapshotBatchFieldContains(prev, "inner_id", "old", 1) {
 		t.Fatal("previous snapshot is missing initial embedded ID posting")
 	}
 
@@ -429,10 +429,10 @@ func TestBuildPreparedPatchOnlyShadowedJSONAliasUpdatesIndex(t *testing.T) {
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if snapshotBatchFieldContains(next, "ID", "old", 1) {
+	if snapshotBatchFieldContains(next, "inner_id", "old", 1) {
 		t.Fatal("patch-only JSON alias update kept stale embedded ID posting")
 	}
-	if !snapshotBatchFieldContains(next, "ID", "new", 1) {
+	if !snapshotBatchFieldContains(next, "inner_id", "new", 1) {
 		t.Fatal("patch-only JSON alias update is missing new embedded ID posting")
 	}
 }

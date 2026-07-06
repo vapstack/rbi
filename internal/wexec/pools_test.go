@@ -27,13 +27,12 @@ func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	req := request{}
 	req.op = opSet
 	req.id = keycodec.DataKeyFromUserKey(uint64(42), false)
-	req.setBaseline = unsafe.Pointer(&v)
+	req.setValue = unsafe.Pointer(&v)
 	req.setPayload = payload
 	req.payloadOff = 8
 	req.patch = append(req.patch, schema.PatchItem{Name: "x"})
 	req.patchIgnoreUnknown = true
 	req.onChange = append(req.onChange, func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error { return nil })
-	req.cloneValue = func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error) { return unsafe.Pointer(&v), nil }
 	req.Err = errSentinel
 
 	ex.releaseRequest(&req)
@@ -41,8 +40,8 @@ func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	if req.op != 0 || req.id != (keycodec.DataKey{}) || req.Err != nil {
 		t.Fatalf("request identity was not cleared: op=%v id=%v err=%v", req.op, req.id, req.Err)
 	}
-	if req.setPayload != nil || req.setBaseline != nil {
-		t.Fatalf("set state was not cleared: payload=%v baseline=%v", req.setPayload, req.setBaseline)
+	if req.setPayload != nil || req.setValue != nil {
+		t.Fatalf("set state was not cleared: payload=%v value=%v", req.setPayload, req.setValue)
 	}
 	if req.payloadOff != 0 {
 		t.Fatalf("payload offset was not cleared: %d", req.payloadOff)
@@ -50,11 +49,11 @@ func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	if len(req.patch) != 0 || req.patchIgnoreUnknown {
 		t.Fatalf("patch state was not cleared: len=%d ignore=%v", len(req.patch), req.patchIgnoreUnknown)
 	}
-	if req.onChange != nil || req.cloneValue != nil {
+	if req.onChange != nil {
 		t.Fatalf("callbacks were not cleared")
 	}
 	if !released {
-		t.Fatalf("baseline was not released")
+		t.Fatalf("set value was not released")
 	}
 }
 

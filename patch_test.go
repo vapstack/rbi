@@ -1,53 +1,21 @@
 package rbi
 
 import (
-	"io"
 	"math"
 	"reflect"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 type patchQueuedOwnershipRec struct {
 	Name string   `db:"name" rbi:"index"`
 	Tags []string `db:"tags" rbi:"index"`
-}
-
-type patchQueuedOwnershipPayload struct {
-	Name string
-	Tags []string
-}
-
-var (
-	patchQueuedOwnershipDecodeArmed   atomic.Bool
-	patchQueuedOwnershipDecodeStarted chan struct{}
-	patchQueuedOwnershipDecodeResume  chan struct{}
-)
-
-func (r *patchQueuedOwnershipRec) EncodeRBI(w io.Writer) error {
-	return msgpack.NewEncoder(w).Encode(patchQueuedOwnershipPayload{Name: r.Name, Tags: r.Tags})
-}
-
-func (r *patchQueuedOwnershipRec) DecodeRBI(rd io.Reader) error {
-	if patchQueuedOwnershipDecodeArmed.CompareAndSwap(true, false) {
-		close(patchQueuedOwnershipDecodeStarted)
-		<-patchQueuedOwnershipDecodeResume
-	}
-	var payload patchQueuedOwnershipPayload
-	if err := msgpack.NewDecoder(rd).Decode(&payload); err != nil {
-		return err
-	}
-	r.Name = payload.Name
-	r.Tags = payload.Tags
-	return nil
 }
 
 func mustMakePatch[V any](t testing.TB, c *Collection[uint64, V], oldVal, newVal *V, opts ...PatchOption) []Field {
@@ -66,6 +34,15 @@ func mustMakePatchInto[V any](t testing.TB, c *Collection[uint64, V], oldVal, ne
 		t.Fatalf("MakePatchInto: %v", err)
 	}
 	return patch
+}
+
+func mustPatchItemsForWrite[V any](t testing.TB, c *Collection[uint64, V], patch []Field) []schema.PatchItem {
+	t.Helper()
+	items, err := c.patchItemsForWrite(patch, false)
+	if err != nil {
+		t.Fatalf("patchItemsForWrite: %v", err)
+	}
+	return items
 }
 
 type PatchAnonymousID string
@@ -104,7 +81,7 @@ func (v PatchAnonymousShadowToken) IndexingValue() string {
 
 type patchAnonymousShadowTokenRec struct {
 	PatchAnonymousShadowToken `rbi:"index"`
-	ID                        string
+	ID                        string `db:"outer_id"`
 }
 
 type PatchAnonymousJSONHiddenToken struct {
@@ -218,7 +195,7 @@ func TestMakePatch_IndexedAnonymousParentSuppressesUnsafeDescendant(t *testing.T
 	}
 
 	applied := *oldVal
-	items := patchItemsForWrite(patch)
+	items := mustPatchItemsForWrite(t, c, patch)
 	defer schema.ReleasePatchItemSlice(items)
 	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
 		t.Fatalf("Apply parent patch: %v", err)
@@ -248,7 +225,7 @@ func TestMakePatch_PatchJSONIndexedAnonymousParentSuppressesJSONHiddenDescendant
 	}
 
 	applied := *oldVal
-	items := patchItemsForWrite(patch)
+	items := mustPatchItemsForWrite(t, c, patch)
 	defer schema.ReleasePatchItemSlice(items)
 	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
 		t.Fatalf("Apply JSON parent patch: %v", err)
@@ -430,12 +407,6 @@ func TestMakePatch_OnChange_DeepCopy_SliceValues(t *testing.T) {
 	}
 }
 
-type patchInterfacePointerRec struct {
-	Name   string `db:"name" rbi:"index"`
-	Value  any
-	Values []any
-}
-
 type patchNamedIntPtr *int
 
 type patchNamedPointerRec struct {
@@ -443,265 +414,11 @@ type patchNamedPointerRec struct {
 	Value patchNamedIntPtr
 }
 
-type patchNamedAnyMap map[string]any
-
-type patchPointerOverlap struct {
-	Value int
-	Next  int
-}
-
 type patchPointerShapeRec struct {
 	Name  string `db:"name" rbi:"index"`
 	Tags  *[]int
 	Next  **int
-	Value *any
-}
-
-func TestMakePatch_RoundTripPreservesInterfacePointerValues(t *testing.T) {
-	c := openTempUint64CollectionReflect[patchInterfacePointerRec](t, "patch_interface_pointer.db")
-
-	ptr := 11
-	var nilPtr *int
-	oldVal := &patchInterfacePointerRec{Name: "alice"}
-	newVal := &patchInterfacePointerRec{
-		Name:   "alice",
-		Value:  &ptr,
-		Values: []any{&ptr, nilPtr},
-	}
-
-	patch := mustMakePatch(t, c, oldVal, newVal)
-	applied := *oldVal
-	items := patchItemsForWrite(patch)
-	defer schema.ReleasePatchItemSlice(items)
-	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
-		t.Fatalf("Patch.Apply: %v", err)
-	}
-
-	if got, ok := applied.Value.(*int); !ok || got == nil || *got != 11 {
-		t.Fatalf("interface pointer round-trip failed: %#v", applied.Value)
-	}
-	if len(applied.Values) != 2 {
-		t.Fatalf("interface slice length=%d want 2", len(applied.Values))
-	}
-	if got, ok := applied.Values[0].(*int); !ok || got == nil || *got != 11 {
-		t.Fatalf("interface slice pointer round-trip failed: %#v", applied.Values)
-	}
-	if got, ok := applied.Values[1].(*int); !ok || got != nil {
-		t.Fatalf("interface slice typed nil pointer round-trip failed: %#v", applied.Values)
-	}
-}
-
-func TestMakePatch_RoundTripPreservesInterfaceNamedPointerValues(t *testing.T) {
-	c := openTempUint64CollectionReflect[patchInterfacePointerRec](t, "patch_interface_named_pointer.db")
-
-	ptr := 11
-	named := patchNamedIntPtr(&ptr)
-	oldVal := &patchInterfacePointerRec{Name: "alice"}
-	newVal := &patchInterfacePointerRec{
-		Name:   "alice",
-		Value:  named,
-		Values: []any{named, &ptr},
-	}
-
-	patch := mustMakePatch(t, c, oldVal, newVal)
-	fields := patchFieldsByName(patch)
-	if got, ok := fields["Value"].(patchNamedIntPtr); !ok || got == nil || *got != 11 {
-		t.Fatalf("patch interface named pointer value=%#v", fields["Value"])
-	} else if got == named {
-		t.Fatal("patch interface named pointer aliases source")
-	}
-	if got, ok := fields["Values"].([]any); !ok || len(got) != 2 {
-		t.Fatalf("patch interface named pointer slice=%#v", fields["Values"])
-	} else if namedPtr, ok := got[0].(patchNamedIntPtr); !ok || namedPtr == nil || *namedPtr != 11 {
-		t.Fatalf("patch interface named pointer slice element=%#v", got[0])
-	} else if ptr, ok := got[1].(*int); !ok || ptr == nil || *ptr != 11 {
-		t.Fatalf("patch interface unnamed pointer slice element=%#v", got[1])
-	} else if namedPtr != patchNamedIntPtr(ptr) {
-		t.Fatalf("patch interface pointer aliases were not preserved: %#v", got)
-	}
-
-	applied := *oldVal
-	items := patchItemsForWrite(patch)
-	defer schema.ReleasePatchItemSlice(items)
-	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
-		t.Fatalf("Patch.Apply: %v", err)
-	}
-
-	if got, ok := applied.Value.(patchNamedIntPtr); !ok || got == nil || *got != 11 {
-		t.Fatalf("interface named pointer round-trip failed: %#v", applied.Value)
-	}
-	if len(applied.Values) != 2 {
-		t.Fatalf("interface named pointer slice length=%d want 2", len(applied.Values))
-	}
-	if got, ok := applied.Values[0].(patchNamedIntPtr); !ok || got == nil || *got != 11 {
-		t.Fatalf("interface named pointer slice round-trip failed: %#v", applied.Values)
-	} else if ptr, ok := applied.Values[1].(*int); !ok || ptr == nil || *ptr != 11 {
-		t.Fatalf("interface unnamed pointer slice round-trip failed: %#v", applied.Values)
-	} else if got != patchNamedIntPtr(ptr) {
-		t.Fatalf("interface pointer aliases were not preserved: %#v", applied.Values)
-	}
-}
-
-func TestMakePatch_RoundTripPreservesNamedMapAliases(t *testing.T) {
-	c := openTempUint64CollectionReflect[patchInterfacePointerRec](t, "patch_named_map_aliases.db")
-
-	shared := map[string]any{"value": 11}
-	namedFirst := patchNamedAnyMap{"value": 33}
-	self := map[string]any{"value": 22}
-	self["self"] = patchNamedAnyMap(self)
-	oldVal := &patchInterfacePointerRec{Name: "alice"}
-	newVal := &patchInterfacePointerRec{
-		Name:   "alice",
-		Values: []any{shared, patchNamedAnyMap(shared), namedFirst, map[string]any(namedFirst), self},
-	}
-
-	patch := mustMakePatch(t, c, oldVal, newVal)
-	fields := patchFieldsByName(patch)
-	values, ok := fields["Values"].([]any)
-	if !ok || len(values) != 5 {
-		t.Fatalf("patch named map values=%#v", fields["Values"])
-	}
-	plain, ok := values[0].(map[string]any)
-	if !ok {
-		t.Fatalf("patch plain map value=%#v", values[0])
-	}
-	named, ok := values[1].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("patch named map value=%#v", values[1])
-	}
-	plain["patchedAlias"] = true
-	if named["patchedAlias"] != true {
-		t.Fatalf("patch named map alias was not preserved: %#v", values)
-	}
-	if shared["patchedAlias"] != nil {
-		t.Fatal("patch named map aliases source")
-	}
-	delete(plain, "patchedAlias")
-
-	patchNamedFirst, ok := values[2].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("patch named-first map value=%#v", values[2])
-	}
-	patchNamedFirstPlain, ok := values[3].(map[string]any)
-	if !ok {
-		t.Fatalf("patch named-first plain map value=%#v", values[3])
-	}
-	patchNamedFirst["patchedNamedFirstAlias"] = true
-	if patchNamedFirstPlain["patchedNamedFirstAlias"] != true {
-		t.Fatalf("patch named-first map alias was not preserved: %#v", values)
-	}
-	if namedFirst["patchedNamedFirstAlias"] != nil {
-		t.Fatal("patch named-first map aliases source")
-	}
-	delete(patchNamedFirst, "patchedNamedFirstAlias")
-
-	cyclic, ok := values[4].(map[string]any)
-	if !ok {
-		t.Fatalf("patch cyclic map value=%#v", values[4])
-	}
-	selfRef, ok := cyclic["self"].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("patch named map self value=%#v", cyclic["self"])
-	}
-	cyclic["cycle"] = true
-	if selfRef["cycle"] != true {
-		t.Fatalf("patch named map self alias was not preserved: %#v", cyclic)
-	}
-	if self["cycle"] != nil {
-		t.Fatal("patch named map self aliases source")
-	}
-	delete(cyclic, "cycle")
-
-	applied := *oldVal
-	items := patchItemsForWrite(patch)
-	defer schema.ReleasePatchItemSlice(items)
-	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
-		t.Fatalf("Patch.Apply: %v", err)
-	}
-	if len(applied.Values) != 5 {
-		t.Fatalf("named map slice length=%d want 5", len(applied.Values))
-	}
-	appliedPlain, ok := applied.Values[0].(map[string]any)
-	if !ok {
-		t.Fatalf("applied plain map value=%#v", applied.Values[0])
-	}
-	appliedNamed, ok := applied.Values[1].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("applied named map value=%#v", applied.Values[1])
-	}
-	appliedNamed["appliedAlias"] = true
-	if appliedPlain["appliedAlias"] != true {
-		t.Fatalf("applied named map alias was not preserved: %#v", applied.Values)
-	}
-	appliedNamedFirst, ok := applied.Values[2].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("applied named-first map value=%#v", applied.Values[2])
-	}
-	appliedNamedFirstPlain, ok := applied.Values[3].(map[string]any)
-	if !ok {
-		t.Fatalf("applied named-first plain map value=%#v", applied.Values[3])
-	}
-	appliedNamedFirstPlain["appliedNamedFirstAlias"] = true
-	if appliedNamedFirst["appliedNamedFirstAlias"] != true {
-		t.Fatalf("applied named-first map alias was not preserved: %#v", applied.Values)
-	}
-	appliedCyclic, ok := applied.Values[4].(map[string]any)
-	if !ok {
-		t.Fatalf("applied cyclic map value=%#v", applied.Values[4])
-	}
-	appliedSelf, ok := appliedCyclic["self"].(patchNamedAnyMap)
-	if !ok {
-		t.Fatalf("applied named map self value=%#v", appliedCyclic["self"])
-	}
-	appliedSelf["appliedCycle"] = true
-	if appliedCyclic["appliedCycle"] != true {
-		t.Fatalf("applied named map self alias was not preserved: %#v", appliedCyclic)
-	}
-}
-
-func TestMakePatch_RoundTripPreservesOverlappingPointerTypes(t *testing.T) {
-	c := openTempUint64CollectionReflect[patchInterfacePointerRec](t, "patch_overlapping_pointer_types.db")
-
-	value := patchPointerOverlap{Value: 11, Next: 22}
-	oldVal := &patchInterfacePointerRec{Name: "alice"}
-	newVal := &patchInterfacePointerRec{
-		Name:   "alice",
-		Values: []any{&value, &value.Value},
-	}
-
-	patch := mustMakePatch(t, c, oldVal, newVal)
-	fields := patchFieldsByName(patch)
-	values, ok := fields["Values"].([]any)
-	if !ok || len(values) != 2 {
-		t.Fatalf("patch overlapping pointer values=%#v", fields["Values"])
-	}
-	if got, ok := values[0].(*patchPointerOverlap); !ok || got == nil || got.Value != 11 || got.Next != 22 {
-		t.Fatalf("patch overlapping struct pointer=%#v", values[0])
-	} else if got == &value {
-		t.Fatal("patch overlapping struct pointer aliases source")
-	}
-	if got, ok := values[1].(*int); !ok || got == nil || *got != 11 {
-		t.Fatalf("patch overlapping field pointer=%#v", values[1])
-	} else if got == &value.Value {
-		t.Fatal("patch overlapping field pointer aliases source")
-	}
-
-	applied := *oldVal
-	items := patchItemsForWrite(patch)
-	defer schema.ReleasePatchItemSlice(items)
-	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
-		t.Fatalf("Patch.Apply: %v", err)
-	}
-
-	if len(applied.Values) != 2 {
-		t.Fatalf("overlapping pointer slice length=%d want 2", len(applied.Values))
-	}
-	if got, ok := applied.Values[0].(*patchPointerOverlap); !ok || got == nil || got.Value != 11 || got.Next != 22 {
-		t.Fatalf("overlapping struct pointer round-trip failed: %#v", applied.Values)
-	}
-	if got, ok := applied.Values[1].(*int); !ok || got == nil || *got != 11 {
-		t.Fatalf("overlapping field pointer round-trip failed: %#v", applied.Values)
-	}
+	Value *int
 }
 
 func TestMakePatch_RoundTripPreservesNamedPointerValueType(t *testing.T) {
@@ -720,7 +437,7 @@ func TestMakePatch_RoundTripPreservesNamedPointerValueType(t *testing.T) {
 	}
 
 	applied := *oldVal
-	items := patchItemsForWrite(patch)
+	items := mustPatchItemsForWrite(t, c, patch)
 	defer schema.ReleasePatchItemSlice(items)
 	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
 		t.Fatalf("Patch.Apply: %v", err)
@@ -736,18 +453,18 @@ func TestMakePatch_RoundTripPreservesPointerValueShape(t *testing.T) {
 	tags := []int{1, 2}
 	nextValue := 33
 	next := &nextValue
-	anyValue := any(44)
+	value := 44
 	oldVal := &patchPointerShapeRec{Name: "alice"}
 	newVal := &patchPointerShapeRec{
 		Name:  "alice",
 		Tags:  &tags,
 		Next:  &next,
-		Value: &anyValue,
+		Value: &value,
 	}
 
 	patch := mustMakePatch(t, c, oldVal, newVal)
 	applied := *oldVal
-	items := patchItemsForWrite(patch)
+	items := mustPatchItemsForWrite(t, c, patch)
 	defer schema.ReleasePatchItemSlice(items)
 	if err := c.schema.Patch.Apply(unsafe.Pointer(&applied), items, false); err != nil {
 		t.Fatalf("Patch.Apply: %v", err)
@@ -760,10 +477,10 @@ func TestMakePatch_RoundTripPreservesPointerValueShape(t *testing.T) {
 		t.Fatalf("nested pointer round-trip failed: %#v", applied.Next)
 	}
 	if applied.Value == nil {
-		t.Fatal("pointer-to-interface round-trip produced nil pointer")
+		t.Fatal("pointer round-trip produced nil pointer")
 	}
-	if got, ok := (*applied.Value).(int); !ok || got != 44 {
-		t.Fatalf("pointer-to-interface round-trip failed: %#v", *applied.Value)
+	if *applied.Value != 44 {
+		t.Fatalf("pointer round-trip failed: %#v", *applied.Value)
 	}
 }
 
@@ -977,21 +694,21 @@ type patchUnaliasedPromotedRec struct {
 }
 
 type PatchShadowedIndexedJSONOnlyEmbeddedRec struct {
-	ID string `json:"inner" rbi:"index"`
+	ID string `db:"inner_id" json:"inner" rbi:"index"`
 }
 
 type patchShadowedIndexedJSONOnlyRec struct {
 	PatchShadowedIndexedJSONOnlyEmbeddedRec
-	ID string
+	ID string `db:"outer_id"`
 }
 
 type PatchShadowedMeasureJSONOnlyEmbeddedRec struct {
-	Score int64 `json:"innerScore" rbi:"measure"`
+	Score int64 `db:"inner_score" json:"innerScore" rbi:"measure"`
 }
 
 type patchShadowedMeasureJSONOnlyRec struct {
 	PatchShadowedMeasureJSONOnlyEmbeddedRec
-	Score int64
+	Score int64 `db:"outer_score"`
 }
 
 type patchMeasureFloatZeroRec struct {
@@ -1026,6 +743,16 @@ type patchFloatPointerFallbackRec struct {
 	Hidden *float64 `json:"-"`
 }
 
+type patchFloatCloneFallbackPayload struct {
+	Value float64
+}
+
+type patchFloatCloneFallbackRec struct {
+	Name  string
+	Ptr   *patchFloatCloneFallbackPayload  `db:"ptr"`
+	Items []patchFloatCloneFallbackPayload `db:"items"`
+}
+
 type patchIndexedFloatHiddenRec struct {
 	Name    string   `db:"name"`
 	Score64 float64  `db:"score64" json:"-" rbi:"index"`
@@ -1038,36 +765,14 @@ type patchIndexedFloatSliceHiddenRec struct {
 	Hidden []float64 `db:"hidden" json:"-" rbi:"index"`
 }
 
-func TestMakePatch_RejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
-	c := openTempUint64CollectionReflect[patchUnaliasedPromotedRec](t, "patch_unaliased_promoted_names.db")
-
-	oldVal := &patchUnaliasedPromotedRec{
-		PatchUnaliasedPromotedLeftRec:  PatchUnaliasedPromotedLeftRec{ID: "left-old"},
-		PatchUnaliasedPromotedRightRec: PatchUnaliasedPromotedRightRec{ID: "right-old"},
-	}
-	newVal := &patchUnaliasedPromotedRec{
-		PatchUnaliasedPromotedLeftRec:  PatchUnaliasedPromotedLeftRec{ID: "left-new"},
-		PatchUnaliasedPromotedRightRec: PatchUnaliasedPromotedRightRec{ID: "right-new"},
-	}
-
-	patch, err := c.MakePatch(oldVal, newVal)
-	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
-		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
-	}
-	if len(patch) != 0 {
-		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
-	}
-
-	patch, err = c.MakePatch(oldVal, newVal, PatchJSON)
-	if err == nil || !strings.Contains(err.Error(), "cannot be emitted with PatchJSON") {
-		t.Fatalf("MakePatch PatchJSON err=%v want unsafe json name error", err)
-	}
-	if len(patch) != 0 {
-		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+func TestCompileRejectsUnaliasedAmbiguousPromotedGoName(t *testing.T) {
+	_, err := schema.Compile(reflect.TypeFor[patchUnaliasedPromotedRec](), schema.Config{})
+	if err == nil || !strings.Contains(err.Error(), "ambiguous promoted field") {
+		t.Fatalf("Compile err=%v want ambiguous promoted field", err)
 	}
 }
 
-func TestMakePatch_RejectsShadowedIndexedDefaultNameAndUsesJSONAlias(t *testing.T) {
+func TestMakePatch_UsesShadowedIndexedDBAndJSONAliases(t *testing.T) {
 	c := openTempUint64CollectionReflect[patchShadowedIndexedJSONOnlyRec](t, "patch_shadowed_indexed_json_only.db")
 
 	oldVal := &patchShadowedIndexedJSONOnlyRec{
@@ -1079,12 +784,9 @@ func TestMakePatch_RejectsShadowedIndexedDefaultNameAndUsesJSONAlias(t *testing.
 		ID:                                      "outer",
 	}
 
-	patch, err := c.MakePatch(oldVal, newVal)
-	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
-		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
-	}
-	if len(patch) != 0 {
-		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
+	patch := mustMakePatch(t, c, oldVal, newVal)
+	if len(patch) != 1 || patch[0].Name != "inner_id" || patch[0].Value != "new" {
+		t.Fatalf("default patch=%#v want inner_id=new", patch)
 	}
 
 	patch = mustMakePatch(t, c, oldVal, newVal, PatchJSON)
@@ -1093,7 +795,7 @@ func TestMakePatch_RejectsShadowedIndexedDefaultNameAndUsesJSONAlias(t *testing.
 	}
 }
 
-func TestMakePatch_RejectsShadowedMeasureDefaultNameAndUsesJSONAlias(t *testing.T) {
+func TestMakePatch_UsesShadowedMeasureDBAndJSONAliases(t *testing.T) {
 	c := openTempUint64CollectionReflect[patchShadowedMeasureJSONOnlyRec](t, "patch_shadowed_measure_json_only.db")
 
 	oldVal := &patchShadowedMeasureJSONOnlyRec{
@@ -1105,12 +807,9 @@ func TestMakePatch_RejectsShadowedMeasureDefaultNameAndUsesJSONAlias(t *testing.
 		Score:                                   100,
 	}
 
-	patch, err := c.MakePatch(oldVal, newVal)
-	if err == nil || !strings.Contains(err.Error(), "cannot be emitted by MakePatch") {
-		t.Fatalf("MakePatch err=%v want unsafe default name error", err)
-	}
-	if len(patch) != 0 {
-		t.Fatalf("MakePatch returned partial patch after error: %#v", patch)
+	patch := mustMakePatch(t, c, oldVal, newVal)
+	if len(patch) != 1 || patch[0].Name != "inner_score" || patch[0].Value != int64(20) {
+		t.Fatalf("default patch=%#v want inner_score=20", patch)
 	}
 
 	patch = mustMakePatch(t, c, oldVal, newVal, PatchJSON)
@@ -1225,6 +924,28 @@ func TestMakePatch_SkipsCanonicalFloatPointerNaNTransitions(t *testing.T) {
 	newVal := &patchFloatPointerFallbackRec{Name: "same", Hidden: &newNaN}
 
 	patch := mustMakePatch(t, c, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("patch fields=%#v want none", patch)
+	}
+}
+
+func TestMakePatch_SkipsCanonicalCloneFallbackFloatNaNTransitions(t *testing.T) {
+	c := openTempUint64CollectionReflect[patchFloatCloneFallbackRec](t, "patch_float_nan_clone_fallback.db")
+
+	oldNaN := math.Float64frombits(0x7ff0000000000001)
+	newNaN := math.Float64frombits(0x7ff8000000000001)
+	oldVal := &patchFloatCloneFallbackRec{
+		Name:  "same",
+		Ptr:   &patchFloatCloneFallbackPayload{Value: oldNaN},
+		Items: []patchFloatCloneFallbackPayload{{Value: oldNaN}},
+	}
+	newVal := &patchFloatCloneFallbackRec{
+		Name:  "same",
+		Ptr:   &patchFloatCloneFallbackPayload{Value: newNaN},
+		Items: []patchFloatCloneFallbackPayload{{Value: newNaN}},
+	}
+
+	patch := mustMakePatch(t, c, oldVal, newVal)
 	if len(patch) != 0 {
 		t.Fatalf("patch fields=%#v want none", patch)
 	}
@@ -1569,34 +1290,20 @@ func TestPatchQueuedRequestCopiesCallerPatchItemsBeforeApply(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	patchQueuedOwnershipDecodeStarted = make(chan struct{})
-	patchQueuedOwnershipDecodeResume = make(chan struct{})
-	patchQueuedOwnershipDecodeArmed.Store(true)
-	defer func() {
-		patchQueuedOwnershipDecodeArmed.Store(false)
-		patchQueuedOwnershipDecodeStarted = nil
-		patchQueuedOwnershipDecodeResume = nil
-	}()
-
 	tags := []string{"owned", "keep"}
 	patch := []Field{{Name: "tags", Value: tags}}
-	done := make(chan error, 1)
-	go func() {
-		done <- writePatch(c, 1, patch, PatchStrict)
-	}()
 
-	select {
-	case <-patchQueuedOwnershipDecodeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("Patch did not reach blocked decode")
+	tx := BeginUpdate()
+	defer tx.Release()
+	if err := c.Patch(tx, 1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch queue: %v", err)
 	}
 
 	patch[0].Name = "name"
 	tags[0] = "mutated"
-	close(patchQueuedOwnershipDecodeResume)
 
-	if err := <-done; err != nil {
-		t.Fatalf("Patch: %v", err)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 
 	got, err := readGet(c, 1)
@@ -1704,6 +1411,78 @@ func TestPatchStrictOption_UnknownFieldOnMissingTarget(t *testing.T) {
 	}
 }
 
+func TestPatchStrictOption_UnknownFieldDoesNotTerminalTx(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+
+	tx := BeginUpdate()
+	defer tx.Release()
+	err := c.Patch(tx, 1, []Field{{Name: "does_not_exist", Value: 123}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field does_not_exist") {
+		t.Fatalf("Patch strict unknown error=%v", err)
+	}
+	if err = c.Set(tx, 1, &Rec{Name: "ok", Age: 1}); err != nil {
+		t.Fatalf("Set after Patch strict unknown: %v", err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("Commit after Patch strict unknown: %v", err)
+	}
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "ok" || got.Age != 1 {
+		t.Fatalf("stored record after non-terminal Patch error: %#v", got)
+	}
+}
+
+func TestPatchConversionErrorDoesNotTerminalTx(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+
+	tx := BeginUpdate()
+	defer tx.Release()
+	err := c.Patch(tx, 1, []Field{{Name: "age", Value: 1.25}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "loss of precision") {
+		t.Fatalf("Patch conversion error=%v", err)
+	}
+	if err = c.Set(tx, 1, &Rec{Name: "ok", Age: 1}); err != nil {
+		t.Fatalf("Set after Patch conversion error: %v", err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("Commit after Patch conversion error: %v", err)
+	}
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "ok" || got.Age != 1 {
+		t.Fatalf("stored record after non-terminal Patch conversion error: %#v", got)
+	}
+}
+
+func TestPatchNilNonNillableDoesNotTerminalTx(t *testing.T) {
+	c, _ := openTempUint64Collection(t)
+
+	tx := BeginUpdate()
+	defer tx.Release()
+	err := c.Patch(tx, 1, []Field{{Name: "age", Value: nil}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot assign nil to non-nillable field") {
+		t.Fatalf("Patch nil non-nillable error=%v", err)
+	}
+	if err = c.Set(tx, 1, &Rec{Name: "ok", Age: 1}); err != nil {
+		t.Fatalf("Set after Patch nil non-nillable error: %v", err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("Commit after Patch nil non-nillable error: %v", err)
+	}
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "ok" || got.Age != 1 {
+		t.Fatalf("stored record after non-terminal Patch nil error: %#v", got)
+	}
+}
+
 func TestMultiPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	type tc struct {
 		name  string
@@ -1792,6 +1571,36 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeValue(t *testing.T) {
 	}
 }
 
+func TestReflectExt_MakePatch_UsesTimeEqual(t *testing.T) {
+	c := openTempUint64CollectionReflect[reflectPatchTimeRec](t, "reflect_patch_time_equal.db")
+
+	loc := time.FixedZone("MSK", 3*60*60)
+	when := time.Date(2025, time.January, 2, 3, 4, 5, 678901234, time.UTC)
+	slot := time.Date(2024, time.March, 1, 10, 11, 12, 123456789, time.UTC)
+	window := time.Date(2024, time.February, 10, 1, 2, 3, 4, time.UTC)
+	oldVal := &reflectPatchTimeRec{
+		Name:    "alice",
+		When:    when,
+		Slots:   []time.Time{slot},
+		Windows: map[string]time.Time{"first": window},
+	}
+	newVal := &reflectPatchTimeRec{
+		Name:    "alice",
+		When:    when.In(loc),
+		Slots:   []time.Time{slot.In(loc)},
+		Windows: map[string]time.Time{"first": window.In(loc)},
+	}
+
+	if !oldVal.When.Equal(newVal.When) || oldVal.When == newVal.When {
+		t.Fatalf("test setup must use Equal times with different structural representation")
+	}
+
+	patch := mustMakePatch(t, c, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("Time.Equal-only changes produced patch: %#v", patch)
+	}
+}
+
 func TestReflectExt_MakePatch_RoundTripPreservesTimeSlice(t *testing.T) {
 	c := openTempUint64CollectionReflect[reflectPatchTimeRec](t, "reflect_patch_time_slice.db")
 
@@ -1827,25 +1636,25 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeSlice(t *testing.T) {
 	}
 }
 
-func TestReflectExt_MakePatch_RoundTripPreservesTimeMapKeys(t *testing.T) {
+func TestReflectExt_MakePatch_RoundTripPreservesTimeMapValues(t *testing.T) {
 	c := openTempUint64CollectionReflect[reflectPatchTimeRec](t, "reflect_patch_time_map.db")
 
 	loc := time.FixedZone("EET", 2*60*60)
 	oldVal := &reflectPatchTimeRec{Name: "alice"}
 	newVal := &reflectPatchTimeRec{
 		Name: "alice",
-		Windows: map[time.Time]string{
-			time.Date(2024, time.February, 10, 1, 2, 3, 4, loc):      "first",
-			time.Date(2024, time.February, 11, 5, 6, 7, 8, time.UTC): "second",
+		Windows: map[string]time.Time{
+			"first":  time.Date(2024, time.February, 10, 1, 2, 3, 4, loc),
+			"second": time.Date(2024, time.February, 11, 5, 6, 7, 8, time.UTC),
 		},
 	}
 
 	patch := mustMakePatch(t, c, oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
-	gotWindows, ok := fields["Windows"].(map[time.Time]string)
+	gotWindows, ok := fields["Windows"].(map[string]time.Time)
 	if !ok {
-		t.Fatalf("patch must contain map[time.Time]string value for Windows, got %#v", fields["Windows"])
+		t.Fatalf("patch must contain map[string]time.Time value for Windows, got %#v", fields["Windows"])
 	}
 	if !reflect.DeepEqual(gotWindows, newVal.Windows) {
 		t.Fatalf("patch lost time map contents: got=%#v want=%#v", gotWindows, newVal.Windows)
@@ -1855,19 +1664,13 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeMapKeys(t *testing.T) {
 	if len(applied.Windows) != len(newVal.Windows) {
 		t.Fatalf("patched record lost time map contents: got=%#v want=%#v", applied.Windows, newVal.Windows)
 	}
-	for wantTime, wantValue := range newVal.Windows {
-		found := false
-		for gotTime, gotValue := range applied.Windows {
-			if gotTime.Equal(wantTime) {
-				found = true
-				if gotValue != wantValue {
-					t.Fatalf("patched time map value mismatch at %#v: got=%q want=%q", gotTime, gotValue, wantValue)
-				}
-				break
-			}
+	for key, want := range newVal.Windows {
+		got, ok := applied.Windows[key]
+		if !ok {
+			t.Fatalf("patched time map missing key %q in %#v", key, applied.Windows)
 		}
-		if !found {
-			t.Fatalf("patched time map missing instant %#v in %#v", wantTime, applied.Windows)
+		if !got.Equal(want) {
+			t.Fatalf("patched time map value mismatch at %q: got=%#v want=%#v", key, got, want)
 		}
 	}
 }
@@ -1988,11 +1791,12 @@ func TestReflectExt_MakePatch_DeepCopyAliasedSliceFieldsByHeader(t *testing.T) {
 	}
 }
 
-func TestReflectExt_MakePatch_DeepCopyUnexportedStructFields(t *testing.T) {
+func TestReflectExt_IgnoresUnexportedMutableStructFields(t *testing.T) {
 	type child struct {
 		values []int
 	}
 	type payload struct {
+		Name  string
 		tags  []string
 		attrs map[string]int
 		child *child
@@ -2002,41 +1806,171 @@ func TestReflectExt_MakePatch_DeepCopyUnexportedStructFields(t *testing.T) {
 		Payload payload `db:"payload"`
 	}
 
-	c := openTempUint64CollectionReflect[rec](t, "reflect_patch_unexported_struct_fields.db")
-
-	oldVal := &rec{Name: "alice"}
-	newVal := &rec{
-		Name: "alice",
+	c := openTempUint64CollectionReflect[rec](t, "reflect_hidden_mutable_ignored.db")
+	err := writeSet(c, 1, &rec{
+		Name: "ok",
 		Payload: payload{
-			tags:  []string{"go", "db"},
-			attrs: map[string]int{"x": 1},
-			child: &child{values: []int{1, 2}},
+			Name:  "payload",
+			tags:  []string{"hidden"},
+			attrs: map[string]int{"hidden": 1},
+			child: &child{values: []int{1}},
 		},
+	})
+	if err != nil {
+		t.Fatalf("Set: %v", err)
 	}
+
+	got, err := readGet(c, 1)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got == nil || got.Name != "ok" || got.Payload.Name != "payload" {
+		t.Fatalf("exported fields were not preserved: %#v", got)
+	}
+	if got.Payload.tags != nil || got.Payload.attrs != nil || got.Payload.child != nil {
+		t.Fatalf("hidden mutable fields were preserved: %#v", got.Payload)
+	}
+}
+
+func TestReflectExt_MakePatchIgnoresUnexportedNestedFields(t *testing.T) {
+	type payload struct {
+		Name string
+		tags []string
+	}
+	type rec struct {
+		Payload payload `db:"payload"`
+	}
+
+	c := openTempUint64CollectionReflect[rec](t, "reflect_patch_hidden_mutable_ignored.db")
+	oldVal := &rec{Payload: payload{Name: "same", tags: []string{"old"}}}
+	newVal := &rec{Payload: payload{Name: "same", tags: []string{"new"}}}
 
 	patch := mustMakePatch(t, c, oldVal, newVal)
-	fields := patchFieldsByName(patch)
+	if len(patch) != 0 {
+		t.Fatalf("hidden-only change produced patch: %#v", patch)
+	}
 
+	newVal.Payload.Name = "changed"
+	patch = mustMakePatch(t, c, oldVal, newVal)
+	fields := patchFieldsByName(patch)
 	gotPayload, ok := fields["payload"].(payload)
 	if !ok {
-		t.Fatalf("patch must contain payload value for payload, got %#v", fields["payload"])
+		t.Fatalf("patch must contain payload value, got %#v", fields["payload"])
+	}
+	if gotPayload.Name != "changed" {
+		t.Fatalf("patch lost exported payload field: %#v", gotPayload)
+	}
+	if gotPayload.tags != nil {
+		t.Fatalf("patch preserved hidden payload field: %#v", gotPayload)
+	}
+}
+
+func TestReflectExt_MakePatchClearsUnexportedScalarSliceElements(t *testing.T) {
+	type item struct {
+		Name   string
+		hidden int
+	}
+	type rec struct {
+		Items []item `db:"items"`
 	}
 
-	newVal.Payload.tags[0] = "mutated"
-	newVal.Payload.attrs["x"] = 9
-	newVal.Payload.child.values[0] = 7
+	c := openTempUint64CollectionReflect[rec](t, "reflect_patch_hidden_scalar_slice.db")
+	oldVal := &rec{Items: []item{{Name: "same", hidden: 1}}}
+	newVal := &rec{Items: []item{{Name: "same", hidden: 2}}}
 
-	if !reflect.DeepEqual(gotPayload.tags, []string{"go", "db"}) {
-		t.Fatalf("patch aliased unexported slice field: %#v", gotPayload.tags)
+	patch := mustMakePatch(t, c, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("hidden-only slice element change produced patch: %#v", patch)
 	}
-	if !reflect.DeepEqual(gotPayload.attrs, map[string]int{"x": 1}) {
-		t.Fatalf("patch aliased unexported map field: %#v", gotPayload.attrs)
+
+	newVal.Items[0].Name = "changed"
+	patch = mustMakePatch(t, c, oldVal, newVal)
+	fields := patchFieldsByName(patch)
+	gotItems, ok := fields["items"].([]item)
+	if !ok {
+		t.Fatalf("patch must contain []item for items, got %#v", fields["items"])
 	}
-	if gotPayload.child == nil || gotPayload.child == newVal.Payload.child {
-		t.Fatalf("patch did not detach unexported pointer field: %#v", gotPayload.child)
+	if len(gotItems) != 1 || gotItems[0].Name != "changed" {
+		t.Fatalf("patch lost exported slice element field: %#v", gotItems)
 	}
-	if !reflect.DeepEqual(gotPayload.child.values, []int{1, 2}) {
-		t.Fatalf("patch aliased unexported pointer data: %#v", gotPayload.child)
+	if gotItems[0].hidden != 0 {
+		t.Fatalf("patch preserved hidden slice element field: %#v", gotItems)
+	}
+
+	applied := applyPatchForTest(t, c, oldVal, patch)
+	if len(applied.Items) != 1 || applied.Items[0].Name != "changed" || applied.Items[0].hidden != 0 {
+		t.Fatalf("patched record preserved hidden slice element field: %#v", applied.Items)
+	}
+}
+
+func TestReflectExt_PatchItemsClearUnexportedScalarPointerAndSliceInputs(t *testing.T) {
+	type payload struct {
+		Name   string
+		hidden int
+	}
+	type rec struct {
+		Ptr   *payload  `db:"ptr"`
+		Items []payload `db:"items"`
+	}
+
+	c := openTempUint64CollectionReflect[rec](t, "reflect_patch_input_hidden_scalar.db")
+	inputPtr := &payload{Name: "ptr", hidden: 7}
+	inputItems := []payload{{Name: "item", hidden: 9}}
+	items := mustPatchItemsForWrite(t, c, []Field{
+		{Name: "ptr", Value: inputPtr},
+		{Name: "items", Value: inputItems},
+	})
+	if len(items) != 2 {
+		t.Fatalf("patchItemsForWrite items=%#v", items)
+	}
+
+	got := make(map[string]any, len(items))
+	for _, item := range items {
+		got[item.Name] = item.Value
+	}
+
+	gotPtr, ok := got["ptr"].(*payload)
+	if !ok || gotPtr == nil || gotPtr.Name != "ptr" {
+		t.Fatalf("converted pointer patch value=%#v", got["ptr"])
+	}
+	if gotPtr == inputPtr || gotPtr.hidden != 0 {
+		t.Fatalf("converted pointer patch value preserved source/hidden state: %#v", gotPtr)
+	}
+
+	gotItems, ok := got["items"].([]payload)
+	if !ok || len(gotItems) != 1 || gotItems[0].Name != "item" {
+		t.Fatalf("converted slice patch value=%#v", got["items"])
+	}
+	if len(gotItems) != 0 && &gotItems[0] == &inputItems[0] {
+		t.Fatalf("converted slice patch value aliases source: %#v", gotItems)
+	}
+	if gotItems[0].hidden != 0 {
+		t.Fatalf("converted slice patch value preserved hidden state: %#v", gotItems)
+	}
+
+	type stored payload
+	type convertedRec struct {
+		Ptr   *stored  `db:"ptr"`
+		Items []stored `db:"items"`
+	}
+
+	c2 := openTempUint64CollectionReflect[convertedRec](t, "reflect_patch_input_converted_hidden_scalar.db")
+	converted := mustPatchItemsForWrite(t, c2, []Field{
+		{Name: "ptr", Value: payload{Name: "converted-ptr", hidden: 11}},
+		{Name: "items", Value: []payload{{Name: "converted-item", hidden: 13}}},
+	})
+	got = make(map[string]any, len(converted))
+	for _, item := range converted {
+		got[item.Name] = item.Value
+	}
+
+	gotConvertedPtr, ok := got["ptr"].(*stored)
+	if !ok || gotConvertedPtr == nil || gotConvertedPtr.Name != "converted-ptr" || gotConvertedPtr.hidden != 0 {
+		t.Fatalf("converted pointer patch input preserved hidden state: %#v", got["ptr"])
+	}
+	gotConvertedItems, ok := got["items"].([]stored)
+	if !ok || len(gotConvertedItems) != 1 || gotConvertedItems[0].Name != "converted-item" || gotConvertedItems[0].hidden != 0 {
+		t.Fatalf("converted slice patch input preserved hidden state: %#v", got["items"])
 	}
 }
 

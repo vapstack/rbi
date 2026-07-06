@@ -1,9 +1,11 @@
 package rebuild
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"unsafe"
 
@@ -12,7 +14,6 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
@@ -113,6 +114,9 @@ var (
 	rebuildBenchMeasurePool = pooled.Pointers[rebuildBenchMeasureRec]{
 		Clear: true,
 	}
+	rebuildBenchScalarCodec  = mustCompileRebuildBenchCodec[rebuildBenchScalarRec]()
+	rebuildBenchWideCodec    = mustCompileRebuildBenchCodec[rebuildBenchWideRec]()
+	rebuildBenchMeasureCodec = mustCompileRebuildBenchCodec[rebuildBenchMeasureRec]()
 )
 
 var rebuildBenchCountries = [...]string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -153,10 +157,7 @@ func seedRebuildBenchBolt(b *testing.B, bucket []byte, rows int, strKey bool) *b
 			case 1:
 				rec.Tags = []string{"go"}
 			}
-			data, e := msgpack.Marshal(&rec)
-			if e != nil {
-				return e
-			}
+			data := encodeRebuildBenchPayload(rebuildTestCodec, &rec)
 			if strKey {
 				skey := keycodec.StringBytes(fmt.Sprintf("key_%08d", i))
 				idx, e := mapBkt.NextSequence()
@@ -201,10 +202,7 @@ func seedRebuildBenchScalarBolt(b *testing.B, bucket []byte, rows int, shape reb
 		var key [8]byte
 		for i := 1; i <= rows; i++ {
 			rec := rebuildBenchScalarRecord(i, shape)
-			data, e := msgpack.Marshal(&rec)
-			if e != nil {
-				return e
-			}
+			data := encodeRebuildBenchPayload(rebuildBenchScalarCodec, &rec)
 			if e = bkt.Put(keycodec.U64BytesWithBuf(uint64(i), &key), data); e != nil {
 				return e
 			}
@@ -234,10 +232,7 @@ func seedRebuildBenchWideBolt(b *testing.B, bucket []byte, rows int, shape rebui
 		var key [8]byte
 		for i := 1; i <= rows; i++ {
 			rec := rebuildBenchWideRecord(i, shape)
-			data, e := msgpack.Marshal(&rec)
-			if e != nil {
-				return e
-			}
+			data := encodeRebuildBenchPayload(rebuildBenchWideCodec, &rec)
 			if strKey {
 				if e = bkt.Put(keycodec.StringBytes(fmt.Sprintf("key_%08d", i)), data); e != nil {
 					return e
@@ -281,10 +276,7 @@ func seedRebuildBenchMeasureBolt(b *testing.B, bucket []byte, rows int) *bbolt.D
 				M6:    uint64(i * 19),
 				M7:    uint64(i * 23),
 			}
-			data, e := msgpack.Marshal(&rec)
-			if e != nil {
-				return e
-			}
+			data := encodeRebuildBenchPayload(rebuildBenchMeasureCodec, &rec)
 			if e = bkt.Put(keycodec.U64BytesWithBuf(uint64(i), &key), data); e != nil {
 				return e
 			}
@@ -315,6 +307,20 @@ func compileRebuildBenchSchemaFor[T any](b *testing.B) *schema.Schema {
 		b.Fatalf("schema.Compile: %v", err)
 	}
 	return rt
+}
+
+func mustCompileRebuildBenchCodec[T any]() *schema.Schema {
+	rt, err := schema.Compile(reflect.TypeFor[T](), schema.Config{})
+	if err != nil {
+		panic(err)
+	}
+	return rt
+}
+
+func encodeRebuildBenchPayload[T any](rt *schema.Schema, rec *T) []byte {
+	var buf bytes.Buffer
+	rt.Codec.Encode(unsafe.Pointer(rec), &buf)
+	return slices.Clone(buf.Bytes())
 }
 
 func baseRebuildBenchConfig(bolt *bbolt.DB, bucket []byte, s *schema.Schema, decode DecodeFunc, release ReleaseFunc) Config {
@@ -418,7 +424,7 @@ func rebuildBenchWideRecord(i int, shape rebuildBenchWideShape) rebuildBenchWide
 
 func decodeRebuildBenchScalarRec(data []byte) (unsafe.Pointer, error) {
 	rec := rebuildBenchScalarPool.Get()
-	if err := msgpack.Unmarshal(data, rec); err != nil {
+	if err := rebuildBenchScalarCodec.Codec.Decode(data, unsafe.Pointer(rec)); err != nil {
 		rebuildBenchScalarPool.Put(rec)
 		return nil, err
 	}
@@ -431,7 +437,7 @@ func releaseRebuildBenchScalarRec(ptr unsafe.Pointer) {
 
 func decodeRebuildBenchWideRec(data []byte) (unsafe.Pointer, error) {
 	rec := rebuildBenchWidePool.Get()
-	if err := msgpack.Unmarshal(data, rec); err != nil {
+	if err := rebuildBenchWideCodec.Codec.Decode(data, unsafe.Pointer(rec)); err != nil {
 		rebuildBenchWidePool.Put(rec)
 		return nil, err
 	}
@@ -444,7 +450,7 @@ func releaseRebuildBenchWideRec(ptr unsafe.Pointer) {
 
 func decodeRebuildBenchMeasureRec(data []byte) (unsafe.Pointer, error) {
 	rec := rebuildBenchMeasurePool.Get()
-	if err := msgpack.Unmarshal(data, rec); err != nil {
+	if err := rebuildBenchMeasureCodec.Codec.Decode(data, unsafe.Pointer(rec)); err != nil {
 		rebuildBenchMeasurePool.Put(rec)
 		return nil, err
 	}

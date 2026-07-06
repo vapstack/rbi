@@ -20,11 +20,6 @@ type attemptRec struct {
 	V byte `db:"v" rbi:"unique"`
 }
 
-type attemptPairRec struct {
-	A byte `db:"a"`
-	B byte `db:"b"`
-}
-
 var testSnapshotManagers sync.Map
 var testCommitFns sync.Map
 var testPublishFns sync.Map
@@ -84,7 +79,7 @@ func executeBatchForTest(ex *Executor, batch []*request) {
 	for i := range batch {
 		reqs := requestScratchPool.Get(1)
 		reqs = append(reqs, *batch[i])
-		batch[i].setBaseline = nil
+		batch[i].setValue = nil
 		batch[i].setPayload = nil
 		batch[i].patch = nil
 		ops := Batch{ex: ex, reqs: reqs}
@@ -231,9 +226,11 @@ func assignRequestErr(reqs []*request, err error) {
 func setAttemptReq(id uint64, v byte) *request {
 	payload := encodePool.Get()
 	_ = payload.WriteByte(v)
+	rec := &attemptRec{V: v}
 	return &request{
 		op:         opSet,
 		id:         keycodec.DataKeyFromUserKey(id, false),
+		setValue:   unsafe.Pointer(rec),
 		setPayload: payload,
 	}
 }
@@ -245,18 +242,6 @@ func stringSetAttemptReq(id string, v byte) *request {
 	req.payloadOff = reserveStringValuePrefix(req.setPayload, true)
 	_ = req.setPayload.WriteByte(v)
 	return req
-}
-
-func cloneSetAttemptReq(id uint64, baseline *attemptRec) *request {
-	return &request{
-		op:          opSet,
-		id:          keycodec.DataKeyFromUserKey(id, false),
-		setBaseline: unsafe.Pointer(baseline),
-		cloneValue: func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-			cp := *(*attemptRec)(value)
-			return unsafe.Pointer(&cp), nil
-		},
-	}
 }
 
 func deleteAttemptReq(id uint64) *request {
@@ -300,34 +285,6 @@ func newTransparentPatchAttemptTestExecutor(t *testing.T, events *[]string, comm
 	ex.schema = rt
 	ex.indexed = false
 	ex.unique = UniqueContext{}
-	ex.snapshotOps = SnapshotOps{}
-	return ex, raw, bucket
-}
-
-func newPairAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.Tx) error) (*Executor, *bbolt.DB, []byte) {
-	t.Helper()
-
-	ex, raw, bucket := newAttemptTestExecutor(t, events, commit)
-	rt, err := schema.Compile(reflect.TypeFor[attemptPairRec](), schema.Config{})
-	if err != nil {
-		t.Fatalf("Compile: %v", err)
-	}
-	ops := RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-			rec := (*attemptPairRec)(ptr)
-			_ = buf.WriteByte(rec.A)
-			_ = buf.WriteByte(rec.B)
-			return nil
-		},
-		Decode: func(data []byte) (unsafe.Pointer, error) {
-			return unsafe.Pointer(&attemptPairRec{A: data[0], B: data[1]}), nil
-		},
-		Release:       func(unsafe.Pointer) {},
-		ValidateIndex: func(unsafe.Pointer) error { return nil },
-	}
-	ex.ops = &ops
-	ex.schema = rt
-	ex.indexed = false
 	ex.snapshotOps = SnapshotOps{}
 	return ex, raw, bucket
 }
@@ -418,12 +375,17 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	}
 
 	ops := RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) {
 			_ = buf.WriteByte((*attemptRec)(ptr).V)
-			return nil
 		},
 		Decode: func(data []byte) (unsafe.Pointer, error) {
 			return unsafe.Pointer(&attemptRec{V: data[0]}), nil
+		},
+		Acquire: func() unsafe.Pointer {
+			return unsafe.Pointer(&attemptRec{})
+		},
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+			*(*attemptRec)(dst) = *(*attemptRec)(src)
 		},
 		Release:       func(unsafe.Pointer) {},
 		ValidateIndex: func(unsafe.Pointer) error { return nil },
@@ -448,13 +410,12 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	ex = NewExecutor(Config{
 		StatsEnabled: true,
 
-		DataBucket:         bucket,
-		BucketFillPercent:  0.8,
-		RejectEmptyPayload: true,
-		Indexed:            true,
-		Ops:                &ops,
-		Schema:             rt,
-		SnapshotOps:        snapOps,
+		DataBucket:        bucket,
+		BucketFillPercent: 0.8,
+		Indexed:           true,
+		Ops:               &ops,
+		Schema:            rt,
+		SnapshotOps:       snapOps,
 	})
 	setSnapshotManagerForTest(ex, manager)
 	testCommitFns.Store(ex, commit)

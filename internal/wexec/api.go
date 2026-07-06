@@ -15,8 +15,7 @@ type Executor struct {
 	dataBucket   []byte
 	strmapBucket []byte
 
-	bucketFillPercent  float64
-	rejectEmptyPayload bool
+	bucketFillPercent float64
 
 	strKey      bool
 	indexed     bool
@@ -33,8 +32,7 @@ type Config struct {
 	StrMapBucket []byte
 	StrKey       bool
 
-	BucketFillPercent  float64
-	RejectEmptyPayload bool
+	BucketFillPercent float64
 
 	Indexed     bool
 	Ops         *RecordOps
@@ -47,16 +45,15 @@ func NewExecutor(cfg Config) *Executor {
 	ex := &Executor{
 		stats: executorStatsCounters{Enabled: cfg.StatsEnabled},
 
-		dataBucket:         cfg.DataBucket,
-		bucketFillPercent:  cfg.BucketFillPercent,
-		rejectEmptyPayload: cfg.RejectEmptyPayload,
-		strKey:             cfg.StrKey,
-		strmapBucket:       cfg.StrMapBucket,
-		indexed:            cfg.Indexed,
-		ops:                cfg.Ops,
-		schema:             cfg.Schema,
-		unique:             cfg.Unique,
-		snapshotOps:        cfg.SnapshotOps,
+		dataBucket:        cfg.DataBucket,
+		bucketFillPercent: cfg.BucketFillPercent,
+		strKey:            cfg.StrKey,
+		strmapBucket:      cfg.StrMapBucket,
+		indexed:           cfg.Indexed,
+		ops:               cfg.Ops,
+		schema:            cfg.Schema,
+		unique:            cfg.Unique,
+		snapshotOps:       cfg.SnapshotOps,
 	}
 	return ex
 }
@@ -75,12 +72,13 @@ func (b *Executor) ExecutorStats() ExecutorStats {
 
 type (
 	OnChangeHook func(unsafe.Pointer, uint8, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
-	CloneFunc    func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error)
 )
 
 type RecordOps struct {
-	Encode        func(unsafe.Pointer, *bytes.Buffer) error
+	Encode        func(unsafe.Pointer, *bytes.Buffer)
 	Decode        func([]byte) (unsafe.Pointer, error)
+	Acquire       func() unsafe.Pointer
+	CloneInto     func(unsafe.Pointer, unsafe.Pointer)
 	Release       func(unsafe.Pointer)
 	ValidateIndex func(unsafe.Pointer) error
 }

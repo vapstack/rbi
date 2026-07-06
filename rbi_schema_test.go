@@ -94,9 +94,7 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 			return err
 		}
 		buf := new(bytes.Buffer)
-		if err := c.encode(&noIndexRec{Name: "k-03", Age: 4}, buf); err != nil {
-			return err
-		}
+		c.encode(&noIndexRec{Name: "k-03", Age: 4}, buf)
 		idx, err := m.NextSequence()
 		if err != nil {
 			return err
@@ -1221,7 +1219,7 @@ func TestReflectExt_NewRejectsNamedNativeTimePointerType(t *testing.T) {
 		_ = c.Close()
 		t.Fatal("New accepted named *time.Time indexed field")
 	}
-	if msg := err.Error(); !strings.Contains(msg, "unsupported named type") || !strings.Contains(msg, "cannot be encoded by msgpack") {
+	if msg := err.Error(); !strings.Contains(msg, "named time field") || !strings.Contains(msg, "is not supported") {
 		t.Fatalf("New named *time.Time indexed field err=%v", err)
 	}
 }

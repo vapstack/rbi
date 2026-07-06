@@ -130,7 +130,7 @@ type reflectPatchTimeRec struct {
 	Name    string               `db:"name" rbi:"index"`
 	When    time.Time            `db:"-"`
 	Slots   []time.Time          `db:"-"`
-	Windows map[time.Time]string `db:"-"`
+	Windows map[string]time.Time `db:"-"`
 }
 
 type reflectNamedTime time.Time
@@ -263,7 +263,7 @@ func assertNewRejectsNamedTime[V any](t *testing.T) {
 		_ = c.Close()
 		t.Fatalf("New accepted indexed named time type %v", reflect.TypeFor[V]())
 	}
-	if msg := err.Error(); !strings.Contains(msg, "unsupported named type") || !strings.Contains(msg, "cannot be encoded by msgpack") {
+	if msg := err.Error(); !strings.Contains(msg, "named time field") || !strings.Contains(msg, "is not supported") {
 		t.Fatalf("New indexed named time type err=%v", err)
 	}
 }
@@ -632,7 +632,7 @@ func TestReflectExt_ValueIndexerDirectIfaceWordStruct_QueryUnique(t *testing.T) 
 
 func TestReflectExt_ValueIndexerInterfaceField_Unsupported(t *testing.T) {
 	raw, _ := openRawBolt(t)
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	c, err := Open[uint64, reflectInterfaceVIRec](raw, testOptions(Options{}))
 	if err == nil {
@@ -643,7 +643,7 @@ func TestReflectExt_ValueIndexerInterfaceField_Unsupported(t *testing.T) {
 
 func TestReflectExt_ValueIndexerInterfaceSlice_Unsupported(t *testing.T) {
 	raw, _ := openRawBolt(t)
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	c, err := Open[uint64, reflectInterfaceVISliceRec](raw, testOptions(Options{}))
 	if err == nil {

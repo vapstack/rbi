@@ -5,14 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -26,7 +24,6 @@ import (
 	"github.com/vapstack/rbi/rbierrors"
 	"github.com/vapstack/rbi/rbistats"
 	"github.com/vapstack/rbi/rbitrace"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
 
@@ -63,22 +60,6 @@ type ValueIndexer = schema.ValueIndexer
 
 // Key is the reserved synthetic query field name for record primary keys.
 const Key = "$key"
-
-// Codec overrides default msgpack encoding/decoding for *V.
-//
-// EncodeRBI must write the full encoded form of the receiver to w.
-// It must not mutate the source value.
-//
-// DecodeRBI must populate the receiver from the encoded form read from r.
-//
-// RBI does not retry decoding with msgpack when DecodeRBI returns an error.
-// If fallback decoding is needed, implement it inside the custom codec.
-type Codec interface {
-	EncodeRBI(io.Writer) error
-	DecodeRBI(io.Reader) error
-}
-
-var codecType = reflect.TypeFor[Codec]()
 
 // Options configures collection and how it works with a bbolt database.
 //
@@ -280,15 +261,11 @@ func (o Options) validate() error {
 }
 
 // Field represents a single field assignment used by Patch.
-// Name is matched against struct field name, "db" tag, or "json" tag,
-// and Value is assigned to the matched field using reflection and conversion rules.
 type Field struct {
 	// Name is the logical name of the field to patch.
 	// It can be a struct field name, a "db" tag value, or a "json" tag value.
 	Name string
-	// Value is the new value to assign to the field.
-	// Patch attempts to convert Value to the field's concrete type,
-	// including numeric widening and some int/float conversions.
+	// Value is converted to the matched field type.
 	Value any
 }
 
@@ -306,8 +283,6 @@ type Collection[K ~string | ~uint64, V any] struct {
 	vtype reflect.Type
 
 	execOptions execOptions[K, V]
-	encodeFn    func(*V, io.Writer) error
-	decodeFn    func(*V, io.Reader) error
 
 	recPool pooled.Pointers[V]
 
@@ -316,8 +291,9 @@ type Collection[K ~string | ~uint64, V any] struct {
 
 // Open opens or creates a Collection that uses the provided bbolt database.
 //
-// The generic type V must be a struct;
-// otherwise rbierrors.ErrNotStructType is returned.
+// The generic type V must be a struct; otherwise rbierrors.ErrNotStructType is
+// returned. Only exported fields are part of the schema, and unsupported
+// exported field types make Open return an error.
 //
 // Zero-valued option fields use defaults.
 //
@@ -365,11 +341,6 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 		}
 	}
 	defaultExecOptions = freezeExecOptions(defaultExecOptions)
-	encodeFn, decodeFn, err := defaultCodecMethods[V]()
-	if err != nil {
-		return nil, err
-	}
-
 	boltPath, err := filepath.Abs(bolt.Path())
 	if err != nil {
 		return nil, fmt.Errorf("error getting absolute file path: %w", err)
@@ -400,8 +371,6 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 		vtype:      vtype,
 
 		execOptions: defaultExecOptions,
-		encodeFn:    encodeFn,
-		decodeFn:    decodeFn,
 	}
 	part.options = &options
 	part.boltPath = boltPath
@@ -421,7 +390,7 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 			schemaIndex[name] = schema.IndexKind(kind)
 		}
 	}
-	c.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex, CustomCodec: decodeFn != nil})
+	c.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex})
 	if err != nil {
 		return nil, err
 	}
@@ -584,7 +553,7 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 			c.index.PublishLoadedPlannerStats(loadedPlannerStats)
 
 		} else {
-			if err = c.index.RefreshPlannerStatsOnSnapshot(c.index.CurrentSnapshot(), c.collection.unavailableErr); err != nil {
+			if err = c.index.RefreshPlannerStatsOnSnapshot(c.index.CurrentSnapshot(), c.unavailableErr); err != nil {
 				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
 			}
 		}
@@ -654,8 +623,8 @@ func (c *Collection[K, V]) initWriteExecutor() {
 	c.root.scheduler.configure(c.options.BatchSoftLimit)
 
 	ops := wexec.RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
-			return c.encode((*V)(ptr), buf)
+		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) {
+			c.encode((*V)(ptr), buf)
 		},
 		Decode: func(data []byte) (unsafe.Pointer, error) {
 			val, err := c.decode(data)
@@ -663,6 +632,12 @@ func (c *Collection[K, V]) initWriteExecutor() {
 				return nil, err
 			}
 			return unsafe.Pointer(val), nil
+		},
+		Acquire: func() unsafe.Pointer {
+			return unsafe.Pointer(c.recPool.Get())
+		},
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+			c.schema.Clone.CloneInto(src, dst)
 		},
 		Release: func(ptr unsafe.Pointer) {
 			c.ReleaseRecords((*V)(ptr))
@@ -673,15 +648,14 @@ func (c *Collection[K, V]) initWriteExecutor() {
 	}
 
 	cfg := wexec.Config{
-		StatsEnabled:       c.root.statsEnabled,
-		DataBucket:         c.dataBucket,
-		StrMapBucket:       c.strmapBucket,
-		BucketFillPercent:  c.options.BucketFillPercent,
-		RejectEmptyPayload: c.decodeFn == nil,
-		StrKey:             c.strKey,
-		Indexed:            c.index != nil,
-		Ops:                &ops,
-		Schema:             c.schema,
+		StatsEnabled:      c.root.statsEnabled,
+		DataBucket:        c.dataBucket,
+		StrMapBucket:      c.strmapBucket,
+		BucketFillPercent: c.options.BucketFillPercent,
+		StrKey:            c.strKey,
+		Indexed:           c.index != nil,
+		Ops:               &ops,
+		Schema:            c.schema,
 	}
 
 	if c.index != nil {
@@ -698,7 +672,7 @@ func (c *Collection[K, V]) configureAsyncMaterializedPredSnapshots() {
 	c.index.ConfigureAsyncMaterializedPredSnapshotOps(qexec.AsyncMaterializedPredSnapshotOps{
 		CurrentSeq: c.currentSnapshotSeq,
 		PinCurrentBySeq: func(seq uint64) (*snapshot.View, qexec.AsyncSnapshotPin, bool) {
-			snap, pin, ok := c.collection.pinCurrentReadStateBySnapshotSeq(seq)
+			snap, pin, ok := c.pinCurrentReadStateBySnapshotSeq(seq)
 			if !ok {
 				return nil, nil, false
 			}
@@ -810,7 +784,7 @@ func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 //
 // LastKey and SnapshotSequence are populated in both modes.
 func (c *Collection[K, V]) Stats() (rbistats.Collection[K], error) {
-	if err := c.collection.unavailableErr(); err != nil {
+	if err := c.unavailableErr(); err != nil {
 		return rbistats.Collection[K]{}, err
 	}
 
@@ -1052,90 +1026,17 @@ func (c *Collection[K, V]) BucketName() []byte {
 	return slices.Clone(c.dataBucket)
 }
 
-var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
-	New: func() *msgpack.Encoder { return msgpack.NewEncoder(io.Discard) },
-	Cleanup: func(enc *msgpack.Encoder) {
-		enc.Reset(io.Discard)
-	},
-}
-
-var msgpackDecPool = pooled.Pointers[msgpack.Decoder]{
-	New: func() *msgpack.Decoder {
-		return msgpack.NewDecoder(strings.NewReader(""))
-	},
-}
-
-var decodeReaderPool = pooled.Pointers[bytes.Reader]{
-	Clear: true,
-}
-
-func defaultCodecMethods[V any]() (func(*V, io.Writer) error, func(*V, io.Reader) error, error) {
-	t := reflect.TypeFor[*V]()
-	if !t.Implements(codecType) {
-		return nil, nil, nil
-	}
-	if _, bad := reflect.TypeFor[V]().MethodByName("DecodeRBI"); bad {
-		return nil, nil, fmt.Errorf("invalid Codec implementation for %v: DecodeRBI must have pointer receiver", t)
-	}
-
-	encodeMethod, ok := t.MethodByName("EncodeRBI")
-	if !ok {
-		return nil, nil, nil
-	}
-	encodeFn, ok := encodeMethod.Func.Interface().(func(*V, io.Writer) error)
-	if !ok {
-		return nil, nil, nil
-	}
-
-	decodeMethod, ok := t.MethodByName("DecodeRBI")
-	if !ok {
-		return nil, nil, nil
-	}
-	decodeFn, ok := decodeMethod.Func.Interface().(func(*V, io.Reader) error)
-	if !ok {
-		return nil, nil, nil
-	}
-
-	return encodeFn, decodeFn, nil
-}
-
 func (c *Collection[K, V]) decode(b []byte) (*V, error) {
 	v := c.recPool.Get()
-
-	reader := decodeReaderPool.Get()
-	defer decodeReaderPool.Put(reader)
-
-	reader.Reset(b)
-
-	if c.decodeFn != nil {
-		if err := c.decodeFn(v, reader); err != nil {
-			c.ReleaseRecords(v)
-			return nil, err
-		}
-		return v, nil
-	}
-
-	dec := msgpackDecPool.Get()
-	defer msgpackDecPool.Put(dec)
-
-	dec.Reset(reader)
-
-	if err := dec.Decode(v); err != nil {
+	if err := c.schema.Codec.Decode(b, unsafe.Pointer(v)); err != nil {
 		c.ReleaseRecords(v)
 		return nil, err
 	}
 	return v, nil
 }
 
-func (c *Collection[K, V]) encode(v *V, b *bytes.Buffer) error {
-	if c.encodeFn != nil {
-		return c.encodeFn(v, b)
-	}
-	enc := msgpackEncPool.Get()
-	enc.Reset(b)
-	err := enc.Encode(v)
-	msgpackEncPool.Put(enc)
-	return err
+func (c *Collection[K, V]) encode(v *V, b *bytes.Buffer) {
+	c.schema.Codec.Encode(unsafe.Pointer(v), b)
 }
 
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }

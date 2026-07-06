@@ -142,6 +142,20 @@ func main() {
 }
 ```
 
+## Supported data types
+
+- `bool`, `string`, `float32`, `float64`
+- signed and unsigned integers (except `uintptr`)
+- named scalar types based on the kinds above
+- exact `time.Time` and `*time.Time`
+- pointers, slices, arrays, structs, and maps containing supported types
+
+Map keys are stricter: string, bool, signed and unsigned integers, arrays of
+supported key values, and structs with only exported supported key fields.
+
+Named wrappers around `time.Time` are not supported. Recursive type graphs are
+rejected during schema construction. Unexported fields are ignored.
+
 ## API
 
 For the full API reference see
@@ -361,37 +375,22 @@ users, err := rbi.New[uint64, User](bolt, rbi.Options{
 ### Hooks
 
 Write methods accept `ExecOption` values, and the same options may also be
-passed to `New` to become defaults for the whole Collection instance.
+passed to `Open` to become defaults for the whole Collection instance.
 
-**Available hooks/options:**
+**Available hooks / options:**
 
-- `OnChange` - runs for inserted, updated, and deleted records. For inserts
-  and updates it receives an RBI-owned mutable `newValue`; for deletes it
-  receives `oldValue != nil` and `newValue == nil`.
-  The hook may modify `newValue` when it is non-nil, but must not modify
-  `oldValue`.
-  Writes issued through the hook `*Tx` passed to the callback are generated
-  writes and commit atomically with the owner write. Do not start independent
-  writes or use another `*Tx` from inside `OnChange`.
+- `PatchStrict` - makes `Patch` reject unknown fields.
 
-- `CloneFunc` - optional helper for cloning `*V` values.
-  It can be used when the value becomes encodable only after normalization, or
-  simply as a faster cloning path than RBI's fallback encode/decode snapshotting.
 
-* `PatchStrict` - makes `Patch` reject unknown fields.
-
-**Important notes:**
-
-- `OnChange` receives RBI-owned record pointers for decoded old values and
-  mutable working copies. Do not modify `oldValue`, and do not retain
+- `OnChange` - runs for inserted, updated, and deleted records.
+  For inserts and updates it receives a mutable `newValue`.
+  For deletes `newValue` is nil. For inserts `oldValue` is nil.
+  Hook may modify `newValue` (when it is non-nil).
+  New writes issued through the provided `*Tx` commit atomically 
+  with the original tx. Do not initiate new writes with another `*Tx`
+  from inside `OnChange`. Do not modify `oldValue`, and do not retain
   `oldValue` or `newValue` after the callback returns.
 
-- All writes go through the root write scheduler. After `Commit`, the scheduler
-  may physically co-batch compatible logical writes from neighboring
-  transactions.
-
-- `OnChange` runs before commit. Avoid external side effects because the owner
-  write may still roll back.
 
 ## Struct tags and indexing
 
@@ -535,32 +534,21 @@ type User struct {
 
 ## Creating a patch
 
-`MakePatch` builds a complete patch from fields changed between two values.
+`MakePatch` builds a complete patch from exported fields changed between two
+values. If `oldVal` is nil, every patchable exported field in `newVal` is
+emitted. If `newVal` is nil, the patch is empty.
 
 By default, field names use `db` tags when present and otherwise fall back to
-the Go field name only when that name is an unambiguous patch identifier. If any
-changed field has no safe default name, `MakePatch` returns an error.
+the Go field name when that name is an unambiguous patch identifier.
+If any changed field has no safe default name, `MakePatch` returns an error.
 
 With `PatchJSON`, names use explicit, non-empty `json` tags and otherwise fall
 back to unambiguous Go field names. Changed fields without a safe JSON patch
 name, including `json:"-"` fields, return an error instead of being dropped.
 
-Float semantics are canonical: `-0` equals `+0`, and all NaN values compare
-equal. `MakePatch` applies the same semantics to schema-known values it can
-compare without walking arbitrary object graphs: direct float fields,
-direct float pointer fields, float slices, and acyclic value composites
-made of structs/arrays. For maps, interfaces, and arbitrary reference graphs,
-MakePatch uses Go reflect equality.
-
-### Ownership and safety
-
-`MakePatch` and `MakePatchInto` copy changed values into the patch,
-including unexported nested fields (if any), so later mutations of `newVal`
-do not affect patch data. These methods are not general object cloners.
-Runtime state such as `sync` or atomic values, locks, channels, functions,
-and other unsafe resources are not supported and are not diagnosed.
-These methods do not return errors for such values and copy safety is provided 
-on a best-effort basis.
+Float equality is canonical across scalar and nested values: `-0` equals `+0`,
+and all NaN values compare equal. `time.Time` values compare with `Time.Equal`.
+Maps are compared by key presence and recursively by value.
 
 ## Index persistence and recovery
 
@@ -569,7 +557,6 @@ Indexes are persisted only on `Close`.
 RBI reserves the bucket sequence counter and advances it on each
 successful write. The `.rbi` file stores the bucket sequence it was
 built from and is loaded only when the current bucket sequence matches.
-
 After a successful `Close`, a fresh `.rbi` file is written from the current
 in-memory snapshot and can be reused on the next open.
 
@@ -619,6 +606,11 @@ ApproxMem(field) ~= D * (K + 20...24) + PostingBytes
 **PostingBytes** depends on data distribution.
 Low-cardinality fields are often much cheaper than unique fields because large
 postings compress well.
+
+High-cardinality regular fields whose value buckets are mostly single-record
+use a compact singleton layout and are closer to unique indexes.
+When a field has both singleton and multi-record buckets, the result falls
+between the unique and generic estimates.
 
 ### Slice fields
 
@@ -695,14 +687,13 @@ if explicit control is required (e.g. when value type is renamed).
 
 ## Encoding and schema evolution
 
-Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack) by
-default. If `*V` implements `Codec`, it is used instead.
+Values are encoded with internal codec.
 
-Msgpack provides good performance, compact binary representation, and a
-flat encoding model similar to JSON. This makes it tolerant to many
-schema changes, including field reordering and movement between embedded
-and top-level structs. Unlike `gob`, field decoding does not depend on 
-the exact structural layout of the type.
+The encoded form stores exported fields by stable storage name instead of
+positional encoding. This keeps decoding tolerant to many schema
+changes, including field reordering and movement between embedded and
+top-level structs when the storage name remains the same. Unlike `gob`, field
+decoding does not depend on the exact structural layout of the type.
 
 Most schema changes are handled gracefully:
 
@@ -715,22 +706,11 @@ Most schema changes are handled gracefully:
   removed and a new one is created; stored data remains until records are
   updated.
 - **Changing field types** – affected indexes for indexed fields are rebuilt;
-  decoding behavior and compatibility are the responsibility of the user.
+  numeric changes decode when the stored value fits the destination type.
+  Other type compatibility remains the responsibility of the user.
 
 Indexes for affected tagged fields are automatically rebuilt when schema
 changes are detected.
-
-### Custom encoding
-
-Type can implement `Codec` interface:
-```go
-type Codec interface {
-    EncodeRBI(io.Writer) error
-    DecodeRBI(io.Reader) error
-}
-```
-If it does, RBI uses it instead of msgpack for all encoding/decoding work.
-Fallback decoding, if required, is the responsibility of the implementation.
 
 ## Storage notes
 

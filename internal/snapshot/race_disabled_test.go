@@ -2,4 +2,4 @@
 
 package snapshot
 
-const testRaceEnabled = false
+const testRaceEnabled = false // nolint
