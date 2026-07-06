@@ -100,6 +100,8 @@ var (
 			} else {
 				p.rowPrefix = p.rowPrefix[:0]
 			}
+			p.numericKeys = false
+			p.stringKeys = false
 			p.refsCount.Store(0)
 		},
 	}

@@ -212,10 +212,12 @@ type fieldIndexChunkRef struct {
 }
 
 type fieldIndexChunkDirPage struct {
-	refsCount atomic.Int32
-	refs      []fieldIndexChunkRef
-	prefix    []int
-	rowPrefix []uint64
+	refsCount   atomic.Int32
+	numericKeys bool
+	stringKeys  bool
+	refs        []fieldIndexChunkRef
+	prefix      []int
+	rowPrefix   []uint64
 }
 
 // fieldIndexChunkedRoot stores immutable directory pages over immutable chunks
@@ -318,13 +320,22 @@ func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPag
 
 	total := 0
 	rows := uint64(0)
+	numericKeys := false
+	stringKeys := false
 	for i := range page.refs {
 		ref := page.refs[i]
 		total += ref.chunk.keyCount()
 		rows += ref.chunk.rowCount()
 		page.prefix[i+1] = total
 		page.rowPrefix[i+1] = rows
+		if ref.last.IsNumeric() {
+			numericKeys = true
+		} else {
+			stringKeys = true
+		}
 	}
+	page.numericKeys = numericKeys
+	page.stringKeys = stringKeys
 	return page
 }
 
@@ -2209,16 +2220,8 @@ func newFieldIndexChunkedRootFromOwnedPages(pages []*fieldIndexChunkDirPage) *fi
 		prefix[i+1] = total
 		rowPrefix[i+1] = rows
 		if !numericKeys || !stringKeys {
-			for j := range page.refs {
-				if page.refs[j].last.IsNumeric() {
-					numericKeys = true
-				} else {
-					stringKeys = true
-				}
-				if numericKeys && stringKeys {
-					break
-				}
-			}
+			numericKeys = numericKeys || page.numericKeys
+			stringKeys = stringKeys || page.stringKeys
 		}
 	}
 	if total == 0 {
