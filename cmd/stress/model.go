@@ -44,7 +44,7 @@ type UserBench struct {
 	LastLogin  int64    `db:"last_login"  rbi:"index"`
 	Tags       []string `db:"tags"        rbi:"index"`
 	Roles      []string `db:"roles"       rbi:"index"`
-	Blob       []byte   `db:"-"`
+	Blob       []byte
 }
 
 type LatencySummary struct {

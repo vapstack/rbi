@@ -884,24 +884,53 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 	}
 }
 
-func TestIndexTags_DBTagDashDoesNotDisableIndexing(t *testing.T) {
+func TestIndexTags_DBTagDashCannotBeIndexed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db_dash_does_not_disable_index.db")
-	c, bolt := openBoltAndCollection[uint64, dbDashDoesNotDisableIndexRec](t, path)
+	raw, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	_, err = Open[uint64, dbDashIndexedRec](raw, testOptions(Options{}))
+	if err == nil || !strings.Contains(err.Error(), `cannot use db:"-" with active rbi tag`) {
+		t.Fatalf("db dash indexed err=%v want active rbi tag rejection", err)
+	}
+}
+
+func TestStructTags_IgnoredFieldsAreNotStored(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ignored_fields_not_stored.db")
+	c, bolt := openBoltAndCollection[uint64, ignoredStorageRec](t, path)
 	t.Cleanup(func() {
 		_ = c.Close()
 		_ = bolt.Close()
 	})
 
-	if err := writeSet(c, 1, &dbDashDoesNotDisableIndexRec{Name: "alice"}); err != nil {
+	if err := writeSet(c, 1, &ignoredStorageRec{
+		Name:     "stored",
+		DBSkip:   "db-skip",
+		RBISkip:  "rbi-skip",
+		Disabled: []byte("disabled"),
+	}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	ids, err := readQueryKeys(c, qx.Query(qx.EQ("Name", "alice")))
+
+	got, err := readGet(c, 1)
 	if err != nil {
-		t.Fatalf("QueryKeys(Name): %v", err)
+		t.Fatalf("Get(1): %v", err)
 	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("QueryKeys(Name)=%v want [1]", ids)
+	if got == nil {
+		t.Fatal("Get(1)=nil")
+	}
+	defer c.ReleaseRecords(got)
+
+	if got.Name != "stored" {
+		t.Fatalf("stored field lost: %#v", got)
+	}
+	if got.DBSkip != "" || got.RBISkip != "" || got.Disabled != nil {
+		t.Fatalf("ignored fields were stored: %#v", got)
 	}
 }
 
@@ -1368,8 +1397,8 @@ func TestStringKeyIndexKeyOnlyDeleteSkipsOldPayloadDecode(t *testing.T) {
 }
 
 type noIndexRec struct {
-	Name string `rbi:"-"`
-	Age  int    `rbi:"-"`
+	Name string
+	Age  int
 }
 
 type stringKeyIndexQueryVI int
@@ -1402,8 +1431,15 @@ type multiValueRBITagRec struct {
 	Name string `db:"name" rbi:"index,unique"`
 }
 
-type dbDashDoesNotDisableIndexRec struct {
+type dbDashIndexedRec struct {
 	Name string `db:"-" rbi:"index"`
+}
+
+type ignoredStorageRec struct {
+	Name     string
+	DBSkip   string `db:"-"`
+	RBISkip  string `db:"rbi_skip" rbi:"-"`
+	Disabled []byte `rbi:"-"`
 }
 
 type EmbeddedSharedFields struct {
@@ -1424,7 +1460,7 @@ type embeddedDisabledByParentRec struct {
 }
 
 type optionsIndexRec struct {
-	Name   string `db:"name" rbi:"-"`
+	Name   string `db:"name"`
 	Email  string `db:"email" rbi:"index"`
 	Score  int    `db:"score_db"`
 	Amount int64  `db:"amount" rbi:"measure"`

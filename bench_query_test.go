@@ -35,7 +35,7 @@ type UserBench struct {
 	Email   string   `db:"email"   rbi:"index"`
 	Tags    []string `db:"tags"    rbi:"index"`
 	Roles   []string `db:"roles"   rbi:"index"`
-	Blob    []byte   `db:"-"       rbi:"-"`
+	Blob    []byte
 }
 
 type queryIRBenchResolver struct{}
@@ -1379,7 +1379,7 @@ type StressBenchUser struct {
 	LastLogin  int64    `db:"last_login"  rbi:"index"`
 	Tags       []string `db:"tags"        rbi:"index"`
 	Roles      []string `db:"roles"       rbi:"index"`
-	Blob       []byte   `db:"-"           rbi:"-"`
+	Blob       []byte
 }
 
 const (

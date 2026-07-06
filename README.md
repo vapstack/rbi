@@ -62,8 +62,8 @@ type User struct {
     Tags    []string `db:"tags"   rbi:"index"`
     Spent   int64    `db:"spent"  rbi:"measure"` // aggregate-only
 
-    Meta    string   `db:"meta"   rbi:"-"` // not indexed
-    Exclude string                         // not indexed
+    Meta    string   `db:"meta"` // not indexed
+    Exclude string   `db:"-"`    // not stored
 }
 
 func main() {
@@ -395,11 +395,14 @@ passed to `Open` to become defaults for the whole Collection instance.
 ## Struct tags and indexing
 
 Fields can be indexed in two ways:
-1. By `rbi` struct tags, used when `Options.Index == nil`.
-2. By `Options.Index`, which ignores all `rbi` tags when non-nil.
+1. By `rbi` struct tags, used when `Options.Index` is nil.
+2. By `Options.Index`, which overrides index declarations when non-nil.
 
-Supported tag values are `index`, `unique`, `measure`, and `-`.\
+Supported `rbi` tag values are `index`, `unique`, `measure`, and `-`.\
 Unknown values or multiple values in one tag are rejected.
+
+Fields tagged `db:"-"` or `rbi:"-"` are completely excluded from RBI storage,
+patching and indexing (including declarations through `Options.Index`).
 
 ```go
 type User struct {
@@ -407,6 +410,8 @@ type User struct {
     Age   int    `db:"age"   rbi:"index"`   // regular inverted index
     Spent int64  `db:"spent" rbi:"measure"` // aggregation-only measure
     Cache string `db:"cache"`               // not indexed
+    Temp  string `db:"-"`                   // not stored
+    Blob  []byte `db:"blob"  rbi:"-"`       // not stored
 }
 ```
 
@@ -513,8 +518,10 @@ The returned value is used as the indexed representation.
 `Patch` accepts string field identifiers matching any registered alias of a field:
 
 - Go struct field name
-- `db` tag value, unless it is `db:"-"`
+- `db` tag value
 - `json` tag name, unless it is `json:"-"` or empty
+
+Fields tagged `db:"-"` or `rbi:"-"` are not registered for patching.
 
 ```go
 type User struct {
@@ -525,7 +532,7 @@ type User struct {
     Email string `db:"email" json:"mail" rbi:"index"`
     
     // Not indexed. Patchable via "Password" or "pass".
-    Password string `db:"-" json:"pass"`
+    Password string `json:"pass"`
     
     // Not indexed. Patchable via "Meta".
     Meta string

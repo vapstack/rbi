@@ -109,6 +109,9 @@ func (c *cloneCompiler) validateRecord(t reflect.Type, path string) error {
 		if !sf.IsExported() {
 			continue
 		}
+		if fieldIgnoredByTags(sf) {
+			continue
+		}
 		if err := c.validateType(sf.Type, path+"."+sf.Name, false); err != nil {
 			delete(c.stack, t)
 			return err
@@ -145,6 +148,9 @@ func (c *cloneCompiler) validateType(t reflect.Type, path string, key bool) erro
 					sf := t.Field(i)
 					if !sf.IsExported() {
 						return fmt.Errorf("%w: unsupported map key field %s.%s type %s", errInvalidRecordType, path, sf.Name, t)
+					}
+					if fieldIgnoredByTags(sf) {
+						return fmt.Errorf("%w: unsupported ignored map key field %s.%s type %s", errInvalidRecordType, path, sf.Name, t)
 					}
 					if err := c.validateType(sf.Type, path+"."+sf.Name, true); err != nil {
 						return err
@@ -203,6 +209,9 @@ func (c *cloneCompiler) validateType(t reflect.Type, path string, key bool) erro
 			for i := 0; i < t.NumField(); i++ {
 				sf := t.Field(i)
 				if !sf.IsExported() {
+					continue
+				}
+				if fieldIgnoredByTags(sf) {
 					continue
 				}
 				if err := c.validateType(sf.Type, path+"."+sf.Name, false); err != nil {
@@ -317,6 +326,9 @@ func (c *cloneCompiler) buildStructPlan(t reflect.Type, offset uintptr, path str
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if !sf.IsExported() {
+			continue
+		}
+		if fieldIgnoredByTags(sf) {
 			continue
 		}
 		if err := c.buildPlan(sf.Type, offset+sf.Offset, path+"."+sf.Name, plan); err != nil {

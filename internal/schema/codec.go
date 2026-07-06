@@ -174,7 +174,10 @@ func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintpt
 		if !sf.IsExported() {
 			continue
 		}
-		name := codecFieldStorageName(sf)
+		if fieldIgnoredByTags(sf) {
+			continue
+		}
+		name := fieldDBName(sf)
 		if sf.Anonymous && sf.Type.Kind() == reflect.Struct && sf.Type != nativeTimeType {
 			nested, err := c.compileStruct(sf.Type, prefix, base+sf.Offset, path+"."+sf.Name)
 			if err != nil {
@@ -231,13 +234,6 @@ func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintpt
 		}
 	}
 	return fields, nil
-}
-
-func codecFieldStorageName(sf reflect.StructField) string {
-	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
-		return dbTag
-	}
-	return sf.Name
 }
 
 func codecAppendPath(prefix []byte, name string) []byte {
@@ -504,7 +500,11 @@ func (c *codecCompiler) makeCodecMapKeyStruct(t reflect.Type, path string) (code
 			delete(c.stack, t)
 			return codecValue{}, fmt.Errorf("%w %s.%s hidden map key field type %s", errUnsupportedCodecField, path, sf.Name, t)
 		}
-		name := codecFieldStorageName(sf)
+		if fieldIgnoredByTags(sf) {
+			delete(c.stack, t)
+			return codecValue{}, fmt.Errorf("%w %s.%s ignored map key field type %s", errUnsupportedCodecField, path, sf.Name, t)
+		}
+		name := fieldDBName(sf)
 		value, err := c.makeCodecMapKey(sf.Type, path+"."+sf.Name)
 		if err != nil {
 			delete(c.stack, t)

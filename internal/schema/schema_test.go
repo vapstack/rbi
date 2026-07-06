@@ -68,6 +68,9 @@ func TestCompileTagsCollectsIndexedUniqueMeasureAndPatch(t *testing.T) {
 	if len(rt.Patch.Access) == 0 || rt.Patch.Fields["name"] == nil || rt.Patch.Fields["email"] == nil {
 		t.Fatal("patch runtime did not include exported fields")
 	}
+	if rt.Patch.Fields["Disabled"] != nil || rt.Patch.Fields["disabled"] != nil {
+		t.Fatal("ignored field was registered in patch runtime")
+	}
 	if !rt.HasUnique {
 		t.Fatal("expected HasUnique")
 	}
@@ -676,7 +679,7 @@ func TestCompileSkippedAnonymousSubtreeIgnoresNestedIndexTags(t *testing.T) {
 	if _, ok := rt.Patch.Fields["SchemaTestAnonymousToken"]; ok {
 		t.Fatal("skipped subtree interpreted nested anonymous index tag as parent patch field")
 	}
-	if f := rt.Patch.Fields["Value"]; f == nil || !slices.Equal(f.Index, []int{0, 0, 0}) {
+	if f := rt.Patch.Fields["Value"]; f != nil {
 		t.Fatalf("skipped subtree promoted child patch field=%+v", f)
 	}
 

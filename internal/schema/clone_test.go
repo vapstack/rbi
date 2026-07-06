@@ -86,6 +86,13 @@ type schemaTestCloneHiddenRec struct {
 	hidden []byte
 }
 
+type schemaTestCloneIgnoredRec struct {
+	Name     string
+	DBSkip   chan int `db:"-"`
+	RBISkip  func()   `db:"skip" rbi:"-"`
+	Disabled []byte   `rbi:"-"`
+}
+
 type schemaTestCloneRawSpanRec struct {
 	ID     uint64
 	Name   string
@@ -239,6 +246,29 @@ func TestCloneRuntimeIgnoresUnexportedFields(t *testing.T) {
 	if dst.hidden != nil || dst.Value.hidden != nil || dst.Ptr.hidden != nil ||
 		dst.Items[0].hidden != nil || dst.Lookup["k"].hidden != nil {
 		t.Fatalf("unexported fields were cloned: %#v", &dst)
+	}
+}
+
+func TestCloneRuntimeIgnoresTaggedFields(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestCloneIgnoredRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	src := schemaTestCloneIgnoredRec{
+		Name:     "root",
+		DBSkip:   make(chan int),
+		RBISkip:  func() {},
+		Disabled: []byte("ignored"),
+	}
+	var dst schemaTestCloneIgnoredRec
+	rt.Clone.CloneInto(unsafe.Pointer(&src), unsafe.Pointer(&dst))
+
+	if dst.Name != "root" {
+		t.Fatalf("exported clone failed: %#v", &dst)
+	}
+	if dst.DBSkip != nil || dst.RBISkip != nil || dst.Disabled != nil {
+		t.Fatalf("ignored fields were cloned: %#v", &dst)
 	}
 }
 

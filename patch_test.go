@@ -1087,6 +1087,13 @@ type patchJSONHiddenAnonymousRec struct {
 	PatchJSONHiddenAnonymousEmbeddedRec `json:"-"`
 }
 
+type patchIgnoredFieldsRec struct {
+	Name     string `db:"name"`
+	DBSkip   string `db:"-" json:"dbSkip"`
+	RBISkip  string `db:"rbi_skip" json:"rbiSkip" rbi:"-"`
+	Disabled []byte `rbi:"-"`
+}
+
 func TestMakePatch_PatchJSON_RejectsChangedJSONOmittedField(t *testing.T) {
 	c := openTempUint64CollectionReflect[patchJSONOmittedRec](t, "patch_json_omitted_field.db")
 
@@ -1099,6 +1106,41 @@ func TestMakePatch_PatchJSON_RejectsChangedJSONOmittedField(t *testing.T) {
 	}
 	if len(patch) != 0 {
 		t.Fatalf("MakePatch PatchJSON returned partial patch after error: %#v", patch)
+	}
+}
+
+func TestMakePatch_IgnoresTaggedFields(t *testing.T) {
+	c := openTempUint64CollectionReflect[patchIgnoredFieldsRec](t, "patch_ignored_fields.db")
+
+	oldVal := &patchIgnoredFieldsRec{
+		Name:     "same",
+		DBSkip:   "old-db",
+		RBISkip:  "old-rbi",
+		Disabled: []byte("old-disabled"),
+	}
+	newVal := &patchIgnoredFieldsRec{
+		Name:     "same",
+		DBSkip:   "new-db",
+		RBISkip:  "new-rbi",
+		Disabled: []byte("new-disabled"),
+	}
+
+	patch := mustMakePatch(t, c, oldVal, newVal)
+	if len(patch) != 0 {
+		t.Fatalf("ignored-only changes produced patch: %#v", patch)
+	}
+	patch = mustMakePatch(t, c, oldVal, newVal, PatchJSON)
+	if len(patch) != 0 {
+		t.Fatalf("ignored-only JSON changes produced patch: %#v", patch)
+	}
+
+	err := writePatch(c, 1, []Field{{Name: "dbSkip", Value: "patched"}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field dbSkip") {
+		t.Fatalf("PatchStrict db ignored err=%v want unknown field", err)
+	}
+	err = writePatch(c, 1, []Field{{Name: "rbi_skip", Value: "patched"}}, PatchStrict)
+	if err == nil || !strings.Contains(err.Error(), "cannot patch field rbi_skip") {
+		t.Fatalf("PatchStrict rbi ignored err=%v want unknown field", err)
 	}
 }
 

@@ -215,6 +215,26 @@ type Config struct {
 	Index map[string]IndexKind
 }
 
+func fieldIgnoredByTags(sf reflect.StructField) bool {
+	return sf.Tag.Get("db") == "-" || sf.Tag.Get("rbi") == "-"
+}
+
+func fieldHasActiveRBITag(sf reflect.StructField) bool {
+	switch sf.Tag.Get("rbi") {
+	case "index", "unique", "measure":
+		return true
+	default:
+		return false
+	}
+}
+
+func fieldDBName(sf reflect.StructField) string {
+	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+		return dbTag
+	}
+	return sf.Name
+}
+
 type Schema struct {
 	Fields           map[string]*Field
 	MeasureFields    map[string]*Field
@@ -416,6 +436,15 @@ func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []in
 		if !f.IsExported() {
 			continue
 		}
+		if f.Tag.Get("db") == "-" {
+			if fieldHasActiveRBITag(f) {
+				return fmt.Errorf("field %v cannot use db:\"-\" with active rbi tag %q", f.Name, f.Tag.Get("rbi"))
+			}
+			continue
+		}
+		if f.Tag.Get("rbi") == "-" {
+			continue
+		}
 		tag := f.Tag.Get("rbi")
 		indexKind, use, skip, err := parseTag(tag, f.Name)
 		if err != nil {
@@ -544,6 +573,15 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 		if !sf.IsExported() {
 			continue
 		}
+		if sf.Tag.Get("db") == "-" {
+			if fieldHasActiveRBITag(sf) {
+				return fmt.Errorf("field %v cannot use db:\"-\" with active rbi tag %q", sf.Name, sf.Tag.Get("rbi"))
+			}
+			continue
+		}
+		if sf.Tag.Get("rbi") == "-" {
+			continue
+		}
 		nextIdx := append(idx, i)
 		if sf.Anonymous && isEmbeddedContainerType(sf.Type) {
 			if err := collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
@@ -554,13 +592,12 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 			}
 		}
 
-		dbName := sf.Name
+		dbName := fieldDBName(sf)
 		hasDBName := false
-		if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+		if dbTag := sf.Tag.Get("db"); dbTag != "" {
 			if dbTag == ReservedKeyFieldName {
 				return fmt.Errorf("field %v uses reserved db tag %q", sf.Name, dbTag)
 			}
-			dbName = dbTag
 			hasDBName = true
 		}
 		info := optionIndexField{
@@ -615,6 +652,15 @@ func hasEmbeddedIndexTags(t reflect.Type, prev *embeddedIndexTagScan) (bool, err
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() {
+			continue
+		}
+		if f.Tag.Get("db") == "-" {
+			if fieldHasActiveRBITag(f) {
+				return false, fmt.Errorf("field %v cannot use db:\"-\" with active rbi tag %q", f.Name, f.Tag.Get("rbi"))
+			}
+			continue
+		}
+		if f.Tag.Get("rbi") == "-" {
 			continue
 		}
 		_, use, skip, err := parseTag(f.Tag.Get("rbi"), f.Name)
@@ -716,10 +762,7 @@ func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index [
 }
 
 func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind) (*Field, error) {
-	dbname := sf.Name
-	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
-		dbname = dbTag
-	}
+	dbname := fieldDBName(sf)
 	if dbname == ReservedKeyFieldName {
 		return nil, fmt.Errorf("field %v uses reserved db tag %q", sf.Name, dbname)
 	}
@@ -907,6 +950,9 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 		rf := t.Field(i)
 
 		if !rf.IsExported() {
+			continue
+		}
+		if fieldIgnoredByTags(rf) {
 			continue
 		}
 

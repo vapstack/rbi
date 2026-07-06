@@ -127,10 +127,10 @@ type reflectUnsafeAccessorRec struct {
 }
 
 type reflectPatchTimeRec struct {
-	Name    string               `db:"name" rbi:"index"`
-	When    time.Time            `db:"-"`
-	Slots   []time.Time          `db:"-"`
-	Windows map[string]time.Time `db:"-"`
+	Name    string `db:"name" rbi:"index"`
+	When    time.Time
+	Slots   []time.Time
+	Windows map[string]time.Time
 }
 
 type reflectNamedTime time.Time
@@ -204,23 +204,23 @@ type reflectPatchNested struct {
 }
 
 type reflectPatchNestedRec struct {
-	Name      string              `db:"name" rbi:"index"`
-	Nested    reflectPatchNested  `db:"-"`
-	NestedPtr *reflectPatchNested `db:"-"`
+	Name      string `db:"name" rbi:"index"`
+	Nested    reflectPatchNested
+	NestedPtr *reflectPatchNested
 }
 
 type reflectPatchNestedSliceRec struct {
-	Name  string                  `db:"name" rbi:"index"`
-	Items []reflectPatchNestedRec `db:"-"`
+	Name  string `db:"name" rbi:"index"`
+	Items []reflectPatchNestedRec
 }
 
 type reflectNumericPatchRec struct {
-	Name  string  `db:"name" rbi:"index"`
-	I8    int8    `db:"-"`
-	U8    uint8   `db:"-"`
-	I64   int64   `db:"-"`
-	U64   uint64  `db:"-"`
-	Bytes []uint8 `db:"-"`
+	Name  string `db:"name" rbi:"index"`
+	I8    int8
+	U8    uint8
+	I64   int64
+	U64   uint64
+	Bytes []uint8
 }
 
 func openTempUint64CollectionReflect[V any](t *testing.T, filename string, options ...Options) *Collection[uint64, V] {

@@ -214,6 +214,21 @@ type schemaCodecMapRec struct {
 	Nested       schemaCodecMapNested
 }
 
+type schemaCodecIgnoredNested struct {
+	Keep     string
+	DBSkip   string `db:"-"`
+	RBISkip  string `db:"skip" rbi:"-"`
+	Disabled []byte `rbi:"-"`
+}
+
+type schemaCodecIgnoredRec struct {
+	Name     string
+	DBSkip   string `db:"-"`
+	RBISkip  string `db:"skip" rbi:"-"`
+	Disabled []byte `rbi:"-"`
+	Nested   schemaCodecIgnoredNested
+}
+
 type schemaCodecUnsupportedMapKeyRec struct {
 	Bad map[float64]string
 }
@@ -237,6 +252,24 @@ type schemaCodecUnsupportedMapHiddenKey struct {
 
 type schemaCodecUnsupportedMapHiddenKeyRec struct {
 	Bad map[schemaCodecUnsupportedMapHiddenKey]string
+}
+
+type schemaCodecUnsupportedMapDBIgnoredKey struct {
+	Exported string
+	Ignored  string `db:"-"`
+}
+
+type schemaCodecUnsupportedMapDBIgnoredKeyRec struct {
+	Bad map[schemaCodecUnsupportedMapDBIgnoredKey]string
+}
+
+type schemaCodecUnsupportedMapRBIIgnoredKey struct {
+	Exported string
+	Ignored  string `rbi:"-"`
+}
+
+type schemaCodecUnsupportedMapRBIIgnoredKeyRec struct {
+	Bad map[schemaCodecUnsupportedMapRBIIgnoredKey]string
 }
 
 func TestCodecRuntimeScalarStringTimeRoundTrip(t *testing.T) {
@@ -931,6 +964,46 @@ func TestCodecRuntimeRejectsMalformedCompositeLengthsBeforeAllocation(t *testing
 	}
 }
 
+func TestCodecRuntimeIgnoresTaggedFields(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaCodecIgnoredRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	src := schemaCodecIgnoredRec{
+		Name:     "root",
+		DBSkip:   "db-skip",
+		RBISkip:  "rbi-skip",
+		Disabled: []byte("disabled"),
+		Nested: schemaCodecIgnoredNested{
+			Keep:     "nested",
+			DBSkip:   "nested-db-skip",
+			RBISkip:  "nested-rbi-skip",
+			Disabled: []byte("nested-disabled"),
+		},
+	}
+	var buf bytes.Buffer
+	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	data := buf.Bytes()
+	for _, name := range []string{"DBSkip", "skip", "Disabled"} {
+		if bytes.Contains(data, []byte(name)) {
+			t.Fatalf("encoded ignored field name %q in %x", name, data)
+		}
+	}
+
+	var dst schemaCodecIgnoredRec
+	if err = rt.Codec.Decode(data, unsafe.Pointer(&dst)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if dst.Name != "root" || dst.Nested.Keep != "nested" {
+		t.Fatalf("decoded stored fields wrong: %#v", dst)
+	}
+	if dst.DBSkip != "" || dst.RBISkip != "" || dst.Disabled != nil ||
+		dst.Nested.DBSkip != "" || dst.Nested.RBISkip != "" || dst.Nested.Disabled != nil {
+		t.Fatalf("decoded ignored fields: %#v", dst)
+	}
+}
+
 func TestCodecRuntimeZerosMissingCompositeFields(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaCodecCompositeRec](), Config{})
 	if err != nil {
@@ -1138,14 +1211,17 @@ func TestCodecRuntimeRejectsInvalidMapKeysAtCompile(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		typ  reflect.Type
+		want string
 	}{
-		{name: "pointer", typ: reflect.TypeFor[schemaCodecUnsupportedMapPointerKeyRec]()},
-		{name: "hidden", typ: reflect.TypeFor[schemaCodecUnsupportedMapHiddenKeyRec]()},
+		{name: "pointer", typ: reflect.TypeFor[schemaCodecUnsupportedMapPointerKeyRec](), want: "unsupported map key"},
+		{name: "hidden", typ: reflect.TypeFor[schemaCodecUnsupportedMapHiddenKeyRec](), want: "unsupported map key"},
+		{name: "db ignored", typ: reflect.TypeFor[schemaCodecUnsupportedMapDBIgnoredKeyRec](), want: "ignored map key"},
+		{name: "rbi ignored", typ: reflect.TypeFor[schemaCodecUnsupportedMapRBIIgnoredKeyRec](), want: "ignored map key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Compile(tc.typ, Config{})
-			if err == nil || !strings.Contains(err.Error(), "unsupported map key") {
-				t.Fatalf("Compile err=%v want unsupported map key", err)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Compile err=%v want %q", err, tc.want)
 			}
 		})
 	}
