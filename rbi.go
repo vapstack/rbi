@@ -889,7 +889,7 @@ func (c *Collection[K, V]) Stats() (rbistats.Collection[K], error) {
 //
 // If Collection is closed or broken, IndexStats returns a zero value.
 func (c *Collection[K, V]) IndexStats() rbistats.Index {
-	if err := c.collection.unavailableErr(); err != nil {
+	if err := c.unavailableErr(); err != nil {
 		return rbistats.Index{}
 	}
 
@@ -1018,7 +1018,7 @@ func (c *Collection[K, V]) PlannerStats() rbistats.Planner {
 //
 // It does not close the underlying *bbolt.DB.
 func (c *Collection[K, V]) Close() error {
-	if !c.collection.beginClose() {
+	if !c.beginClose() {
 		return nil
 	}
 	defer unreserveCollection(c.collection)
@@ -1048,7 +1048,7 @@ func (c *Collection[K, V]) Close() error {
 //
 // Truncate does not reclaim disk space.
 func (c *Collection[K, V]) Truncate() error {
-	if err := c.collection.retain(); err != nil {
+	if err := c.retain(); err != nil {
 		return err
 	}
 	unit := writeUnit{root: c.root, truncate: c.collection}

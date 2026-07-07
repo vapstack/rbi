@@ -280,7 +280,7 @@ func (s *asyncMaterializedPredScheduler) run(exec *Runtime, plan asyncMaterializ
 		ProbeInterval: int64(asyncMaterializedPredCancelProbeInterval),
 	}
 	if plan.kind.numericRange() {
-		status := asyncMaterializedPredBuildFailed
+		var status asyncMaterializedPredBuildStatus
 		if plan.kind == asyncMaterializedPredPlanNumericSpan {
 			status = view.buildAndStoreAsyncNumericRangeSpan(plan, &cancel)
 		} else {
