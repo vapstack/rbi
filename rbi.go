@@ -1073,6 +1073,11 @@ func (c *Collection[K, V]) ReleaseRecords(v ...*V) {
 	}
 }
 
+// Bolt returns the underlying bbolt database used by this collection.
+func (c *Collection[K, V]) Bolt() *bbolt.DB {
+	return c.root.bolt
+}
+
 // BucketName returns a name of the bucket at which the data is stored.
 func (c *Collection[K, V]) BucketName() []byte {
 	return slices.Clone(c.dataBucket)
