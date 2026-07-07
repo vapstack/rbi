@@ -108,47 +108,48 @@ func main() {
         panic(err)
     }
 
-    tx := rbi.BeginView()
-    defer tx.Close()
+    err = rbi.View(func(tx *rbi.Tx) error {
 
-    u1, err := users.Get(tx, 1)
-    if err != nil {
-        panic(err)
-    }
-    fmt.Printf("%v (%v)\n", u1.Name, u1.Age)
+        u1, err := users.Get(tx, 1)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("%v (%v)\n\n", u1.Name, u1.Age)
 
-    records, err := users.Query(tx,
-        qx.Where(
-            qx.EQ("active", true),
-            qx.HASALL("tags", []string{"dev"}),
-            qx.GT("age", 25),
-        ).
-        Sort("age", qx.ASC).
-        Limit(10),
-    )
-    if err != nil {
-        panic(err)
-    }
+        records, err := users.Query(tx,
+            qx.Where(
+                qx.EQ("active", true),
+                qx.HASALL("tags", []string{"dev"}),
+                qx.GT("age", 25),
+            ).
+            Sort("age", qx.ASC).
+            Limit(10),
+        )
+        if err != nil {
+            panic(err)
+        }
 
-    for _, u := range records {
-        fmt.Printf("%v (%v)\n", u.Name, u.Age)
-    }
+        for _, u := range records {
+            fmt.Printf("%v (%v)\n", u.Name, u.Age)
+        }
 
-    totals, err := users.Aggregate(tx,
-        qx.Metrics(
-            qx.ROWCOUNT().AS("users"),
-            qx.SUM("spent").AS("spent"),
-        ).Group(
-            "age",
-        ).Where(
-            qx.EQ("active", true),
-        ),
-    )
-    if err != nil {
-        panic(err)
-    }
+        totals, err := users.Aggregate(tx,
+            qx.Metrics(
+                qx.ROWCOUNT().AS("users"),
+                qx.SUM("spent").AS("spent"),
+            ).Group(
+                "age",
+            ).Where(
+                qx.EQ("active", true),
+            ),
+        )
+        if err != nil {
+            panic(err)
+        }
 
-    fmt.Println(totals.Layout, totals.Rows)
+        fmt.Println(totals.Layout, totals.Rows)
+    })
+    // ...
 }
 ```
 
@@ -237,12 +238,10 @@ q := qx.Query(
 - Predicate right-hand side must always be a literal value.
 - No computed expressions on any side.
 
-
 - Supported predicate helpers:\
   `AND`, `OR`, `NOT`, `EQ`, `NE`/`NOTEQ`, `GT`, `GTE`, `LT`, `LTE`, `IN`,
   `NOTIN`, `HAS`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
   `PREFIX`, `SUFFIX`, and `CONTAINS`.
-
 
 - Outside aggregation, ordering supports exactly one expression, and only these forms:
   - By field:\
@@ -253,7 +252,6 @@ q := qx.Query(
     `SortBy(qx.POS(qx.REF("field"), []T{...}), ASC|DESC)`\
     It requires a literal priority list/array value.\
     Scalar-string `POS(field, "alice bob")` is not supported.
-
 
 - Projection is not supported, queries return whole records.
 
@@ -370,7 +368,7 @@ All runtime controls are configured through `Options`.
 Recommended pattern is to set only the required fields.
 
 ```go
-users, err := rbi.New[uint64, User](bolt, rbi.Options{
+users, err := rbi.Open[uint64, User](bolt, rbi.Options{
 
     // Planner/trace settings
     AnalyzeInterval: 30 * time.Minute, // < 0 disables periodic analyze loop
@@ -392,7 +390,6 @@ passed to `Open` to become defaults for the whole Collection instance.
 **Available hooks / options:**
 
 - `PatchStrict` - makes `Patch` reject unknown fields.
-
 
 - `OnChange` - runs for inserted, updated, and deleted records.
   For inserts and updates it receives a mutable `newValue`.
@@ -507,6 +504,7 @@ type ValueIndexer interface {
 The returned value is used as the indexed representation.
 
 ### Contract:
+
 - Must return a stable, deterministic value.
 - Equal values must produce equal indexing values.
 - The returned string must not exceed 65535 bytes.
