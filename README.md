@@ -243,7 +243,8 @@ q := qx.Query(
   `NOTIN`, `HAS`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
   `PREFIX`, `SUFFIX`, and `CONTAINS`.
 
-- Outside aggregation, ordering supports exactly one expression, and only these forms:
+- Outside aggregation, ordering supports at most one expression,
+  and only these forms:
   - By field:\
     `Sort("field", ASC|DESC)` or `SortBy(REF("field"), ASC)`
   - By slice-field length:\
