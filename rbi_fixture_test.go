@@ -134,7 +134,7 @@ func readScanKeys[K ~string | ~uint64, V any](c *Collection[K, V], seek K, fn fu
 func readSeqScan[K ~string | ~uint64, V any](c *Collection[K, V], seek K, fn func(K, *V) (bool, error)) error {
 	tx := BeginView()
 	defer tx.Release()
-	err := c.SeqScan(tx, seek, fn)
+	err := c.Scan(tx, seek, fn)
 	return err
 }
 

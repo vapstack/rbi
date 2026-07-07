@@ -85,7 +85,7 @@ func TestAPI_ReadQueryMethodsRequireTx(t *testing.T) {
 	if err := c.ScanKeys(nilRead, 0, func(uint64) (bool, error) { return true, nil }); !errors.Is(err, rbierrors.ErrNilTx) {
 		t.Fatalf("ScanKeys nil tx err=%v, want ErrNilTx", err)
 	}
-	if err := c.SeqScan(nilRead, 0, func(uint64, *Rec) (bool, error) { return true, nil }); !errors.Is(err, rbierrors.ErrNilTx) {
+	if err := c.Scan(nilRead, 0, func(uint64, *Rec) (bool, error) { return true, nil }); !errors.Is(err, rbierrors.ErrNilTx) {
 		t.Fatalf("SeqScan nil tx err=%v, want ErrNilTx", err)
 	}
 	if _, err := c.Query(nilRead, qx.Query()); !errors.Is(err, rbierrors.ErrNilTx) {

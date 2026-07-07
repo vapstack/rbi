@@ -226,7 +226,7 @@ q := qx.Query(
 
 * `Query(tx, q)` - return matching records
 * `QueryKeys(tx, q)` - return matching IDs
-* `SeqScan(tx, seek, fn)` - perform a sequential scan over all records starting at the given key
+* `Scan(tx, seek, fn)` - perform a sequential scan over all records starting at the given key
 * `ScanKeys(tx, seek, fn)` - traverse live keys starting at the given key
 * `Aggregate(tx, q)` - evaluate grouped or ungrouped reductions over indexed and measure fields
 * `Count(tx, exprs...)` - return result cardinality; it is a reduced non-allocating version of `Aggregate`

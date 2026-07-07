@@ -89,15 +89,16 @@ func (c *Collection[K, V]) ScanKeys(tx *Tx, seek K, fn func(K) (bool, error)) er
 	return nil
 }
 
-// SeqScan performs a sequential scan over all records starting at the given
-// key (inclusive), decoding each value and passing it to the provided fn.
-// SeqScan stops reading when the fn returns false or a non-nil error.
-// The scan runs inside a read-only transaction which remains open for the
+// Scan iterates over all records starting at seek (inclusive),
+// decoding each value and passing it to the provided fn.
+//
+// Scan stops when fn returns false or a non-nil error.
+// Scan runs inside a read-only transaction which remains open for the
 // duration of the scan.
 //
 // Records passed to fn can optionally be returned back using ReleaseRecords
 // to minimize GC pressure.
-func (c *Collection[K, V]) SeqScan(tx *Tx, seek K, fn func(K, *V) (bool, error)) error {
+func (c *Collection[K, V]) Scan(tx *Tx, seek K, fn func(K, *V) (bool, error)) error {
 	if tx == nil {
 		return rbierrors.ErrNilTx
 	}
