@@ -28,23 +28,27 @@ import (
 )
 
 type Index struct {
-	current                atomic.Pointer[snapshot.View]
-	schema                 *schema.Schema
-	strKey                 bool
-	keyMode                qexec.KeyMode
-	index                  []indexdata.FieldStorage
-	keyIndex               indexdata.FieldStorage
-	keyIndexLoaded         bool
-	nilIndex               []indexdata.FieldStorage
-	lenIndex               []indexdata.FieldStorage
-	lenZeroComplement      []bool
-	measure                []indexdata.MeasureStorage
-	universe               posting.List
-	lenIndexLoaded         bool
-	matPredCacheMaxEntries int
-	matPredCacheMaxCard    uint64
-	runtimeCachesDirty     *atomic.Bool
-	runtimeCachesEpoch     *atomic.Uint64
+	current                   atomic.Pointer[snapshot.View]
+	schema                    *schema.Schema
+	strKey                    bool
+	keyMode                   qexec.KeyMode
+	index                     []indexdata.FieldStorage
+	keyIndex                  indexdata.FieldStorage
+	keyIndexLoaded            bool
+	nilIndex                  []indexdata.FieldStorage
+	lenIndex                  []indexdata.FieldStorage
+	lenZeroComplement         []bool
+	measure                   []indexdata.MeasureStorage
+	universe                  posting.List
+	lenIndexLoaded            bool
+	matPredCacheMaxEntries    int
+	matPredCacheMaxCard       uint64
+	numericSpanMaxEntries     int
+	numericSpanMaxEntryBytes  uint64
+	numericExactMaxEntries    int
+	numericExactMaxEntryBytes uint64
+	runtimeCachesDirty        *atomic.Bool
+	runtimeCachesEpoch        *atomic.Uint64
 
 	exec *qexec.Runtime
 }
@@ -59,9 +63,13 @@ type Config struct {
 	RuntimeCachesDirtyOwner             *atomic.Bool
 	RuntimeCachesRetireEpoch            *atomic.Uint64
 
-	NumericRangeBucketSize         int
-	NumericRangeBucketMinFieldKeys int
-	NumericRangeBucketMinSpanKeys  int
+	NumericRangeBucketSize              int
+	NumericRangeBucketMinFieldKeys      int
+	NumericRangeBucketMinSpanKeys       int
+	NumericRangeSpanCacheMaxEntries     int
+	NumericRangeSpanCacheMaxEntryBytes  int64
+	NumericRangeExactCacheMaxEntries    int
+	NumericRangeExactCacheMaxEntryBytes int64
 
 	AnalyzeInterval  time.Duration
 	TraceSink        func(rbitrace.Event)
@@ -105,24 +113,32 @@ func NewIndex(cfg Config) (*Index, error) {
 	}
 
 	r := &Index{
-		schema:                 cfg.Schema,
-		strKey:                 cfg.StrKey,
-		keyMode:                keyMode,
-		universe:               posting.List{},
-		matPredCacheMaxEntries: max(0, cfg.MaterializedPredCacheMaxEntries),
-		matPredCacheMaxCard:    qcache.MaterializedPredMaxCardinality(cfg.MaterializedPredCacheMaxCardinality),
-		runtimeCachesDirty:     cfg.RuntimeCachesDirtyOwner,
-		runtimeCachesEpoch:     cfg.RuntimeCachesRetireEpoch,
+		schema:                    cfg.Schema,
+		strKey:                    cfg.StrKey,
+		keyMode:                   keyMode,
+		universe:                  posting.List{},
+		matPredCacheMaxEntries:    max(0, cfg.MaterializedPredCacheMaxEntries),
+		matPredCacheMaxCard:       qcache.MaterializedPredMaxCardinality(cfg.MaterializedPredCacheMaxCardinality),
+		numericSpanMaxEntries:     qcache.NumericRangeSpanCacheMaxEntries(cfg.NumericRangeSpanCacheMaxEntries),
+		numericSpanMaxEntryBytes:  qcache.NumericRangeSpanCacheMaxEntryBytes(cfg.NumericRangeSpanCacheMaxEntryBytes),
+		numericExactMaxEntries:    qcache.NumericRangeExactCacheMaxEntries(cfg.NumericRangeExactCacheMaxEntries),
+		numericExactMaxEntryBytes: qcache.NumericRangeExactCacheMaxEntryBytes(cfg.NumericRangeExactCacheMaxEntryBytes),
+		runtimeCachesDirty:        cfg.RuntimeCachesDirtyOwner,
+		runtimeCachesEpoch:        cfg.RuntimeCachesRetireEpoch,
 		exec: qexec.NewRuntime(qexec.Config{
-			StrKey:                         cfg.StrKey,
-			KeyMode:                        keyMode,
-			Schema:                         cfg.Schema,
-			NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
-			NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
-			NumericRangeBucketMinSpanKeys:  cfg.NumericRangeBucketMinSpanKeys,
-			AnalyzeInterval:                cfg.AnalyzeInterval,
-			TraceSink:                      cfg.TraceSink,
-			TraceSampleEvery:               cfg.TraceSampleEvery,
+			StrKey:                              cfg.StrKey,
+			KeyMode:                             keyMode,
+			Schema:                              cfg.Schema,
+			NumericRangeBucketSize:              cfg.NumericRangeBucketSize,
+			NumericRangeBucketMinFieldKeys:      cfg.NumericRangeBucketMinFieldKeys,
+			NumericRangeBucketMinSpanKeys:       cfg.NumericRangeBucketMinSpanKeys,
+			NumericRangeSpanCacheMaxEntries:     cfg.NumericRangeSpanCacheMaxEntries,
+			NumericRangeSpanCacheMaxEntryBytes:  cfg.NumericRangeSpanCacheMaxEntryBytes,
+			NumericRangeExactCacheMaxEntries:    cfg.NumericRangeExactCacheMaxEntries,
+			NumericRangeExactCacheMaxEntryBytes: cfg.NumericRangeExactCacheMaxEntryBytes,
+			AnalyzeInterval:                     cfg.AnalyzeInterval,
+			TraceSink:                           cfg.TraceSink,
+			TraceSampleEvery:                    cfg.TraceSampleEvery,
 		}),
 	}
 	slotCount := len(cfg.Schema.Indexed)
@@ -138,10 +154,49 @@ func NewIndex(cfg Config) (*Index, error) {
 
 func (index *Index) SnapshotCacheConfig() snapshot.CacheConfig {
 	return snapshot.CacheConfig{
-		MatPredMaxEntries:        index.matPredCacheMaxEntries,
-		MatPredMaxCard:           index.matPredCacheMaxCard,
-		RuntimeCachesDirtyOwner:  index.runtimeCachesDirty,
-		RuntimeCachesRetireEpoch: index.runtimeCachesEpoch,
+		MatPredMaxEntries:         index.matPredCacheMaxEntries,
+		MatPredMaxCard:            index.matPredCacheMaxCard,
+		NumericSpanMaxEntries:     index.numericSpanMaxEntries,
+		NumericSpanMaxEntryBytes:  index.numericSpanMaxEntryBytes,
+		NumericExactMaxEntries:    index.numericExactMaxEntries,
+		NumericExactMaxEntryBytes: index.numericExactMaxEntryBytes,
+		RuntimeCachesDirtyOwner:   index.runtimeCachesDirty,
+		RuntimeCachesRetireEpoch:  index.runtimeCachesEpoch,
+	}
+}
+
+func (index *Index) RuntimeCacheStats(snap *snapshot.View) rbistats.RuntimeCaches {
+	if snap == nil {
+		return rbistats.RuntimeCaches{}
+	}
+	num := snap.NumericRangeSpanCacheStats()
+	exact := snap.NumericRangeExactResultCacheStats()
+	return rbistats.RuntimeCaches{
+		NumericRangeSpan: rbistats.NumericRangeSpanCache{
+			CurrentBytes:           num.CurrentBytes,
+			RetiredBytes:           num.RetiredBytes,
+			EntryCount:             num.EntryCount,
+			MaxEntryBytes:          num.MaxEntryBytes,
+			MaxEntries:             num.MaxEntries,
+			Stores:                 num.Stores,
+			Evictions:              num.Evictions,
+			RejectedTooLarge:       num.RejectedTooLarge,
+			RejectedCapacity:       num.RejectedCapacity,
+			RejectedRetiredBacklog: num.RejectedRetiredBacklog,
+		},
+		NumericRangeExactResult: rbistats.NumericRangeExactResultCache{
+			CurrentBytes:             exact.CurrentBytes,
+			RetiredBytes:             exact.RetiredBytes,
+			EntryCount:               exact.EntryCount,
+			MaxEntryBytes:            exact.MaxEntryBytes,
+			MaxEntries:               exact.MaxEntries,
+			Stores:                   exact.Stores,
+			Evictions:                exact.Evictions,
+			RejectedTooLarge:         exact.RejectedTooLarge,
+			RejectedCapacity:         exact.RejectedCapacity,
+			RejectedRetiredBacklog:   exact.RejectedRetiredBacklog,
+			RejectedFirstObservation: exact.RejectedFirstObservation,
+		},
 	}
 }
 

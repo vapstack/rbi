@@ -154,7 +154,8 @@ func TestBuildAsyncRangeMaterializedPredCancelsNumericBucketBuild(t *testing.T) 
 		t.Fatal("canceled build returned ids")
 	}
 	entry := requireNumericRangeBucketCacheEntry(t, db.engine.snapshot.Current(), "age")
-	if got := numericRangeFullSpanCacheEntryCount(entry); got != 0 {
+	_ = entry
+	if got := numericRangeFullSpanCacheEntryCount(db.engine.snapshot.Current()); got != 0 {
 		t.Fatalf("stale numeric bucket warmup stored %d full-span entries", got)
 	}
 }
@@ -231,6 +232,206 @@ func TestBuildAsyncRangeComplementMaterializedPredUsesNumericBuckets(t *testing.
 		t.Fatalf("materialized complement cardinality=%d want 2499", got)
 	}
 	requireNumericRangeBucketCacheEntry(t, db.engine.snapshot.Current(), "age")
+}
+
+func TestAsyncMaterializedPredPlanForNumericRangeStoresExactResultNotMaterializedKey(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{Age: i}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	compiled := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
+	bound, isSlice, err := view.normalizedScalarBoundForExpr(compiled)
+	if err != nil || isSlice || bound.empty || bound.full {
+		t.Fatalf("normalizedScalarBoundForExpr: bound=%+v isSlice=%v err=%v", bound, isSlice, err)
+	}
+	exactKey := view.materializedPredKeyForNormalizedScalarBound("age", bound)
+	if exactKey.IsZero() {
+		t.Fatal("expected exact range cache key")
+	}
+	plan, ok := view.asyncMaterializedPredPlanForPredicate(predicate{expr: compiled}, false)
+	if !ok {
+		t.Fatal("expected async numeric exact plan")
+	}
+	if plan.kind != asyncMaterializedPredPlanNumericExact {
+		t.Fatalf("plan kind=%d want numeric exact", plan.kind)
+	}
+	if !view.scheduleAsyncMaterializedPredWarmup(plan) {
+		t.Fatal("expected async numeric exact warmup schedule")
+	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
+
+	snap := db.engine.snapshot.Current()
+	if snap.HasMaterializedPredKey(exactKey) {
+		t.Fatal("numeric exact warmup populated materialized predicate key")
+	}
+	if got := snap.NumericRangeExactResultCacheStats().EntryCount; got != 1 {
+		t.Fatalf("expected numeric exact warmup to store one result, got %d", got)
+	}
+	stats := db.engine.exec.AsyncMaterializedPredStats()
+	if stats.NumericExactScheduled == 0 || stats.NumericExactStored == 0 {
+		t.Fatalf("numeric exact async stats not updated: %+v", stats)
+	}
+	if stats.Stored != 0 {
+		t.Fatalf("materialized async stored counter changed for numeric exact: %+v", stats)
+	}
+}
+
+func TestAsyncMaterializedPredPlanForCollapsedNumericRangeUsesNumericKey(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	lo, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", 2501))
+	if err != nil || isSlice || isNil {
+		t.Fatalf("age lo key: key=%+v isSlice=%v isNil=%v err=%v", lo, isSlice, isNil, err)
+	}
+	hi, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.LT("age", 3501))
+	if err != nil || isSlice || isNil {
+		t.Fatalf("age hi key: key=%+v isSlice=%v isNil=%v err=%v", hi, isSlice, isNil, err)
+	}
+	var bounds indexdata.Bounds
+	bounds.ApplyLo(lo, true)
+	bounds.ApplyHi(hi, false)
+
+	cacheKey := view.materializedPredKeyForExactScalarRange("age", bounds)
+	if !cacheKey.IsZero() {
+		t.Fatalf("bucket-eligible collapsed numeric range should not have materialized key: %v", cacheKey)
+	}
+	plan, ok := view.asyncMaterializedPredPlanForOrderBasicBaseCore(orderBasicBaseCore{
+		kind: orderBasicBaseCoreCollapsedRange,
+		collapsed: preparedScalarExactRange{
+			field:        "age",
+			fieldOrdinal: ageOrdinal,
+			bounds:       bounds,
+			cacheKey:     cacheKey,
+		},
+	})
+	if !ok || plan.kind != asyncMaterializedPredPlanNumericExact {
+		t.Fatalf("expected collapsed numeric exact async plan, ok=%v plan=%+v", ok, plan)
+	}
+}
+
+func TestBuildAndStoreAsyncNumericRangeSpanCancelsBeforeStaleStore(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries:  16,
+		NumericRangeExactCacheMaxEntries: -1,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{Age: i}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	compiled := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
+	plan, ok := view.asyncMaterializedPredPlanForPredicate(predicate{expr: compiled}, false)
+	if !ok || plan.kind != asyncMaterializedPredPlanNumericSpan {
+		t.Fatalf("expected async numeric span plan, ok=%v plan=%+v", ok, plan)
+	}
+	cancel := asyncMaterializedPredCancel{
+		CurrentSeq: func() uint64 { return view.snap.Seq + 1 },
+		Seq:        view.snap.Seq,
+		NextProbe:  1<<63 - 1,
+	}
+	status := view.buildAndStoreAsyncNumericRangeSpan(plan, &cancel)
+	if status != asyncMaterializedPredBuildCanceled {
+		t.Fatalf("build status=%d want canceled", status)
+	}
+	if got := view.snap.NumericRangeBucketCache().FullSpanEntryCount(); got != 0 {
+		t.Fatalf("stale numeric span warmup stored %d full-span entries", got)
+	}
+}
+
+func TestBuildAndStoreAsyncNumericRangeExactCancelsBeforeStaleStore(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{Age: i}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	compiled := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
+	plan, ok := view.asyncMaterializedPredPlanForPredicate(predicate{expr: compiled}, false)
+	if !ok || plan.kind != asyncMaterializedPredPlanNumericExact {
+		t.Fatalf("expected async numeric exact plan, ok=%v plan=%+v", ok, plan)
+	}
+	calls := 0
+	cancel := asyncMaterializedPredCancel{
+		CurrentSeq: func() uint64 {
+			calls++
+			if calls <= 2 {
+				return view.snap.Seq
+			}
+			return view.snap.Seq + 1
+		},
+		Seq:       view.snap.Seq,
+		NextProbe: 1<<63 - 1,
+	}
+	status := view.buildAndStoreAsyncNumericRangeExact(plan, &cancel)
+	if status != asyncMaterializedPredBuildCanceled {
+		t.Fatalf("build status=%d want canceled", status)
+	}
+	if calls < 3 {
+		t.Fatalf("expected final stale sequence check, calls=%d", calls)
+	}
+	if stats := view.snap.NumericRangeExactResultCacheStats(); stats.EntryCount != 0 {
+		t.Fatalf("stale numeric exact warmup stored exact result: %+v", stats)
+	}
+}
+
+func TestAsyncMaterializedPredPlanSkipsRejectedTooLargeNumericSpan(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries:    16,
+		NumericRangeSpanCacheMaxEntries:    8,
+		NumericRangeSpanCacheMaxEntryBytes: 1,
+		NumericRangeExactCacheMaxEntries:   -1,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{Age: i}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	compiled := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
+	plan, ok := view.asyncMaterializedPredPlanForPredicate(predicate{expr: compiled}, false)
+	if !ok || plan.kind != asyncMaterializedPredPlanNumericSpan {
+		t.Fatalf("expected async numeric span plan, plan=%+v ok=%v", plan, ok)
+	}
+	if !view.scheduleAsyncMaterializedPredWarmup(plan) {
+		t.Fatal("expected first oversized numeric span warmup schedule")
+	}
+	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
+
+	snap := db.engine.snapshot.Current()
+	if got := snap.NumericRangeBucketCache().FullSpanEntryCount(); got != 0 {
+		t.Fatalf("oversized numeric span stored %d entries", got)
+	}
+	if !snap.NumericRangeFullSpanRejectedTooLarge(plan.fieldSlot, plan.startBucket, plan.endBucket) {
+		t.Fatal("oversized numeric span reject was not remembered")
+	}
+	stats := db.engine.exec.AsyncMaterializedPredStats()
+	if stats.NumericSpanStoreRejected == 0 {
+		t.Fatalf("numeric span reject stat not updated: %+v", stats)
+	}
+
+	if plan, ok := view.asyncMaterializedPredPlanForPredicate(predicate{expr: compiled}, false); ok {
+		t.Fatalf("rejected oversized numeric span planned again: %+v", plan)
+	}
 }
 
 func TestAsyncMaterializedPredWarmupStoresStringRangeComplement(t *testing.T) {
@@ -315,7 +516,7 @@ func TestAsyncMaterializedPredWarmupDropsDuplicateInFlight(t *testing.T) {
 	view, plan := asyncMaterializedPredPlanForTest(t, db, qx.GTE("age", 64))
 	plan.seq = view.snap.Seq
 	scheduler := db.engine.exec.asyncMaterializedPredWarm
-	taskKey := asyncMaterializedPredTaskKey{seq: plan.seq, key: plan.key}
+	taskKey := plan.taskKey()
 	origOps := scheduler.ops
 	pinCalls := 0
 	scheduler.ops.PinCurrentBySeq = func(seq uint64) (*snapshot.View, AsyncSnapshotPin, bool) {

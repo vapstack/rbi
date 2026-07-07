@@ -240,6 +240,54 @@ func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
 	}
 }
 
+func TestAPI_SnapshotStats_RuntimeCacheStatsAreCallerOwned(t *testing.T) {
+	c, _ := openTempUint64Collection(t, Options{
+		AnalyzeInterval:                    -1,
+		NumericRangeBucketSize:             64,
+		NumericRangeBucketMinFieldKeys:     1,
+		NumericRangeBucketMinSpanKeys:      1,
+		NumericRangeSpanCacheMaxEntries:    8,
+		NumericRangeSpanCacheMaxEntryBytes: 1 << 20,
+	})
+
+	ids := make([]uint64, 2048)
+	recs := make([]*Rec, len(ids))
+	for i := range ids {
+		ids[i] = uint64(i + 1)
+		recs[i] = &Rec{Age: i}
+	}
+	if err := writeSets(c, ids, recs); err != nil {
+		t.Fatalf("writeSets: %v", err)
+	}
+	keys, err := readQueryKeys(c, qx.Query(qx.GTE("age", 300)))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Fatal("expected range query results")
+	}
+
+	s1 := c.SnapshotStats()
+	span := s1.RuntimeCaches.NumericRangeSpan
+	if span.EntryCount == 0 || span.CurrentBytes == 0 || span.Stores == 0 {
+		t.Fatalf("numeric runtime span stats not populated: %+v", s1)
+	}
+	if span.MaxEntries != 8 || span.MaxEntryBytes != 1<<20 {
+		t.Fatalf("numeric runtime span limits not reported: %+v", span)
+	}
+
+	s1.RuntimeCaches.NumericRangeSpan.EntryCount = 0
+	s1.RuntimeCaches.NumericRangeSpan.CurrentBytes = 0
+	s1.RuntimeCaches.NumericRangeSpan.MaxEntries = 0
+	s1.RuntimeCaches.NumericRangeSpan.MaxEntryBytes = 0
+
+	s2 := c.SnapshotStats()
+	span = s2.RuntimeCaches.NumericRangeSpan
+	if span.EntryCount == 0 || span.CurrentBytes == 0 || span.MaxEntries != 8 || span.MaxEntryBytes != 1<<20 {
+		t.Fatalf("caller mutation leaked into SnapshotStats runtime cache stats: %+v", s2)
+	}
+}
+
 func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 	c, _ := openTempUint64Collection(t, Options{
 		AnalyzeInterval: -1,

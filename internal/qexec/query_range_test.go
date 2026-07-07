@@ -7,6 +7,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/snapshot"
 )
@@ -104,8 +105,16 @@ func TestEvalExprAppliesRangeResidualToLookupLead(t *testing.T) {
 	}
 }
 
-func numericRangeFullSpanCacheEntryCount(entry *qcache.NumericRangeBucketEntry) int {
-	return entry.FullSpanEntryCount()
+func numericRangeFullSpanCacheEntryCount(snap *snapshot.View) int {
+	return snap.NumericRangeBucketCache().FullSpanEntryCount()
+}
+
+func loadNumericRangeFullSpan(t testing.TB, snap *snapshot.View, entry *qcache.NumericRangeBucketEntry, fieldOrdinal, start, end int) (posting.List, bool) {
+	t.Helper()
+	if snap == nil {
+		t.Fatal("expected snapshot")
+	}
+	return snap.LoadNumericRangeFullSpan(entry, fieldOrdinal, start, end)
 }
 
 func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*qcache.NumericRangeBucketEntry, indexdata.FieldIndexRange) {
@@ -360,6 +369,49 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	}
 }
 
+func TestEvalSimple_NumericRangeBuckets_WorkWhenSpanCacheDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: -1,
+		NumericRangeSpanCacheMaxEntries: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+
+	expr := qx.GTE("age", 2_500)
+	setNumericBucketKnobs(t, db, 128, 1, 1<<30)
+	classic, err := db.engine.evalSimple(expr)
+	if err != nil {
+		t.Fatalf("evalSimple classic: %v", err)
+	}
+	want := bitmapToIDs(t, classic)
+	classic.ids.Release()
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	got, err := db.engine.evalSimple(expr)
+	if err != nil {
+		t.Fatalf("evalSimple buckets: %v", err)
+	}
+	ids := bitmapToIDs(t, got)
+	got.ids.Release()
+
+	if !slices.Equal(ids, want) {
+		t.Fatalf("bucket result mismatch with span cache disabled: got=%d want=%d", len(ids), len(want))
+	}
+	entry := requireNumericRangeBucketCacheEntry(t, db.engine.snapshot.Current(), "age")
+	if entry.Storage().KeyCount() == 0 {
+		t.Fatalf("expected numeric range bucket entry to remain enabled")
+	}
+	if got := numericRangeFullSpanCacheEntryCount(db.engine.snapshot.Current()); got != 0 {
+		t.Fatalf("disabled numeric span cache stored %d entries", got)
+	}
+}
+
 func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldIndexUnchanged(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		MaterializedPredCacheMaxEntries: 64,
@@ -507,12 +559,12 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cached1, ok := entry.LoadFullSpan(start1, end1)
+	cached1, ok := loadNumericRangeFullSpan(t, snap, entry, ageOrdinal, start1, end1)
 	if !ok || cached1.IsEmpty() {
 		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
 	cached1.Release()
-	countAfterFirst := numericRangeFullSpanCacheEntryCount(entry)
+	countAfterFirst := numericRangeFullSpanCacheEntryCount(snap)
 
 	br2 := makeRange(2501)
 	start2, end2, ok := entry.Index().FullBucketSpan(br2)
@@ -527,7 +579,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		t.Fatalf("expected numeric range bucket path for second bound")
 	}
 	out2.ids.Release()
-	if got := numericRangeFullSpanCacheEntryCount(entry); got != countAfterFirst {
+	if got := numericRangeFullSpanCacheEntryCount(snap); got != countAfterFirst {
 		t.Fatalf("expected cached local full span reuse without new entries: before=%d after=%d", countAfterFirst, got)
 	}
 }
@@ -584,7 +636,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cached, ok := entry.LoadFullSpan(start1, end1)
+	cached, ok := loadNumericRangeFullSpan(t, snap, entry, ageOrdinal, start1, end1)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
@@ -624,6 +676,124 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	}
 	if !slices.Equal(got2, want2IDs) {
 		t.Fatalf("expected cached full-span reuse to still merge edge buckets: got=%v want=%v", got2, want2IDs)
+	}
+}
+
+func TestNumericRangeBucketSpanCache_DoesNotPopulateExactMaterializedRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	expr := qx.GTE("age", 2_500)
+	key := db.engine.materializedPredCacheKey(expr)
+	if key.IsZero() {
+		t.Fatal("expected exact range cache key")
+	}
+	out, err := db.engine.evalSimple(expr)
+	if err != nil {
+		t.Fatalf("evalSimple: %v", err)
+	}
+	out.ids.Release()
+
+	snap := db.engine.snapshot.Current()
+	if snap.HasMaterializedPredKey(key) {
+		t.Fatal("bucket-eligible numeric range populated exact materialized predicate cache")
+	}
+	if got := snap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatal("expected numeric span cache entry")
+	}
+}
+
+func TestNumericRangeBucketSpanCache_LazyMaterializationDoesNotPopulateExactRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	view := db.engine.currentQueryViewForTests()
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
+	key := view.materializedPredKey(expr)
+	if key.IsZero() {
+		t.Fatal("expected exact range cache key")
+	}
+
+	ids := view.evalLazyMaterializedPredicateWithKey(expr, key)
+	if ids.IsEmpty() {
+		t.Fatal("expected lazy materialized numeric range result")
+	}
+	ids.Release()
+
+	snap := db.engine.snapshot.Current()
+	if snap.HasMaterializedPredKey(key) {
+		t.Fatal("lazy bucket-eligible numeric range populated exact materialized predicate cache")
+	}
+	if got := snap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatal("expected lazy numeric range to populate numeric span cache")
+	}
+}
+
+func TestNumericRangeBucketSpanCache_DeferredMaterializationUsesNumericSpanCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                 -1,
+		MaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:          8,
+		NumericRangeBucketMinFieldKeys:  16,
+		NumericRangeBucketMinSpanKeys:   4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+
+	view := db.engine.currentQueryViewForTests()
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("age", 6_000))
+	key := view.materializedPredKey(expr)
+	if key.IsZero() {
+		t.Fatal("expected exact range cache key")
+	}
+	p, ok := view.buildPredicateWithColdMode(expr, true, true)
+	if !ok {
+		t.Fatal("buildPredicateWithColdMode: ok=false")
+	}
+	defer releasePredicates([]predicate{p})
+	if p.fieldIndexRangeState == nil {
+		t.Fatal("expected deferred numeric range state")
+	}
+	if p.fieldIndexRangeState.numericSpan.entry == nil {
+		t.Fatal("expected deferred state to keep numeric span target")
+	}
+
+	ids := p.fieldIndexRangeState.materializeRange()
+	if ids.IsEmpty() {
+		t.Fatal("expected deferred numeric range materialization")
+	}
+
+	snap := db.engine.snapshot.Current()
+	if snap.HasMaterializedPredKey(key) {
+		t.Fatal("deferred bucket-eligible numeric range populated exact materialized predicate cache")
+	}
+	if got := snap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatal("expected deferred numeric range to populate numeric span cache")
 	}
 }
 
@@ -740,7 +910,8 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	cachedBefore, ok := entry.LoadFullSpan(start, end)
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	cachedBefore, ok := loadNumericRangeFullSpan(t, db.engine.snapshot.Current(), entry, ageOrdinal, start, end)
 	if !ok || cachedBefore.IsEmpty() {
 		t.Fatal("expected cached full-span posting after predicate build")
 	}
@@ -748,7 +919,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 	releasePredicates([]predicate{pred})
 	released = true
 
-	cachedAfter, ok := entry.LoadFullSpan(start, end)
+	cachedAfter, ok := loadNumericRangeFullSpan(t, db.engine.snapshot.Current(), entry, ageOrdinal, start, end)
 	if !ok || cachedAfter.IsEmpty() {
 		t.Fatal("expected cached full-span posting to survive predicate cleanup")
 	}
@@ -798,7 +969,8 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	cachedBefore, ok := entry.LoadFullSpan(start, end)
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	cachedBefore, ok := loadNumericRangeFullSpan(t, db.engine.snapshot.Current(), entry, ageOrdinal, start, end)
 	if !ok || cachedBefore.IsEmpty() {
 		t.Fatal("expected cached full-span posting after predicate build")
 	}
@@ -806,7 +978,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 	releasePredicates([]predicate{pred})
 	released = true
 
-	cachedAfter, ok := entry.LoadFullSpan(start, end)
+	cachedAfter, ok := loadNumericRangeFullSpan(t, db.engine.snapshot.Current(), entry, ageOrdinal, start, end)
 	if !ok || cachedAfter.IsEmpty() {
 		t.Fatal("expected cached full-span posting to survive predicate cleanup")
 	}
@@ -815,10 +987,10 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 	}
 }
 
-func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
+func TestNumericRangeBucketSpanCache_RespectsEntryByteGuard(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		MaterializedPredCacheMaxEntries:             -1,
-		SnapshotMaterializedPredCacheMaxCardinality: 32,
+		MaterializedPredCacheMaxEntries:    -1,
+		NumericRangeSpanCacheMaxEntryBytes: 1,
 	})
 
 	seedGeneratedUint64Data(t, db, 2_000, func(i int) *Rec {
@@ -865,8 +1037,8 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	if cached, ok := entry.LoadFullSpan(start, end); ok && !cached.IsEmpty() {
-		t.Fatal("expected oversized full-span posting to be rejected by cache guard")
+	if cached, ok := loadNumericRangeFullSpan(t, snap, entry, ageOrdinal, start, end); ok && !cached.IsEmpty() {
+		t.Fatal("expected oversized full-span posting to be rejected by byte guard")
 	}
 }
 
@@ -917,6 +1089,223 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	})
 	if allocs > 12 {
 		t.Fatalf("unexpected allocs per run on warmed numeric bucket load: got=%v want<=12", allocs)
+	}
+}
+
+func TestNumericRangeExactResultCache_PromotesFixedRangeWithoutMaterializedPollution(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 64,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	fm := db.engine.schema.Fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	qv := db.engine.currentQueryViewForTests()
+	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, "age")
+	if !ov.HasData() {
+		t.Fatalf("expected age overlay data")
+	}
+	br := ov.RangeByRanks(2501, 3001)
+	desc := qv.exec.fields[ageOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry("age", desc.storageOrdinal, qv.snap.Index[desc.storageOrdinal], 128, 1)
+	if entry == nil {
+		t.Fatal("expected numeric range bucket cache entry")
+	}
+	start, end, ok := entry.Index().FullBucketSpan(br)
+	if !ok {
+		t.Fatal("expected full bucket span")
+	}
+	leftEnd := min(br.BaseEnd, entry.Index().BucketStart(start))
+	rightStart := max(br.BaseStart, entry.Index().BucketEnd(end))
+	if leftEnd <= br.BaseStart && rightStart >= br.BaseEnd {
+		t.Fatal("test range must have edge buckets")
+	}
+
+	first, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
+	if !ok {
+		t.Fatal("expected first numeric range bucket eval")
+	}
+	wantIDs := bitmapToIDs(t, first)
+	first.ids.Release()
+	if stats := qv.snap.NumericRangeExactResultCacheStats(); stats.EntryCount != 0 || stats.RejectedFirstObservation != 1 {
+		t.Fatalf("exact result cache after first eval: %+v", stats)
+	}
+
+	second, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
+	if !ok {
+		t.Fatal("expected second numeric range bucket eval")
+	}
+	got := bitmapToIDs(t, second)
+	second.ids.Release()
+	if !slices.Equal(got, wantIDs) {
+		t.Fatalf("exact range result mismatch: got=%v want=%v", got, wantIDs)
+	}
+
+	stats := qv.snap.NumericRangeExactResultCacheStats()
+	if stats.EntryCount != 1 || stats.Stores != 1 {
+		t.Fatalf("expected second eval to store exact result, stats=%+v", stats)
+	}
+	third, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
+	if !ok {
+		t.Fatal("expected third numeric range bucket eval")
+	}
+	got = bitmapToIDs(t, third)
+	third.ids.Release()
+	if !slices.Equal(got, wantIDs) {
+		t.Fatalf("cached exact range result mismatch: got=%v want=%v", got, wantIDs)
+	}
+	if stats = qv.snap.NumericRangeExactResultCacheStats(); stats.EntryCount != 1 || stats.Stores != 1 {
+		t.Fatalf("unexpected exact result cache state after warm eval: %+v", stats)
+	}
+	if got := qv.snap.MaterializedPredCacheEntryCount(); got != 0 {
+		t.Fatalf("bucket-eligible numeric exact range polluted MaterializedPredCache: entries=%d", got)
+	}
+}
+
+func TestNumericRangeExactResultCache_OrderedORWarmupUsesNumericCacheKey(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries: 64,
+	})
+
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i,
+			Score:  float64(12_000 - i),
+			Active: i&1 == 0,
+		}
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	qv := db.engine.currentQueryViewForTests()
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, "age")
+	if !ov.HasData() {
+		t.Fatalf("expected age overlay data")
+	}
+
+	lo, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", 2501))
+	if err != nil || isSlice || isNil {
+		t.Fatalf("age lo key: key=%+v isSlice=%v isNil=%v err=%v", lo, isSlice, isNil, err)
+	}
+	hi, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.LT("age", 3501))
+	if err != nil || isSlice || isNil {
+		t.Fatalf("age hi key: key=%+v isSlice=%v isNil=%v err=%v", hi, isSlice, isNil, err)
+	}
+	var bounds indexdata.Bounds
+	bounds.ApplyLo(lo, true)
+	bounds.ApplyHi(hi, false)
+	if key := qv.materializedPredKeyForExactScalarRange("age", bounds); !key.IsZero() {
+		t.Fatalf("bucket-eligible exact range should not have materialized key: %v", key)
+	}
+
+	br := ov.RangeForBounds(bounds)
+	fm := db.engine.schema.Fields["age"]
+	span, ok := qv.numericRangeBucketSpan("age", ageOrdinal, fm, ov, br)
+	if !ok {
+		t.Fatal("expected ordered OR range to be numeric-bucket eligible")
+	}
+	leftEnd := min(br.BaseEnd, span.index.BucketStart(span.start))
+	rightStart := max(br.BaseStart, span.index.BucketEnd(span.end))
+	if leftEnd <= br.BaseStart && rightStart >= br.BaseEnd {
+		t.Fatal("test range must have edge buckets")
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("age", 2501),
+				qx.LT("age", 3501),
+			),
+			qx.AND(
+				qx.EQ("active", false),
+				qx.GTE("age", 2501),
+				qx.LT("age", 3501),
+			),
+		),
+	).Sort("score", qx.DESC).Limit(100)
+
+	for i := 0; i < 3; i++ {
+		if _, err := db.QueryKeys(q); err != nil {
+			t.Fatalf("ordered OR query %d: %v", i, err)
+		}
+		db.engine.waitAsyncMaterializedPredWarmupForTests(t)
+	}
+
+	stats := qv.snap.NumericRangeExactResultCacheStats()
+	if stats.EntryCount == 0 || stats.Stores == 0 {
+		t.Fatalf("expected ordered OR warmup to store numeric exact result, stats=%+v", stats)
+	}
+	if got := qv.snap.MaterializedPredCacheEntryCount(); got != 0 {
+		t.Fatalf("ordered OR numeric warmup polluted MaterializedPredCache: entries=%d", got)
+	}
+
+	storesBefore := stats.Stores
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("ordered OR warm query: %v", err)
+	}
+	if stats = qv.snap.NumericRangeExactResultCacheStats(); stats.EntryCount == 0 || stats.Stores != storesBefore {
+		t.Fatalf("unexpected numeric exact result cache state after warm query: beforeStores=%d stats=%+v", storesBefore, stats)
+	}
+}
+
+func TestNumericRangeExactResultCache_DisabledStillUsesSpanCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		MaterializedPredCacheMaxEntries:  64,
+		NumericRangeExactCacheMaxEntries: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	fm := db.engine.schema.Fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ageOrdinal := db.engine.schema.IndexedByName["age"].Ordinal
+	qv := db.engine.currentQueryViewForTests()
+	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, "age")
+	if !ov.HasData() {
+		t.Fatalf("expected age overlay data")
+	}
+	br := ov.RangeByRanks(1001, 3001)
+
+	for i := 0; i < 2; i++ {
+		out, ok := qv.tryEvalNumericRangeBuckets("age", ageOrdinal, fm, ov, br)
+		if !ok {
+			t.Fatalf("expected numeric range bucket eval %d", i)
+		}
+		out.ids.Release()
+	}
+	if got := qv.snap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatal("expected span cache to remain active while exact result cache is disabled")
+	}
+	if stats := qv.snap.NumericRangeExactResultCacheStats(); stats.MaxEntries != 0 || stats.EntryCount != 0 {
+		t.Fatalf("exact result cache should be disabled: %+v", stats)
+	}
+	if got := qv.snap.MaterializedPredCacheEntryCount(); got != 0 {
+		t.Fatalf("disabled exact cache should not route bucket-eligible numeric range into MaterializedPredCache: entries=%d", got)
 	}
 }
 

@@ -18,7 +18,6 @@ const (
 	materializedPredKeyScalarComplement
 	materializedPredKeyExactScalarRange
 	materializedPredKeyExactScalarRangeComplement
-	materializedPredKeyNumericBucketSpan
 	materializedPredKeyDistinctSet
 )
 
@@ -85,8 +84,6 @@ type MaterializedPredKey struct {
 	loIndex     keycodec.IndexKey
 	hiIndex     keycodec.IndexKey
 	flags       uint8
-	startBucket int
-	endBucket   int
 	setTerms    [materializedPredKeyDistinctSetInlineMax]keycodec.IndexLookupKey
 	setValueCnt uint8
 }
@@ -257,10 +254,6 @@ func (key MaterializedPredKey) String() string {
 		}
 		return buf.String()
 
-	case materializedPredKeyNumericBucketSpan:
-		return key.field + "\x1f" + "range_bucket" + "\x1f" +
-			strconv.Itoa(key.startBucket) + "\x1f" + strconv.Itoa(key.endBucket)
-
 	default:
 		return ""
 	}
@@ -311,11 +304,6 @@ func (key *MaterializedPredKey) hash() uint64 {
 			}
 		}
 		return h
-
-	case materializedPredKeyNumericBucketSpan:
-		h = materializedPredKeyHashString(h, key.field)
-		h = materializedPredKeyHashUint(h, uint64(key.startBucket))
-		return materializedPredKeyHashUint(h, uint64(key.endBucket))
 
 	case materializedPredKeyDistinctSet:
 		h = materializedPredKeyHashString(h, key.field)
@@ -477,18 +465,6 @@ func MaterializedPredKeyForExactScalarRange(field string, bounds indexdata.Bound
 
 func MaterializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) MaterializedPredKey {
 	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRangeComplement, field, bounds)
-}
-
-func MaterializedPredKeyForNumericBucketSpan(field string, startBucket, endBucket int) MaterializedPredKey {
-	if field == "" || startBucket < 0 || endBucket < startBucket {
-		return MaterializedPredKey{}
-	}
-	return MaterializedPredKey{
-		kind:        materializedPredKeyNumericBucketSpan,
-		field:       field,
-		startBucket: startBucket,
-		endBucket:   endBucket,
-	}
 }
 
 func MaterializedPredKeyForDistinctLookupKeys(field string, op qir.Op, vals []keycodec.IndexLookupKey, includeNil bool) MaterializedPredKey {

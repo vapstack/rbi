@@ -269,6 +269,18 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 	)
 
 	report := app.buildReport(false)
+	if report.Schema != reportSchema {
+		t.Fatalf("report.Schema = %q, want %q", report.Schema, reportSchema)
+	}
+	if report.SnapshotBaseline.Stats.RuntimeCaches.NumericRangeSpan.MaxEntries == 0 {
+		t.Fatalf("snapshot baseline missing numeric span cache stats: %+v", report.SnapshotBaseline.Stats)
+	}
+	if report.SnapshotFinal.Stats.RuntimeCaches.NumericRangeSpan.MaxEntries == 0 {
+		t.Fatalf("snapshot final missing numeric span cache stats: %+v", report.SnapshotFinal.Stats)
+	}
+	if len(report.Phases) == 0 || report.Phases[0].SnapshotBaseline.Stats.RuntimeCaches.NumericRangeSpan.MaxEntries == 0 {
+		t.Fatalf("phase snapshot missing numeric span cache stats: %+v", report.Phases)
+	}
 	want := handle.Collection.IndexStats()
 	if !reflect.DeepEqual(report.IndexStats, want) {
 		t.Fatalf("report.IndexStats = %+v, want %+v", report.IndexStats, want)
@@ -280,6 +292,9 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 	}
 	if got := bytes.Count(data, []byte(`"index_stats"`)); got != 1 {
 		t.Fatalf("expected final report JSON to contain exactly one index_stats section, got %d", got)
+	}
+	if !bytes.Contains(data, []byte(`"RuntimeCaches"`)) {
+		t.Fatal("expected stress report JSON to include snapshot runtime cache stats")
 	}
 
 	var raw map[string]json.RawMessage

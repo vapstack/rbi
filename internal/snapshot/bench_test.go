@@ -493,7 +493,7 @@ func BenchmarkNumericRangeCacheEntry(b *testing.B) {
 	b.Run("Build", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			v := &View{numericRangeBucketCache: qcache.GetNumericRangeBucketCache(1, 0)}
+			v := &View{numericRangeBucketCache: qcache.GetNumericRangeBucketCache(1)}
 			entry := v.NumericRangeBucketCacheEntry("age", 0, storage, 16, 1)
 			if entry == nil {
 				b.Fatal("entry")
@@ -503,7 +503,7 @@ func BenchmarkNumericRangeCacheEntry(b *testing.B) {
 	})
 
 	b.Run("Hit", func(b *testing.B) {
-		v := &View{numericRangeBucketCache: qcache.GetNumericRangeBucketCache(1, 0)}
+		v := &View{numericRangeBucketCache: qcache.GetNumericRangeBucketCache(1)}
 		defer v.releaseRuntimeCaches()
 		if entry := v.NumericRangeBucketCacheEntry("age", 0, storage, 16, 1); entry == nil {
 			b.Fatal("seed entry")

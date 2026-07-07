@@ -2,7 +2,7 @@ package main
 
 import "github.com/vapstack/rbi/rbistats"
 
-const reportSchema = "rbi.stress_report/v13"
+const reportSchema = "rbi.stress_report/v14"
 
 type stressReport struct {
 	Schema      string `json:"schema"`

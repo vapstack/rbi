@@ -110,6 +110,11 @@ var plannerORPredicateBuildInfoSlicePool = pooled.Slices[orderedORMaterializedPr
 	Clear:  pooled.ClearCap,
 }
 
+var asyncMaterializedPredPlanSlicePool = pooled.Slices[asyncMaterializedPredPlan]{
+	MaxCap: 64,
+	Clear:  pooled.ClearCap,
+}
+
 var plannerOROrderIterSlicePool = pooled.Slices[plannerOROrderBranchIter]{
 	MaxCap: 512,
 	Clear:  pooled.ClearCap,

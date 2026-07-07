@@ -2,15 +2,24 @@ package qexec
 
 import (
 	"github.com/vapstack/rbi/internal/indexdata"
-
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
-func (qv *View) tryEvalNumericRangeBuckets(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
+type numericRangeBucketSpan struct {
+	snap      *snapshot.View
+	entry     *qcache.NumericRangeBucketEntry
+	index     qcache.NumericRangeBucketIndex
+	fieldSlot int
+	start     int
+	end       int
+}
+
+func (qv *View) numericRangeBucketSpan(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (numericRangeBucketSpan, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	bucketSize := qv.exec.NumericRangeBucketSize
@@ -18,173 +27,157 @@ func (qv *View) tryEvalNumericRangeBuckets(field string, fieldOrdinal int, fm *s
 	minSpan := qv.exec.NumericRangeBucketMinSpanKeys
 
 	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	span := br.BaseEnd - br.BaseStart
 	if span < minSpan {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	if br.BaseStart >= br.BaseEnd || ov.KeyCount() == 0 {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	desc := qv.exec.fields[fieldOrdinal]
 	storage := qv.snap.Index[desc.storageOrdinal]
 	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
 	if entry == nil {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	idx := entry.Index()
 	if idx.BucketCount() == 0 {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 	if idx.KeyCount() != ov.KeyCount() {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
 	startFull, endFull, ok := idx.FullBucketSpan(br)
 	if !ok {
-		return postingResult{}, false
+		return numericRangeBucketSpan{}, false
 	}
 
-	fullSpanReuse := newMaterializedPredReadOnlyReuse(
-		qv.snap,
-		qcache.MaterializedPredKeyForNumericBucketSpan(field, startFull, endFull),
-	)
+	return numericRangeBucketSpan{
+		snap:      qv.snap,
+		entry:     entry,
+		index:     idx,
+		fieldSlot: desc.storageOrdinal,
+		start:     startFull,
+		end:       endFull,
+	}, true
+}
+
+func (qv *View) tryEvalNumericRangeBuckets(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
+	span, ok := qv.numericRangeBucketSpan(field, fieldOrdinal, fm, ov, br)
+	if !ok {
+		return postingResult{}, false
+	}
+	return evalNumericRangeBucketSpan(ov, br, span), true
+}
+
+func evalNumericRangeBucketSpan(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, span numericRangeBucketSpan) postingResult {
+	leftEnd := min(br.BaseEnd, span.index.BucketStart(span.start))
+	rightStart := max(br.BaseStart, span.index.BucketEnd(span.end))
+	hasEdge := leftEnd > br.BaseStart || rightStart < br.BaseEnd
+	if hasEdge {
+		if cached, ok := span.snap.LoadNumericRangeExactResult(span.fieldSlot, br.BaseStart, br.BaseEnd); ok {
+			return postingResult{ids: cached}
+		}
+	}
 
 	var res posting.List
-	if cached, ok := entry.LoadFullSpan(startFull, endFull); ok {
+	if cached, ok := span.snap.LoadNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end); ok {
 		res = cached
 	}
 
 	if res.IsEmpty() {
-		if cached, ok := fullSpanReuse.load(); ok && !cached.IsEmpty() {
-			res = cached
-		}
-	}
-
-	if res.IsEmpty() {
-		if cached, cachedStart, cachedEnd, ok := entry.LoadExtendedFullSpan(startFull, endFull); ok {
+		if cached, cachedStart, cachedEnd, ok := span.snap.LoadExtendedNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end); ok {
 			res = cached
 			switch {
 
-			case cachedStart == startFull && cachedEnd < endFull:
+			case cachedStart == span.start && cachedEnd < span.end:
 				res = ov.MergeRangePostingsInto(
 					res,
-					ov.RangeByRanks(idx.BucketStart(cachedEnd+1), idx.BucketEnd(endFull)),
+					ov.RangeByRanks(span.index.BucketStart(cachedEnd+1), span.index.BucketEnd(span.end)),
 					indexdata.FieldIndexRange{},
 				)
 
-			case cachedEnd == endFull && cachedStart > startFull:
+			case cachedEnd == span.end && cachedStart > span.start:
 				res = ov.MergeRangePostingsInto(
 					res,
-					ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketStart(cachedStart)),
+					ov.RangeByRanks(span.index.BucketStart(span.start), span.index.BucketStart(cachedStart)),
 					indexdata.FieldIndexRange{},
 				)
 			}
 
 		} else {
-			res = ov.MergeRangePostingsInto(res, ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketEnd(endFull)), indexdata.FieldIndexRange{})
+			res = ov.MergeRangePostingsInto(res, ov.RangeByRanks(span.index.BucketStart(span.start), span.index.BucketEnd(span.end)), indexdata.FieldIndexRange{})
 		}
-		res, _ = entry.TryStoreFullSpan(startFull, endFull, res)
+		res, _ = span.snap.TryStoreNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end, res)
 	}
 
-	leftEnd := min(br.BaseEnd, idx.BucketStart(startFull))
-	rightStart := max(br.BaseStart, idx.BucketEnd(endFull))
-
-	if (leftEnd > br.BaseStart) || (rightStart < br.BaseEnd) {
+	if hasEdge {
 		res = ov.MergeRangePostingsInto(
 			res,
 			ov.RangeByRanks(br.BaseStart, leftEnd),
 			ov.RangeByRanks(rightStart, br.BaseEnd),
 		)
+		res, _ = span.snap.TryStoreNumericRangeExactResult(span.fieldSlot, br.BaseStart, br.BaseEnd, res)
 	}
 
-	return postingResult{ids: res}, true
+	return postingResult{ids: res}
 }
 
 func (qv *View) tryEvalNumericRangeBucketsUntil(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, cancel *indexdata.RangePostingsUnionCancel) (postingResult, bool) {
-	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return postingResult{}, false
-	}
-
-	bucketSize := qv.exec.NumericRangeBucketSize
-	minFieldKeys := qv.exec.NumericRangeBucketMinFieldKeys
-	minSpan := qv.exec.NumericRangeBucketMinSpanKeys
-
-	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
-		return postingResult{}, false
-	}
-
-	span := br.BaseEnd - br.BaseStart
-	if span < minSpan {
-		return postingResult{}, false
-	}
-
-	if br.BaseStart >= br.BaseEnd || ov.KeyCount() == 0 {
-		return postingResult{}, false
-	}
 	if cancel.Canceled() {
 		return postingResult{}, false
 	}
-
-	desc := qv.exec.fields[fieldOrdinal]
-	storage := qv.snap.Index[desc.storageOrdinal]
-	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
-	if entry == nil {
-		return postingResult{}, false
-	}
-	if cancel.Canceled() {
-		return postingResult{}, false
-	}
-
-	idx := entry.Index()
-	if idx.BucketCount() == 0 {
-		return postingResult{}, false
-	}
-	if idx.KeyCount() != ov.KeyCount() {
-		return postingResult{}, false
-	}
-
-	startFull, endFull, ok := idx.FullBucketSpan(br)
+	span, ok := qv.numericRangeBucketSpan(field, fieldOrdinal, fm, ov, br)
 	if !ok {
 		return postingResult{}, false
 	}
+	if cancel.Canceled() {
+		return postingResult{}, false
+	}
+	return evalNumericRangeBucketSpanUntil(ov, br, span, cancel)
+}
 
-	fullSpanReuse := newMaterializedPredReadOnlyReuse(
-		qv.snap,
-		qcache.MaterializedPredKeyForNumericBucketSpan(field, startFull, endFull),
-	)
+func evalNumericRangeBucketSpanUntil(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, span numericRangeBucketSpan, cancel *indexdata.RangePostingsUnionCancel) (postingResult, bool) {
+	leftEnd := min(br.BaseEnd, span.index.BucketStart(span.start))
+	rightStart := max(br.BaseStart, span.index.BucketEnd(span.end))
+	hasEdge := leftEnd > br.BaseStart || rightStart < br.BaseEnd
+	if hasEdge {
+		if cached, ok := span.snap.LoadNumericRangeExactResult(span.fieldSlot, br.BaseStart, br.BaseEnd); ok {
+			if cancel.Canceled() {
+				cached.Release()
+				return postingResult{}, false
+			}
+			return postingResult{ids: cached}, true
+		}
+	}
 
 	var res posting.List
-	if cached, ok := entry.LoadFullSpan(startFull, endFull); ok {
+	if cached, ok := span.snap.LoadNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end); ok {
 		res = cached
 	}
 
 	if res.IsEmpty() {
-		if cached, ok := fullSpanReuse.load(); ok && !cached.IsEmpty() {
-			res = cached
-		}
-	}
-
-	if res.IsEmpty() {
 		var pending indexdata.FieldIndexRange
-		if cached, cachedStart, cachedEnd, ok := entry.LoadExtendedFullSpan(startFull, endFull); ok {
+		if cached, cachedStart, cachedEnd, ok := span.snap.LoadExtendedNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end); ok {
 			res = cached
 			switch {
 
-			case cachedStart == startFull && cachedEnd < endFull:
-				pending = ov.RangeByRanks(idx.BucketStart(cachedEnd+1), idx.BucketEnd(endFull))
+			case cachedStart == span.start && cachedEnd < span.end:
+				pending = ov.RangeByRanks(span.index.BucketStart(cachedEnd+1), span.index.BucketEnd(span.end))
 
-			case cachedEnd == endFull && cachedStart > startFull:
-				pending = ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketStart(cachedStart))
+			case cachedEnd == span.end && cachedStart > span.start:
+				pending = ov.RangeByRanks(span.index.BucketStart(span.start), span.index.BucketStart(cachedStart))
 			}
 
 		} else {
-			pending = ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketEnd(endFull))
+			pending = ov.RangeByRanks(span.index.BucketStart(span.start), span.index.BucketEnd(span.end))
 		}
 		if !pending.Empty() {
 			pendingIDs, ok := ov.UnionRangePostingsUntil(pending, indexdata.FieldIndexRange{}, cancel)
@@ -202,13 +195,10 @@ func (qv *View) tryEvalNumericRangeBucketsUntil(field string, fieldOrdinal int, 
 			res.Release()
 			return postingResult{}, false
 		}
-		res, _ = entry.TryStoreFullSpan(startFull, endFull, res)
+		res, _ = span.snap.TryStoreNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end, res)
 	}
 
-	leftEnd := min(br.BaseEnd, idx.BucketStart(startFull))
-	rightStart := max(br.BaseStart, idx.BucketEnd(endFull))
-
-	if (leftEnd > br.BaseStart) || (rightStart < br.BaseEnd) {
+	if hasEdge {
 		edgeIDs, ok := ov.UnionRangePostingsUntil(
 			ov.RangeByRanks(br.BaseStart, leftEnd),
 			ov.RangeByRanks(rightStart, br.BaseEnd),
@@ -228,75 +218,40 @@ func (qv *View) tryEvalNumericRangeBucketsUntil(field string, fieldOrdinal int, 
 		res.Release()
 		return postingResult{}, false
 	}
+	if hasEdge {
+		res, _ = span.snap.TryStoreNumericRangeExactResult(span.fieldSlot, br.BaseStart, br.BaseEnd, res)
+	}
 
 	return postingResult{ids: res}, true
 }
 
 func (qv *View) tryLoadNumericRangeBuckets(field string, fieldOrdinal int, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
-	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return postingResult{}, false
-	}
-
-	bucketSize := qv.exec.NumericRangeBucketSize
-	minFieldKeys := qv.exec.NumericRangeBucketMinFieldKeys
-	minSpan := qv.exec.NumericRangeBucketMinSpanKeys
-
-	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
-		return postingResult{}, false
-	}
-
-	span := br.BaseEnd - br.BaseStart
-	if span < minSpan {
-		return postingResult{}, false
-	}
-
-	if br.BaseStart >= br.BaseEnd || ov.KeyCount() == 0 {
-		return postingResult{}, false
-	}
-
-	desc := qv.exec.fields[fieldOrdinal]
-	storage := qv.snap.Index[desc.storageOrdinal]
-	entry := qv.snap.NumericRangeBucketCacheEntry(field, desc.storageOrdinal, storage, bucketSize, minFieldKeys)
-	if entry == nil {
-		return postingResult{}, false
-	}
-
-	idx := entry.Index()
-	if idx.BucketCount() == 0 {
-		return postingResult{}, false
-	}
-
-	if idx.KeyCount() != ov.KeyCount() {
-		return postingResult{}, false
-	}
-
-	startFull, endFull, ok := idx.FullBucketSpan(br)
+	span, ok := qv.numericRangeBucketSpan(field, fieldOrdinal, fm, ov, br)
 	if !ok {
 		return postingResult{}, false
 	}
+	return loadNumericRangeBucketSpan(ov, br, span)
+}
 
-	fullSpanReuse := newMaterializedPredReadOnlyReuse(
-		qv.snap,
-		qcache.MaterializedPredKeyForNumericBucketSpan(field, startFull, endFull),
-	)
+func loadNumericRangeBucketSpan(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, span numericRangeBucketSpan) (postingResult, bool) {
+	leftEnd := min(br.BaseEnd, span.index.BucketStart(span.start))
+	rightStart := max(br.BaseStart, span.index.BucketEnd(span.end))
+	hasEdge := leftEnd > br.BaseStart || rightStart < br.BaseEnd
+	if hasEdge {
+		if cached, ok := span.snap.LoadNumericRangeExactResult(span.fieldSlot, br.BaseStart, br.BaseEnd); ok {
+			return postingResult{ids: cached}, true
+		}
+	}
 
 	var res posting.List
-	if cached, ok := entry.LoadFullSpan(startFull, endFull); ok {
+	if cached, ok := span.snap.LoadNumericRangeFullSpan(span.entry, span.fieldSlot, span.start, span.end); ok {
 		res = cached
-	}
-	if res.IsEmpty() {
-		if cached, ok := fullSpanReuse.load(); ok && !cached.IsEmpty() {
-			res = cached
-		}
 	}
 	if res.IsEmpty() {
 		return postingResult{}, false
 	}
 
-	leftEnd := min(br.BaseEnd, idx.BucketStart(startFull))
-	rightStart := max(br.BaseStart, idx.BucketEnd(endFull))
-
-	if (leftEnd > br.BaseStart) || (rightStart < br.BaseEnd) {
+	if hasEdge {
 		res = ov.MergeRangePostingsInto(
 			res,
 			ov.RangeByRanks(br.BaseStart, leftEnd),

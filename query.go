@@ -290,20 +290,16 @@ func (c *Collection[K, V]) SnapshotStats() rbistats.Snapshot {
 		return rbistats.Snapshot{}
 	}
 
-	return c.rootSnapshotStats()
-}
-
-func (c *Collection[K, V]) rootSnapshotStats() rbistats.Snapshot {
 	rr := &c.root.registry
 	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+
 	ref := rr.currentRef.Load()
 	if ref == nil || ref.gen == nil || int(c.ordinal) >= len(ref.gen.entries) {
-		rr.mu.RUnlock()
 		return rbistats.Snapshot{}
 	}
 	entry := ref.gen.entries[c.ordinal]
 	if entry.collection != c.collection || entry.read == nil || entry.read.snap == nil {
-		rr.mu.RUnlock()
 		return rbistats.Snapshot{}
 	}
 	snap := entry.read.snap
@@ -311,6 +307,7 @@ func (c *Collection[K, V]) rootSnapshotStats() rbistats.Snapshot {
 	if !snap.Universe.IsEmpty() {
 		out.UniverseCard = snap.Universe.Cardinality()
 	}
-	rr.mu.RUnlock()
+	out.RuntimeCaches = c.index.RuntimeCacheStats(snap)
+
 	return out
 }

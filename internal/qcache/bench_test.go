@@ -165,7 +165,7 @@ func BenchmarkMaterializedPredCacheLoadOrStoreHit(b *testing.B) {
 }
 
 func BenchmarkMaterializedPredCacheTryLoadOrStoreOversizedHit(b *testing.B) {
-	key := MaterializedPredKeyForNumericBucketSpan("age", 3, 7)
+	key := MaterializedPredKeyFromOpaque("age:3:7")
 	cache := GetMaterializedPredCache(8, 1)
 	defer cache.ReleaseRef()
 	caller := qcacheTestPosting(1, 2, 3)
@@ -273,11 +273,11 @@ func BenchmarkNumericRangeBucketIndexFullBucketSpan(b *testing.B) {
 func BenchmarkNumericRangeBucketCacheLoadSlot(b *testing.B) {
 	storage := qcacheTestFieldStorage(256, 1000)
 	defer storage.Release()
-	cache := GetNumericRangeBucketCache(64, 0)
+	cache := GetNumericRangeBucketCache(64)
 	defer ReleaseNumericRangeBucketCache(cache)
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
 	for i := 0; i < 64; i++ {
-		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx, 0))
+		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -293,11 +293,11 @@ func BenchmarkNumericRangeBucketCacheLoadSlot(b *testing.B) {
 func BenchmarkNumericRangeBucketCacheLoadField(b *testing.B) {
 	storage := qcacheTestFieldStorage(256, 1000)
 	defer storage.Release()
-	cache := GetNumericRangeBucketCache(64, 0)
+	cache := GetNumericRangeBucketCache(64)
 	defer ReleaseNumericRangeBucketCache(cache)
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
 	for i := 0; i < 64; i++ {
-		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx, 0))
+		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -313,9 +313,9 @@ func BenchmarkNumericRangeBucketCacheLoadField(b *testing.B) {
 func BenchmarkNumericRangeBucketCacheStoreSlot(b *testing.B) {
 	storage := qcacheTestFieldStorage(256, 1000)
 	defer storage.Release()
-	cache := GetNumericRangeBucketCache(64, 0)
+	cache := GetNumericRangeBucketCache(64)
 	defer ReleaseNumericRangeBucketCache(cache)
-	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -326,11 +326,11 @@ func BenchmarkNumericRangeBucketCacheStoreSlot(b *testing.B) {
 func BenchmarkNumericRangeBucketCacheEntryCount(b *testing.B) {
 	storage := qcacheTestFieldStorage(256, 1000)
 	defer storage.Release()
-	cache := GetNumericRangeBucketCache(64, 0)
+	cache := GetNumericRangeBucketCache(64)
 	defer ReleaseNumericRangeBucketCache(cache)
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
 	for i := 0; i < 64; i++ {
-		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx, 0))
+		cache.StoreSlot("field"+strconv.Itoa(i), i, GetNumericRangeBucketEntry(storage, idx))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -342,8 +342,8 @@ func BenchmarkNumericRangeBucketCacheEntryCount(b *testing.B) {
 func BenchmarkNumericRangeBucketCacheInheritFrom(b *testing.B) {
 	storage := qcacheTestFieldStorage(256, 1000)
 	defer storage.Release()
-	prev := GetNumericRangeBucketCache(32, 0)
-	next := GetNumericRangeBucketCache(32, 0)
+	prev := GetNumericRangeBucketCache(32)
+	next := GetNumericRangeBucketCache(32)
 	defer ReleaseNumericRangeBucketCache(prev)
 	defer ReleaseNumericRangeBucketCache(next)
 
@@ -352,7 +352,7 @@ func BenchmarkNumericRangeBucketCacheInheritFrom(b *testing.B) {
 	fields := make(schema.IndexedFieldMap, 32)
 	for i := 0; i < 32; i++ {
 		field := "field" + strconv.Itoa(i)
-		prev.StoreSlot(field, i, GetNumericRangeBucketEntry(storage, idx, 0))
+		prev.StoreSlot(field, i, GetNumericRangeBucketEntry(storage, idx))
 		nextIndex[i] = storage
 		fields[field] = schema.IndexedFieldAccessor{Ordinal: i}
 	}
@@ -365,10 +365,12 @@ func BenchmarkNumericRangeBucketCacheInheritFrom(b *testing.B) {
 	}
 }
 
-func BenchmarkNumericRangeBucketEntryLoadFullSpanHit(b *testing.B) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
-	seed, ok := entry.TryStoreFullSpan(3, 7, qcacheTestPosting(1, 2, 3, 4))
+func BenchmarkNumericRangeBucketCacheLoadFullSpanHit(b *testing.B) {
+	cache := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(cache)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
+	seed, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, qcacheTestPosting(1, 2, 3, 4))
 	if !ok {
 		b.Fatal("full-span seed miss")
 	}
@@ -376,7 +378,7 @@ func BenchmarkNumericRangeBucketEntryLoadFullSpanHit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ids, ok := entry.LoadFullSpan(3, 7)
+		ids, ok := cache.LoadFullSpan(entry, 0, 3, 7)
 		if !ok || ids.IsEmpty() {
 			b.Fatal("full-span load miss")
 		}
@@ -384,11 +386,13 @@ func BenchmarkNumericRangeBucketEntryLoadFullSpanHit(b *testing.B) {
 	}
 }
 
-func BenchmarkNumericRangeBucketEntryLoadExtendedFullSpan(b *testing.B) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+func BenchmarkNumericRangeBucketCacheLoadExtendedFullSpan(b *testing.B) {
+	cache := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(cache)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
 	for i := 0; i < 4; i++ {
-		ids, ok := entry.TryStoreFullSpan(i*4, i*4+3, qcacheTestPosting(uint64(i+1), uint64(i+17)))
+		ids, ok := cache.TryStoreFullSpan(entry, 0, i*4, i*4+3, qcacheTestPosting(uint64(i+1), uint64(i+17)))
 		if !ok {
 			b.Fatal("full-span seed miss")
 		}
@@ -397,7 +401,7 @@ func BenchmarkNumericRangeBucketEntryLoadExtendedFullSpan(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ids, _, _, ok := entry.LoadExtendedFullSpan(0, 19)
+		ids, _, _, ok := cache.LoadExtendedFullSpan(entry, 0, 0, 19)
 		if !ok || ids.IsEmpty() {
 			b.Fatal("extended load miss")
 		}
@@ -405,12 +409,14 @@ func BenchmarkNumericRangeBucketEntryLoadExtendedFullSpan(b *testing.B) {
 	}
 }
 
-func BenchmarkNumericRangeBucketEntryTryStoreFullSpanHit(b *testing.B) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+func BenchmarkNumericRangeBucketCacheTryStoreFullSpanHit(b *testing.B) {
+	cache := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(cache)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
 	caller := qcacheTestPosting(1, 2, 3, 4)
 	defer caller.Release()
-	seed, ok := entry.TryStoreFullSpan(3, 7, caller.Borrow())
+	seed, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, caller.Borrow())
 	if !ok {
 		b.Fatal("full-span seed miss")
 	}
@@ -418,7 +424,7 @@ func BenchmarkNumericRangeBucketEntryTryStoreFullSpanHit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ids, ok := entry.TryStoreFullSpan(3, 7, caller.Borrow())
+		ids, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, caller.Borrow())
 		if !ok || ids.IsEmpty() {
 			b.Fatal("full-span store hit miss")
 		}

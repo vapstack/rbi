@@ -1520,7 +1520,7 @@ func (qv *View) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcac
 				}
 				return posting.List{}
 			}
-			return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, core.evalMaterializedPostingResult(ov).ids)
+			return core.evalMaterializedPostingResult(ov).ids
 		}
 	}
 

@@ -120,9 +120,13 @@ type Options struct {
 	MaterializedPredCacheMaxEntries             int
 	SnapshotMaterializedPredCacheMaxCardinality int
 
-	NumericRangeBucketSize         int
-	NumericRangeBucketMinFieldKeys int
-	NumericRangeBucketMinSpanKeys  int
+	NumericRangeBucketSize              int
+	NumericRangeBucketMinFieldKeys      int
+	NumericRangeBucketMinSpanKeys       int
+	NumericRangeSpanCacheMaxEntries     int
+	NumericRangeSpanCacheMaxEntryBytes  int64
+	NumericRangeExactCacheMaxEntries    int
+	NumericRangeExactCacheMaxEntryBytes int64
 }
 
 type Field struct {
@@ -161,9 +165,13 @@ type testOptions struct {
 	TraceSink        func(rbitrace.Event)
 	TraceSampleEvery int
 
-	NumericRangeBucketSize         int
-	NumericRangeBucketMinFieldKeys int
-	NumericRangeBucketMinSpanKeys  int
+	NumericRangeBucketSize              int
+	NumericRangeBucketMinFieldKeys      int
+	NumericRangeBucketMinSpanKeys       int
+	NumericRangeSpanCacheMaxEntries     int
+	NumericRangeSpanCacheMaxEntryBytes  int64
+	NumericRangeExactCacheMaxEntries    int
+	NumericRangeExactCacheMaxEntryBytes int64
 
 	MatPredCacheMaxEntries int
 	MatPredCacheMaxCard    uint64
@@ -263,19 +271,27 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 	}
 
 	exec := NewRuntime(Config{
-		Schema:                         rt,
-		asyncMaterializedPredStats:     true,
-		AnalyzeInterval:                options.AnalyzeInterval,
-		NumericRangeBucketSize:         options.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
-		TraceSink:                      options.TraceSink,
-		TraceSampleEvery:               options.TraceSampleEvery,
+		Schema:                              rt,
+		asyncMaterializedPredStats:          true,
+		AnalyzeInterval:                     options.AnalyzeInterval,
+		NumericRangeBucketSize:              options.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:      options.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:       options.NumericRangeBucketMinSpanKeys,
+		NumericRangeSpanCacheMaxEntries:     options.NumericRangeSpanCacheMaxEntries,
+		NumericRangeSpanCacheMaxEntryBytes:  options.NumericRangeSpanCacheMaxEntryBytes,
+		NumericRangeExactCacheMaxEntries:    options.NumericRangeExactCacheMaxEntries,
+		NumericRangeExactCacheMaxEntryBytes: options.NumericRangeExactCacheMaxEntryBytes,
+		TraceSink:                           options.TraceSink,
+		TraceSampleEvery:                    options.TraceSampleEvery,
 	})
 
 	cfg := snapshot.CacheConfig{
-		MatPredMaxEntries: options.MaterializedPredCacheMaxEntries,
-		MatPredMaxCard:    uint64(options.SnapshotMaterializedPredCacheMaxCardinality),
+		MatPredMaxEntries:         options.MaterializedPredCacheMaxEntries,
+		MatPredMaxCard:            uint64(options.SnapshotMaterializedPredCacheMaxCardinality),
+		NumericSpanMaxEntries:     qcache.NumericRangeSpanCacheMaxEntries(options.NumericRangeSpanCacheMaxEntries),
+		NumericSpanMaxEntryBytes:  qcache.NumericRangeSpanCacheMaxEntryBytes(options.NumericRangeSpanCacheMaxEntryBytes),
+		NumericExactMaxEntries:    qcache.NumericRangeExactCacheMaxEntries(options.NumericRangeExactCacheMaxEntries),
+		NumericExactMaxEntryBytes: qcache.NumericRangeExactCacheMaxEntryBytes(options.NumericRangeExactCacheMaxEntryBytes),
 	}
 	qe := &queryEngine{
 		snapshot: newTestSnapshotSource(),
@@ -351,6 +367,18 @@ func (o *Options) setDefaults() {
 	}
 	if o.NumericRangeBucketMinSpanKeys == 0 {
 		o.NumericRangeBucketMinSpanKeys = testNumericRangeMinSpan
+	}
+	if o.NumericRangeSpanCacheMaxEntries == 0 {
+		o.NumericRangeSpanCacheMaxEntries = qcache.NumericRangeSpanCacheMaxEntries(0)
+	}
+	if o.NumericRangeSpanCacheMaxEntryBytes == 0 {
+		o.NumericRangeSpanCacheMaxEntryBytes = int64(qcache.NumericRangeSpanCacheMaxEntryBytes(0))
+	}
+	if o.NumericRangeExactCacheMaxEntries == 0 {
+		o.NumericRangeExactCacheMaxEntries = qcache.NumericRangeExactCacheMaxEntries(0)
+	}
+	if o.NumericRangeExactCacheMaxEntryBytes == 0 {
+		o.NumericRangeExactCacheMaxEntryBytes = int64(qcache.NumericRangeExactCacheMaxEntryBytes(0))
 	}
 }
 
@@ -724,20 +752,40 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 	if opts.MatPredCacheMaxCard == 0 {
 		opts.MatPredCacheMaxCard = testMatPredCacheMaxCard
 	}
+	if opts.NumericRangeSpanCacheMaxEntries == 0 {
+		opts.NumericRangeSpanCacheMaxEntries = qcache.NumericRangeSpanCacheMaxEntries(0)
+	}
+	if opts.NumericRangeSpanCacheMaxEntryBytes == 0 {
+		opts.NumericRangeSpanCacheMaxEntryBytes = int64(qcache.NumericRangeSpanCacheMaxEntryBytes(0))
+	}
+	if opts.NumericRangeExactCacheMaxEntries == 0 {
+		opts.NumericRangeExactCacheMaxEntries = qcache.NumericRangeExactCacheMaxEntries(0)
+	}
+	if opts.NumericRangeExactCacheMaxEntryBytes == 0 {
+		opts.NumericRangeExactCacheMaxEntryBytes = int64(qcache.NumericRangeExactCacheMaxEntryBytes(0))
+	}
 
 	exec := NewRuntime(Config{
-		Schema:                         rt,
-		asyncMaterializedPredStats:     true,
-		NumericRangeBucketSize:         opts.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys: opts.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:  opts.NumericRangeBucketMinSpanKeys,
-		TraceSink:                      opts.TraceSink,
-		TraceSampleEvery:               opts.TraceSampleEvery,
+		Schema:                              rt,
+		asyncMaterializedPredStats:          true,
+		NumericRangeBucketSize:              opts.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:      opts.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:       opts.NumericRangeBucketMinSpanKeys,
+		NumericRangeSpanCacheMaxEntries:     opts.NumericRangeSpanCacheMaxEntries,
+		NumericRangeSpanCacheMaxEntryBytes:  opts.NumericRangeSpanCacheMaxEntryBytes,
+		NumericRangeExactCacheMaxEntries:    opts.NumericRangeExactCacheMaxEntries,
+		NumericRangeExactCacheMaxEntryBytes: opts.NumericRangeExactCacheMaxEntryBytes,
+		TraceSink:                           opts.TraceSink,
+		TraceSampleEvery:                    opts.TraceSampleEvery,
 	})
 
 	cfg := snapshot.CacheConfig{
-		MatPredMaxEntries: opts.MatPredCacheMaxEntries,
-		MatPredMaxCard:    opts.MatPredCacheMaxCard,
+		MatPredMaxEntries:         opts.MatPredCacheMaxEntries,
+		MatPredMaxCard:            opts.MatPredCacheMaxCard,
+		NumericSpanMaxEntries:     qcache.NumericRangeSpanCacheMaxEntries(opts.NumericRangeSpanCacheMaxEntries),
+		NumericSpanMaxEntryBytes:  qcache.NumericRangeSpanCacheMaxEntryBytes(opts.NumericRangeSpanCacheMaxEntryBytes),
+		NumericExactMaxEntries:    qcache.NumericRangeExactCacheMaxEntries(opts.NumericRangeExactCacheMaxEntries),
+		NumericExactMaxEntryBytes: qcache.NumericRangeExactCacheMaxEntryBytes(opts.NumericRangeExactCacheMaxEntryBytes),
 	}
 	registry := newTestSnapshotSource()
 	snap := newEmptySnapshotForTests(0, rt, cfg)

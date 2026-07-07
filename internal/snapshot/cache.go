@@ -31,7 +31,10 @@ func inheritNumericRangeBucketCache(next, prev *View) {
 func (v *View) initRuntimeCaches(s *schema.Schema, cfg CacheConfig) {
 	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCacheWithRetireContext(
 		len(s.Indexed),
-		cfg.MatPredMaxCard,
+		cfg.NumericSpanMaxEntries,
+		cfg.NumericSpanMaxEntryBytes,
+		cfg.NumericExactMaxEntries,
+		cfg.NumericExactMaxEntryBytes,
 		cfg.RuntimeCachesDirtyOwner,
 		cfg.RuntimeCachesRetireEpoch,
 	)
@@ -62,8 +65,106 @@ func (v *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage i
 	}
 	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 	idx, _ := qcache.BuildNumericRangeBucketIndex(ov, bucketSize, minFieldKeys)
-	entry := qcache.GetNumericRangeBucketEntry(storage, idx, cache.MaxCardinality())
+	entry := qcache.GetNumericRangeBucketEntry(storage, idx)
 	return cache.LoadOrStoreSlot(field, ordinal, entry)
+}
+
+func (v *View) LoadNumericRangeFullSpan(entry *qcache.NumericRangeBucketEntry, fieldOrdinal, start, end int) (posting.List, bool) {
+	if v.numericRangeBucketCache == nil || entry == nil {
+		return posting.List{}, false
+	}
+	return v.numericRangeBucketCache.LoadFullSpan(entry, fieldOrdinal, start, end)
+}
+
+func (v *View) LoadExtendedNumericRangeFullSpan(entry *qcache.NumericRangeBucketEntry, fieldOrdinal, start, end int) (posting.List, int, int, bool) {
+	if v.numericRangeBucketCache == nil || entry == nil {
+		return posting.List{}, 0, 0, false
+	}
+	return v.numericRangeBucketCache.LoadExtendedFullSpan(entry, fieldOrdinal, start, end)
+}
+
+func (v *View) TryStoreNumericRangeFullSpan(entry *qcache.NumericRangeBucketEntry, fieldOrdinal, start, end int, ids posting.List) (posting.List, bool) {
+	if v.numericRangeBucketCache == nil || entry == nil {
+		return ids, false
+	}
+	return v.numericRangeBucketCache.TryStoreFullSpan(entry, fieldOrdinal, start, end, ids)
+}
+
+func (v *View) LoadNumericRangeExactResult(fieldOrdinal, start, end int) (posting.List, bool) {
+	if v.numericRangeBucketCache == nil {
+		return posting.List{}, false
+	}
+	return v.numericRangeBucketCache.LoadExactResult(fieldOrdinal, start, end)
+}
+
+func (v *View) TryStoreNumericRangeExactResult(fieldOrdinal, start, end int, ids posting.List) (posting.List, bool) {
+	if v.numericRangeBucketCache == nil {
+		return ids, false
+	}
+	return v.numericRangeBucketCache.TryStoreExactResult(fieldOrdinal, start, end, ids)
+}
+
+func (v *View) TryStorePromotedNumericRangeExactResult(fieldOrdinal, start, end int, ids posting.List) (posting.List, bool) {
+	if v.numericRangeBucketCache == nil {
+		return ids, false
+	}
+	return v.numericRangeBucketCache.TryStorePromotedExactResult(fieldOrdinal, start, end, ids)
+}
+
+func (v *View) ShouldPromoteRuntimeNumericRangeExactResult(fieldOrdinal, start, end int) bool {
+	if v.numericRangeBucketCache == nil {
+		return false
+	}
+	return v.numericRangeBucketCache.ShouldPromoteRuntimeExactResult(fieldOrdinal, start, end)
+}
+
+func (v *View) HasObservedNumericRangeExactResult(fieldOrdinal, start, end int) bool {
+	if v.numericRangeBucketCache == nil {
+		return false
+	}
+	return v.numericRangeBucketCache.HasObservedExactResult(fieldOrdinal, start, end)
+}
+
+func (v *View) ObservedNumericRangeExactResultWork(fieldOrdinal, start, end int) uint64 {
+	if v.numericRangeBucketCache == nil {
+		return 0
+	}
+	return v.numericRangeBucketCache.ObservedExactResultWork(fieldOrdinal, start, end)
+}
+
+func (v *View) ShouldPromoteObservedNumericRangeExactResult(fieldOrdinal, start, end int, observedWork, buildWork uint64) bool {
+	if v.numericRangeBucketCache == nil {
+		return false
+	}
+	return v.numericRangeBucketCache.ShouldPromoteObservedExactResult(fieldOrdinal, start, end, observedWork, buildWork)
+}
+
+func (v *View) NumericRangeExactResultRejectedTooLarge(fieldOrdinal, start, end int) bool {
+	if v.numericRangeBucketCache == nil {
+		return false
+	}
+	return v.numericRangeBucketCache.ExactResultRejectedTooLarge(fieldOrdinal, start, end)
+}
+
+func (v *View) NumericRangeFullSpanRejectedTooLarge(fieldOrdinal, start, end int) bool {
+	if v.numericRangeBucketCache == nil {
+		return false
+	}
+	return v.numericRangeBucketCache.FullSpanRejectedTooLarge(fieldOrdinal, start, end)
+}
+
+func (v *View) NumericRangeSpanCacheStats() qcache.NumericRangeSpanCacheStats {
+	if v.numericRangeBucketCache == nil {
+		return qcache.NumericRangeSpanCacheStats{}
+	}
+	return v.numericRangeBucketCache.NumericSpanStats()
+}
+
+func (v *View) NumericRangeExactResultCacheStats() qcache.NumericRangeExactResultCacheStats {
+	if v.numericRangeBucketCache == nil {
+		return qcache.NumericRangeExactResultCacheStats{}
+	}
+	return v.numericRangeBucketCache.NumericExactResultStats()
 }
 
 func (v *View) MaterializedPredCacheEntryCount() int {

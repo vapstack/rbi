@@ -63,6 +63,10 @@ func buildRBIOptions(cfg DBConfig) rbi.Options {
 		dbOpts.NumericRangeBucketSize = -1
 		dbOpts.NumericRangeBucketMinFieldKeys = -1
 		dbOpts.NumericRangeBucketMinSpanKeys = -1
+		dbOpts.NumericRangeSpanCacheMaxEntries = -1
+		dbOpts.NumericRangeSpanCacheMaxEntryBytes = -1
+		dbOpts.NumericRangeExactCacheMaxEntries = -1
+		dbOpts.NumericRangeExactCacheMaxEntryBytes = -1
 	}
 	if cfg.AnalyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = cfg.AnalyzeInterval

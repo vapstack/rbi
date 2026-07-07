@@ -438,10 +438,10 @@ func (rr *rootRegistry) cleanupOnce() {
 	rr.mu.Unlock()
 
 	releaseRetiredRootGenerations(retired)
-	rr.drainCurrentRuntimeCaches()
+	rr.drainRuntimeCaches()
 }
 
-func (rr *rootRegistry) drainCurrentRuntimeCaches() bool {
+func (rr *rootRegistry) drainRuntimeCaches() bool {
 	if !rr.runtimeCachesDirty.Load() {
 		return false
 	}
@@ -449,7 +449,7 @@ func (rr *rootRegistry) drainCurrentRuntimeCaches() bool {
 	rr.mu.Lock()
 	// Read states are retained before rr.mu is dropped so their snapshots cannot
 	// be released while retired runtime-cache payloads are being detached.
-	reads, safeEpoch, ok := rr.retainCurrentRuntimeCacheReadsLocked()
+	reads, safeEpoch, ok := rr.retainRuntimeCacheReadsLocked()
 	rr.mu.Unlock()
 
 	if !ok {
@@ -485,12 +485,11 @@ func (rr *rootRegistry) drainCurrentRuntimeCaches() bool {
 	return stillDirty || rr.runtimeCachesDirty.Load()
 }
 
-func (rr *rootRegistry) retainCurrentRuntimeCacheReadsLocked() ([]*collectionReadState, uint64, bool) {
+func (rr *rootRegistry) retainRuntimeCacheReadsLocked() ([]*collectionReadState, uint64, bool) {
 	if !rr.runtimeCachesDirty.Load() {
 		return nil, 0, false
 	}
-	ref := rr.currentRef.Load()
-	if ref == nil || ref.gen == nil {
+	if rr.currentRef.Load() == nil {
 		rr.runtimeCachesDirty.Store(false)
 		return nil, 0, false
 	}
@@ -502,8 +501,21 @@ func (rr *rootRegistry) retainCurrentRuntimeCacheReadsLocked() ([]*collectionRea
 	rr.runtimeCachesDirty.Store(false)
 
 	var reads []*collectionReadState
-	for i := range ref.gen.entries {
-		read := ref.gen.entries[i].read
+	for epoch, ref := range rr.byEpoch {
+		if ref.gen == nil || ref.gen.epoch != epoch {
+			continue
+		}
+		reads = retainRuntimeCacheGenerationReads(reads, ref.gen)
+		for i := range ref.retired {
+			reads = retainRuntimeCacheGenerationReads(reads, ref.retired[i])
+		}
+	}
+	return reads, safeEpoch, true
+}
+
+func retainRuntimeCacheGenerationReads(reads []*collectionReadState, gen *rootGeneration) []*collectionReadState {
+	for i := range gen.entries {
+		read := gen.entries[i].read
 		if read == nil || read.snap == nil {
 			continue
 		}
@@ -513,7 +525,7 @@ func (rr *rootRegistry) retainCurrentRuntimeCacheReadsLocked() ([]*collectionRea
 		}
 		reads = append(reads, read)
 	}
-	return reads, safeEpoch, true
+	return reads
 }
 
 func releaseRuntimeCacheReadStates(reads []*collectionReadState) {
@@ -588,7 +600,7 @@ func (rr *rootRegistry) stage(epoch uint64, gen *rootGeneration) {
 
 	if prev != nil {
 		releaseRootGeneration(prev)
-		if rr.drainCurrentRuntimeCaches() {
+		if rr.drainRuntimeCaches() {
 			rr.scheduleCleanup()
 		}
 	}
@@ -602,7 +614,7 @@ func (rr *rootRegistry) dropStaged(epoch uint64) {
 
 	if gen != nil {
 		releaseRootGeneration(gen)
-		if rr.drainCurrentRuntimeCaches() {
+		if rr.drainRuntimeCaches() {
 			rr.scheduleCleanup()
 		}
 	}
@@ -632,7 +644,7 @@ func (rr *rootRegistry) publish(epoch uint64) {
 
 	releaseRetiredRootGenerations(retired)
 	if retired != nil {
-		if rr.drainCurrentRuntimeCaches() {
+		if rr.drainRuntimeCaches() {
 			rr.scheduleCleanup()
 		}
 	}
@@ -673,7 +685,7 @@ func (rr *rootRegistry) publishMetadata(gen *rootGeneration) {
 
 	releaseRetiredRootGenerations(retired)
 	if retired != nil {
-		if rr.drainCurrentRuntimeCaches() {
+		if rr.drainRuntimeCaches() {
 			rr.scheduleCleanup()
 		}
 	}
@@ -814,7 +826,7 @@ func (rr *rootRegistry) reap() bool {
 
 	releaseRetiredRootGenerations(retired)
 	if retired != nil {
-		if rr.drainCurrentRuntimeCaches() {
+		if rr.drainRuntimeCaches() {
 			rr.scheduleCleanup()
 		}
 	}

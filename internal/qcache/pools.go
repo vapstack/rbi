@@ -10,6 +10,9 @@ const (
 	materializedPredCacheRetiredPoolMaxCap = 512
 	materializedPredCacheIndexPoolMaxLen   = 512
 	numericRangeBucketRetiredPoolMaxCap    = 512
+	numericRangeExactRetiredPoolMaxCap     = 512
+	numericRangeSpanObservedSlotPoolMaxCap = 512
+	numericRangeSpanCacheIndexPoolMaxLen   = 512
 
 	recentKeyCacheIndexPoolMaxLen = recentKeyCacheSlotPoolMaxCap + materializedPredCacheOversizedMaxEntries
 
@@ -47,14 +50,33 @@ var materializedPredCacheRetiredPool = pooled.Slices[materializedPredRetiredEntr
 	Clear:  pooled.ClearCap,
 }
 
-var numericRangeBucketRetiredPool = pooled.Slices[[]numericRangeRetiredPosting]{
+var numericRangeBucketRetiredPool = pooled.Slices[numericRangeSpanRetiredEntry]{
 	MaxCap: numericRangeBucketRetiredPoolMaxCap,
 	Clear:  pooled.ClearCap,
 }
 
-var numericRangeRetiredPostingPool = pooled.Slices[numericRangeRetiredPosting]{
-	MaxCap: numericRangeFullSpanCacheMaxEntries,
+var numericRangeExactRetiredPool = pooled.Slices[numericRangeExactRetiredEntry]{
+	MaxCap: numericRangeExactRetiredPoolMaxCap,
 	Clear:  pooled.ClearCap,
+}
+
+var numericRangeSpanObservedSlotPool = pooled.Slices[numericRangeSpanObservedSlot]{
+	MaxCap: numericRangeSpanObservedSlotPoolMaxCap,
+	Clear:  pooled.ClearCap,
+}
+
+var numericRangeSpanCacheIndexPool = pooled.Maps[numericRangeSpanKey, int]{
+	NewCap: 128,
+	MaxLen: numericRangeSpanCacheIndexPoolMaxLen,
+}
+
+var numericRangeSpanObservedIndexPool = pooled.Maps[numericRangeSpanKey, int]{
+	NewCap: 128,
+	MaxLen: numericRangeSpanObservedSlotPoolMaxCap,
+}
+
+var numericRangeCachedPostingPool = pooled.Pointers[numericRangeCachedPosting]{
+	Clear: true,
 }
 
 var materializedPredCacheEntryPool = pooled.Pointers[materializedPredCacheEntry]{
@@ -74,7 +96,7 @@ var numericRangeBucketFieldIndexPool = pooled.Maps[string, *NumericRangeBucketEn
 
 var numericRangeBucketEntryPool = pooled.Pointers[NumericRangeBucketEntry]{
 	Cleanup: func(e *NumericRangeBucketEntry) {
-		e.releaseFullSpanCache()
+		e.resetRecentFullSpans()
 	},
 	Clear: true,
 }

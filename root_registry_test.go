@@ -370,7 +370,7 @@ func TestRootRegistryOldGenerationReleaseReDrainsCurrentNumericRuntimeCaches(t *
 	firstIndex := indexdata.GetFieldStorageSlice(len(rt.Indexed))[:len(rt.Indexed)]
 	firstIndex[0] = newRootRegistryNumericStorage()
 	first := snapshot.NewView(17, nil, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{Index: firstIndex})
-	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{}, 0)
+	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{})
 	first.NumericRangeBucketCache().StoreSlot(field, 0, entry)
 
 	c := &collection{root: r, ordinal: 0, dataBucket: []byte("users")}
@@ -397,14 +397,20 @@ func TestRootRegistryOldGenerationReleaseReDrainsCurrentNumericRuntimeCaches(t *
 	r.registry.publish(3)
 
 	evicted := false
-	count := entry.FullSpanEntryCount()
+	cache := second.NumericRangeBucketCache()
+	count := cache.FullSpanEntryCount()
 	for i := 0; !evicted && i < 64; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, (posting.List{}).BuildAdded(uint64(i+1)))
+		ids := (posting.List{}).BuildAdded(uint64(i + 1))
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, ids)
 		if !ok {
-			t.Fatalf("TryStoreFullSpan(%d): not stored", i)
+			cached, ok = cache.TryStoreFullSpan(entry, 0, i, i, ids)
+			if !ok {
+				ids.Release()
+				t.Fatalf("TryStoreFullSpan(%d): not stored", i)
+			}
 		}
 		cached.Release()
-		nextCount := entry.FullSpanEntryCount()
+		nextCount := cache.FullSpanEntryCount()
 		evicted = nextCount == count
 		count = nextCount
 	}
@@ -421,7 +427,7 @@ func TestRootRegistryOldGenerationReleaseReDrainsCurrentNumericRuntimeCaches(t *
 		t.Fatal("expected current drain to keep retired postings while numeric entry is shared")
 	}
 	retained.Release()
-	if entry.FullSpanEntryCount() == 0 {
+	if cache.FullSpanEntryCount() == 0 {
 		t.Fatal("expected current drain to keep full-span cache while numeric entry is shared")
 	}
 
@@ -433,6 +439,177 @@ func TestRootRegistryOldGenerationReleaseReDrainsCurrentNumericRuntimeCaches(t *
 		t.Fatal("expected old generation release to re-drain current numeric retired postings")
 	}
 	redrained.Release()
+	if !r.registry.reap() {
+		t.Fatal("expected registry reap to release current generation")
+	}
+}
+
+func TestRootRegistryPreviousNumericRuntimeCachesStayOwnedByPreviousSnapshot(t *testing.T) {
+	r := &rootStore{}
+	r.registry.init(1)
+
+	rt, err := schema.Compile(reflect.TypeOf(rootRegistryNumericCacheRec{}), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	field := rt.Indexed[0].Name
+
+	firstIndex := indexdata.GetFieldStorageSlice(len(rt.Indexed))[:len(rt.Indexed)]
+	firstIndex[0] = newRootRegistryNumericStorage()
+	first := snapshot.NewView(17, nil, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{Index: firstIndex})
+	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{})
+	first.NumericRangeBucketCache().StoreSlot(field, 0, entry)
+
+	c := &collection{root: r, ordinal: 0, dataBucket: []byte("users")}
+	firstRead := newCollectionReadState(c, first.Seq, first)
+	firstGen := r.registry.buildFromCurrent(2, 1)
+	firstGen.setEntry(0, c, firstRead)
+	r.registry.stage(2, firstGen)
+	r.registry.publish(2)
+
+	_, oldEpoch, oldPin := r.registry.pinCurrent()
+
+	evicted := false
+	cache := first.NumericRangeBucketCache()
+	count := cache.FullSpanEntryCount()
+	for i := 0; !evicted && i < 64; i++ {
+		ids := (posting.List{}).BuildAdded(uint64(i + 1))
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, ids)
+		if !ok {
+			cached, ok = cache.TryStoreFullSpan(entry, 0, i, i, ids)
+			if !ok {
+				ids.Release()
+				t.Fatalf("TryStoreFullSpan(%d): not stored", i)
+			}
+		}
+		cached.Release()
+		nextCount := cache.FullSpanEntryCount()
+		evicted = nextCount == count
+		count = nextCount
+	}
+	if !evicted {
+		t.Fatal("expected first snapshot numeric cache to have retired full-span postings")
+	}
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("expected first snapshot numeric eviction to dirty runtime caches")
+	}
+
+	second := snapshot.NewView(18, first, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{
+		Index: indexdata.CloneFieldStorageSlots(first.Index, len(rt.Indexed)),
+	})
+	second.NumericRangeBucketCache().InheritFrom(first.NumericRangeBucketCache(), second.Index, second.IndexedFieldByName)
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("expected previous snapshot to keep numeric retired backlog after inheritance")
+	}
+	if second.RuntimeCachesDirty() {
+		t.Fatal("inherited snapshot must not own previous numeric retired backlog")
+	}
+
+	secondRead := newCollectionReadState(c, second.Seq, second)
+	secondGen := r.registry.buildFromCurrent(3, 1)
+	secondGen.setEntry(0, c, secondRead)
+	r.registry.stage(3, secondGen)
+	r.registry.publish(3)
+
+	_, currentEpoch, currentPin := r.registry.pinCurrent()
+	r.registry.unpin(currentEpoch, currentPin)
+	waitRootRegistryCleanup(t, &r.registry)
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("runtime cleanup detached previous numeric retired backlog before old pin release")
+	}
+
+	r.registry.unpin(oldEpoch, oldPin)
+	waitRootRegistryCleanup(t, &r.registry)
+	if cache := first.NumericRangeBucketCache(); cache != nil && first.RuntimeCachesDirty() {
+		t.Fatal("old generation release did not clear previous numeric retired backlog")
+	}
+	if !r.registry.reap() {
+		t.Fatal("expected registry reap to release current generation")
+	}
+}
+
+func TestRootRegistryPreviousNumericExactRuntimeCachesStayOwnedByPreviousSnapshot(t *testing.T) {
+	r := &rootStore{}
+	r.registry.init(1)
+
+	rt, err := schema.Compile(reflect.TypeOf(rootRegistryNumericCacheRec{}), schema.Config{})
+	if err != nil {
+		t.Fatalf("schema.Compile: %v", err)
+	}
+	field := rt.Indexed[0].Name
+
+	firstIndex := indexdata.GetFieldStorageSlice(len(rt.Indexed))[:len(rt.Indexed)]
+	firstIndex[0] = newRootRegistryNumericStorage()
+	first := snapshot.NewView(17, nil, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{Index: firstIndex})
+	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{})
+	first.NumericRangeBucketCache().StoreSlot(field, 0, entry)
+
+	c := &collection{root: r, ordinal: 0, dataBucket: []byte("users")}
+	firstRead := newCollectionReadState(c, first.Seq, first)
+	firstGen := r.registry.buildFromCurrent(2, 1)
+	firstGen.setEntry(0, c, firstRead)
+	r.registry.stage(2, firstGen)
+	r.registry.publish(2)
+
+	_, oldEpoch, oldPin := r.registry.pinCurrent()
+
+	evicted := false
+	cache := first.NumericRangeBucketCache()
+	count := cache.ExactResultEntryCount()
+	for i := 0; !evicted && i < 64; i++ {
+		ids := (posting.List{}).BuildAdded(uint64(i + 1))
+		cached, ok := cache.TryStoreExactResult(0, i, i+10, ids.Borrow())
+		if ok {
+			cached.Release()
+			ids.Release()
+			t.Fatalf("first TryStoreExactResult(%d): stored", i)
+		}
+		cached.Release()
+		cached, ok = cache.TryStoreExactResult(0, i, i+10, ids)
+		if !ok {
+			t.Fatalf("second TryStoreExactResult(%d): not stored", i)
+		}
+		cached.Release()
+		nextCount := cache.ExactResultEntryCount()
+		evicted = nextCount == count
+		count = nextCount
+	}
+	if !evicted {
+		t.Fatal("expected first snapshot numeric cache to have retired exact result postings")
+	}
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("expected first snapshot numeric exact eviction to dirty runtime caches")
+	}
+
+	second := snapshot.NewView(18, first, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{
+		Index: indexdata.CloneFieldStorageSlots(first.Index, len(rt.Indexed)),
+	})
+	second.NumericRangeBucketCache().InheritFrom(first.NumericRangeBucketCache(), second.Index, second.IndexedFieldByName)
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("expected previous snapshot to keep numeric exact retired backlog after inheritance")
+	}
+	if second.RuntimeCachesDirty() {
+		t.Fatal("inherited snapshot must not own previous numeric exact retired backlog")
+	}
+
+	secondRead := newCollectionReadState(c, second.Seq, second)
+	secondGen := r.registry.buildFromCurrent(3, 1)
+	secondGen.setEntry(0, c, secondRead)
+	r.registry.stage(3, secondGen)
+	r.registry.publish(3)
+
+	_, currentEpoch, currentPin := r.registry.pinCurrent()
+	r.registry.unpin(currentEpoch, currentPin)
+	waitRootRegistryCleanup(t, &r.registry)
+	if !first.RuntimeCachesDirty() {
+		t.Fatal("runtime cleanup detached previous numeric exact retired backlog before old pin release")
+	}
+
+	r.registry.unpin(oldEpoch, oldPin)
+	waitRootRegistryCleanup(t, &r.registry)
+	if cache := first.NumericRangeBucketCache(); cache != nil && first.RuntimeCachesDirty() {
+		t.Fatal("old generation release did not clear previous numeric exact retired backlog")
+	}
 	if !r.registry.reap() {
 		t.Fatal("expected registry reap to release current generation")
 	}
@@ -451,7 +628,7 @@ func TestRootRegistryRuntimePinReleaseDrainsCurrentNumericRetiredWithCurrentPin(
 	firstIndex := indexdata.GetFieldStorageSlice(len(rt.Indexed))[:len(rt.Indexed)]
 	firstIndex[0] = newRootRegistryNumericStorage()
 	first := snapshot.NewView(17, nil, rt, rootRegistrySnapshotCacheConfig(&r.registry, 0), snapshot.Storage{Index: firstIndex})
-	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{}, 0)
+	entry := qcache.GetNumericRangeBucketEntry(first.Index[0], qcache.NumericRangeBucketIndex{})
 	first.NumericRangeBucketCache().StoreSlot(field, 0, entry)
 
 	c := &collection{root: r, ordinal: 0, dataBucket: []byte("users")}
@@ -478,14 +655,20 @@ func TestRootRegistryRuntimePinReleaseDrainsCurrentNumericRetiredWithCurrentPin(
 	r.registry.publish(3)
 
 	evicted := false
-	count := entry.FullSpanEntryCount()
+	cache := second.NumericRangeBucketCache()
+	count := cache.FullSpanEntryCount()
 	for i := 0; !evicted && i < 64; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, (posting.List{}).BuildAdded(uint64(i+1)))
+		ids := (posting.List{}).BuildAdded(uint64(i + 1))
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, ids)
 		if !ok {
-			t.Fatalf("TryStoreFullSpan(%d): not stored", i)
+			cached, ok = cache.TryStoreFullSpan(entry, 0, i, i, ids)
+			if !ok {
+				ids.Release()
+				t.Fatalf("TryStoreFullSpan(%d): not stored", i)
+			}
 		}
 		cached.Release()
-		nextCount := entry.FullSpanEntryCount()
+		nextCount := cache.FullSpanEntryCount()
 		evicted = nextCount == count
 		count = nextCount
 	}
@@ -570,9 +753,13 @@ func TestCollectionPinsCurrentReadStateBySnapshotSeq(t *testing.T) {
 
 func rootRegistrySnapshotCacheConfig(rr *rootRegistry, matPredMaxEntries int) snapshot.CacheConfig {
 	return snapshot.CacheConfig{
-		MatPredMaxEntries:        matPredMaxEntries,
-		RuntimeCachesDirtyOwner:  &rr.runtimeCachesDirty,
-		RuntimeCachesRetireEpoch: &rr.runtimeEpoch.issued,
+		MatPredMaxEntries:         matPredMaxEntries,
+		NumericSpanMaxEntries:     4,
+		NumericSpanMaxEntryBytes:  qcache.NumericRangeSpanCacheMaxEntryBytes(0),
+		NumericExactMaxEntries:    4,
+		NumericExactMaxEntryBytes: qcache.NumericRangeExactCacheMaxEntryBytes(0),
+		RuntimeCachesDirtyOwner:   &rr.runtimeCachesDirty,
+		RuntimeCachesRetireEpoch:  &rr.runtimeEpoch.issued,
 	}
 }
 

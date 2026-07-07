@@ -3225,26 +3225,22 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	cacheKey := db.engine.materializedPredCacheKey(qx.LT("score", 4_000.0))
-	if cacheKey.IsZero() {
-		t.Fatalf("expected score range cache key")
-	}
 	prevSnap := db.engine.snapshot.Current()
-	prevBM, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
-	if !ok || prevBM.IsEmpty() {
-		t.Fatalf("expected score range cache entry before unrelated patch")
+	if got := prevSnap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatalf("expected numeric span cache entry before unrelated patch")
 	}
+	prevEntry := requireNumericRangeBucketCacheEntry(t, prevSnap, "score")
 
 	if err := db.Patch(1, []Field{{Name: "active", Value: false}}); err != nil {
 		t.Fatalf("Patch(active): %v", err)
 	}
 
 	nextSnap := db.engine.snapshot.Current()
-	nextBM, ok := snapshotExtLoadMaterializedPred(nextSnap, cacheKey)
-	if !ok || nextBM.IsEmpty() {
-		t.Fatalf("expected score range cache entry after unrelated patch")
+	if got := nextSnap.NumericRangeBucketCache().FullSpanEntryCount(); got == 0 {
+		t.Fatalf("expected numeric span cache entry after unrelated patch")
 	}
-	if nextBM != prevBM {
+	nextEntry := requireNumericRangeBucketCacheEntry(t, nextSnap, "score")
+	if nextEntry != prevEntry {
 		t.Fatalf("expected unchanged-field cache entry to be inherited across snapshot publish")
 	}
 }
@@ -3349,27 +3345,27 @@ func TestQuery_OrderBasic_EvalRawBaseOpMaterializesPlannedComplement(t *testing.
 	cached.Release()
 }
 
-func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) {
+func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeExactResult(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                 -1,
-		MaterializedPredCacheMaxEntries: 0,
-		NumericRangeBucketSize:          8,
+		MaterializedPredCacheMaxEntries: -1,
+		NumericRangeBucketSize:          128,
 		NumericRangeBucketMinFieldKeys:  16,
 		NumericRangeBucketMinSpanKeys:   4,
 	})
 
-	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
-			Age:    18 + (i % 60),
+			Age:    i,
 			Score:  float64(i),
 			Active: true,
 		}
 	})
 
 	q := qx.Query(
-		qx.GTE("age", 25),
-		qx.LTE("age", 40),
+		qx.GTE("age", 2501),
+		qx.LT("age", 3501),
 		qx.GT("score", 0.5),
 	).Sort("score", qx.DESC).Limit(100)
 
@@ -3380,8 +3376,19 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
-	view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
-	db.engine.waitAsyncMaterializedPredWarmupForTests(t)
+	if !collapsed.collapsed.cacheKey.IsZero() {
+		t.Fatalf("bucket-eligible collapsed numeric range should have zero materialized key: %v", collapsed.collapsed.cacheKey)
+	}
+	for i := 0; i < 3; i++ {
+		view.scheduleOrderBasicLimitMaterializedBaseOps("score", baseOps, view.snap.Universe.Cardinality(), 100)
+		db.engine.waitAsyncMaterializedPredWarmupForTests(t)
+	}
+	if stats := view.snap.NumericRangeExactResultCacheStats(); stats.EntryCount == 0 || stats.Stores == 0 {
+		t.Fatalf("expected collapsed numeric range to warm numeric exact cache: %+v", stats)
+	}
+	if got := view.snap.MaterializedPredCacheEntryCount(); got != 0 {
+		t.Fatalf("collapsed numeric range populated materialized predicate cache while disabled: entries=%d", got)
+	}
 	spanHit, ok := view.loadWarmOrderBasicBaseCore(collapsed)
 	if !ok {
 		t.Fatalf("expected collapsed numeric range span to be directly reusable")

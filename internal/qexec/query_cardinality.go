@@ -885,7 +885,6 @@ func (qv *View) evalMergedExactRangePostingResult(e qir.Expr, bounds indexdata.B
 			if out.ids.IsEmpty() {
 				return postingResult{}, true
 			}
-			out.ids = core.secondHitReuse.share(out.ids)
 			return out, true
 		}
 	}
@@ -999,6 +998,16 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	if totalVals == 0 || totalVals > cardinalityScalarInSplitMaxValues {
 		return 0, false, nil
 	}
+	leadRows := uint64(0)
+	for i := 0; i < valCount; i++ {
+		leadRows = mathutil.SatAddUint64(leadRows, lookupScalarCardinality(ov, valsBuf[i]))
+	}
+	if hasNil {
+		leadRows = mathutil.SatAddUint64(leadRows, qv.nilIndexViewByOrdinal(inLeaf.FieldOrdinal).LookupCardinality(indexdata.NilIndexEntryKey))
+	}
+	if qv.scalarInSplitShouldYieldToNumericBucketCount(leaves, lead, leadRows) {
+		return 0, false, nil
+	}
 
 	var (
 		filter    postingResult
@@ -1060,6 +1069,66 @@ func (qv *View) TryFilterCardinalityByScalarInSplit(expr qir.Expr, trace *Trace)
 	}
 
 	return cnt, true, nil
+}
+
+func (qv *View) scalarInSplitShouldYieldToNumericBucketCount(leaves []qir.Expr, lead int, leadRows uint64) bool {
+	if len(leaves) != 2 || leadRows < cardinalityNumericBucketExactMinRows {
+		return false
+	}
+
+	other := 1 - lead
+	e := leaves[other]
+	if e.Not || !qv.hasFieldOrdinal(e.FieldOrdinal) || !e.Op.IsNumericRange() {
+		return false
+	}
+
+	fm := qv.fieldMetaByOrdinal(e.FieldOrdinal)
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
+		return false
+	}
+
+	bucketSize := qv.exec.NumericRangeBucketSize
+	minFieldKeys := qv.exec.NumericRangeBucketMinFieldKeys
+	minSpan := qv.exec.NumericRangeBucketMinSpanKeys
+	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
+		return false
+	}
+
+	bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
+	if err != nil || isSlice || bound.empty || bound.full {
+		return false
+	}
+
+	ov := qv.indexViewByOrdinal(e.FieldOrdinal)
+	if !ov.HasData() {
+		return false
+	}
+
+	bounds := rangeBoundsForNormalizedScalarBound(bound)
+	br := ov.RangeForBounds(bounds)
+	if br.Empty() || br.BaseEnd-br.BaseStart < minSpan {
+		return false
+	}
+
+	rows := ov.RangeRows(br.BaseStart, br.BaseEnd)
+	if rows < cardinalityNumericBucketExactMinRows || leadRows < rows || qv.snap.AllowsMaterializedPredCard(rows) {
+		return false
+	}
+
+	desc := qv.exec.fields[e.FieldOrdinal]
+	storage := qv.snap.Index[desc.storageOrdinal]
+	entry := qv.snap.NumericRangeBucketCacheEntry(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), desc.storageOrdinal, storage, bucketSize, minFieldKeys)
+	if entry == nil {
+		return false
+	}
+
+	idx := entry.Index()
+	if idx.BucketCount() == 0 || idx.KeyCount() != ov.KeyCount() {
+		return false
+	}
+
+	_, _, ok := idx.FullBucketSpan(br)
+	return ok
 }
 
 func (qv *View) uniqueCardinalityPathPrecheck(expr qir.Expr) (hasUnique bool, ok bool) {

@@ -97,7 +97,7 @@ func testScalarMatPredKey(field, key string) qcache.MaterializedPredKey {
 }
 
 func testBucketMatPredKey(field string, bucket int) qcache.MaterializedPredKey {
-	return qcache.MaterializedPredKeyForNumericBucketSpan(field, bucket, bucket)
+	return qcache.MaterializedPredKeyFromOpaque(fmt.Sprintf("%s:%d:%d", field, bucket, bucket))
 }
 
 func testLoadMaterializedPred(v *View, key qcache.MaterializedPredKey) (posting.List, bool) {
@@ -443,17 +443,17 @@ func TestViewInheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *testing.
 	prevChanged := testStorage("30")
 	nextChanged := testStorage("30")
 
-	ageEntry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{}, 0)
-	scoreEntry := qcache.GetNumericRangeBucketEntry(prevChanged, qcache.NumericRangeBucketIndex{}, 0)
+	ageEntry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{})
+	scoreEntry := qcache.GetNumericRangeBucketEntry(prevChanged, qcache.NumericRangeBucketIndex{})
 
 	prev := testView(map[string]indexdata.FieldStorage{"age": shared, "score": prevChanged})
-	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(2, 0)
+	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(2)
 	prev.numericRangeBucketCache.StoreSlot("age", 0, ageEntry)
 	prev.numericRangeBucketCache.StoreSlot("score", 1, scoreEntry)
 	defer prev.releaseRuntimeCaches()
 
 	next := testView(map[string]indexdata.FieldStorage{"age": shared, "score": nextChanged})
-	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(2, 0)
+	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(2)
 	defer next.releaseRuntimeCaches()
 	inheritNumericRangeBucketCache(next, prev)
 
@@ -474,18 +474,18 @@ func TestViewInheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *testing.
 
 func TestViewInheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries(t *testing.T) {
 	valid := testStorage("10")
-	validEntry := qcache.GetNumericRangeBucketEntry(valid, qcache.NumericRangeBucketIndex{}, 0)
+	validEntry := qcache.GetNumericRangeBucketEntry(valid, qcache.NumericRangeBucketIndex{})
 
 	prev := testView(map[string]indexdata.FieldStorage{"age": valid})
-	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(3, 0)
+	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(3)
 	prev.numericRangeBucketCache.StoreSlot("", 0, validEntry)
-	prev.numericRangeBucketCache.StoreSlot("score", 1, qcache.GetNumericRangeBucketEntry(indexdata.FieldStorage{}, qcache.NumericRangeBucketIndex{}, 0))
+	prev.numericRangeBucketCache.StoreSlot("score", 1, qcache.GetNumericRangeBucketEntry(indexdata.FieldStorage{}, qcache.NumericRangeBucketIndex{}))
 	validEntry.Retain()
 	prev.numericRangeBucketCache.StoreSlot("age", 2, validEntry)
 	defer prev.releaseRuntimeCaches()
 
 	next := testView(map[string]indexdata.FieldStorage{"age": valid})
-	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(3, 0)
+	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(3)
 	defer next.releaseRuntimeCaches()
 	inheritNumericRangeBucketCache(next, prev)
 
@@ -1030,7 +1030,7 @@ func TestBuildPreparedKeyDeltaKeepsOrdinaryMaterializedPredCache(t *testing.T) {
 func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	v := testMatPredView(64, 0)
 	defer v.releaseRuntimeCaches()
-	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1)
 
 	matKey := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a")
 	v.StoreMaterializedPredKey(matKey, testPosting(1))
@@ -1138,11 +1138,16 @@ func TestNumericRangeInheritedBorrowedMutationDetaches(t *testing.T) {
 	shared := testStorage("10", "20")
 	defer shared.Release()
 
-	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{}, 0)
+	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{})
+
+	prev := testView(map[string]indexdata.FieldStorage{"age": shared})
+	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1)
+	prev.numericRangeBucketCache.StoreSlot("age", 0, entry)
+	defer prev.releaseRuntimeCaches()
 
 	base := testLargePosting()
 	want := base.ToArray()
-	stored, ok := entry.TryStoreFullSpan(0, 0, base.Borrow())
+	stored, ok := prev.TryStoreNumericRangeFullSpan(entry, 0, 0, 0, base.Borrow())
 	if !ok || stored.IsEmpty() {
 		base.Release()
 		entry.Release()
@@ -1151,13 +1156,8 @@ func TestNumericRangeInheritedBorrowedMutationDetaches(t *testing.T) {
 	stored.Release()
 	base.Release()
 
-	prev := testView(map[string]indexdata.FieldStorage{"age": shared})
-	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	prev.numericRangeBucketCache.StoreSlot("age", 0, entry)
-	defer prev.releaseRuntimeCaches()
-
 	next := testView(map[string]indexdata.FieldStorage{"age": shared})
-	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1)
 	defer next.releaseRuntimeCaches()
 
 	inheritNumericRangeBucketCache(next, prev)
@@ -1174,13 +1174,13 @@ func TestNumericRangeInheritedBorrowedMutationDetaches(t *testing.T) {
 		t.Fatal("expected inherited numeric range cache to reuse entry pointer")
 	}
 
-	fromPrev, ok := prevEntry.LoadFullSpan(0, 0)
+	fromPrev, ok := prev.LoadNumericRangeFullSpan(prevEntry, 0, 0, 0)
 	if !ok || fromPrev.IsEmpty() {
 		t.Fatal("expected prev full-span cached posting")
 	}
 	defer fromPrev.Release()
 
-	fromNext, ok := nextEntry.LoadFullSpan(0, 0)
+	fromNext, ok := next.LoadNumericRangeFullSpan(nextEntry, 0, 0, 0)
 	if !ok || fromNext.IsEmpty() {
 		t.Fatal("expected next full-span cached posting")
 	}
@@ -1207,13 +1207,13 @@ func TestNumericRangeInheritedBorrowedMutationDetaches(t *testing.T) {
 		t.Fatalf("mutated numeric full-span posting missing id=%d", extra)
 	}
 
-	reloadedPrev, ok := prevEntry.LoadFullSpan(0, 0)
+	reloadedPrev, ok := prev.LoadNumericRangeFullSpan(prevEntry, 0, 0, 0)
 	if !ok || reloadedPrev.IsEmpty() {
 		t.Fatal("expected reloaded prev numeric full-span posting")
 	}
 	defer reloadedPrev.Release()
 
-	reloadedNext, ok := nextEntry.LoadFullSpan(0, 0)
+	reloadedNext, ok := next.LoadNumericRangeFullSpan(nextEntry, 0, 0, 0)
 	if !ok || reloadedNext.IsEmpty() {
 		t.Fatal("expected reloaded next numeric full-span posting")
 	}
@@ -1319,11 +1319,16 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 	shared := testStorage("10", "20")
 	defer shared.Release()
 
-	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{}, 0)
+	entry := qcache.GetNumericRangeBucketEntry(shared, qcache.NumericRangeBucketIndex{})
+
+	prev := testView(map[string]indexdata.FieldStorage{"age": shared})
+	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1)
+	prev.numericRangeBucketCache.StoreSlot("age", 0, entry)
+	defer prev.releaseRuntimeCaches()
 
 	base := testLargePosting()
 	want := base.ToArray()
-	stored, ok := entry.TryStoreFullSpan(0, 0, base.Borrow())
+	stored, ok := prev.TryStoreNumericRangeFullSpan(entry, 0, 0, 0, base.Borrow())
 	if !ok || stored.IsEmpty() {
 		base.Release()
 		entry.Release()
@@ -1332,13 +1337,8 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 	stored.Release()
 	base.Release()
 
-	prev := testView(map[string]indexdata.FieldStorage{"age": shared})
-	prev.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	prev.numericRangeBucketCache.StoreSlot("age", 0, entry)
-	defer prev.releaseRuntimeCaches()
-
 	next := testView(map[string]indexdata.FieldStorage{"age": shared})
-	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
+	next.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1)
 	defer next.releaseRuntimeCaches()
 	inheritNumericRangeBucketCache(next, prev)
 
@@ -1347,7 +1347,7 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 		t.Fatal("expected inherited numeric range cache entry in next snapshot")
 	}
 
-	held, ok := nextEntry.LoadFullSpan(0, 0)
+	held, ok := next.LoadNumericRangeFullSpan(nextEntry, 0, 0, 0)
 	if !ok || held.IsEmpty() {
 		t.Fatal("expected held inherited numeric full-span posting")
 	}
@@ -1355,7 +1355,7 @@ func TestNumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 
 	prev.releaseRuntimeCaches()
 
-	reloaded, ok := nextEntry.LoadFullSpan(0, 0)
+	reloaded, ok := next.LoadNumericRangeFullSpan(nextEntry, 0, 0, 0)
 	if !ok || reloaded.IsEmpty() {
 		t.Fatal("expected sibling numeric full-span cache entry after prev release")
 	}
@@ -1378,16 +1378,25 @@ func TestViewRuntimeCachesDirtyAndTakeRetiredRuntimeCaches(t *testing.T) {
 
 	storage := testStorage("10", "20")
 	defer storage.Release()
-	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(1, 0)
-	entry := qcache.GetNumericRangeBucketEntry(storage, qcache.NumericRangeBucketIndex{}, 0)
+	v.numericRangeBucketCache = qcache.GetNumericRangeBucketCacheWithRetireContext(1, 4, qcache.NumericRangeSpanCacheMaxEntryBytes(0), qcache.NumericRangeExactCacheMaxEntries(0), qcache.NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	entry := qcache.GetNumericRangeBucketEntry(storage, qcache.NumericRangeBucketIndex{})
 	v.numericRangeBucketCache.StoreSlot("age", 0, entry)
-	for i := 0; i < 5; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, testPosting(uint64(i+1)))
+	for i := 0; i < 4; i++ {
+		cached, ok := v.TryStoreNumericRangeFullSpan(entry, 0, i, i, testPosting(uint64(i+1)))
 		if !ok {
 			t.Fatalf("TryStoreFullSpan(%d): not stored", i)
 		}
 		cached.Release()
 	}
+	if cached, ok := v.TryStoreNumericRangeFullSpan(entry, 0, 4, 4, testPosting(5)); ok {
+		cached.Release()
+		t.Fatal("expected first over-capacity span observation to skip admission")
+	}
+	cached, ok := v.TryStoreNumericRangeFullSpan(entry, 0, 4, 4, testPosting(5))
+	if !ok {
+		t.Fatal("expected second over-capacity span observation to evict/admit")
+	}
+	cached.Release()
 
 	if !v.RuntimeCachesDirty() {
 		t.Fatal("expected retired runtime caches to mark view dirty")

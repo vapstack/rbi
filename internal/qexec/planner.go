@@ -2979,7 +2979,14 @@ func initOrderedORObservedStats(
 				active++
 				continue
 			}
-			if rememberKeysBuf != nil && qv.shouldRememberColdOrderedORPredicate(info) {
+			if qv.shouldRememberColdOrderedORPredicate(info) {
+				if info.warmupPlan.kind == asyncMaterializedPredPlanNumericExact {
+					qv.snap.ShouldPromoteRuntimeNumericRangeExactResult(info.warmupPlan.fieldSlot, info.warmupPlan.startRank, info.warmupPlan.endRank)
+					continue
+				}
+				if rememberKeysBuf == nil {
+					continue
+				}
 				seen := false
 				for i := 0; i < len(rememberKeysBuf); i++ {
 					if rememberKeysBuf[i] == info.cacheKey {
@@ -3510,6 +3517,7 @@ func (qv *View) orderedORMaterializedPrefixLeafBuildWork(orderField string, leaf
 
 type orderedORMaterializedPredicateBuildInfo struct {
 	cacheKey        qcache.MaterializedPredKey
+	warmupPlan      asyncMaterializedPredPlan
 	buildWork       uint64
 	checkWork       uint64
 	cachedCheckWork uint64
@@ -3517,28 +3525,42 @@ type orderedORMaterializedPredicateBuildInfo struct {
 	ok              bool
 }
 
+func (qv *View) attachOrderedORNumericWarmupPlan(p predicate, info *orderedORMaterializedPredicateBuildInfo) {
+	if info == nil {
+		return
+	}
+	plan, ok := qv.asyncMaterializedPredPlanForOrderedORPredicate(p)
+	if ok && plan.kind.numericRange() {
+		info.warmupPlan = plan
+	}
+}
+
 func (qv *View) orderedORMaterializedPredicateBuildInfo(orderField string, p predicate) orderedORMaterializedPredicateBuildInfo {
 
 	cacheKey, buildWork, checkWork, cachedCheckWork, ok := qv.orderedORMaterializedExactRangePredicateCosts(orderField, p)
 	if ok && buildWork != 0 && checkWork != 0 {
-		return orderedORMaterializedPredicateBuildInfo{
+		info := orderedORMaterializedPredicateBuildInfo{
 			cacheKey:        cacheKey,
 			buildWork:       buildWork,
 			checkWork:       checkWork,
 			cachedCheckWork: cachedCheckWork,
 			ok:              true,
 		}
+		qv.attachOrderedORNumericWarmupPlan(p, &info)
+		return info
 	}
 
 	cacheKey, buildWork, checkWork, cachedCheckWork, ok = qv.orderedORMaterializedRangeLeafCosts(orderField, p.expr)
 	if ok && buildWork != 0 && checkWork != 0 {
-		return orderedORMaterializedPredicateBuildInfo{
+		info := orderedORMaterializedPredicateBuildInfo{
 			cacheKey:        cacheKey,
 			buildWork:       buildWork,
 			checkWork:       checkWork,
 			cachedCheckWork: cachedCheckWork,
 			ok:              true,
 		}
+		qv.attachOrderedORNumericWarmupPlan(p, &info)
+		return info
 	}
 
 	cacheKey, buildWork, ok = qv.orderedORMaterializedPrefixLeafBuildWork(orderField, p.expr)
@@ -4203,9 +4225,6 @@ func (qv *View) scheduleOrderedORMaterializedBaseOps(
 	if q == nil || branches.Len() == 0 || qv.snap == nil || !q.HasOrder || observed == nil {
 		return
 	}
-	if qv.snap.MaterializedPredCacheLimit() <= 0 {
-		return
-	}
 	orderField := qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal)
 	if !qv.hasFieldOrdinal(q.Order.FieldOrdinal) {
 		return
@@ -4221,6 +4240,9 @@ func (qv *View) scheduleOrderedORMaterializedBaseOps(
 
 	cacheKeysBuf := qcache.GetMaterializedPredKeySlice(repCap)
 	defer qcache.ReleaseMaterializedPredKeySlice(cacheKeysBuf)
+
+	warmupPlansBuf := asyncMaterializedPredPlanSlicePool.Get(repCap)
+	defer asyncMaterializedPredPlanSlicePool.Put(warmupPlansBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
 	defer pooled.ReleaseIntSlice(repBranchBuf)
@@ -4254,17 +4276,17 @@ func (qv *View) scheduleOrderedORMaterializedBaseOps(
 				continue
 			}
 			info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, branch, bi, pi)
-			if !info.ok || info.cacheKey.IsZero() || info.buildWork == 0 {
+			if !orderedORPredicateObservationEligible(info) {
+				continue
+			}
+			observedWork := orderedORPredicateObservedWork(info, leafChecks)
+			if observedWork == 0 {
 				continue
 			}
 			found := false
 			for slot := 0; slot < len(cacheKeysBuf); slot++ {
-				if cacheKeysBuf[slot] == info.cacheKey {
-					if info.isPrefix {
-						observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], leafChecks)
-					} else if info.checkWork > info.cachedCheckWork {
-						observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
-					}
+				if orderedORWarmupMatches(cacheKeysBuf[slot], warmupPlansBuf[slot], info) {
+					observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], observedWork)
 					found = true
 					break
 				}
@@ -4273,16 +4295,11 @@ func (qv *View) scheduleOrderedORMaterializedBaseOps(
 				continue
 			}
 			cacheKeysBuf = append(cacheKeysBuf, info.cacheKey)
+			warmupPlansBuf = append(warmupPlansBuf, info.warmupPlan)
 			repBranchBuf = append(repBranchBuf, bi)
 			repPredBuf = append(repPredBuf, pi)
 			buildWorksBuf = append(buildWorksBuf, info.buildWork)
-			if info.isPrefix {
-				observedWorksBuf = append(observedWorksBuf, leafChecks)
-			} else if info.checkWork > info.cachedCheckWork {
-				observedWorksBuf = append(observedWorksBuf, mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
-			} else {
-				observedWorksBuf = append(observedWorksBuf, 0)
-			}
+			observedWorksBuf = append(observedWorksBuf, observedWork)
 		}
 	}
 	if len(cacheKeysBuf) == 0 {
@@ -4292,16 +4309,26 @@ func (qv *View) scheduleOrderedORMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
+		info := orderedORMaterializedPredicateBuildInfo{
+			cacheKey:   cacheKeysBuf[i],
+			warmupPlan: warmupPlansBuf[i],
+			buildWork:  buildWorksBuf[i],
+			ok:         true,
+		}
+		if !qv.shouldPromoteObservedOrderedORWarmup(info, observedWorksBuf[i]) {
 			continue
 		}
-		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], asyncMaterializedPredObservedThreshold(buildWorksBuf[i])) {
-			continue
+		plan := warmupPlansBuf[i]
+		if !plan.kind.numericRange() {
+			branchIdx := repBranchBuf[i]
+			predIdx := repPredBuf[i]
+			var ok bool
+			plan, ok = qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
+			if !ok {
+				continue
+			}
 		}
-		branchIdx := repBranchBuf[i]
-		predIdx := repPredBuf[i]
-		plan, ok := qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
-		if ok {
+		if plan.kind != asyncMaterializedPredPlanNone {
 			qv.scheduleAsyncMaterializedPredWarmup(plan)
 		}
 	}
@@ -4316,9 +4343,6 @@ func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 	analysis *plannerOROrderAnalysis,
 ) {
 	if q == nil || branches.Len() == 0 || qv.snap == nil || !q.HasOrder || branchObservedRows == nil || branchUniverses == nil {
-		return
-	}
-	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return
 	}
 	needWindow, ok := orderWindow(q)
@@ -4343,6 +4367,9 @@ func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 
 	cacheKeysBuf := qcache.GetMaterializedPredKeySlice(repCap)
 	defer qcache.ReleaseMaterializedPredKeySlice(cacheKeysBuf)
+
+	warmupPlansBuf := asyncMaterializedPredPlanSlicePool.Get(repCap)
+	defer asyncMaterializedPredPlanSlicePool.Put(warmupPlansBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
 	defer pooled.ReleaseIntSlice(repBranchBuf)
@@ -4376,29 +4403,27 @@ func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 				continue
 			}
 			info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, branch, bi, pi)
-			if info.ok && !info.cacheKey.IsZero() && info.buildWork != 0 {
-				observedWork := uint64(0)
-				if info.isPrefix {
-					observedWork = rows
-				} else if info.checkWork > info.cachedCheckWork {
-					observedWork = mathutil.SatMulUint64(rows, info.checkWork-info.cachedCheckWork)
+			if orderedORPredicateObservationEligible(info) {
+				observedWork := orderedORPredicateObservedWork(info, rows)
+				if observedWork == 0 {
+					rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
+					continue
 				}
-				if observedWork != 0 {
-					found := false
-					for slot := 0; slot < len(cacheKeysBuf); slot++ {
-						if cacheKeysBuf[slot] == info.cacheKey {
-							observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], observedWork)
-							found = true
-							break
-						}
+				found := false
+				for slot := 0; slot < len(cacheKeysBuf); slot++ {
+					if orderedORWarmupMatches(cacheKeysBuf[slot], warmupPlansBuf[slot], info) {
+						observedWorksBuf[slot] = mathutil.SatAddUint64(observedWorksBuf[slot], observedWork)
+						found = true
+						break
 					}
-					if !found {
-						cacheKeysBuf = append(cacheKeysBuf, info.cacheKey)
-						repBranchBuf = append(repBranchBuf, bi)
-						repPredBuf = append(repPredBuf, pi)
-						buildWorksBuf = append(buildWorksBuf, info.buildWork)
-						observedWorksBuf = append(observedWorksBuf, observedWork)
-					}
+				}
+				if !found {
+					cacheKeysBuf = append(cacheKeysBuf, info.cacheKey)
+					warmupPlansBuf = append(warmupPlansBuf, info.warmupPlan)
+					repBranchBuf = append(repBranchBuf, bi)
+					repPredBuf = append(repPredBuf, pi)
+					buildWorksBuf = append(buildWorksBuf, info.buildWork)
+					observedWorksBuf = append(observedWorksBuf, observedWork)
 				}
 			}
 			rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
@@ -4409,16 +4434,26 @@ func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
+		info := orderedORMaterializedPredicateBuildInfo{
+			cacheKey:   cacheKeysBuf[i],
+			warmupPlan: warmupPlansBuf[i],
+			buildWork:  buildWorksBuf[i],
+			ok:         true,
+		}
+		if !qv.shouldPromoteObservedOrderedORWarmup(info, observedWorksBuf[i]) {
 			continue
 		}
-		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], asyncMaterializedPredObservedThreshold(buildWorksBuf[i])) {
-			continue
+		plan := warmupPlansBuf[i]
+		if !plan.kind.numericRange() {
+			branchIdx := repBranchBuf[i]
+			predIdx := repPredBuf[i]
+			var ok bool
+			plan, ok = qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
+			if !ok {
+				continue
+			}
 		}
-		branchIdx := repBranchBuf[i]
-		predIdx := repPredBuf[i]
-		plan, ok := qv.asyncMaterializedPredPlanForOrderedORPredicate(branches.owner[branchIdx].preds.owner[predIdx])
-		if ok {
+		if plan.kind != asyncMaterializedPredPlanNone {
 			qv.scheduleAsyncMaterializedPredWarmup(plan)
 		}
 	}
@@ -4427,6 +4462,12 @@ func (qv *View) scheduleObservedOrderedORKWayMaterializedBaseOps(
 func (qv *View) shouldObserveOrderedORPredicate(info orderedORMaterializedPredicateBuildInfo) bool {
 	if !orderedORPredicateObservationEligible(info) {
 		return false
+	}
+	if info.warmupPlan.kind == asyncMaterializedPredPlanNumericExact {
+		return qv.snap.HasObservedNumericRangeExactResult(info.warmupPlan.fieldSlot, info.warmupPlan.startRank, info.warmupPlan.endRank)
+	}
+	if info.warmupPlan.kind == asyncMaterializedPredPlanNumericSpan {
+		return true
 	}
 	if qv.snap.HasMaterializedPredKey(info.cacheKey) {
 		return false
@@ -4443,6 +4484,12 @@ func (qv *View) shouldRememberColdOrderedORPredicate(info orderedORMaterializedP
 	if !orderedORPredicateObservationEligible(info) {
 		return false
 	}
+	if info.warmupPlan.kind == asyncMaterializedPredPlanNumericExact {
+		return !qv.snap.HasObservedNumericRangeExactResult(info.warmupPlan.fieldSlot, info.warmupPlan.startRank, info.warmupPlan.endRank)
+	}
+	if info.warmupPlan.kind == asyncMaterializedPredPlanNumericSpan {
+		return false
+	}
 	if qv.snap.HasMaterializedPredKey(info.cacheKey) {
 		return false
 	}
@@ -4450,10 +4497,56 @@ func (qv *View) shouldRememberColdOrderedORPredicate(info orderedORMaterializedP
 }
 
 func orderedORPredicateObservationEligible(info orderedORMaterializedPredicateBuildInfo) bool {
-	if !info.ok || info.cacheKey.IsZero() || info.buildWork == 0 {
+	if !info.ok || info.buildWork == 0 {
+		return false
+	}
+	if info.cacheKey.IsZero() && !info.warmupPlan.kind.numericRange() {
 		return false
 	}
 	return info.isPrefix || info.checkWork != 0
+}
+
+func orderedORPredicateObservedWork(info orderedORMaterializedPredicateBuildInfo, leafChecks uint64) uint64 {
+	if leafChecks == 0 {
+		return 0
+	}
+	if info.isPrefix {
+		return leafChecks
+	}
+	if info.checkWork > info.cachedCheckWork {
+		return mathutil.SatMulUint64(leafChecks, info.checkWork-info.cachedCheckWork)
+	}
+	return 0
+}
+
+func orderedORWarmupMatches(cacheKey qcache.MaterializedPredKey, plan asyncMaterializedPredPlan, info orderedORMaterializedPredicateBuildInfo) bool {
+	if !info.cacheKey.IsZero() {
+		return cacheKey == info.cacheKey
+	}
+	return info.warmupPlan.kind.numericRange() && plan.taskKey() == info.warmupPlan.taskKey()
+}
+
+func (qv *View) shouldPromoteObservedOrderedORWarmup(info orderedORMaterializedPredicateBuildInfo, observedWork uint64) bool {
+	if observedWork == 0 {
+		return false
+	}
+	threshold := asyncMaterializedPredObservedThreshold(info.buildWork)
+	switch info.warmupPlan.kind {
+	case asyncMaterializedPredPlanNumericExact:
+		return qv.snap.ShouldPromoteObservedNumericRangeExactResult(
+			info.warmupPlan.fieldSlot,
+			info.warmupPlan.startRank,
+			info.warmupPlan.endRank,
+			observedWork,
+			threshold,
+		)
+	case asyncMaterializedPredPlanNumericSpan:
+		return observedWork >= threshold
+	}
+	if info.cacheKey.IsZero() || qv.snap.HasMaterializedPredKey(info.cacheKey) {
+		return false
+	}
+	return qv.snap.ShouldPromoteObservedMaterializedPredKey(info.cacheKey, observedWork, threshold)
 }
 
 func (qv *View) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {

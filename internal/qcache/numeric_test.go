@@ -21,17 +21,25 @@ func qcacheTestFieldStorage(n int, base uint64) indexdata.FieldStorage {
 	return indexdata.NewRegularFieldStorageFromFixedPostingMapOwned(m)
 }
 
+func qcacheTestNumericSpanCache(t testing.TB) (*NumericRangeBucketCache, *NumericRangeBucketEntry) {
+	t.Helper()
+	cache := GetNumericRangeBucketCache(1)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
+	t.Cleanup(func() {
+		ReleaseNumericRangeBucketCache(cache)
+	})
+	return cache, entry
+}
+
 func TestNumericRangeBucketCache_SlotLifecycleAndClear(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	cache := GetNumericRangeBucketCache(3, 99)
+	cache := GetNumericRangeBucketCache(3)
 	defer ReleaseNumericRangeBucketCache(cache)
-	if got := cache.MaxCardinality(); got != 99 {
-		t.Fatalf("MaxCardinality=%d want 99", got)
-	}
 
-	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
 	cache.StoreSlot("age", 1, entry)
 
 	if got := cache.EntryCount(); got != 1 {
@@ -60,16 +68,16 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	cache := GetNumericRangeBucketCache(2, 99)
-	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
-	cached, ok := entry.TryStoreFullSpan(0, 1, qcacheTestPosting(1, 2, 3))
+	cache := GetNumericRangeBucketCache(2)
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
+	cache.StoreSlot("age", 0, entry)
+	cached, ok := cache.TryStoreFullSpan(entry, 0, 0, 1, qcacheTestPosting(1, 2, 3))
 	if !ok {
 		ReleaseNumericRangeBucketCache(cache)
 		t.Fatal("expected full-span store to succeed")
 	}
 	cached.Release()
 
-	cache.StoreSlot("age", 0, entry)
 	if got, ok := cache.LoadField("age"); !ok || got != entry {
 		ReleaseNumericRangeBucketCache(cache)
 		t.Fatal("expected field index load to return stored entry")
@@ -81,9 +89,10 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 
 	if len(cache.slots) != 0 ||
 		cache.count != 0 ||
-		cache.maxCard != 0 ||
 		cache.fieldIndex != nil ||
-		cache.fieldIndexLen != 0 {
+		cache.fieldIndexLen != 0 ||
+		cache.spanCount != 0 ||
+		cache.spanLiveBytes != 0 {
 		t.Fatalf("released numeric range cache retained state: %+v", cache)
 	}
 	if slots[0].field != "" || slots[0].entry != nil {
@@ -95,14 +104,12 @@ func TestNumericRangeBucketCacheReleaseClearsSlotsIndexAndEntry(t *testing.T) {
 	if entry.refs.Load() != 0 ||
 		entry.storage.KeyCount() != 0 ||
 		entry.idx.keyCount != 0 ||
-		entry.maxCard != 0 ||
-		entry.fullSpanClock != 0 ||
-		entry.retired != nil {
+		entry.fullSpanClock != 0 {
 		t.Fatalf("released numeric range entry retained state: %+v", entry)
 	}
-	for i := range entry.fullSpanCache {
-		if entry.fullSpanCache[i].used || !entry.fullSpanCache[i].ids.IsEmpty() {
-			t.Fatalf("released numeric full-span slot %d retained state: %+v", i, entry.fullSpanCache[i])
+	for i := range entry.fullSpanRecent {
+		if entry.fullSpanRecent[i].used {
+			t.Fatalf("released numeric full-span recent slot %d retained state: %+v", i, entry.fullSpanRecent[i])
 		}
 	}
 }
@@ -111,12 +118,12 @@ func TestNumericRangeBucketCacheInitClearsSlotsFieldIndexAndEntries(t *testing.T
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	cache := GetNumericRangeBucketCache(2, 99)
+	cache := GetNumericRangeBucketCache(2)
 	defer ReleaseNumericRangeBucketCache(cache)
 
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
-	ageEntry := GetNumericRangeBucketEntry(storage, idx, 0)
-	scoreEntry := GetNumericRangeBucketEntry(storage, idx, 0)
+	ageEntry := GetNumericRangeBucketEntry(storage, idx)
+	scoreEntry := GetNumericRangeBucketEntry(storage, idx)
 	cache.StoreSlot("age", 0, ageEntry)
 	cache.StoreSlot("score", 1, scoreEntry)
 	if _, ok := cache.LoadField("age"); !ok {
@@ -124,15 +131,15 @@ func TestNumericRangeBucketCacheInitClearsSlotsFieldIndexAndEntries(t *testing.T
 	}
 	fieldIndex := cache.fieldIndex
 
-	cache.Init(2, 7)
+	cache.Init(2)
 	if ageEntry.refs.Load() != 0 || scoreEntry.refs.Load() != 0 {
 		t.Fatalf("expected init to release old entries: age=%d score=%d", ageEntry.refs.Load(), scoreEntry.refs.Load())
 	}
 	if got := cache.EntryCount(); got != 0 {
 		t.Fatalf("EntryCount after init=%d want 0", got)
 	}
-	if got := cache.MaxCardinality(); got != 7 {
-		t.Fatalf("MaxCardinality after init=%d want 7", got)
+	if got := cache.spanMaxEntries; got != NumericRangeSpanCacheMaxEntries(0) {
+		t.Fatalf("spanMaxEntries after init=%d want %d", got, NumericRangeSpanCacheMaxEntries(0))
 	}
 	if cache.fieldIndexLen != 0 {
 		t.Fatalf("fieldIndexLen after init=%d want 0", cache.fieldIndexLen)
@@ -147,21 +154,21 @@ func TestNumericRangeBucketCacheInitClearsSlotsFieldIndexAndEntries(t *testing.T
 		t.Fatal("expected old field index entry to miss after init")
 	}
 
-	heightEntry := GetNumericRangeBucketEntry(storage, idx, 0)
+	heightEntry := GetNumericRangeBucketEntry(storage, idx)
 	cache.StoreSlot("height", 1, heightEntry)
 	if _, ok := cache.LoadField("height"); !ok {
 		t.Fatal("expected fresh field index entry")
 	}
 
-	cache.Init(4, 8)
+	cache.Init(4)
 	if heightEntry.refs.Load() != 0 {
 		t.Fatalf("expected growing init to release old entry, refs=%d", heightEntry.refs.Load())
 	}
 	if got := cache.EntryCount(); got != 0 {
 		t.Fatalf("EntryCount after growing init=%d want 0", got)
 	}
-	if got := cache.MaxCardinality(); got != 8 {
-		t.Fatalf("MaxCardinality after growing init=%d want 8", got)
+	if got := cache.spanMaxEntries; got != NumericRangeSpanCacheMaxEntries(0) {
+		t.Fatalf("spanMaxEntries after growing init=%d want %d", got, NumericRangeSpanCacheMaxEntries(0))
 	}
 	if _, ok := cache.LoadSlot("height", 1); ok {
 		t.Fatal("expected fresh slot to miss after growing init")
@@ -172,11 +179,11 @@ func TestNumericRangeBucketCacheStoreSlotReleasesReplacedEntry(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	cache := GetNumericRangeBucketCache(1, 0)
+	cache := GetNumericRangeBucketCache(1)
 	defer ReleaseNumericRangeBucketCache(cache)
 
-	oldEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
-	newEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
+	oldEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
+	newEntry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
 
 	cache.StoreSlot("age", 0, oldEntry)
 	if _, ok := cache.LoadField("age"); !ok {
@@ -210,7 +217,7 @@ func TestNumericRangeBucketCacheLoadOrStoreSlotConcurrentSameStorage(t *testing.
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	cache := GetNumericRangeBucketCache(1, 0)
+	cache := GetNumericRangeBucketCache(1)
 	defer ReleaseNumericRangeBucketCache(cache)
 
 	n := max(4, runtime.GOMAXPROCS(0)*2)
@@ -218,7 +225,7 @@ func TestNumericRangeBucketCacheLoadOrStoreSlotConcurrentSameStorage(t *testing.
 	candidates := make([]*NumericRangeBucketEntry, n)
 	got := make([]*NumericRangeBucketEntry, n)
 	for i := range candidates {
-		candidates[i] = GetNumericRangeBucketEntry(storage, idx, 0)
+		candidates[i] = GetNumericRangeBucketEntry(storage, idx)
 	}
 
 	start := make(chan struct{})
@@ -253,47 +260,39 @@ func TestNumericRangeBucketCacheLoadOrStoreSlotConcurrentSameStorage(t *testing.
 	}
 }
 
-func TestNumericRangeBucketCacheDrainRetiredSkipsSharedEntries(t *testing.T) {
-	cache := GetNumericRangeBucketCache(2, 0)
+func TestNumericRangeBucketCacheDrainRetiredDetachesEvictedSpans(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
 	defer ReleaseNumericRangeBucketCache(cache)
 
-	unshared := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	shared := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	shared.Retain()
-	defer shared.Release()
-
-	for i := 0; i <= numericRangeFullSpanCacheMaxEntries; i++ {
-		ids := qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1))
-		cached, ok := unshared.TryStoreFullSpan(i, i, ids)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
+	for i := 0; i < 4; i++ {
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
 		if !ok {
-			t.Fatalf("expected unshared full-span store %d to succeed", i)
-		}
-		cached.Release()
-
-		ids = qcacheTestPosting(uint64(i+11), 1<<32|uint64(i+11))
-		cached, ok = shared.TryStoreFullSpan(i, i, ids)
-		if !ok {
-			t.Fatalf("expected shared full-span store %d to succeed", i)
+			t.Fatalf("expected full-span store %d to succeed", i)
 		}
 		cached.Release()
 	}
-	if len(unshared.retired) == 0 || len(shared.retired) == 0 {
-		t.Fatal("expected both numeric entries to have retired full-span postings")
+	if cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5)); ok {
+		cached.Release()
+		t.Fatal("expected first over-capacity span to be observed, not admitted")
+	}
+	cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5))
+	if !ok {
+		t.Fatal("expected second over-capacity span to evict/admit")
+	}
+	cached.Release()
+	if cache.spanRetiredCount != 1 {
+		t.Fatalf("retired count=%d want 1", cache.spanRetiredCount)
 	}
 
-	cache.StoreSlot("age", 0, unshared)
-	cache.StoreSlot("score", 1, shared)
 	retired := cache.TakeRetired()
 	if retired.IsEmpty() {
-		t.Fatal("expected unshared numeric retired postings to be detached")
+		t.Fatal("expected numeric retired postings to be detached")
 	}
 	retired.Release()
-
-	if unshared.retired != nil {
-		t.Fatal("expected unshared numeric retired postings to be drained")
-	}
-	if len(shared.retired) == 0 {
-		t.Fatal("expected shared numeric retired postings to remain protected")
+	if cache.spanRetiredCount != 0 || cache.spanRetiredBytes != 0 {
+		t.Fatalf("retired accounting after drain: count=%d bytes=%d", cache.spanRetiredCount, cache.spanRetiredBytes)
 	}
 }
 
@@ -301,23 +300,30 @@ func TestNumericRangeBucketCacheTakeRetiredBeforeUsesEpochForSharedEntries(t *te
 	var epoch atomic.Uint64
 	epoch.Store(1)
 
-	cache := GetNumericRangeBucketCacheWithRetireContext(1, 0, nil, &epoch)
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, &epoch)
 	defer ReleaseNumericRangeBucketCache(cache)
 
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	entry.Retain()
-	defer entry.Release()
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
 	cache.StoreSlot("age", 0, entry)
 
-	for i := 0; i <= numericRangeFullSpanCacheMaxEntries; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
+	for i := 0; i < 4; i++ {
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
 		if !ok {
 			t.Fatalf("expected full-span store %d to succeed", i)
 		}
 		cached.Release()
 	}
-	if len(entry.retired) == 0 {
-		t.Fatal("expected shared numeric entry to have retired full-span postings")
+	if cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5)); ok {
+		cached.Release()
+		t.Fatal("expected first over-capacity span to be observed, not admitted")
+	}
+	cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5))
+	if !ok {
+		t.Fatal("expected second over-capacity span to evict/admit")
+	}
+	cached.Release()
+	if cache.spanRetiredCount == 0 {
+		t.Fatal("expected numeric cache to have retired full-span postings")
 	}
 
 	retained := cache.TakeRetiredBefore(1)
@@ -326,36 +332,49 @@ func TestNumericRangeBucketCacheTakeRetiredBeforeUsesEpochForSharedEntries(t *te
 		t.Fatal("expected retired postings at safe epoch to remain protected")
 	}
 	retained.Release()
-	if len(entry.retired) == 0 {
+	if cache.spanRetiredCount == 0 {
 		t.Fatal("expected retained retired postings after same-epoch drain")
 	}
 
 	retired := cache.TakeRetiredBefore(2)
 	if retired.IsEmpty() {
-		t.Fatal("expected older retired postings to detach despite shared entry refs")
+		t.Fatal("expected older retired postings to detach by epoch")
 	}
 	retired.Release()
-	if entry.retired != nil {
+	if cache.spanRetiredCount != 0 {
 		t.Fatal("expected shared numeric retired postings to be drained by epoch")
 	}
 }
 
-func TestNumericRangeBucketEntryRetiredBacklogRejectsReplacementUntilDrain(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
+func TestNumericRangeBucketCacheRetiredBacklogRejectsReplacementUntilDrain(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
 
-	for i := 0; i < numericRangeFullSpanCacheMaxEntries*2; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
+	for i := 0; i < 4; i++ {
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
 		if !ok {
-			t.Fatalf("expected full-span store %d to succeed before retired backlog fills", i)
+			t.Fatalf("expected full-span store %d to succeed", i)
 		}
 		cached.Release()
 	}
-	if got := len(entry.retired); got != numericRangeFullSpanCacheMaxEntries {
-		t.Fatalf("retired backlog=%d want %d", got, numericRangeFullSpanCacheMaxEntries)
+	for i := 4; i < 8; i++ {
+		if cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1))); ok {
+			cached.Release()
+			t.Fatalf("expected first observation for span %d to skip admission", i)
+		}
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
+		if !ok {
+			t.Fatalf("expected second observation for span %d to evict/admit", i)
+		}
+		cached.Release()
+	}
+	if got := cache.spanRetiredCount; got != 4 {
+		t.Fatalf("retired backlog=%d want 4", got)
 	}
 
 	caller := qcacheTestPosting(99, 1<<32|99)
-	got, ok := entry.TryStoreFullSpan(99, 99, caller.Borrow())
+	got, ok := cache.TryStoreFullSpan(entry, 0, 99, 99, caller.Borrow())
 	if ok {
 		got.Release()
 		caller.Release()
@@ -367,11 +386,9 @@ func TestNumericRangeBucketEntryRetiredBacklogRejectsReplacementUntilDrain(t *te
 	}
 	caller.Release()
 
-	cache := GetNumericRangeBucketCache(1, 0)
-	cache.StoreSlot("age", 0, entry)
 	retired := cache.TakeRetired()
 	retired.Release()
-	cached, ok := entry.TryStoreFullSpan(99, 99, qcacheTestPosting(99, 1<<32|99))
+	cached, ok := cache.TryStoreFullSpan(entry, 0, 99, 99, qcacheTestPosting(99, 1<<32|99))
 	ReleaseNumericRangeBucketCache(cache)
 	if !ok {
 		t.Fatal("expected replacement to resume after retired drain")
@@ -385,21 +402,21 @@ func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 	defer shared.Release()
 	defer changed.Release()
 
-	prev := GetNumericRangeBucketCache(2, 0)
-	next := GetNumericRangeBucketCache(2, 0)
+	prev := GetNumericRangeBucketCache(2)
+	next := GetNumericRangeBucketCache(2)
 	defer ReleaseNumericRangeBucketCache(next)
 
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: shared.KeyCount()}
-	ageEntry := GetNumericRangeBucketEntry(shared, idx, 0)
-	stored, ok := ageEntry.TryStoreFullSpan(0, 0, qcacheTestPosting(1, 2, 3))
+	ageEntry := GetNumericRangeBucketEntry(shared, idx)
+	prev.StoreSlot("age", 0, ageEntry)
+	stored, ok := prev.TryStoreFullSpan(ageEntry, 0, 0, 0, qcacheTestPosting(1, 2, 3))
 	if !ok {
 		ReleaseNumericRangeBucketCache(prev)
 		t.Fatal("expected full-span store to succeed")
 	}
 	stored.Release()
-	prev.StoreSlot("age", 0, ageEntry)
 
-	scoreEntry := GetNumericRangeBucketEntry(changed, idx, 0)
+	scoreEntry := GetNumericRangeBucketEntry(changed, idx)
 	prev.StoreSlot("score", 1, scoreEntry)
 
 	fields := schema.IndexedFieldMap{
@@ -416,7 +433,7 @@ func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 	if _, ok := next.LoadField("score"); ok {
 		t.Fatal("expected changed storage entry to be skipped")
 	}
-	cached, ok := inherited.LoadFullSpan(0, 0)
+	cached, ok := next.LoadFullSpan(inherited, 0, 0, 0)
 	if !ok {
 		t.Fatal("expected inherited retained entry to survive previous cache release")
 	}
@@ -428,14 +445,14 @@ func TestNumericRangeBucketCacheInheritReleasesReplacedEntry(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	prev := GetNumericRangeBucketCache(1, 0)
-	next := GetNumericRangeBucketCache(1, 0)
+	prev := GetNumericRangeBucketCache(1)
+	next := GetNumericRangeBucketCache(1)
 	defer ReleaseNumericRangeBucketCache(prev)
 	defer ReleaseNumericRangeBucketCache(next)
 
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
-	inherited := GetNumericRangeBucketEntry(storage, idx, 0)
-	replaced := GetNumericRangeBucketEntry(storage, idx, 0)
+	inherited := GetNumericRangeBucketEntry(storage, idx)
+	replaced := GetNumericRangeBucketEntry(storage, idx)
 	prev.StoreSlot("age", 0, inherited)
 	next.StoreSlot("score", 0, replaced)
 	if _, ok := next.LoadField("score"); !ok {
@@ -463,13 +480,13 @@ func TestNumericRangeBucketCacheInheritSameEntryDoesNotRetainAgain(t *testing.T)
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	prev := GetNumericRangeBucketCache(1, 0)
-	next := GetNumericRangeBucketCache(1, 0)
+	prev := GetNumericRangeBucketCache(1)
+	next := GetNumericRangeBucketCache(1)
 	defer ReleaseNumericRangeBucketCache(prev)
 	defer ReleaseNumericRangeBucketCache(next)
 
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
-	entry := GetNumericRangeBucketEntry(storage, idx, 0)
+	entry := GetNumericRangeBucketEntry(storage, idx)
 	prev.StoreSlot("age", 0, entry)
 
 	fields := schema.IndexedFieldMap{"age": {Ordinal: 0}}
@@ -484,94 +501,170 @@ func TestNumericRangeBucketCacheInheritSameEntryDoesNotRetainAgain(t *testing.T)
 	}
 }
 
-func TestNumericRangeBucketCacheInheritKeepsSharedEntryRootOwnerStable(t *testing.T) {
+func TestNumericRangeBucketCacheEvictionMarksDirtyOwner(t *testing.T) {
 	storage := qcacheTestFieldStorage(32, 100)
 	defer storage.Release()
 
-	var prevOwner atomic.Bool
-	var prevEpoch atomic.Uint64
-	prev := GetNumericRangeBucketCacheWithRetireContext(1, 0, &prevOwner, &prevEpoch)
-	defer ReleaseNumericRangeBucketCache(prev)
-
-	var nextOwner atomic.Bool
-	var nextEpoch atomic.Uint64
-	next := GetNumericRangeBucketCacheWithRetireContext(1, 0, &nextOwner, &nextEpoch)
-	defer ReleaseNumericRangeBucketCache(next)
+	var owner atomic.Bool
+	var epoch atomic.Uint64
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), &owner, &epoch)
+	defer ReleaseNumericRangeBucketCache(cache)
 
 	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
-	entry := GetNumericRangeBucketEntry(storage, idx, 0)
-	prev.StoreSlot("age", 0, entry)
-	if entry.rootOwner.Load() != &prevOwner {
-		t.Fatal("expected published numeric entry to point at previous root dirty owner")
-	}
-	if entry.retireEpoch.Load() != &prevEpoch {
-		t.Fatal("expected published numeric entry to point at previous retire epoch source")
-	}
-
-	fields := schema.IndexedFieldMap{"age": {Ordinal: 0}}
-	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, fields)
-	if entry.rootOwner.Load() != &prevOwner {
-		t.Fatal("inherit replaced previous root dirty owner")
-	}
-	if entry.retireEpoch.Load() != &prevEpoch {
-		t.Fatal("inherit replaced previous retire epoch source")
-	}
-}
-
-func TestNumericRangeBucketCacheInheritRetiredEntryMarksNextDirtyOwner(t *testing.T) {
-	storage := qcacheTestFieldStorage(32, 100)
-	defer storage.Release()
-
-	var prevOwner atomic.Bool
-	prev := GetNumericRangeBucketCacheWithRetireContext(1, 0, &prevOwner, nil)
-	defer ReleaseNumericRangeBucketCache(prev)
-
-	var nextOwner atomic.Bool
-	next := GetNumericRangeBucketCacheWithRetireContext(1, 0, &nextOwner, nil)
-	defer ReleaseNumericRangeBucketCache(next)
-
-	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}, 0)
-	prev.StoreSlot("age", 0, entry)
-	for i := 0; i <= numericRangeFullSpanCacheMaxEntries; i++ {
-		cached, ok := entry.TryStoreFullSpan(i, i, qcacheTestPosting(uint64(i+1)))
+	entry := GetNumericRangeBucketEntry(storage, idx)
+	cache.StoreSlot("age", 0, entry)
+	for i := 0; i < 4; i++ {
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1)))
 		if !ok {
 			t.Fatalf("expected full-span store %d to succeed", i)
 		}
 		cached.Release()
 	}
-	if !entry.retiredDirty.Load() {
-		t.Fatal("expected source entry to carry retired postings")
+	if cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5)); ok {
+		cached.Release()
+		t.Fatal("expected first over-capacity span observation to skip admission")
 	}
-	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, schema.IndexedFieldMap{"age": {Ordinal: 0}})
-	if !next.retiredDirty.Load() {
-		t.Fatal("expected inherited retired entry to mark next cache dirty")
+	cached, ok := cache.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5))
+	if !ok {
+		t.Fatal("expected second over-capacity span observation to evict/admit")
 	}
-	if !nextOwner.Load() {
-		t.Fatal("expected inherited retired entry to mark next dirty owner")
+	cached.Release()
+	if !cache.retiredDirty.Load() {
+		t.Fatal("expected eviction to mark numeric cache dirty")
+	}
+	if !owner.Load() {
+		t.Fatal("expected eviction to mark dirty owner")
 	}
 }
 
-func TestNumericRangeBucketEntryRetainedBorrowedViewSurvivesSourceRelease(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
+func TestNumericRangeBucketCacheInheritsLiveSpansForMatchingStorage(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	prev := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(prev)
+
+	next := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(next)
+
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
+	prev.StoreSlot("age", 0, entry)
+	cached, ok := prev.TryStoreFullSpan(entry, 0, 1, 3, qcacheTestPosting(1, 2, 3))
+	if !ok {
+		t.Fatal("expected source full-span store")
+	}
+	cached.Release()
+	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, schema.IndexedFieldMap{"age": {Ordinal: 0}})
+	nextEntry, ok := next.LoadField("age")
+	if !ok {
+		t.Fatal("expected inherited numeric entry")
+	}
+	got, ok := next.LoadFullSpan(nextEntry, 0, 1, 3)
+	if !ok {
+		t.Fatal("expected inherited full-span hit")
+	}
+	qcacheTestAssertPostingSet(t, got, []uint64{1, 2, 3})
+	got.Release()
+}
+
+func TestNumericRangeBucketCacheKeepsRetiredSpansOnSource(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	var owner atomic.Bool
+	var epoch atomic.Uint64
+	epoch.Store(1)
+
+	prev := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), &owner, &epoch)
+	defer ReleaseNumericRangeBucketCache(prev)
+
+	next := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), &owner, &epoch)
+	defer ReleaseNumericRangeBucketCache(next)
+
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
+	prev.StoreSlot("age", 0, entry)
+	for i := 0; i < 4; i++ {
+		cached, ok := prev.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1)))
+		if !ok {
+			t.Fatalf("expected source full-span store %d", i)
+		}
+		cached.Release()
+	}
+	if cached, ok := prev.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5)); ok {
+		cached.Release()
+		t.Fatal("expected first over-capacity span to be observed, not admitted")
+	}
+	cached, ok := prev.TryStoreFullSpan(entry, 0, 4, 4, qcacheTestPosting(5, 1<<32|5))
+	if !ok {
+		t.Fatal("expected second over-capacity span to evict/admit")
+	}
+	cached.Release()
+	if prev.spanRetiredCount != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source retired backlog: count=%d dirty=%v", prev.spanRetiredCount, prev.RetiredDirty())
+	}
+
+	owner.Store(false)
+	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, schema.IndexedFieldMap{"age": {Ordinal: 0}})
+	if prev.spanRetiredCount != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source retired backlog after inherit: count=%d dirty=%v", prev.spanRetiredCount, prev.RetiredDirty())
+	}
+	if next.spanRetiredCount != 0 || next.RetiredDirty() || owner.Load() {
+		t.Fatalf("target retired backlog: count=%d dirty=%v owner=%v", next.spanRetiredCount, next.RetiredDirty(), owner.Load())
+	}
+
+	retained := prev.TakeRetiredBefore(1)
+	if !retained.IsEmpty() {
+		retained.Release()
+		t.Fatal("expected source retired span to remain protected at same safe epoch")
+	}
+	retained.Release()
+	if prev.spanRetiredCount != 1 {
+		t.Fatalf("source retired backlog after protected drain=%d want 1", prev.spanRetiredCount)
+	}
+
+	retired := prev.TakeRetiredBefore(2)
+	if retired.IsEmpty() {
+		t.Fatal("expected source retired span to detach after safe epoch advances")
+	}
+	retired.Release()
+	if prev.spanRetiredCount != 0 || prev.RetiredDirty() {
+		t.Fatalf("source retired backlog after drain: count=%d dirty=%v", prev.spanRetiredCount, prev.RetiredDirty())
+	}
+}
+
+func TestNumericRangeBucketInheritedBorrowedViewSurvivesSourceRelease(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+	idx := NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()}
+
+	prev := GetNumericRangeBucketCache(1)
+	next := GetNumericRangeBucketCache(1)
+	defer ReleaseNumericRangeBucketCache(next)
+
+	entry := GetNumericRangeBucketEntry(storage, idx)
+	prev.StoreSlot("age", 0, entry)
 
 	base := qcacheTestLargePosting()
 	want := base.ToArray()
-	stored, ok := entry.TryStoreFullSpan(0, 0, base.Borrow())
+	stored, ok := prev.TryStoreFullSpan(entry, 0, 0, 0, base.Borrow())
 	if !ok || stored.IsEmpty() {
 		base.Release()
-		entry.Release()
+		ReleaseNumericRangeBucketCache(prev)
 		t.Fatal("expected full-span cache store to succeed")
 	}
 	stored.Release()
 	base.Release()
 
-	retained := entry
-	retained.Retain()
-	defer retained.Release()
+	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, schema.IndexedFieldMap{"age": {Ordinal: 0}})
+	nextEntry, ok := next.LoadField("age")
+	if !ok {
+		ReleaseNumericRangeBucketCache(prev)
+		t.Fatal("expected inherited entry")
+	}
 
-	held, ok := retained.LoadFullSpan(0, 0)
+	held, ok := next.LoadFullSpan(nextEntry, 0, 0, 0)
 	if !ok || held.IsEmpty() {
-		entry.Release()
+		ReleaseNumericRangeBucketCache(prev)
 		t.Fatal("expected retained full-span posting")
 	}
 	defer held.Release()
@@ -608,7 +701,7 @@ func TestNumericRangeBucketEntryRetainedBorrowedViewSurvivesSourceRelease(t *tes
 	for i := 0; i < readerN; i++ {
 		<-ready
 	}
-	entry.Release()
+	ReleaseNumericRangeBucketCache(prev)
 	wg.Wait()
 
 	if msg := failed.Load(); msg != nil {
@@ -650,16 +743,17 @@ func TestNumericRangeBucketIndex_BuildAndFullBucketSpan(t *testing.T) {
 }
 
 func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+	cache, entry := qcacheTestNumericSpanCache(t)
 
 	base := qcacheTestPosting(10, 20, 30, 40)
-	if _, ok := entry.TryStoreFullSpan(4, 10, base); !ok {
+	stored, ok := cache.TryStoreFullSpan(entry, 0, 4, 10, base)
+	if !ok {
 		base.Release()
 		t.Fatal("expected first full span store to succeed")
 	}
+	stored.Release()
 
-	cachedSuffix, startSuffix, endSuffix, ok := entry.LoadExtendedFullSpan(2, 10)
+	cachedSuffix, startSuffix, endSuffix, ok := cache.LoadExtendedFullSpan(entry, 0, 2, 10)
 	if !ok {
 		t.Fatal("expected suffix extension hit")
 	}
@@ -668,7 +762,7 @@ func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
 	}
 	cachedSuffix.Release()
 
-	cachedPrefix, startPrefix, endPrefix, ok := entry.LoadExtendedFullSpan(4, 12)
+	cachedPrefix, startPrefix, endPrefix, ok := cache.LoadExtendedFullSpan(entry, 0, 4, 12)
 	if !ok {
 		t.Fatal("expected prefix extension hit")
 	}
@@ -678,14 +772,129 @@ func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
 	cachedPrefix.Release()
 }
 
+func TestNumericRangeBucketSpanCacheStoresMoreThanRecentRing(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 8, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
+
+	for i := 0; i < 8; i++ {
+		ids, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i+1), uint64(i+101)))
+		if !ok {
+			t.Fatalf("TryStoreFullSpan(%d) rejected before capacity", i)
+		}
+		ids.Release()
+	}
+	if got := cache.FullSpanEntryCount(); got != 8 {
+		t.Fatalf("FullSpanEntryCount=%d want 8", got)
+	}
+
+	recent := 0
+	for i := range entry.fullSpanRecent {
+		if entry.fullSpanRecent[i].used {
+			recent++
+		}
+	}
+	if recent != numericRangeFullSpanRecentMaxEntries {
+		t.Fatalf("recent ring entries=%d want %d", recent, numericRangeFullSpanRecentMaxEntries)
+	}
+
+	for i := 0; i < 8; i++ {
+		ids, ok := cache.LoadFullSpan(entry, 0, i, i)
+		if !ok {
+			t.Fatalf("LoadFullSpan(%d) missed stored span", i)
+		}
+		qcacheTestAssertPostingSet(t, ids, []uint64{uint64(i + 1), uint64(i + 101)})
+		ids.Release()
+	}
+}
+
+func TestNumericRangeBucketSpanCacheStatsTrackAdmissionLifecycle(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 1, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
+
+	ids, ok := cache.TryStoreFullSpan(entry, 0, 0, 0, qcacheTestPosting(1, 2, 3))
+	if !ok {
+		t.Fatal("initial full-span store rejected")
+	}
+	ids.Release()
+
+	hit, ok := cache.LoadFullSpan(entry, 0, 0, 0)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	hit.Release()
+	if miss, ok := cache.LoadFullSpan(entry, 0, 10, 10); ok {
+		miss.Release()
+		t.Fatal("expected cache miss")
+	}
+
+	rejected, ok := cache.TryStoreFullSpan(entry, 0, 1, 1, qcacheTestPosting(4))
+	if ok {
+		rejected.Release()
+		t.Fatal("first observation admitted while cache was full")
+	}
+	rejected.Release()
+
+	admitted, ok := cache.TryStoreFullSpan(entry, 0, 1, 1, qcacheTestPosting(4))
+	if !ok {
+		t.Fatal("second observation did not admit replacement")
+	}
+	admitted.Release()
+
+	rejected, ok = cache.TryStoreFullSpan(entry, 0, 2, 2, qcacheTestPosting(5))
+	if ok {
+		rejected.Release()
+		t.Fatal("first observation admitted while retired backlog was full")
+	}
+	rejected.Release()
+	rejected, ok = cache.TryStoreFullSpan(entry, 0, 2, 2, qcacheTestPosting(5))
+	if ok {
+		rejected.Release()
+		t.Fatal("retired backlog allowed another eviction")
+	}
+	rejected.Release()
+
+	stats := cache.NumericSpanStats()
+	if stats.EntryCount != 1 || stats.CurrentBytes == 0 || stats.RetiredBytes == 0 {
+		t.Fatalf("unexpected span size stats: %+v", stats)
+	}
+	if stats.MaxEntries != 1 || stats.MaxEntryBytes != NumericRangeSpanCacheMaxEntryBytes(0) {
+		t.Fatalf("unexpected span limits: %+v", stats)
+	}
+	if stats.Stores != 2 || stats.Evictions != 1 {
+		t.Fatalf("unexpected span lifecycle counters: %+v", stats)
+	}
+	if stats.RejectedCapacity != 2 || stats.RejectedRetiredBacklog != 1 {
+		t.Fatalf("unexpected span reject counters: %+v", stats)
+	}
+
+	tooLargeCache := GetNumericRangeBucketCacheWithRetireContext(1, 1, 1, NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(tooLargeCache)
+	tooLargeEntry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	tooLargeCache.StoreSlot("age", 0, tooLargeEntry)
+	rejected, ok = tooLargeCache.TryStoreFullSpan(tooLargeEntry, 0, 0, 0, qcacheTestLargePosting())
+	if ok {
+		rejected.Release()
+		t.Fatal("oversized span admitted")
+	}
+	rejected.Release()
+	if stats := tooLargeCache.NumericSpanStats(); stats.RejectedTooLarge != 1 {
+		t.Fatalf("RejectedTooLarge=%d want 1: %+v", stats.RejectedTooLarge, stats)
+	}
+}
+
 func TestNumericRangeFullSpanStoreBorrowedDetachesFromSourceOwner(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+	cache, entry := qcacheTestNumericSpanCache(t)
 
 	base := qcacheTestLargePosting()
 	want := base.ToArray()
 
-	stored, ok := entry.TryStoreFullSpan(3, 7, base.Borrow())
+	stored, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, base.Borrow())
 	if !ok || stored.IsEmpty() {
 		base.Release()
 		t.Fatal("expected numeric full-span cache store to succeed")
@@ -704,7 +913,7 @@ func TestNumericRangeFullSpanStoreBorrowedDetachesFromSourceOwner(t *testing.T) 
 	}
 	base = base.BuildAdded(extra)
 
-	cached, ok := entry.LoadFullSpan(3, 7)
+	cached, ok := cache.LoadFullSpan(entry, 0, 3, 7)
 	if !ok || cached.IsEmpty() {
 		base.Release()
 		t.Fatal("expected cached numeric full-span posting after source mutation")
@@ -725,20 +934,19 @@ func TestNumericRangeFullSpanStoreBorrowedDetachesFromSourceOwner(t *testing.T) 
 }
 
 func TestNumericRangeFullSpanRepeatedStoreSameKeyReturnsCachedPayloadNotCaller(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+	cache, entry := qcacheTestNumericSpanCache(t)
 
 	cachedBase := qcacheTestLargePosting()
 	want := cachedBase.ToArray()
 
-	stored, ok := entry.TryStoreFullSpan(3, 7, cachedBase.Borrow())
+	stored, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, cachedBase.Borrow())
 	if !ok || stored.IsEmpty() {
 		cachedBase.Release()
 		t.Fatal("expected initial numeric full-span store to succeed")
 	}
 	stored.Release()
 
-	cached, ok := entry.LoadFullSpan(3, 7)
+	cached, ok := cache.LoadFullSpan(entry, 0, 3, 7)
 	if !ok || cached.IsEmpty() {
 		cachedBase.Release()
 		t.Fatal("expected seeded cached numeric full-span posting")
@@ -754,7 +962,7 @@ func TestNumericRangeFullSpanRepeatedStoreSameKeyReturnsCachedPayloadNotCaller(t
 	}
 	source = source.BuildAdded(extraSource)
 
-	got, ok := entry.TryStoreFullSpan(3, 7, source.Borrow())
+	got, ok := cache.TryStoreFullSpan(entry, 0, 3, 7, source.Borrow())
 	if !ok || got.IsEmpty() {
 		source.Release()
 		cachedBase.Release()
@@ -781,7 +989,7 @@ func TestNumericRangeFullSpanRepeatedStoreSameKeyReturnsCachedPayloadNotCaller(t
 	}
 	source = source.BuildAdded(extraMut)
 
-	reloaded, ok := entry.LoadFullSpan(3, 7)
+	reloaded, ok := cache.LoadFullSpan(entry, 0, 3, 7)
 	if !ok || reloaded.IsEmpty() {
 		source.Release()
 		cachedBase.Release()
@@ -809,9 +1017,194 @@ func TestNumericRangeFullSpanRepeatedStoreSameKeyReturnsCachedPayloadNotCaller(t
 	cachedBase.Release()
 }
 
+func TestNumericRangeExactResultCachePromotesOnRepeatAndDetachesBorrowedInput(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), 2, NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	source := qcacheTestLargePosting()
+	want := source.ToArray()
+
+	rejected, ok := cache.TryStoreExactResult(0, 100, 900, source.Borrow())
+	if ok {
+		rejected.Release()
+		source.Release()
+		t.Fatal("first exact result observation admitted")
+	}
+	if !rejected.SharesPayload(source) {
+		rejected.Release()
+		source.Release()
+		t.Fatal("first exact result observation did not return caller payload")
+	}
+	rejected.Release()
+	if got := cache.ExactResultEntryCount(); got != 0 {
+		source.Release()
+		t.Fatalf("exact entries after first observation=%d want 0", got)
+	}
+
+	stored, ok := cache.TryStoreExactResult(0, 100, 900, source.Borrow())
+	if !ok {
+		source.Release()
+		t.Fatal("second exact result observation did not admit")
+	}
+	if stored.SharesPayload(source) {
+		stored.Release()
+		source.Release()
+		t.Fatal("borrowed exact result store kept caller payload")
+	}
+	stored.Release()
+
+	extra := uint64(1<<32 | 17)
+	if source.Contains(extra) {
+		source.Release()
+		t.Fatalf("test setup chose existing id %d", extra)
+	}
+	source = source.BuildAdded(extra)
+
+	cached, ok := cache.LoadExactResult(0, 100, 900)
+	if !ok {
+		source.Release()
+		t.Fatal("expected exact result cache hit")
+	}
+	if !slices.Equal(cached.ToArray(), want) {
+		cached.Release()
+		source.Release()
+		t.Fatalf("cached exact result changed after source mutation: got=%v want=%v", cached.ToArray(), want)
+	}
+	if cached.Contains(extra) {
+		cached.Release()
+		source.Release()
+		t.Fatalf("cached exact result leaked caller mutation id=%d", extra)
+	}
+	cached.Release()
+	source.Release()
+
+	stats := cache.NumericExactResultStats()
+	if stats.EntryCount != 1 || stats.Stores != 1 || stats.RejectedFirstObservation != 1 {
+		t.Fatalf("unexpected exact result stats: %+v", stats)
+	}
+}
+
+func TestNumericRangeExactResultCacheEvictsAndBacklogRejectsUntilDrain(t *testing.T) {
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), 1, NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	for i := 0; i < 2; i++ {
+		ids := qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1))
+		if probe, ok := cache.TryStoreExactResult(0, i, i+10, ids.Borrow()); ok {
+			probe.Release()
+			ids.Release()
+			t.Fatalf("first exact observation %d admitted", i)
+		} else {
+			probe.Release()
+		}
+		stored, ok := cache.TryStoreExactResult(0, i, i+10, ids)
+		if !ok {
+			t.Fatalf("second exact observation %d rejected", i)
+		}
+		stored.Release()
+	}
+	if cache.exactRetiredCount != 1 || !cache.RetiredDirty() {
+		t.Fatalf("exact retired backlog after eviction: count=%d dirty=%v", cache.exactRetiredCount, cache.RetiredDirty())
+	}
+
+	ids := qcacheTestPosting(99, 1<<32|99)
+	if probe, ok := cache.TryStoreExactResult(0, 99, 199, ids.Borrow()); ok {
+		probe.Release()
+		ids.Release()
+		t.Fatal("first exact observation while retired backlog full admitted")
+	} else {
+		probe.Release()
+	}
+	rejected, ok := cache.TryStoreExactResult(0, 99, 199, ids)
+	if ok {
+		rejected.Release()
+		t.Fatal("exact retired backlog allowed another eviction")
+	}
+	rejected.Release()
+
+	retired := cache.TakeRetired()
+	if retired.IsEmpty() {
+		t.Fatal("expected exact retired payloads to detach")
+	}
+	retired.Release()
+	if cache.exactRetiredCount != 0 || cache.exactRetiredBytes != 0 || cache.RetiredDirty() {
+		t.Fatalf("exact retired accounting after drain: count=%d bytes=%d dirty=%v", cache.exactRetiredCount, cache.exactRetiredBytes, cache.RetiredDirty())
+	}
+}
+
+func TestNumericRangeExactResultCacheInheritsLiveEntriesAndKeepsRetiredOnSource(t *testing.T) {
+	storage := qcacheTestFieldStorage(32, 100)
+	defer storage.Release()
+
+	var owner atomic.Bool
+	var epoch atomic.Uint64
+	epoch.Store(1)
+
+	prev := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), 1, NumericRangeExactCacheMaxEntryBytes(0), &owner, &epoch)
+	defer ReleaseNumericRangeBucketCache(prev)
+
+	next := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), 1, NumericRangeExactCacheMaxEntryBytes(0), &owner, &epoch)
+	defer ReleaseNumericRangeBucketCache(next)
+
+	entry := GetNumericRangeBucketEntry(storage, NumericRangeBucketIndex{bucketSize: 16, keyCount: storage.KeyCount()})
+	prev.StoreSlot("age", 0, entry)
+
+	for i := 0; i < 2; i++ {
+		ids := qcacheTestPosting(uint64(i+1), 1<<32|uint64(i+1))
+		if probe, ok := prev.TryStoreExactResult(0, i, i+10, ids.Borrow()); ok {
+			probe.Release()
+			ids.Release()
+			t.Fatalf("first exact observation %d admitted", i)
+		} else {
+			probe.Release()
+		}
+		stored, ok := prev.TryStoreExactResult(0, i, i+10, ids)
+		if !ok {
+			t.Fatalf("second exact observation %d rejected", i)
+		}
+		stored.Release()
+	}
+	if prev.exactRetiredCount != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source exact retired backlog: count=%d dirty=%v", prev.exactRetiredCount, prev.RetiredDirty())
+	}
+
+	owner.Store(false)
+	next.InheritFrom(prev, []indexdata.FieldStorage{storage}, schema.IndexedFieldMap{"age": {Ordinal: 0}})
+	if prev.exactRetiredCount != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source exact retired backlog after inherit: count=%d dirty=%v", prev.exactRetiredCount, prev.RetiredDirty())
+	}
+	if next.exactRetiredCount != 0 || next.RetiredDirty() || owner.Load() {
+		t.Fatalf("target exact retired backlog: count=%d dirty=%v owner=%v", next.exactRetiredCount, next.RetiredDirty(), owner.Load())
+	}
+	if got, ok := next.LoadExactResult(0, 1, 11); !ok {
+		t.Fatal("expected live exact result to inherit")
+	} else {
+		qcacheTestAssertPostingSet(t, got, []uint64{2, 1<<32 | 2})
+		got.Release()
+	}
+
+	retained := prev.TakeRetiredBefore(1)
+	if !retained.IsEmpty() {
+		retained.Release()
+		t.Fatal("expected same-epoch exact retired payload to remain protected")
+	}
+	retained.Release()
+	if prev.exactRetiredCount != 1 {
+		t.Fatalf("source exact retired backlog after protected drain=%d want 1", prev.exactRetiredCount)
+	}
+
+	retired := prev.TakeRetiredBefore(2)
+	if retired.IsEmpty() {
+		t.Fatal("expected exact retired payload to detach after safe epoch advances")
+	}
+	retired.Release()
+	if prev.exactRetiredCount != 0 || prev.RetiredDirty() {
+		t.Fatalf("source exact retired backlog after drain: count=%d dirty=%v", prev.exactRetiredCount, prev.RetiredDirty())
+	}
+}
+
 func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+	cache, entry := qcacheTestNumericSpanCache(t)
 
 	base := qcacheTestPosting()
 	for i := uint64(1); i <= 48; i++ {
@@ -821,7 +1214,7 @@ func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) 
 
 	stored := base.Borrow()
 	var ok bool
-	stored, ok = entry.TryStoreFullSpan(11, 23, stored)
+	stored, ok = cache.TryStoreFullSpan(entry, 0, 11, 23, stored)
 	if !ok {
 		t.Fatal("expected initial full-span store to succeed")
 	}
@@ -852,7 +1245,7 @@ func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) 
 			defer wg.Done()
 			<-start
 			for i := 0; i < 1000; i++ {
-				cached, ok := entry.LoadFullSpan(11, 23)
+				cached, ok := cache.LoadFullSpan(entry, 0, 11, 23)
 				if !ok {
 					setFailed("full-span cache entry unexpectedly missing")
 					return
@@ -872,7 +1265,7 @@ func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) 
 		defer wg.Done()
 		<-start
 		for i := 0; i < 300; i++ {
-			cached, ok := entry.LoadFullSpan(11, 23)
+			cached, ok := cache.LoadFullSpan(entry, 0, 11, 23)
 			if !ok {
 				setFailed("writer unexpectedly missed full-span cache entry")
 				return
@@ -891,7 +1284,7 @@ func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) 
 		t.Fatal(*msg)
 	}
 
-	cached, ok := entry.LoadFullSpan(11, 23)
+	cached, ok := cache.LoadFullSpan(entry, 0, 11, 23)
 	if !ok {
 		t.Fatal("full-span cache entry missing after concurrent mutations")
 	}
@@ -900,8 +1293,11 @@ func TestNumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) 
 }
 
 func TestNumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t *testing.T) {
-	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{}, 0)
-	defer entry.Release()
+	cache := GetNumericRangeBucketCacheWithRetireContext(1, 4, NumericRangeSpanCacheMaxEntryBytes(0), NumericRangeExactCacheMaxEntries(0), NumericRangeExactCacheMaxEntryBytes(0), nil, nil)
+	defer ReleaseNumericRangeBucketCache(cache)
+
+	entry := GetNumericRangeBucketEntry(indexdata.FieldStorage{}, NumericRangeBucketIndex{})
+	cache.StoreSlot("age", 0, entry)
 
 	base := qcacheTestPosting()
 	for i := uint64(1); i <= 48; i++ {
@@ -910,18 +1306,26 @@ func TestNumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t *testing.T
 	want := base.ToArray()
 
 	stored := base.Borrow()
-	stored, ok := entry.TryStoreFullSpan(0, 0, stored)
+	stored, ok := cache.TryStoreFullSpan(entry, 0, 0, 0, stored)
 	if !ok {
 		t.Fatal("expected initial full-span store to succeed")
 	}
 	stored.Release()
 	base.Release()
 
-	held, ok := entry.LoadFullSpan(0, 0)
+	held, ok := cache.LoadFullSpan(entry, 0, 0, 0)
 	if !ok || held.IsEmpty() {
 		t.Fatal("expected held full-span cache entry")
 	}
 	defer held.Release()
+
+	for i := 1; i < 4; i++ {
+		cached, ok := cache.TryStoreFullSpan(entry, 0, i, i, qcacheTestPosting(uint64(i), 1<<32|uint64(i)))
+		if !ok {
+			t.Fatalf("expected prefill span %d to store", i)
+		}
+		cached.Release()
+	}
 
 	var failed atomic.Pointer[string]
 	setFailed := func(msg string) {
@@ -954,10 +1358,18 @@ func TestNumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t *testing.T
 	go func() {
 		defer wg.Done()
 		<-start
-		for i := 1; i < numericRangeFullSpanCacheMaxEntries*2; i++ {
+		for i := 4; i < 8; i++ {
 			ids := qcacheTestPosting(uint64(i), 1<<32|uint64(i))
 			var ok bool
-			ids, ok = entry.TryStoreFullSpan(i, i, ids)
+			probe, ok := cache.TryStoreFullSpan(entry, 0, i, i, ids.Borrow())
+			if ok {
+				probe.Release()
+				ids.Release()
+				setFailed(fmt.Sprintf("first tryStoreFullSpan(%d,%d) admitted unexpectedly", i, i))
+				return
+			}
+			probe.Release()
+			ids, ok = cache.TryStoreFullSpan(entry, 0, i, i, ids)
 			if !ok {
 				setFailed(fmt.Sprintf("tryStoreFullSpan(%d,%d) failed", i, i))
 				return

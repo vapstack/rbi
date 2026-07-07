@@ -47,9 +47,13 @@ type Config struct {
 	AsyncMaterializedPredMaxWorkers int
 	asyncMaterializedPredStats      bool
 
-	NumericRangeBucketSize         int
-	NumericRangeBucketMinFieldKeys int
-	NumericRangeBucketMinSpanKeys  int
+	NumericRangeBucketSize              int
+	NumericRangeBucketMinFieldKeys      int
+	NumericRangeBucketMinSpanKeys       int
+	NumericRangeSpanCacheMaxEntries     int
+	NumericRangeSpanCacheMaxEntryBytes  int64
+	NumericRangeExactCacheMaxEntries    int
+	NumericRangeExactCacheMaxEntryBytes int64
 
 	AnalyzeInterval time.Duration
 
@@ -62,9 +66,13 @@ type Runtime struct {
 	StrKey  bool
 	KeyMode KeyMode
 
-	NumericRangeBucketSize         int
-	NumericRangeBucketMinFieldKeys int
-	NumericRangeBucketMinSpanKeys  int
+	NumericRangeBucketSize              int
+	NumericRangeBucketMinFieldKeys      int
+	NumericRangeBucketMinSpanKeys       int
+	NumericRangeSpanCacheMaxEntries     int
+	NumericRangeSpanCacheMaxEntryBytes  int64
+	NumericRangeExactCacheMaxEntries    int
+	NumericRangeExactCacheMaxEntryBytes int64
 
 	StatsVersion atomic.Uint64
 	Stats        atomic.Pointer[rbistats.PlannerSnapshot]
@@ -83,12 +91,16 @@ type Runtime struct {
 func NewRuntime(cfg Config) *Runtime {
 	fields, fieldByName, keyOrdinal := buildQueryFieldCatalog(cfg.Schema, cfg.KeyMode)
 	return &Runtime{
-		Schema:                         cfg.Schema,
-		StrKey:                         cfg.StrKey,
-		KeyMode:                        cfg.KeyMode,
-		NumericRangeBucketSize:         cfg.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:  cfg.NumericRangeBucketMinSpanKeys,
+		Schema:                              cfg.Schema,
+		StrKey:                              cfg.StrKey,
+		KeyMode:                             cfg.KeyMode,
+		NumericRangeBucketSize:              cfg.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:      cfg.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:       cfg.NumericRangeBucketMinSpanKeys,
+		NumericRangeSpanCacheMaxEntries:     cfg.NumericRangeSpanCacheMaxEntries,
+		NumericRangeSpanCacheMaxEntryBytes:  cfg.NumericRangeSpanCacheMaxEntryBytes,
+		NumericRangeExactCacheMaxEntries:    cfg.NumericRangeExactCacheMaxEntries,
+		NumericRangeExactCacheMaxEntryBytes: cfg.NumericRangeExactCacheMaxEntryBytes,
 		Analyzer: &Analyzer{
 			Interval: cfg.AnalyzeInterval,
 		},

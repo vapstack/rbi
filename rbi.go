@@ -207,17 +207,53 @@ type Options struct {
 	//
 	// Default: 1024
 	NumericRangeBucketMinSpanKeys int
+
+	// NumericRangeSpanCacheMaxEntries controls the number of snapshot-local
+	// cached full-bucket numeric range spans.
+	//
+	// Negative value disables full-span admission/storage.
+	//
+	// Default: 128
+	NumericRangeSpanCacheMaxEntries int
+
+	// NumericRangeSpanCacheMaxEntryBytes rejects cached full-bucket numeric
+	// range spans larger than this size.
+	//
+	// Negative value disables full-span admission/storage.
+	//
+	// Default: 16MiB
+	NumericRangeSpanCacheMaxEntryBytes int64
+
+	// NumericRangeExactCacheMaxEntries controls the number of snapshot-local
+	// cached exact numeric range results promoted after repeated use.
+	//
+	// Negative value disables exact-result admission/storage.
+	//
+	// Default: 32
+	NumericRangeExactCacheMaxEntries int
+
+	// NumericRangeExactCacheMaxEntryBytes rejects cached exact numeric range
+	// results larger than this size.
+	//
+	// Negative value disables exact-result admission/storage.
+	//
+	// Default: 16MiB
+	NumericRangeExactCacheMaxEntryBytes int64
 }
 
 const (
-	defaultOptionsAnalyzeInterval                   = time.Hour
-	defaultBucketFillPercent                        = 0.8
-	defaultMaterializedPredicateCacheMaxEntries     = 32
-	defaultMaterializedPredicateCacheMaxCardinality = 128 << 10
-	defaultBatchSoftLimit                           = 64
-	defaultNumericRangeBucketSize                   = 512
-	defaultNumericRangeBucketMinFieldKeys           = 8192
-	defaultNumericRangeBucketMinSpanKeys            = 1024
+	defaultOptionsAnalyzeInterval                         = time.Hour
+	defaultBucketFillPercent                              = 0.8
+	defaultMaterializedPredicateCacheMaxEntries           = 32
+	defaultMaterializedPredicateCacheMaxCardinality       = 128 << 10
+	defaultBatchSoftLimit                                 = 64
+	defaultNumericRangeBucketSize                         = 512
+	defaultNumericRangeBucketMinFieldKeys                 = 8192
+	defaultNumericRangeBucketMinSpanKeys                  = 1024
+	defaultNumericRangeSpanCacheMaxEntries                = 128
+	defaultNumericRangeSpanCacheMaxEntryBytes       int64 = 16 << 20
+	defaultNumericRangeExactCacheMaxEntries               = 32
+	defaultNumericRangeExactCacheMaxEntryBytes      int64 = 16 << 20
 )
 
 func (o *Options) setDefaults() {
@@ -250,6 +286,18 @@ func (o *Options) setDefaults() {
 	}
 	if o.NumericRangeBucketMinSpanKeys == 0 {
 		o.NumericRangeBucketMinSpanKeys = defaultNumericRangeBucketMinSpanKeys
+	}
+	if o.NumericRangeSpanCacheMaxEntries == 0 {
+		o.NumericRangeSpanCacheMaxEntries = defaultNumericRangeSpanCacheMaxEntries
+	}
+	if o.NumericRangeSpanCacheMaxEntryBytes == 0 {
+		o.NumericRangeSpanCacheMaxEntryBytes = defaultNumericRangeSpanCacheMaxEntryBytes
+	}
+	if o.NumericRangeExactCacheMaxEntries == 0 {
+		o.NumericRangeExactCacheMaxEntries = defaultNumericRangeExactCacheMaxEntries
+	}
+	if o.NumericRangeExactCacheMaxEntryBytes == 0 {
+		o.NumericRangeExactCacheMaxEntryBytes = defaultNumericRangeExactCacheMaxEntryBytes
 	}
 }
 
@@ -405,9 +453,13 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 		RuntimeCachesDirtyOwner:             &root.registry.runtimeCachesDirty,
 		RuntimeCachesRetireEpoch:            &root.registry.runtimeEpoch.issued,
 
-		NumericRangeBucketSize:         c.options.NumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys: c.options.NumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:  c.options.NumericRangeBucketMinSpanKeys,
+		NumericRangeBucketSize:              c.options.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:      c.options.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:       c.options.NumericRangeBucketMinSpanKeys,
+		NumericRangeSpanCacheMaxEntries:     c.options.NumericRangeSpanCacheMaxEntries,
+		NumericRangeSpanCacheMaxEntryBytes:  c.options.NumericRangeSpanCacheMaxEntryBytes,
+		NumericRangeExactCacheMaxEntries:    c.options.NumericRangeExactCacheMaxEntries,
+		NumericRangeExactCacheMaxEntryBytes: c.options.NumericRangeExactCacheMaxEntryBytes,
 
 		AnalyzeInterval: plannerAnalyzeInterval(c.options.AnalyzeInterval),
 

@@ -57,6 +57,18 @@ func TestBuildRBIOptions(t *testing.T) {
 	if opts.NumericRangeBucketMinSpanKeys != -1 {
 		t.Fatalf("NumericRangeBucketMinSpanKeys = %d, want -1", opts.NumericRangeBucketMinSpanKeys)
 	}
+	if opts.NumericRangeSpanCacheMaxEntries != -1 {
+		t.Fatalf("NumericRangeSpanCacheMaxEntries = %d, want -1", opts.NumericRangeSpanCacheMaxEntries)
+	}
+	if opts.NumericRangeSpanCacheMaxEntryBytes != -1 {
+		t.Fatalf("NumericRangeSpanCacheMaxEntryBytes = %d, want -1", opts.NumericRangeSpanCacheMaxEntryBytes)
+	}
+	if opts.NumericRangeExactCacheMaxEntries != -1 {
+		t.Fatalf("NumericRangeExactCacheMaxEntries = %d, want -1", opts.NumericRangeExactCacheMaxEntries)
+	}
+	if opts.NumericRangeExactCacheMaxEntryBytes != -1 {
+		t.Fatalf("NumericRangeExactCacheMaxEntryBytes = %d, want -1", opts.NumericRangeExactCacheMaxEntryBytes)
+	}
 	if opts.TraceSink == nil || opts.TraceSampleEvery != 17 {
 		t.Fatalf("trace = sink:%v every:%d, want non-nil/17", opts.TraceSink == nil, opts.TraceSampleEvery)
 	}

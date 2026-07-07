@@ -10,6 +10,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 )
 
@@ -609,6 +610,7 @@ type fieldIndexRangePredicateState struct {
 	probeMaterializeAt    int
 	rangeMaterializeAt    int
 	postingFilterCalls    int
+	numericSpan           numericRangeBucketSpan
 	rangeMaterialized     bool
 	probeMaterialized     bool
 	linearPostsBuf        []posting.List
@@ -669,10 +671,14 @@ func (state *fieldIndexRangePredicateState) materializeRange() posting.List {
 			return state.rangeIDs
 		}
 	}
-	state.rangeIDs = state.ov.UnionRangePostings(state.br, indexdata.FieldIndexRange{})
+	if state.numericSpan.entry != nil {
+		state.rangeIDs = evalNumericRangeBucketSpan(state.ov, state.br, state.numericSpan).ids
+	} else {
+		state.rangeIDs = state.ov.UnionRangePostings(state.br, indexdata.FieldIndexRange{})
+	}
 	state.rangeMaterialized = true
 	state.releaseLinearPosts()
-	if !state.probe.useComplement {
+	if !state.probe.useComplement && state.numericSpan.entry == nil {
 		state.rangeIDs = state.reuse.share(state.rangeIDs)
 	}
 	return state.rangeIDs
@@ -975,6 +981,9 @@ func (qv *View) materializedPredKeyForExactScalarRange(field string, bounds inde
 	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
+	if qv.exactScalarRangeUsesNumericBucketCache(field, bounds) {
+		return qcache.MaterializedPredKey{}
+	}
 	return qcache.MaterializedPredKeyForExactScalarRange(field, bounds)
 }
 
@@ -983,6 +992,31 @@ func (qv *View) materializedPredComplementKeyForExactScalarRange(field string, b
 		return qcache.MaterializedPredKey{}
 	}
 	return qcache.MaterializedPredComplementKeyForExactScalarRange(field, bounds)
+}
+
+func (qv *View) exactScalarRangeUsesNumericBucketCache(field string, bounds indexdata.Bounds) bool {
+	fieldOrdinal, ok := qv.exec.fieldByName[field]
+	if !ok {
+		return false
+	}
+	desc := qv.exec.fields[fieldOrdinal]
+	if desc.storageOrdinal < 0 {
+		return false
+	}
+	fm := qv.fieldMetaByOrdinal(fieldOrdinal)
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
+		return false
+	}
+	ov := qv.indexViewByOrdinal(fieldOrdinal)
+	if !ov.HasData() {
+		return false
+	}
+	br := ov.RangeForBounds(bounds)
+	if br.Empty() {
+		return false
+	}
+	_, ok = qv.numericRangeBucketSpan(field, fieldOrdinal, fm, ov, br)
+	return ok
 }
 
 /**/

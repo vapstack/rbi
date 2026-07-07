@@ -445,6 +445,68 @@ func TestCountScalarInSplit_BroadSingleValueIN(t *testing.T) {
 	}
 }
 
+func TestCountBroadNumericRangeWithScalarINUsesNumericBucketPredicates(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxCardinality: 1,
+		NumericRangeBucketSize:                      128,
+		NumericRangeBucketMinFieldKeys:              1,
+		NumericRangeBucketMinSpanKeys:               1,
+		NumericRangeSpanCacheMaxEntries:             8,
+	})
+
+	const rows = cardinalityNumericBucketExactMinRows + 1024
+	const startAge = 512
+	ids := make([]uint64, rows)
+	vals := make([]*Rec, rows)
+	for i := 0; i < rows; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &Rec{
+			Meta: Meta{Country: "US"},
+			Name: fmt.Sprintf("n%05d", i),
+			Age:  i,
+		}
+	}
+	if err := db.MultiSet(ids, vals); err != nil {
+		t.Fatalf("MultiSet: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.IN("country", []string{"US"}),
+		qx.GTE("age", startAge),
+	)
+	prepared, compiled, err := prepareTestExpr(db.engine, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.currentQueryViewForTests()
+	if got, ok, err := view.TryFilterCardinalityByScalarInSplit(compiled, nil); err != nil {
+		t.Fatalf("TryFilterCardinalityByScalarInSplit: %v", err)
+	} else if ok {
+		t.Fatalf("scalar IN split was used for bucket-countable numeric range, got=%d", got)
+	}
+
+	trace := &Trace{}
+	got, ok, err := view.TryFilterCardinalityByPredicates(compiled, trace)
+	if err != nil {
+		t.Fatalf("TryFilterCardinalityByPredicates: %v", err)
+	}
+	if !ok {
+		t.Fatal("TryFilterCardinalityByPredicates was not used")
+	}
+	want := uint64(rows - startAge)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if trace.Event().Plan != rbitrace.PlanCountPredicates {
+		t.Fatalf("expected plan %q, got %q", rbitrace.PlanCountPredicates, trace.Event().Plan)
+	}
+	if got := db.engine.snapshot.Current().NumericRangeBucketCache().FullSpanEntryCount(); got != 0 {
+		t.Fatalf("count route populated numeric full-span cache: entries=%d", got)
+	}
+}
+
 func TestCardinalityORByPredicates_DisjointScalarEQBranches(t *testing.T) {
 	db := newCorrectnessDB(t)
 

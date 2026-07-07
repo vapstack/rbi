@@ -1347,9 +1347,6 @@ func (qv *View) shouldScheduleObservedOrderBasicBaseCore(
 		return qv.shouldScheduleObservedPreparedScalarExactRange(core.collapsed, observedRows, needWindow)
 
 	case orderBasicBaseCoreRawExpr:
-		if qv.snap.MaterializedPredCacheLimit() <= 0 {
-			return false
-		}
 		return qv.shouldScheduleObservedOrderBasicRawBaseOp(
 			orderField,
 			core.expr,
@@ -1373,6 +1370,27 @@ func (qv *View) materializedPredObservationCandidate(key qcache.MaterializedPred
 	return qv.snap.AllowsMaterializedPredCard(est) || qv.snap.MaterializedPredCacheOversizedLimit() > 0
 }
 
+func (qv *View) shouldPromoteObservedNumericWarmup(plan asyncMaterializedPredPlan, observedWork, buildWork uint64) bool {
+	if observedWork == 0 || buildWork == 0 {
+		return false
+	}
+	switch plan.kind {
+
+	case asyncMaterializedPredPlanNumericExact:
+		return qv.snap.ShouldPromoteObservedNumericRangeExactResult(
+			plan.fieldSlot,
+			plan.startRank,
+			plan.endRank,
+			observedWork,
+			asyncMaterializedPredObservedThreshold(buildWork),
+		)
+
+	case asyncMaterializedPredPlanNumericSpan:
+		return observedWork >= asyncMaterializedPredObservedThreshold(buildWork)
+	}
+	return false
+}
+
 func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core orderBasicBaseCore, universe uint64) bool {
 	switch core.kind {
 
@@ -1382,6 +1400,9 @@ func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core o
 			return false
 		}
 		buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+		if _, ok, handled := qv.asyncNumericRangePlanForBounds(core.collapsed.fieldOrdinal, core.collapsed.bounds); handled {
+			return ok && buildWork != 0
+		}
 		return qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork)
 
 	case orderBasicBaseCoreRawExpr:
@@ -1394,6 +1415,9 @@ func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core o
 			return false
 		}
 		buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+		if plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(core); ok && plan.kind.numericRange() {
+			return buildWork != 0
+		}
 		return qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork)
 
 	default:
@@ -1402,7 +1426,7 @@ func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core o
 }
 
 func (qv *View) hasOrderBasicBaseOpObservationCandidate(orderField string, baseOps []qir.Expr) bool {
-	if qv.snap.MaterializedPredCacheLimit() <= 0 || len(baseOps) == 0 {
+	if len(baseOps) == 0 {
 		return false
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1440,7 +1464,7 @@ func (qv *View) hasOrderBasicBaseOpObservationCandidate(orderField string, baseO
 }
 
 func (qv *View) hasLimitLeafPredObservationCandidate(orderField string, preds []leafPred) bool {
-	if qv.snap.MaterializedPredCacheLimit() <= 0 || len(preds) == 0 {
+	if len(preds) == 0 {
 		return false
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1470,14 +1494,6 @@ func (qv *View) hasLimitLeafPredObservationCandidate(orderField string, preds []
 		}
 	}
 	return false
-}
-
-func (qv *View) scheduleObservedOrderBasicBaseCore(core orderBasicBaseCore) {
-	plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(core)
-	if !ok {
-		return
-	}
-	qv.scheduleAsyncMaterializedPredWarmup(plan)
 }
 
 func (qv *View) loadFirstWarmOrderBasicBaseCore(cores []orderBasicBaseCore) (int, postingResult, bool) {
@@ -1523,7 +1539,7 @@ func (qv *View) shouldScheduleObservedOrderBasicRawBaseOp(
 	}
 	stats, ok := qv.orderBasicRawBaseOpStats(op, universe)
 	emptyComplement := ok && stats.buildComplement && stats.buildEst == 0
-	if !ok || stats.cacheKey.IsZero() || (!emptyComplement && (stats.probeBuckets == 0 || stats.probeEst == 0)) {
+	if !ok || (!emptyComplement && (stats.probeBuckets == 0 || stats.probeEst == 0)) {
 		return false
 	}
 
@@ -1531,7 +1547,16 @@ func (qv *View) shouldScheduleObservedOrderBasicRawBaseOp(
 	if buildWork == 0 {
 		return false
 	}
-	if !qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork) {
+
+	var numericPlan asyncMaterializedPredPlan
+	numericHandled := false
+	if plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(orderBasicBaseCore{
+		kind: orderBasicBaseCoreRawExpr,
+		expr: op,
+	}); ok && plan.kind.numericRange() {
+		numericPlan = plan
+		numericHandled = true
+	} else if !qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork) {
 		return false
 	}
 
@@ -1543,11 +1568,14 @@ func (qv *View) shouldScheduleObservedOrderBasicRawBaseOp(
 	if probeWork == 0 {
 		return false
 	}
+	if numericHandled {
+		return qv.shouldPromoteObservedNumericWarmup(numericPlan, probeWork, buildWork)
+	}
 	return qv.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, probeWork, asyncMaterializedPredObservedThreshold(buildWork))
 }
 
 func (qv *View) scheduleOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
-	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(baseOps) == 0 || observedRows == 0 {
+	if qv.snap == nil || len(baseOps) == 0 || observedRows == 0 {
 		return
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1569,8 +1597,8 @@ func (qv *View) scheduleOrderBasicLimitMaterializedBaseOps(orderField string, ba
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 
-	keysBuf := qcache.GetMaterializedPredKeySlice(len(coresBuf))
-	defer qcache.ReleaseMaterializedPredKeySlice(keysBuf)
+	plansBuf := asyncMaterializedPredPlanSlicePool.Get(len(coresBuf))
+	defer asyncMaterializedPredPlanSlicePool.Put(plansBuf)
 
 	for i := 0; i < len(coresBuf); i++ {
 		core := coresBuf[i]
@@ -1594,22 +1622,14 @@ func (qv *View) scheduleOrderBasicLimitMaterializedBaseOps(orderField string, ba
 		if !qv.shouldScheduleObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
 			continue
 		}
-		key := qcache.MaterializedPredKey{}
-		switch core.kind {
-		case orderBasicBaseCoreCollapsedRange:
-			key = core.collapsed.cacheKey
-		case orderBasicBaseCoreRawExpr:
-			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snap.Universe.Cardinality())
-			if ok {
-				key = stats.cacheKey
-			}
-		}
-		if key.IsZero() {
+		plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(core)
+		if !ok {
 			continue
 		}
+		taskKey := plan.taskKey()
 		seen := false
-		for j := 0; j < len(keysBuf); j++ {
-			if keysBuf[j] == key {
+		for j := 0; j < len(plansBuf); j++ {
+			if plansBuf[j].taskKey() == taskKey {
 				seen = true
 				break
 			}
@@ -1617,13 +1637,13 @@ func (qv *View) scheduleOrderBasicLimitMaterializedBaseOps(orderField string, ba
 		if seen {
 			continue
 		}
-		keysBuf = append(keysBuf, key)
-		qv.scheduleObservedOrderBasicBaseCore(core)
+		plansBuf = append(plansBuf, plan)
+		qv.scheduleAsyncMaterializedPredWarmup(plan)
 	}
 }
 
 func (qv *View) scheduleObservedLimitLeafPreds(orderField string, preds []leafPred, observedRows uint64, needWindow uint64) {
-	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(preds) == 0 || observedRows == 0 {
+	if qv.snap == nil || len(preds) == 0 || observedRows == 0 {
 		return
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1631,8 +1651,8 @@ func (qv *View) scheduleObservedLimitLeafPreds(orderField string, preds []leafPr
 		return
 	}
 
-	keysBuf := qcache.GetMaterializedPredKeySlice(len(preds))
-	defer qcache.ReleaseMaterializedPredKeySlice(keysBuf)
+	plansBuf := asyncMaterializedPredPlanSlicePool.Get(len(preds))
+	defer asyncMaterializedPredPlanSlicePool.Put(plansBuf)
 
 	for i := 0; i < len(preds); i++ {
 		pred := preds[i]
@@ -1659,26 +1679,15 @@ func (qv *View) scheduleObservedLimitLeafPreds(orderField string, preds []leafPr
 			continue
 		}
 
-		key := qcache.MaterializedPredKey{}
-
-		switch core.kind {
-		case orderBasicBaseCoreCollapsedRange:
-			key = core.collapsed.cacheKey
-
-		case orderBasicBaseCoreRawExpr:
-			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, universe)
-			if ok {
-				key = stats.cacheKey
-			}
-		}
-
-		if key.IsZero() {
+		plan, ok := qv.asyncMaterializedPredPlanForOrderBasicBaseCore(core)
+		if !ok {
 			continue
 		}
 
+		taskKey := plan.taskKey()
 		seen := false
-		for j := 0; j < len(keysBuf); j++ {
-			if keysBuf[j] == key {
+		for j := 0; j < len(plansBuf); j++ {
+			if plansBuf[j].taskKey() == taskKey {
 				seen = true
 				break
 			}
@@ -1686,9 +1695,8 @@ func (qv *View) scheduleObservedLimitLeafPreds(orderField string, preds []leafPr
 		if seen {
 			continue
 		}
-		keysBuf = append(keysBuf, key)
-
-		qv.scheduleObservedOrderBasicBaseCore(core)
+		plansBuf = append(plansBuf, plan)
+		qv.scheduleAsyncMaterializedPredWarmup(plan)
 	}
 }
 

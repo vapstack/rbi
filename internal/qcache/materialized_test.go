@@ -25,6 +25,10 @@ func requireZeroAllocsAfterWarmupQCache(t *testing.T, fn func()) {
 	}
 }
 
+func materializedPredTestKey(field string, start, end int) MaterializedPredKey {
+	return MaterializedPredKeyFromOpaque(fmt.Sprintf("%s:%d:%d", field, start, end))
+}
+
 func qcacheTestPosting(ids ...uint64) posting.List {
 	var out posting.List
 	for _, id := range ids {
@@ -256,7 +260,7 @@ func TestMaterializedPredCacheInitClearsEntriesIndexAndCounters(t *testing.T) {
 	defer large.Release()
 
 	regularKey := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user")
-	oversizedKey := MaterializedPredKeyForNumericBucketSpan("age", 3, 7)
+	oversizedKey := materializedPredTestKey("age", 3, 7)
 	cache.Store(regularKey, small.Borrow())
 	if !cache.TryStoreOversized(oversizedKey, large.Borrow()) {
 		t.Fatal("expected oversized entry to be stored")
@@ -494,7 +498,7 @@ func TestMaterializedPredCache_OversizedLoadOrStoreHitReturnsCachedPayloadNotCal
 	cache := GetMaterializedPredCache(4, 1)
 	defer cache.ReleaseRef()
 
-	key := MaterializedPredKeyForNumericBucketSpan("age", 3, 7)
+	key := materializedPredTestKey("age", 3, 7)
 	cachedBase := qcacheTestLargePosting()
 	want := cachedBase.ToArray()
 	got, ok := cache.TryLoadOrStoreOversized(key, cachedBase.Borrow())
@@ -616,7 +620,7 @@ func TestMaterializedPredCache_OversizedConcurrentDistinctKeysRespectsTotalLimit
 		cache := GetMaterializedPredCache(1, 1)
 		qcacheTestRunConcurrent(n, func(i int) {
 			ids := qcacheTestPosting(1, 2)
-			if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", i, i), ids) {
+			if !cache.TryStoreOversized(materializedPredTestKey("age", i, i), ids) {
 				ids.Release()
 			}
 		})
@@ -637,7 +641,7 @@ func TestMaterializedPredCache_OversizedConcurrentSameKeyDoesNotLeakCounters(t *
 	cache := GetMaterializedPredCache(8, 1)
 	defer cache.ReleaseRef()
 
-	key := MaterializedPredKeyForNumericBucketSpan("age", 1, 1)
+	key := materializedPredTestKey("age", 1, 1)
 	qcacheTestRunConcurrent(n, func(i int) {
 		ids := qcacheTestPosting(1, 2)
 		if !cache.TryStoreOversized(key, ids) {
@@ -669,13 +673,13 @@ func TestMaterializedPredCache_OversizedAdmissionTurnsOverEntries(t *testing.T) 
 		t.Fatalf("expected regular cache to fill total limit, got=%d", got)
 	}
 
-	if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", 0, 0), large.Borrow()) {
+	if !cache.TryStoreOversized(materializedPredTestKey("age", 0, 0), large.Borrow()) {
 		t.Fatal("expected first oversized cache entry to replace an older entry")
 	}
-	if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", 1, 1), large.Borrow()) {
+	if !cache.TryStoreOversized(materializedPredTestKey("age", 1, 1), large.Borrow()) {
 		t.Fatal("expected second oversized cache entry to replace an older entry")
 	}
-	if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", 2, 2), large.Borrow()) {
+	if !cache.TryStoreOversized(materializedPredTestKey("age", 2, 2), large.Borrow()) {
 		t.Fatal("expected oversized cache admission to replace an older oversized entry at limit")
 	}
 
@@ -685,14 +689,14 @@ func TestMaterializedPredCache_OversizedAdmissionTurnsOverEntries(t *testing.T) 
 	if got := cache.OversizedCount(); got != 2 {
 		t.Fatalf("expected oversized counter to settle at 2, got=%d", got)
 	}
-	if ids, ok := cache.Load(MaterializedPredKeyForNumericBucketSpan("age", 2, 2)); !ok {
+	if ids, ok := cache.Load(materializedPredTestKey("age", 2, 2)); !ok {
 		t.Fatal("expected newest oversized entry to remain cached")
 	} else {
 		ids.Release()
 	}
 	kept := 0
 	for i := 0; i < 3; i++ {
-		if ids, ok := cache.Load(MaterializedPredKeyForNumericBucketSpan("age", i, i)); ok {
+		if ids, ok := cache.Load(materializedPredTestKey("age", i, i)); ok {
 			kept++
 			ids.Release()
 		}
@@ -714,10 +718,10 @@ func TestMaterializedPredCache_RegularAdmissionTurnsOverOlderRegularEntries(t *t
 	for i := 0; i < 8; i++ {
 		cache.Store(MaterializedPredKeyForScalar("email", qir.OpPREFIX, fmt.Sprintf("%d", i)), small.Borrow())
 	}
-	if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", 0, 0), large.Borrow()) {
+	if !cache.TryStoreOversized(materializedPredTestKey("age", 0, 0), large.Borrow()) {
 		t.Fatal("expected first oversized cache entry to be admitted")
 	}
-	if !cache.TryStoreOversized(MaterializedPredKeyForNumericBucketSpan("age", 1, 1), large.Borrow()) {
+	if !cache.TryStoreOversized(materializedPredTestKey("age", 1, 1), large.Borrow()) {
 		t.Fatal("expected second oversized cache entry to be admitted")
 	}
 
@@ -952,6 +956,53 @@ func TestMaterializedPredCacheTakeRetiredBeforeUsesEpoch(t *testing.T) {
 	retired.Release()
 	if cache.retired != nil {
 		t.Fatal("expected materialized retired entries to be drained by epoch")
+	}
+}
+
+func TestMaterializedPredCacheKeepsRetiredEntriesOnSource(t *testing.T) {
+	var owner atomic.Bool
+	var epoch atomic.Uint64
+	epoch.Store(1)
+
+	prev := GetMaterializedPredCacheWithRetireContext(1, 0, &owner, &epoch)
+	next := GetMaterializedPredCacheWithRetireContext(1, 0, &owner, &epoch)
+	defer prev.ReleaseRef()
+	defer next.ReleaseRef()
+
+	keyA := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a")
+	keyB := MaterializedPredKeyForScalar("email", qir.OpPREFIX, "b")
+	prev.Store(keyA, qcacheTestPosting(1))
+	prev.Store(keyB, qcacheTestPosting(2))
+	if len(prev.retired) != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source retired backlog: count=%d dirty=%v", len(prev.retired), prev.RetiredDirty())
+	}
+
+	owner.Store(false)
+	next.InheritFrom(prev, FieldChangeSet{})
+	if len(prev.retired) != 1 || !prev.RetiredDirty() {
+		t.Fatalf("source retired backlog after inherit: count=%d dirty=%v", len(prev.retired), prev.RetiredDirty())
+	}
+	if next.retired != nil || next.RetiredDirty() || owner.Load() {
+		t.Fatalf("target retired backlog: count=%d dirty=%v owner=%v", len(next.retired), next.RetiredDirty(), owner.Load())
+	}
+
+	retained := prev.TakeRetiredBefore(1)
+	if !retained.IsEmpty() {
+		retained.Release()
+		t.Fatal("expected source retired entry to remain protected at same safe epoch")
+	}
+	retained.Release()
+	if len(prev.retired) != 1 {
+		t.Fatalf("source retired backlog after protected drain=%d want 1", len(prev.retired))
+	}
+
+	retired := prev.TakeRetiredBefore(2)
+	if retired.IsEmpty() {
+		t.Fatal("expected source retired entry to detach after safe epoch advances")
+	}
+	retired.Release()
+	if prev.retired != nil || prev.RetiredDirty() {
+		t.Fatalf("source retired backlog after drain: count=%d dirty=%v", len(prev.retired), prev.RetiredDirty())
 	}
 }
 

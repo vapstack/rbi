@@ -142,6 +142,41 @@ type Snapshot struct {
 
 	// UniverseCard is cardinality of the published universe bitmap.
 	UniverseCard uint64
+
+	// RuntimeCaches contains snapshot-local runtime cache diagnostics.
+	RuntimeCaches RuntimeCaches
+}
+
+type RuntimeCaches struct {
+	NumericRangeSpan        NumericRangeSpanCache
+	NumericRangeExactResult NumericRangeExactResultCache
+}
+
+type NumericRangeSpanCache struct {
+	CurrentBytes           uint64
+	RetiredBytes           uint64
+	EntryCount             int
+	MaxEntryBytes          uint64
+	MaxEntries             int
+	Stores                 uint64
+	Evictions              uint64
+	RejectedTooLarge       uint64
+	RejectedCapacity       uint64
+	RejectedRetiredBacklog uint64
+}
+
+type NumericRangeExactResultCache struct {
+	CurrentBytes             uint64
+	RetiredBytes             uint64
+	EntryCount               int
+	MaxEntryBytes            uint64
+	MaxEntries               int
+	Stores                   uint64
+	Evictions                uint64
+	RejectedTooLarge         uint64
+	RejectedCapacity         uint64
+	RejectedRetiredBacklog   uint64
+	RejectedFirstObservation uint64
 }
 
 // Store contains root-scoped generation and write-scheduler diagnostics.

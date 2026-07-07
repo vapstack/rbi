@@ -755,7 +755,17 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 		return pred, true
 	}
 
+	var numericSpan numericRangeBucketSpan
+	if !core.expr.Not && core.expr.Op.IsNumericRange() {
+		numericSpan, _ = core.qv.numericRangeBucketSpan(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, plan.br)
+	}
+
 	if allowWarmLoad {
+		if numericSpan.entry != nil {
+			if out, ok := loadNumericRangeBucketSpan(ov, plan.br, numericSpan); ok {
+				return materializedRangePredicateWithMode(core.expr, out.ids), true
+			}
+		}
 		if cached, ok := core.loadReuse.load(); ok {
 			return materializedRangePredicateWithMode(core.expr, cached), true
 		}
@@ -791,26 +801,24 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 		}
 	}
 
+	if core.expr.Not && core.expr.Op.IsNumericRange() {
+		numericSpan, _ = core.qv.numericRangeBucketSpan(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, plan.br)
+	}
+
 	if allowMaterialize && core.expr.Op.IsNumericRange() && (allowPositiveMaterialize || core.qv.snap.MaterializedPredCacheLimit() <= 0) {
-		fieldName := core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal)
-		if coldMaterializeAllowed {
-			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.br); ok {
-				if allowPositiveMaterialize {
-					out.ids = core.sharedReuse.share(out.ids)
-				}
+		if numericSpan.entry != nil {
+			if coldMaterializeAllowed {
+				out := evalNumericRangeBucketSpan(ov, plan.br, numericSpan)
+				return materializedRangePredicateWithMode(core.expr, out.ids), true
+			} else if out, ok := loadNumericRangeBucketSpan(ov, plan.br, numericSpan); ok {
 				return materializedRangePredicateWithMode(core.expr, out.ids), true
 			}
-		} else if out, ok := core.qv.tryLoadNumericRangeBuckets(fieldName, core.expr.FieldOrdinal, core.fm, ov, plan.br); ok {
-			if allowPositiveMaterialize {
-				out.ids = core.sharedReuse.share(out.ids)
-			}
-			return materializedRangePredicateWithMode(core.expr, out.ids), true
 		}
 	}
 
 	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
 	if allowMaterialize && !useRuntimeComplement &&
-		(!schema.FieldUsesOrderedNumericKeys(core.fm) || core.usePostingFilter) {
+		(!schema.FieldUsesOrderedNumericKeys(core.fm) || (core.usePostingFilter && numericSpan.entry == nil)) {
 		reuse = core.sharedReuse
 	}
 
@@ -829,6 +837,7 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 	state.probePostingFilter = false
 	state.postingFilterCheap = false
 	state.probeMaterializeAt = 0
+	state.numericSpan = numericSpan
 
 	if core.usePostingFilter {
 		totalBuckets := probe.ov.KeyCount()
@@ -881,7 +890,6 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov index
 
 	if core.expr.Op != qir.OpPREFIX {
 		if out, ok := core.qv.tryEvalNumericRangeBuckets(core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal), core.expr.FieldOrdinal, core.fm, ov, br); ok {
-			out.ids = core.sharedReuse.share(out.ids)
 			if out.ids.IsEmpty() {
 				return postingResult{}
 			}
@@ -975,37 +983,28 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 }
 
 func (qv *View) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, bool) {
+	fm := qv.fieldMeta(op.field, op.fieldOrdinal)
+	if schema.FieldUsesOrderedNumericKeys(fm) {
+		ov := qv.indexViewByOrdinal(op.fieldOrdinal)
+		if ov.HasData() {
+			br := ov.RangeForBounds(op.bounds)
+			if !br.Empty() {
+				if out, ok := qv.tryLoadNumericRangeBuckets(op.field, op.fieldOrdinal, fm, ov, br); ok {
+					return out, true
+				}
+			}
+		}
+	}
+
 	if !op.cacheKey.IsZero() {
 		if cached, ok := qv.snap.LoadMaterializedPredKey(op.cacheKey); ok {
 			return postingResult{ids: cached}, true
 		}
 	}
-
-	fm := qv.fieldMeta(op.field, op.fieldOrdinal)
-	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return postingResult{}, false
-	}
-
-	ov := qv.indexViewByOrdinal(op.fieldOrdinal)
-	if !ov.HasData() {
-		return postingResult{}, false
-	}
-
-	br := ov.RangeForBounds(op.bounds)
-	if br.Empty() {
-		return postingResult{}, false
-	}
-
-	return qv.tryLoadNumericRangeBuckets(op.field, op.fieldOrdinal, fm, ov, br)
+	return postingResult{}, false
 }
 
 func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, error) {
-	if !op.cacheKey.IsZero() {
-		if cached, ok := qv.snap.LoadMaterializedPredKey(op.cacheKey); ok {
-			return postingResult{ids: cached}, nil
-		}
-	}
-
 	fm := qv.fieldMeta(op.field, op.fieldOrdinal)
 	ov := qv.indexViewByOrdinal(op.fieldOrdinal)
 	if !ov.HasData() {
@@ -1019,10 +1018,13 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 
 	if schema.FieldUsesOrderedNumericKeys(fm) {
 		if out, ok := qv.tryEvalNumericRangeBuckets(op.field, op.fieldOrdinal, fm, ov, br); ok {
-			if !op.cacheKey.IsZero() {
-				out.ids = qv.tryShareMaterializedPred(op.cacheKey, out.ids)
-			}
 			return out, nil
+		}
+	}
+
+	if !op.cacheKey.IsZero() {
+		if cached, ok := qv.snap.LoadMaterializedPredKey(op.cacheKey); ok {
+			return postingResult{ids: cached}, nil
 		}
 	}
 
@@ -1071,9 +1073,19 @@ func (qv *View) shouldScheduleObservedPreparedScalarExactRange(op preparedScalar
 	if buildWork == 0 {
 		return false
 	}
-	if !qv.materializedPredObservationCandidate(op.cacheKey, est, buildWork) {
+
+	var numericPlan asyncMaterializedPredPlan
+	numericHandled := false
+	if plan, ok, handled := qv.asyncNumericRangePlanForBounds(op.fieldOrdinal, op.bounds); handled {
+		if !ok {
+			return false
+		}
+		numericPlan = plan
+		numericHandled = true
+	} else if !qv.materializedPredObservationCandidate(op.cacheKey, est, buildWork) {
 		return false
 	}
+
 	probeBuckets := buckets
 	probeEst := est
 	if useComplementProbe {
@@ -1090,6 +1102,9 @@ func (qv *View) shouldScheduleObservedPreparedScalarExactRange(op preparedScalar
 	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, probeBuckets, probeEst)
 	if probeWork == 0 {
 		return false
+	}
+	if numericHandled {
+		return qv.shouldPromoteObservedNumericWarmup(numericPlan, probeWork, buildWork)
 	}
 	return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, asyncMaterializedPredObservedThreshold(buildWork))
 }

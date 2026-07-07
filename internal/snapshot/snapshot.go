@@ -33,10 +33,14 @@ type View struct {
 }
 
 type CacheConfig struct {
-	MatPredMaxEntries        int
-	MatPredMaxCard           uint64
-	RuntimeCachesDirtyOwner  *atomic.Bool
-	RuntimeCachesRetireEpoch *atomic.Uint64
+	MatPredMaxEntries         int
+	MatPredMaxCard            uint64
+	NumericSpanMaxEntries     int
+	NumericSpanMaxEntryBytes  uint64
+	NumericExactMaxEntries    int
+	NumericExactMaxEntryBytes uint64
+	RuntimeCachesDirtyOwner   *atomic.Bool
+	RuntimeCachesRetireEpoch  *atomic.Uint64
 }
 
 type Storage struct {
