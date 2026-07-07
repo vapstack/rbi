@@ -81,6 +81,7 @@ func main() {
     defer users.Close()
 
     err = rbi.Update(func(tx *rbi.Tx) error {
+
         if err := users.Set(tx, 1, &User{
             ID:     1,
             Name:   "Alice",
@@ -92,6 +93,7 @@ func main() {
         }); err != nil {
             return err
         }
+
         return users.Set(tx, 2, &User{
             ID:     2,
             Name:   "Bob",
@@ -109,7 +111,13 @@ func main() {
     tx := rbi.BeginView()
     defer tx.Close()
 
-    result, err := users.Query(tx,
+    u1, err := users.Get(tx, 1)
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("%v (%v)\n", u1.Name, u1.Age)
+
+    records, err := users.Query(tx,
         qx.Where(
             qx.EQ("active", true),
             qx.HASALL("tags", []string{"dev"}),
@@ -121,7 +129,8 @@ func main() {
     if err != nil {
         panic(err)
     }
-    for _, u := range result {
+
+    for _, u := range records {
         fmt.Printf("%v (%v)\n", u.Name, u.Age)
     }
 
@@ -138,6 +147,7 @@ func main() {
     if err != nil {
         panic(err)
     }
+
     fmt.Println(totals.Layout, totals.Rows)
 }
 ```
@@ -163,10 +173,12 @@ For the full API reference see
 
 ### Transactions
 
-- `View`/`BeginView` create a read transaction.
-- `IndexView`/`BeginIndexView` create an index-only transaction.
-- `Update`/`BeginUpdate` create a write transaction.
+- `View`/`BeginView` create a **read-only** transaction.
+- `IndexView`/`BeginIndexView` create an **index-only** transaction.
+- `Update`/`BeginUpdate` create a **write-only** transaction.
   Writes queued in one `Tx` are committed as one atomic logical write.
+
+Read-write transactions are not supported.
 
 ### Writing data
 
