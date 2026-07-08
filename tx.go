@@ -65,6 +65,7 @@ var txPool = pooled.Pointers[Tx]{
 		clear(tx.collections)
 		clear(tx.readBindings)
 		clear(tx.unit.segments)
+		clear(tx.unit.autoIncCollections)
 		clear(tx.unit.generatedCollections)
 		hookTx := tx.unit.hookTx
 		if hookTx != nil {
@@ -77,6 +78,7 @@ var txPool = pooled.Pointers[Tx]{
 			unit: writeUnit{
 				done:                 tx.unit.done,
 				segments:             tx.unit.segments[:0],
+				autoIncCollections:   tx.unit.autoIncCollections[:0],
 				generatedCollections: tx.unit.generatedCollections[:0],
 				hookTx:               hookTx,
 			},
@@ -331,12 +333,27 @@ func (tx *Tx) commit() error {
 
 	case writeTxOpen:
 		var err error
-		if len(tx.unit.segments) != 0 {
+		if len(tx.unit.segments) != 0 || len(tx.unit.autoIncCollections) != 0 {
 			work := 0
-			limit := tx.unit.segments[0].collection.options.BatchSoftLimit
+			var limit int
+			// Auto-ID metadata is counted as work only for auto-only units. In mixed write
+			// units, the data/index work is the batching driver; counting the auto marker
+			// per logical unit would overcharge the hot NextID+Set path because physical
+			// commit deduplicates auto metadata to one Put per collection per batch.
+			if len(tx.unit.segments) != 0 {
+				limit = tx.unit.segments[0].collection.options.BatchSoftLimit
+			} else {
+				limit = tx.unit.autoIncCollections[0].options.BatchSoftLimit
+				work = len(tx.unit.autoIncCollections)
+			}
 			for i := range tx.unit.segments {
 				work += tx.unit.segments[i].work
 				if maxOps := tx.unit.segments[i].collection.options.BatchSoftLimit; maxOps < limit {
+					limit = maxOps
+				}
+			}
+			for i := range tx.unit.autoIncCollections {
+				if maxOps := tx.unit.autoIncCollections[i].options.BatchSoftLimit; maxOps < limit {
 					limit = maxOps
 				}
 			}

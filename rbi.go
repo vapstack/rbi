@@ -239,6 +239,10 @@ type Options struct {
 	//
 	// Default: 16MiB
 	NumericRangeExactCacheMaxEntryBytes int64
+
+	// NodeID specifies an identifier that is embedded in each automatically
+	// generated sequence produced by NextID.
+	NodeID uint16
 }
 
 const (
@@ -514,6 +518,9 @@ func Open[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts 
 				return fmt.Errorf("invalid rbi uid length: %d", len(id))
 			}
 			copy(c.rbiUID[:], id)
+		}
+		if e = c.initAutoIncID(tx, rbiMeta); e != nil {
+			return e
 		}
 		if c.strKey {
 			_, e = createStrMapBucket(tx, c.dataBucket)

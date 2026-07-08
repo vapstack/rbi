@@ -22,4 +22,5 @@ var (
 	ErrTxDone                     = errors.New("transaction is done")
 	ErrCollectionNotVisible       = errors.New("collection is not visible in transaction")
 	ErrGeneratedWriteDepth        = errors.New("generated write depth exceeded")
+	ErrSequenceExhausted          = errors.New("automatic id sequence exhausted")
 )

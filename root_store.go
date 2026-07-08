@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/vapstack/monotime"
 	"github.com/vapstack/rbi/internal/engine"
 	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/schema"
@@ -17,7 +18,11 @@ import (
 
 var rootMetadataBucketName = []byte(".rbi")
 
-const rootCollectionUIDKeyKind byte = 0x01
+const (
+	rootCollectionUIDKeyKind byte = 0x01
+	rootAutoUintKeyKind      byte = 0x02
+	rootAutoStringKeyKind    byte = 0x03
+)
 
 var EnableStoreStats bool
 
@@ -34,6 +39,7 @@ type rootStore struct {
 	generationMu sync.Mutex
 	scheduler    *writeScheduler
 	statsEnabled bool
+	autoMark     uint64
 
 	mu                  sync.Mutex
 	collections         map[string]*collection
@@ -66,6 +72,11 @@ type collection struct {
 	boltPath string
 	rbiFile  string
 	rbiUID   [persist.UIDLen]byte
+
+	autoMetaKey []byte
+	autoMark    uint64
+	autoUint    atomic.Uint64
+	autoUUID    *monotime.GenUUID
 }
 
 var (

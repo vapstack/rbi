@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/vapstack/pooled"
 	"github.com/vapstack/rbi/internal/engine"
+	"github.com/vapstack/rbi/internal/persist"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/wexec"
 	"github.com/vapstack/rbi/rbierrors"
@@ -24,6 +26,7 @@ type writeUnit struct {
 	work     int
 	limit    int
 
+	autoIncCollections   []*collection
 	generatedCollections []*collection
 	hookTx               *Tx
 }
@@ -72,6 +75,12 @@ type collectionFrameAttempt struct {
 type collectionAppliedBatch struct {
 	collection *collection
 	applied    wexec.AppliedBatch
+}
+
+type rootAutoMarkers struct {
+	collections []*collection
+	units       []*writeUnit
+	errs        []error
 }
 
 var (
@@ -396,6 +405,8 @@ func (unit *writeUnit) cancel() {
 	}
 	clear(unit.segments)
 	unit.segments = unit.segments[:0]
+	clear(unit.autoIncCollections)
+	unit.autoIncCollections = unit.autoIncCollections[:0]
 	unit.releaseGeneratedCollections()
 }
 
@@ -519,6 +530,7 @@ func (r *rootStore) executePreparedRootFrame(tx *bbolt.Tx, units []*writeUnit, e
 	touched := pooled.GetIntSlice(0)
 
 	var appliedBatches []collectionAppliedBatch
+	var autoUnits []*writeUnit
 	var err error
 
 	for unitIdx := range units {
@@ -637,6 +649,9 @@ func (r *rootStore) executePreparedRootFrame(tx *bbolt.Tx, units []*writeUnit, e
 		for j := range touched {
 			attempts[touched[j]].attempt.AcceptValidatedCurrent()
 		}
+		if len(unit.autoIncCollections) != 0 {
+			autoUnits = units
+		}
 	}
 
 	appliedBatches = rootAppliedBatchSlicePool.Get(len(attempts))
@@ -656,7 +671,7 @@ func (r *rootStore) executePreparedRootFrame(tx *bbolt.Tx, units []*writeUnit, e
 			})
 		}
 	}
-	if err = r.commitAppliedCollectionWrites(tx, appliedBatches); err != nil {
+	if err = r.commitRootWrites(tx, appliedBatches, rootAutoMarkers{units: autoUnits, errs: errs}); err != nil {
 		retErr = err
 	}
 
@@ -725,8 +740,29 @@ func rootWriteBatchWideErr(err error) bool {
 		errors.Is(err, berrors.ErrDatabaseNotOpen)
 }
 
-func (r *rootStore) commitAppliedCollectionWrites(tx *bbolt.Tx, applied []collectionAppliedBatch) error {
+func (r *rootStore) commitRootWrites(tx *bbolt.Tx, applied []collectionAppliedBatch, auto rootAutoMarkers) error {
+	autoWritten := false
+	if len(auto.collections) != 0 || len(auto.units) != 0 {
+		var err error
+		autoWritten, err = r.writeRootAutoMetadata(tx, auto)
+		if err != nil {
+			releaseRootAppliedBatches(applied, true)
+			if r.scheduler.stats.Enabled {
+				r.scheduler.stats.TxOpErrors.Add(1)
+			}
+			return err
+		}
+	}
 	if len(applied) == 0 {
+		if !autoWritten {
+			return nil
+		}
+		if err := tx.Commit(); err != nil {
+			if r.scheduler.stats.Enabled {
+				r.scheduler.stats.TxCommitErrors.Add(1)
+			}
+			return fmt.Errorf("commit error: %w", err)
+		}
 		return nil
 	}
 
@@ -791,6 +827,71 @@ func (r *rootStore) commitAppliedCollectionWrites(tx *bbolt.Tx, applied []collec
 	return nil
 }
 
+func (r *rootStore) writeRootAutoMetadata(tx *bbolt.Tx, auto rootAutoMarkers) (bool, error) {
+	meta := tx.Bucket(r.metaBucket)
+	if meta == nil {
+		return false, fmt.Errorf("root metadata bucket %q does not exist", r.metaBucket)
+	}
+	if len(auto.collections) == 1 && len(auto.units) == 0 {
+		if err := writeRootAutoCollectionMetadata(meta, auto.collections[0]); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	r.autoMark++
+	mark := r.autoMark
+	written := false
+	for i := range auto.collections {
+		c := auto.collections[i]
+		if c.autoMark == mark {
+			continue
+		}
+		c.autoMark = mark
+		if err := writeRootAutoCollectionMetadata(meta, c); err != nil {
+			return false, err
+		}
+		written = true
+	}
+	for unitIdx := range auto.units {
+		if auto.errs != nil && auto.errs[unitIdx] != nil {
+			continue
+		}
+		collections := auto.units[unitIdx].autoIncCollections
+		for i := range collections {
+			c := collections[i]
+			if c.autoMark == mark {
+				continue
+			}
+			c.autoMark = mark
+			if err := writeRootAutoCollectionMetadata(meta, c); err != nil {
+				return false, err
+			}
+			written = true
+		}
+	}
+	return written, nil
+}
+
+func writeRootAutoCollectionMetadata(meta *bbolt.Bucket, c *collection) error {
+	if c.strKey {
+		id := c.autoUUID.Next()
+		var value [persist.UIDLen + autoUUIDLen]byte
+		copy(value[:persist.UIDLen], c.rbiUID[:])
+		copy(value[persist.UIDLen:], id[:])
+		if err := meta.Put(c.autoMetaKey, value[:]); err != nil {
+			return fmt.Errorf("store automatic UUID metadata: %w", err)
+		}
+		return nil
+	}
+	var value [persist.UIDLen + 8]byte
+	copy(value[:persist.UIDLen], c.rbiUID[:])
+	binary.BigEndian.PutUint64(value[persist.UIDLen:], c.autoUint.Load())
+	if err := meta.Put(c.autoMetaKey, value[:]); err != nil {
+		return fmt.Errorf("store automatic uint64 id metadata: %w", err)
+	}
+	return nil
+}
+
 func (r *rootStore) executeLogicalUnit(unit *writeUnit) error {
 	defer unit.releaseGeneratedCollections()
 	if r.broken.Load() {
@@ -824,6 +925,10 @@ func (r *rootStore) executeLogicalUnit(unit *writeUnit) error {
 		return rbierrors.ErrBroken
 	}
 
+	if len(segments) == 0 {
+		return r.commitRootWrites(tx, nil, rootAutoMarkers{collections: unit.autoIncCollections})
+	}
+
 	if len(segments) == 1 {
 		segment := &segments[0]
 		if segment.ops.HasOnChange() {
@@ -834,14 +939,14 @@ func (r *rootStore) executeLogicalUnit(unit *writeUnit) error {
 			return err
 		}
 		if applied.Seq == 0 {
-			return nil
+			return r.commitRootWrites(tx, nil, rootAutoMarkers{collections: unit.autoIncCollections})
 		}
 
 		appliedBatch := [1]collectionAppliedBatch{{
 			collection: segment.collection,
 			applied:    applied,
 		}}
-		return r.commitAppliedCollectionWrites(tx, appliedBatch[:])
+		return r.commitRootWrites(tx, appliedBatch[:], rootAutoMarkers{collections: unit.autoIncCollections})
 	}
 
 	for i := range segments {
@@ -876,9 +981,9 @@ func (r *rootStore) executeLogicalUnit(unit *writeUnit) error {
 		}
 	}
 	if len(appliedBatches) == 0 {
-		return nil
+		return r.commitRootWrites(tx, nil, rootAutoMarkers{collections: unit.autoIncCollections})
 	}
-	return r.commitAppliedCollectionWrites(tx, appliedBatches)
+	return r.commitRootWrites(tx, appliedBatches, rootAutoMarkers{collections: unit.autoIncCollections})
 }
 
 func (r *rootStore) executePreparedLogicalUnit(tx *bbolt.Tx, unit *writeUnit) (retErr error) {
@@ -969,5 +1074,5 @@ func (r *rootStore) executeTruncate(p *collection) error {
 			Snapshot: snap,
 		},
 	}}
-	return r.commitAppliedCollectionWrites(tx, applied[:])
+	return r.commitRootWrites(tx, applied[:], rootAutoMarkers{})
 }
