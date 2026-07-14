@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -40,7 +39,7 @@ type request struct {
 	id keycodec.DataKey
 
 	setValue   unsafe.Pointer
-	setPayload *bytes.Buffer
+	setBuffer  []byte
 	payloadOff uint8
 
 	patch []schema.PatchItem
@@ -114,23 +113,37 @@ func (b *Executor) buildSetRequest(key keycodec.DataKey, newVal unsafe.Pointer, 
 	req.id = key
 	req.onChange = onChange
 	req.generationDepth = depth
+
 	if b.setNeedsValue(onChange) {
 		req.setValue = b.ops.Acquire()
-		b.ops.CloneInto(newVal, req.setValue)
+		if err := b.ops.CloneInto(newVal, req.setValue); err != nil {
+			b.ops.Release(req.setValue)
+			return request{}, formatPrepareErr(prepareErrClone, err)
+		}
 	}
+
 	if len(onChange) == 0 {
-		buf := encodePool.Get()
-		req.payloadOff = reserveStringValuePrefix(buf, b.strKey)
-		b.ops.Encode(newVal, buf)
-		if buf.Len() == int(req.payloadOff) {
-			encodePool.Put(buf)
+		buf := encodeBufferPool.Get()
+		buf, req.payloadOff = reserveStringValuePrefix(buf, b.strKey)
+		var err error
+		buf, err = b.ops.Encode(newVal, buf)
+		if err != nil {
+			encodeBufferPool.Put(buf)
+			if req.setValue != nil {
+				b.ops.Release(req.setValue)
+			}
+			return request{}, formatPrepareErr(prepareErrEncode, err)
+		}
+		if len(buf) == int(req.payloadOff) {
+			encodeBufferPool.Put(buf)
 			if req.setValue != nil {
 				b.ops.Release(req.setValue)
 			}
 			return request{}, errEmptyPayload
 		}
-		req.setPayload = buf
+		req.setBuffer = buf
 	}
+
 	return req, nil
 }
 
@@ -163,10 +176,10 @@ func (b *Executor) buildDeleteRequest(key keycodec.DataKey, onChange []OnChangeH
 }
 
 func (req *request) payloadBytes() []byte {
-	if req.setPayload == nil {
+	if req.setBuffer == nil {
 		return nil
 	}
-	return req.setPayload.Bytes()[req.payloadOff:]
+	return req.setBuffer[req.payloadOff:]
 }
 
 func (b *Executor) releaseRequest(req *request) {
@@ -174,9 +187,9 @@ func (b *Executor) releaseRequest(req *request) {
 		b.ops.Release(req.setValue)
 		req.setValue = nil
 	}
-	if req.setPayload != nil {
-		encodePool.Put(req.setPayload)
-		req.setPayload = nil
+	if req.setBuffer != nil {
+		encodeBufferPool.Put(req.setBuffer)
+		req.setBuffer = nil
 	}
 	req.payloadOff = 0
 	schema.ReleasePatchItemSlice(req.patch)

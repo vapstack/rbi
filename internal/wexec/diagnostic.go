@@ -21,6 +21,8 @@ const (
 	prepareErrRedecodeEmpty
 	prepareErrRedecodeValue
 	prepareErrApplyPatch
+	prepareErrEncode
+	prepareErrClone
 )
 
 func formatPrepareErr(kind prepareErr, err error) error {
@@ -37,6 +39,10 @@ func formatPrepareErr(kind prepareErr, err error) error {
 		return fmt.Errorf("failed to re-decode value for patching: %w", err)
 	case prepareErrApplyPatch:
 		return fmt.Errorf("failed to apply patch: %w", err)
+	case prepareErrEncode:
+		return fmt.Errorf("encode: %w", err)
+	case prepareErrClone:
+		return fmt.Errorf("clone: %w", err)
 	default:
 		return err
 	}

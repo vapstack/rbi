@@ -504,30 +504,70 @@ func BenchmarkMeasureAccessorModified(b *testing.B) {
 	}
 }
 
+func BenchmarkPatchValueCompareChanged(b *testing.B) {
+	rt := benchmarkSchemaMustCompile(b)
+	recordType := reflect.TypeFor[benchmarkSchemaRecord]()
+	oldRec := benchmarkSchemaRecordValue()
+	newRec := benchmarkSchemaChangedRecordValue()
+	oldPtr := unsafe.Pointer(&oldRec)
+	newPtr := unsafe.Pointer(&newRec)
+	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
+
+	for _, name := range cases {
+		acc := benchmarkSchemaPatchAccess(b, rt, name)
+		fieldType, offset := resolveFieldTypeAndOffset(recordType, acc.Field.Index)
+		equal := buildPatchValueEqualFn(acc.Field, fieldType, offset)
+		b.Run(name, func(b *testing.B) {
+			result := false
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				result = equal(oldPtr, newPtr)
+			}
+			benchmarkSchemaBoolSink = result
+		})
+	}
+}
+
 func BenchmarkPatchValueEqual(b *testing.B) {
+	rt := benchmarkSchemaMustCompile(b)
+	oldRec := benchmarkSchemaRecordValue()
+	equalRec := benchmarkSchemaRecordValue()
+	oldPtr := unsafe.Pointer(&oldRec)
+	equalPtr := unsafe.Pointer(&equalRec)
+	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
+
+	for _, name := range cases {
+		acc := benchmarkSchemaPatchAccess(b, rt, name)
+		b.Run(name, func(b *testing.B) {
+			changed := false
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_, changed, _ = acc.value(oldPtr, equalPtr, true, nil)
+			}
+			benchmarkSchemaBoolSink = changed
+		})
+	}
+}
+
+func BenchmarkPatchValueChanged(b *testing.B) {
 	rt := benchmarkSchemaMustCompile(b)
 	oldRec := benchmarkSchemaRecordValue()
 	newRec := benchmarkSchemaChangedRecordValue()
 	oldPtr := unsafe.Pointer(&oldRec)
 	newPtr := unsafe.Pointer(&newRec)
-	oldValue := reflect.ValueOf(&oldRec).Elem()
-	newValue := reflect.ValueOf(&newRec).Elem()
 	cases := [...]string{"PatchScalar", "PatchTyped", "PatchNamed", "PatchNested", "PatchVI"}
 
 	for _, name := range cases {
 		acc := benchmarkSchemaPatchAccess(b, rt, name)
-		fieldIndex := acc.Field.Index
 		b.Run(name, func(b *testing.B) {
-			equal := false
+			var value any
+			changed := false
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if acc.ValueEqual != nil {
-					equal = acc.ValueEqual(oldPtr, newPtr)
-				} else {
-					equal = reflect.DeepEqual(oldValue.FieldByIndex(fieldIndex).Interface(), newValue.FieldByIndex(fieldIndex).Interface())
-				}
+				value, changed, _ = acc.value(oldPtr, newPtr, true, nil)
 			}
-			benchmarkSchemaBoolSink = equal
+			benchmarkSchemaAnySink = value
+			benchmarkSchemaBoolSink = changed
 		})
 	}
 }
@@ -544,7 +584,7 @@ func BenchmarkPatchValueCopy(b *testing.B) {
 			var copied any
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				copied = acc.CopyValue(ptr)
+				copied, _, _ = acc.value(nil, ptr, false, nil)
 			}
 			benchmarkSchemaAnySink = copied
 		})

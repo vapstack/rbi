@@ -82,9 +82,11 @@ var patchScratchPool = pooled.Pointers[patchScratch]{
 func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) ([]Field, error) {
 	target = target[:0]
 
-	if newVal == nil {
+	if newVal == nil || oldVal == newVal {
 		return target, nil
 	}
+	operation := c.schema.Patch.BeginOperation()
+	defer c.schema.Patch.EndOperation(&operation)
 
 	patchAccess := c.schema.Patch.Access
 	if c.schema.Patch.Flat {
@@ -96,10 +98,12 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 
 		for i := range patchAccess {
 			patchAcc := &patchAccess[i]
-			if oldVal != nil {
-				if patchAcc.ValueEqual(oldPtr, newPtr) {
-					continue
-				}
+			value, changed, err := c.schema.Patch.Value(patchAcc, oldPtr, newPtr, oldVal != nil, &operation)
+			if err != nil {
+				return target[:0], err
+			}
+			if !changed {
+				continue
 			}
 
 			name := patchFieldName(patchAcc.Field, useJSON)
@@ -113,7 +117,7 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 
 			target = append(target, Field{
 				Name:  name,
-				Value: patchAcc.CopyValue(newPtr),
+				Value: value,
 			})
 		}
 
@@ -151,7 +155,10 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 			} else if name == "" {
 				return target[:0], fmt.Errorf("field %v cannot be emitted by MakePatch: add an explicit non-empty db tag", patchAcc.Field.Name)
 			}
-			value := patchAcc.CopyValue(newPtr)
+			value, _, err := c.schema.Patch.Value(&patchAcc, oldPtr, newPtr, false, &operation)
+			if err != nil {
+				return target[:0], err
+			}
 			markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 			target = append(target, Field{
 				Name:  name,
@@ -165,10 +172,12 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 			continue
 		}
 
-		if oldVal != nil {
-			if patchAcc.ValueEqual(oldPtr, newPtr) {
-				continue
-			}
+		value, changed, err := c.schema.Patch.Value(&patchAcc, oldPtr, newPtr, oldVal != nil, &operation)
+		if err != nil {
+			return target[:0], err
+		}
+		if !changed {
+			continue
 		}
 
 		name := patchFieldName(patchAcc.Field, useJSON)
@@ -182,7 +191,7 @@ func (c *Collection[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON 
 
 		target = append(target, Field{
 			Name:  name,
-			Value: patchAcc.CopyValue(newPtr),
+			Value: value,
 		})
 		markPatchSubtreeSeen(scratch.seen, patchAccess, ordinal)
 	}
@@ -236,8 +245,10 @@ func markPatchSubtreeSeen(seen []bool, access []schema.PatchFieldAccessor, ordin
 // wexec or release it with schema.ReleasePatchItemSlice.
 func (c *Collection[K, V]) patchItemsForWrite(fields []Field, ignoreUnknown bool) ([]schema.PatchItem, error) {
 	items := schema.GetPatchItemSlice(len(fields))[:0]
+	operation := c.schema.Patch.BeginOperation()
+	defer c.schema.Patch.EndOperation(&operation)
 	for i := range fields {
-		value, ok, err := c.schema.Patch.CopyItemValue(fields[i].Name, fields[i].Value, ignoreUnknown)
+		value, ok, err := c.schema.Patch.CopyItemValue(fields[i].Name, fields[i].Value, ignoreUnknown, &operation)
 		if err != nil {
 			schema.ReleasePatchItemSlice(items)
 			return nil, err

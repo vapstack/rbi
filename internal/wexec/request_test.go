@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"errors"
 	"testing"
 	"unsafe"
@@ -12,7 +11,7 @@ import (
 func TestBuildSetRequestRejectEmptyPayloadBeforeReturningRequest(t *testing.T) {
 	ex := NewExecutor(Config{})
 	ex.ops = &RecordOps{
-		Encode: func(unsafe.Pointer, *bytes.Buffer) {},
+		Encode: func(_ unsafe.Pointer, dst []byte) ([]byte, error) { return dst, nil },
 	}
 
 	v := attemptRec{V: 1}
@@ -24,8 +23,8 @@ func TestBuildSetRequestRejectEmptyPayloadBeforeReturningRequest(t *testing.T) {
 		t.Fatalf("buildSetRequest error = %v, want empty payload", err)
 	}
 
-	ex.ops.Encode = func(_ unsafe.Pointer, buf *bytes.Buffer) {
-		_ = buf.WriteByte(1)
+	ex.ops.Encode = func(_ unsafe.Pointer, buf []byte) ([]byte, error) {
+		return append(buf, 1), nil
 	}
 	req, err = ex.buildSetRequest(keycodec.DataKeyFromUserKey(uint64(3), false), unsafe.Pointer(&v), nil, 0)
 	if err != nil {
@@ -40,8 +39,9 @@ func TestBuildSetRequestOnChangeDetachesValue(t *testing.T) {
 		Acquire: func() unsafe.Pointer {
 			return unsafe.Pointer(&attemptRec{})
 		},
-		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) error {
 			*(*attemptRec)(dst) = *(*attemptRec)(src)
+			return nil
 		},
 		Release: func(unsafe.Pointer) {},
 	}
@@ -69,8 +69,9 @@ func TestBuildSetRequestDetachedValueReleasedOnRequestCleanup(t *testing.T) {
 		Acquire: func() unsafe.Pointer {
 			return unsafe.Pointer(baseline)
 		},
-		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) error {
 			*(*attemptRec)(dst) = *(*attemptRec)(src)
+			return nil
 		},
 		Release: func(ptr unsafe.Pointer) {
 			released++

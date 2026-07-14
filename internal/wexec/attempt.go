@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"fmt"
 	"math/bits"
 	"slices"
@@ -89,11 +88,9 @@ type recordState struct {
 	idxNew   bool
 	exists   bool
 
-	value           unsafe.Pointer
-	ownedPayload    *bytes.Buffer
-	payloadOff      uint8
-	payloadKnown    bool
-	borrowedPayload []byte
+	value        unsafe.Pointer
+	payload      []byte
+	payloadKnown bool
 }
 
 type attemptState struct {
@@ -118,7 +115,7 @@ type attemptState struct {
 	states             []recordState
 	state              recordState
 
-	ownedPayloads []*bytes.Buffer
+	ownedBuffers  [][]byte
 	releaseValues []unsafe.Pointer
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
@@ -189,14 +186,11 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 
 	payload := req.payloadBytes()
 	physical := payload
-	if req.setPayload != nil {
-		physical = req.setPayload.Bytes()
+	if req.setBuffer != nil {
+		physical = req.setBuffer
 	}
 
-	var (
-		newVal       unsafe.Pointer
-		ownedPayload *bytes.Buffer
-	)
+	var newVal unsafe.Pointer
 	payloadOff := req.payloadOff
 
 	if len(state.key) > bbolt.MaxKeySize {
@@ -224,12 +218,16 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 			return
 		}
 
-		buf := encodePool.Get()
-		payloadOff = reserveStringValuePrefix(buf, b.strKey)
-		b.ops.Encode(newVal, buf)
-		ownedPayload = buf
-		att.ownedPayloads = append(att.ownedPayloads, buf)
-		physical = buf.Bytes()
+		buf := encodeBufferPool.Get()
+		buf, payloadOff = reserveStringValuePrefix(buf, b.strKey)
+		buf, err = b.ops.Encode(newVal, buf)
+		if err != nil {
+			encodeBufferPool.Put(buf)
+			req.Err = formatPrepareErr(prepareErrEncode, err)
+			return
+		}
+		att.ownedBuffers = append(att.ownedBuffers, buf)
+		physical = buf
 		payload = physical[payloadOff:]
 	}
 
@@ -296,12 +294,7 @@ func (b *Executor) prepareSet(att *attemptState, req *request, hookTx unsafe.Poi
 
 	state.value = newVal
 	state.exists = true
-
-	if ownedPayload != nil {
-		state.setOwnedPayload(ownedPayload, payloadOff)
-	} else {
-		state.setBorrowedPayload(payload)
-	}
+	state.setPayload(payload)
 
 	if pos < 0 && !att.singleState {
 		pos = len(att.states)
@@ -329,7 +322,11 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 	oldVal := state.value
 	snapOld := oldVal
 	newVal := b.ops.Acquire()
-	b.ops.CloneInto(oldVal, newVal)
+	if err = b.ops.CloneInto(oldVal, newVal); err != nil {
+		b.ops.Release(newVal)
+		req.Err = formatPrepareErr(prepareErrClone, err)
+		return
+	}
 	att.releaseValues = append(att.releaseValues, newVal)
 	if err = b.schema.Patch.ApplyCopied(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.Err = formatPrepareErr(prepareErrApplyPatch, err)
@@ -353,13 +350,19 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 		return
 	}
 
-	buf := encodePool.Get()
-	payloadOff := reserveStringValuePrefix(buf, b.strKey)
-	b.ops.Encode(newVal, buf)
-	att.ownedPayloads = append(att.ownedPayloads, buf)
+	buf := encodeBufferPool.Get()
+	var payloadOff uint8
+	buf, payloadOff = reserveStringValuePrefix(buf, b.strKey)
+	buf, err = b.ops.Encode(newVal, buf)
+	if err != nil {
+		encodeBufferPool.Put(buf)
+		req.Err = formatPrepareErr(prepareErrEncode, err)
+		return
+	}
+	att.ownedBuffers = append(att.ownedBuffers, buf)
 
-	payload := buf.Bytes()[payloadOff:]
-	physical := buf.Bytes()
+	payload := buf[payloadOff:]
+	physical := buf
 	if len(state.key) > bbolt.MaxKeySize {
 		req.Err = formatBoltWriteErr(berrors.ErrKeyTooLarge, req.op, req.id.Format(b.strKey), state.idx, state.key, payload)
 		return
@@ -400,7 +403,7 @@ func (b *Executor) preparePatch(att *attemptState, req *request, hookTx unsafe.P
 	}
 	state.value = newVal
 	state.exists = true
-	state.setOwnedPayload(buf, payloadOff)
+	state.setPayload(payload)
 }
 
 func (b *Executor) prepareDelete(att *attemptState, req *request, hookTx unsafe.Pointer) {
@@ -527,7 +530,7 @@ func (b *Executor) loadState(st *attemptState, req *request, read bool, decodeOl
 					state.value = oldVal
 					st.releaseValues = append(st.releaseValues, oldVal)
 				}
-				state.setBorrowedPayload(payload)
+				state.setPayload(payload)
 			}
 		}
 
@@ -618,7 +621,7 @@ func (b *Executor) loadState(st *attemptState, req *request, read bool, decodeOl
 			state.value = oldVal
 			st.releaseValues = append(st.releaseValues, oldVal)
 		}
-		state.setBorrowedPayload(payload)
+		state.setPayload(payload)
 	}
 
 	st.setStatePos(b.strKey, req.id, pos)
@@ -844,8 +847,8 @@ func (st *attemptState) prepare(bucket *bbolt.Bucket, statsEnabled bool, release
 	st.statsEnabled = statsEnabled
 	st.release = release
 	st.singleState = singleState
-	if cap(st.ownedPayloads) < capHint {
-		st.ownedPayloads = slices.Grow(st.ownedPayloads, capHint)
+	if cap(st.ownedBuffers) < capHint {
+		st.ownedBuffers = slices.Grow(st.ownedBuffers, capHint)
 	}
 	releaseCapHint := capHint * 2
 	if cap(st.releaseValues) < releaseCapHint {
@@ -880,11 +883,11 @@ func (st *attemptState) cleanup() {
 	clear(st.releaseValues)
 	st.releaseValues = st.releaseValues[:0]
 
-	for _, buf := range st.ownedPayloads {
-		encodePool.Put(buf)
+	for _, buf := range st.ownedBuffers {
+		encodeBufferPool.Put(buf)
 	}
-	clear(st.ownedPayloads)
-	st.ownedPayloads = st.ownedPayloads[:0]
+	clear(st.ownedBuffers)
+	st.ownedBuffers = st.ownedBuffers[:0]
 
 	clear(st.preparedSnapshots)
 	st.preparedSnapshots = st.preparedSnapshots[:0]
@@ -915,38 +918,23 @@ func (st *attemptState) cleanup() {
 }
 
 func (st *recordState) payloadBytes() []byte {
-	if st.ownedPayload != nil {
-		return st.ownedPayload.Bytes()[st.payloadOff:]
-	}
-	return st.borrowedPayload
+	return st.payload
 }
 
-func (st *recordState) setOwnedPayload(buf *bytes.Buffer, payloadOff uint8) {
-	st.ownedPayload = buf
-	st.payloadOff = payloadOff
+func (st *recordState) setPayload(payload []byte) {
+	st.payload = payload
 	st.payloadKnown = true
-	st.borrowedPayload = nil
-}
-
-func (st *recordState) setBorrowedPayload(payload []byte) {
-	st.ownedPayload = nil
-	st.payloadOff = 0
-	st.payloadKnown = true
-	st.borrowedPayload = payload
 }
 
 func (st *recordState) clearPayload() {
-	st.ownedPayload = nil
-	st.payloadOff = 0
+	st.payload = nil
 	st.payloadKnown = false
-	st.borrowedPayload = nil
 }
 
-func reserveStringValuePrefix(buf *bytes.Buffer, strKey bool) uint8 {
+func reserveStringValuePrefix(buf []byte, strKey bool) ([]byte, uint8) {
 	if !strKey {
-		return 0
+		return buf, 0
 	}
 	var prefix [stringValuePrefixLen]byte
-	buf.Write(prefix[:])
-	return stringValuePrefixLen
+	return append(buf, prefix[:]...), stringValuePrefixLen
 }

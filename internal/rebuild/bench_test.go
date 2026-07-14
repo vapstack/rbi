@@ -1,7 +1,6 @@
 package rebuild
 
 import (
-	"bytes"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -318,9 +317,11 @@ func mustCompileRebuildBenchCodec[T any]() *schema.Schema {
 }
 
 func encodeRebuildBenchPayload[T any](rt *schema.Schema, rec *T) []byte {
-	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(rec), &buf)
-	return slices.Clone(buf.Bytes())
+	payload, err := rt.Codec.Encode(unsafe.Pointer(rec), nil)
+	if err != nil {
+		panic(err)
+	}
+	return slices.Clone(payload)
 }
 
 func baseRebuildBenchConfig(bolt *bbolt.DB, bucket []byte, s *schema.Schema, decode DecodeFunc, release ReleaseFunc) Config {

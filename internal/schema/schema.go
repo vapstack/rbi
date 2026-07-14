@@ -50,31 +50,19 @@ const (
 
 const ReservedKeyFieldName = "$key"
 
-// ValueIndexer defines how a Field value is converted into a canonical string
-// representation used as an index key in rbi.
-//
-// A type that implements ValueIndexer is responsible for ensuring that
-// IndexingValue returns a valid and stable string for every value that may
-// appear in indexed data. Indexed fields that use ValueIndexer must be
-// declared with concrete types, not interfaces.
-//
-// Nil pointers to value-receiver ValueIndexer values are indexed as null.
-// In slice indexes, nil pointers to value-receiver ValueIndexer values do not
-// emit index keys. Other nil receivers are passed to IndexingValue.
-//
-// IndexingValue must return a deterministic string: the same value must
-// always produce the same indexing key.
-//
-// The returned string is compared lexicographically when evaluating
-// range queries (>, >=, <, <=). Implementation must ensure that the
-// produced ordering matches the intent.
 type ValueIndexer interface {
 	IndexingValue() string
+}
+
+type Codec interface {
+	EncodeRBI(b []byte) ([]byte, error)
+	DecodeRBI(b []byte) error
 }
 
 var (
 	viType            = reflect.TypeFor[ValueIndexer]()
 	ValueIndexerType  = viType
+	codecType         = reflect.TypeFor[Codec]()
 	nativeTimeType    = reflect.TypeFor[time.Time]()
 	nativeTimePtrType = reflect.PointerTo(nativeTimeType)
 )
@@ -102,6 +90,48 @@ func isEmbeddedPointerContainerType(t reflect.Type) bool {
 
 func isValueReceiverValueIndexerPointer(t reflect.Type) bool {
 	return t.Kind() == reflect.Pointer && t.Implements(viType) && t.Elem().Implements(viType)
+}
+
+type codecLeaf struct {
+	typ  reflect.Type
+	path string
+	tab  unsafe.Pointer
+}
+
+func resolveCodecLeaf(t reflect.Type, path string) (*codecLeaf, error) {
+	if t == nativeTimeType || t.Kind() == reflect.Pointer || t.Kind() == reflect.Interface {
+		return nil, nil
+	}
+	ptr := reflect.PointerTo(t)
+	if !ptr.Implements(codecType) {
+		return nil, nil
+	}
+	if _, ok := t.MethodByName("DecodeRBI"); ok {
+		return nil, fmt.Errorf("field %s type %s must implement DecodeRBI on pointer receiver *%s", path, t, t)
+	}
+
+	codec := reflect.New(t).Interface().(Codec)
+	return &codecLeaf{
+		typ:  t,
+		path: path,
+		tab:  (*ifaceWords)(unsafe.Pointer(&codec)).tab,
+	}, nil
+}
+
+func codecAt(tab unsafe.Pointer, data unsafe.Pointer) Codec {
+	var codec Codec
+	words := (*ifaceWords)(unsafe.Pointer(&codec))
+	words.tab = tab
+	words.data = data
+	return codec
+}
+
+func (c *codecLeaf) encode(src unsafe.Pointer, dst []byte) ([]byte, error) {
+	return codecAt(c.tab, src).EncodeRBI(dst)
+}
+
+func (c *codecLeaf) decode(src []byte, dst unsafe.Pointer) error {
+	return codecAt(c.tab, dst).DecodeRBI(src)
 }
 
 func IsNativeTimeField(f *Field) bool {
@@ -296,13 +326,16 @@ type MeasureFieldAccessor struct {
 }
 
 type PatchFieldAccessor struct {
-	Field              *Field
-	Type               reflect.Type
-	ValueEqual         PatchValueEqualFn
-	CopyValue          PatchValueCopyFn
-	CopyFieldValue     PatchValueCopyFn
-	CopyConvertedValue PatchValueCopyFn
+	Field         *Field
+	Type          reflect.Type
+	value         patchValueFn
+	copyField     patchCopyFn
+	copyConverted patchCopyFn
+	codec         bool
 }
+
+type patchValueFn func(oldRoot, newRoot unsafe.Pointer, compare bool, scratch *codecScratch) (any, bool, error)
+type patchCopyFn func(src unsafe.Pointer, scratch *codecScratch) (any, error)
 
 type PatchItem struct {
 	Name  string
@@ -310,11 +343,12 @@ type PatchItem struct {
 }
 
 type PatchRuntime struct {
-	Fields       map[string]*Field
-	AccessByName map[string]PatchFieldAccessor
-	Access       []PatchFieldAccessor
-	Flat         bool
-	typ          reflect.Type
+	Fields           map[string]*Field
+	AccessByName     map[string]PatchFieldAccessor
+	Access           []PatchFieldAccessor
+	Flat             bool
+	typ              reflect.Type
+	usesCodecScratch bool
 }
 
 func Compile(vtype reflect.Type, config Config) (*Schema, error) {
@@ -461,6 +495,22 @@ func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []in
 				}
 				continue
 			}
+			leaf, leafErr := resolveCodecLeaf(f.Type, f.Name)
+			if leafErr != nil {
+				return leafErr
+			}
+			if leaf != nil {
+				continue
+			}
+			if isEmbeddedPointerContainerType(f.Type) {
+				leaf, leafErr = resolveCodecLeaf(f.Type.Elem(), f.Name)
+				if leafErr != nil {
+					return leafErr
+				}
+				if leaf != nil {
+					continue
+				}
+			}
 			if isEmbeddedContainerType(f.Type) {
 				if err = collector.populateFieldsFromTags(f.Type, newIdx); err != nil {
 					return err
@@ -584,11 +634,17 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 		}
 		nextIdx := append(idx, i)
 		if sf.Anonymous && isEmbeddedContainerType(sf.Type) {
-			if err := collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
+			leaf, err := resolveCodecLeaf(sf.Type, sf.Name)
+			if err != nil {
 				return err
 			}
-			if !sf.Type.Implements(viType) {
-				continue
+			if leaf == nil {
+				if err = collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
+					return err
+				}
+				if !sf.Type.Implements(viType) {
+					continue
+				}
 			}
 		}
 
@@ -674,6 +730,14 @@ func hasEmbeddedIndexTags(t reflect.Type, prev *embeddedIndexTagScan) (bool, err
 			continue
 		}
 		if f.Anonymous {
+			leaf, err := resolveCodecLeaf(f.Type, f.Name)
+			if err != nil {
+				return false, err
+			}
+			if leaf != nil {
+				continue
+			}
+
 			if isEmbeddedContainerType(f.Type) {
 				hasIndexTags, err := hasEmbeddedIndexTags(f.Type, &frame)
 				if err != nil {
@@ -682,7 +746,15 @@ func hasEmbeddedIndexTags(t reflect.Type, prev *embeddedIndexTagScan) (bool, err
 				if hasIndexTags {
 					return true, nil
 				}
+
 			} else if isEmbeddedPointerContainerType(f.Type) {
+				leaf, err := resolveCodecLeaf(f.Type.Elem(), f.Name)
+				if err != nil {
+					return false, err
+				}
+				if leaf != nil {
+					continue
+				}
 				hasIndexTags, err := hasEmbeddedIndexTags(f.Type.Elem(), &frame)
 				if err != nil {
 					return false, err
@@ -778,12 +850,20 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 
 	useVI = sf.Type.Implements(viType)
 	if isNativeTimeWrapperType(sf.Type) {
-		// ValueIndexer only defines index-key projection.
-		// Record snapshotting depends on the value codec, which supports only exact time.Time.
-		return nil, fmt.Errorf("field %v has unsupported named time type %v, use time.Time directly", sf.Name, sf.Type)
+		codecType := sf.Type
+		if codecType.Kind() == reflect.Pointer && codecType.Name() == "" {
+			codecType = codecType.Elem()
+		}
+		leaf, err := resolveCodecLeaf(codecType, sf.Name)
+		if err != nil {
+			return nil, err
+		}
+		if leaf == nil {
+			return nil, fmt.Errorf("field %v has unsupported named time type %v, use time.Time directly", sf.Name, sf.Type)
+		}
 	}
 
-	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
+	nativeTime = !useVI && sf.Type == nativeTimeType
 	if useVI {
 		if kind == reflect.Interface {
 			return nil, fmt.Errorf("field %v has unsupported ValueIndexer interface type %v, use a concrete ValueIndexer type", sf.Name, sf.Type)
@@ -793,7 +873,17 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 			valueType = valueType.Elem()
 		}
 		if valueType.Kind() == reflect.Slice && isNativeTimeWrapperType(valueType.Elem()) {
-			return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, valueType.Elem())
+			codecType := valueType.Elem()
+			if codecType.Kind() == reflect.Pointer && codecType.Name() == "" {
+				codecType = codecType.Elem()
+			}
+			leaf, err := resolveCodecLeaf(codecType, sf.Name+"[]")
+			if err != nil {
+				return nil, err
+			}
+			if leaf == nil {
+				return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, valueType.Elem())
+			}
 		}
 		if kind == reflect.Pointer && sf.Type.Elem().Implements(viType) {
 			ptr = true
@@ -833,10 +923,20 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 		slice = true
 		elem := sf.Type.Elem()
 
-		// ValueIndexer only defines index-key projection. Record snapshotting still
-		// depends on the value codec, which supports only exact time.Time.
+		// ValueIndexer only defines index-key projection. Named time elements still
+		// need a persistence codec on the concrete value type.
 		if isNativeTimeWrapperType(elem) {
-			return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, elem)
+			codecType := elem
+			if codecType.Kind() == reflect.Pointer && codecType.Name() == "" {
+				codecType = codecType.Elem()
+			}
+			leaf, err := resolveCodecLeaf(codecType, sf.Name+"[]")
+			if err != nil {
+				return nil, err
+			}
+			if leaf == nil {
+				return nil, fmt.Errorf("field %v has unsupported named time element type %v, use time.Time directly", sf.Name, elem)
+			}
 		}
 
 		kind = elem.Kind()
@@ -887,7 +987,7 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 			reflect.Uintptr:
 			return nil, fmt.Errorf("cannot index field %v of type %v", sf.Name, sf.Type)
 		case reflect.Pointer:
-			if isNativeTimePointerType(sf.Type) {
+			if sf.Type == nativeTimePtrType {
 				ptr = true
 				kind = reflect.Struct
 				nativeTime = true
@@ -957,8 +1057,12 @@ func populatePatcher(patchMap map[string]*Field, patchFields *[]*Field, ambiguou
 		}
 
 		if rf.Anonymous && rf.Type.Kind() == reflect.Struct {
+			leaf, err := resolveCodecLeaf(rf.Type, rf.Name)
+			if err != nil {
+				return err
+			}
 			recurse := isEmbeddedContainerType(rf.Type)
-			if recurse {
+			if recurse && leaf == nil {
 				nidx := append(idx, i)
 				selfIndexed := false
 				if patchIndexed != nil {
@@ -1141,7 +1245,10 @@ func makePatchRuntime(vtype reflect.Type, patchIndexed map[string]struct{}) (Pat
 			}
 		}
 	}
-	access := makePatchFieldAccessors(vtype, patchFields)
+	access, usesCodecScratch, err := makePatchFieldAccessors(vtype, patchFields)
+	if err != nil {
+		return PatchRuntime{}, err
+	}
 	accessByName := make(map[string]PatchFieldAccessor, len(patchMap))
 	for name, f := range patchMap {
 		for i := range access {
@@ -1159,17 +1266,18 @@ func makePatchRuntime(vtype reflect.Type, patchIndexed map[string]struct{}) (Pat
 		}
 	}
 	return PatchRuntime{
-		Fields:       patchMap,
-		AccessByName: accessByName,
-		Access:       access,
-		Flat:         flat,
-		typ:          vtype,
+		Fields:           patchMap,
+		AccessByName:     accessByName,
+		Access:           access,
+		Flat:             flat,
+		typ:              vtype,
+		usesCodecScratch: usesCodecScratch,
 	}, nil
 }
 
-func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) []PatchFieldAccessor {
+func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) ([]PatchFieldAccessor, bool, error) {
 	if len(fields) == 0 {
-		return nil
+		return nil, false, nil
 	}
 
 	patchFields := fields
@@ -1178,6 +1286,7 @@ func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) []PatchFieldAc
 	})
 
 	access := make([]PatchFieldAccessor, 0, len(patchFields))
+	usesCodecScratch := false
 
 	var prev *Field
 	for _, f := range patchFields {
@@ -1188,16 +1297,42 @@ func makePatchFieldAccessors(vtype reflect.Type, fields []*Field) []PatchFieldAc
 
 		fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
 		acc := PatchFieldAccessor{Field: f, Type: fieldType}
-		acc.ValueEqual = buildPatchValueEqualFn(f, fieldType, offset)
-		acc.CopyValue = buildPatchValueCopyFn(f, fieldType, offset)
-		acc.CopyFieldValue = buildPatchValueCopyFn(f, fieldType, 0)
-		acc.CopyConvertedValue = acc.CopyFieldValue
-		if patchCanReturnConvertedValue(fieldType) {
-			acc.CopyConvertedValue = reflectPatchValueCopy(fieldType, 0)
+		codec, err := compilePatchCodecAccessor(fieldType, offset, f.Name)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if codec != nil {
+			usesCodecScratch = true
+			acc.codec = true
+			acc.value = codec.value
+			acc.copyField = codec.copy
+			acc.copyConverted = codec.copy
+
+		} else {
+			equal := buildPatchValueEqualFn(f, fieldType, offset)
+			copyValue := buildPatchValueCopyFn(f, fieldType, offset)
+			acc.value = func(oldRoot, newRoot unsafe.Pointer, compare bool, _ *codecScratch) (any, bool, error) {
+				if compare && equal(oldRoot, newRoot) {
+					return nil, false, nil
+				}
+				return copyValue(newRoot), true, nil
+			}
+			copyField := buildPatchValueCopyFn(f, fieldType, 0)
+			acc.copyField = func(src unsafe.Pointer, _ *codecScratch) (any, error) {
+				return copyField(src), nil
+			}
+			acc.copyConverted = acc.copyField
+			if patchCanReturnConvertedValue(fieldType) {
+				copyConverted := reflectPatchValueCopy(fieldType, 0)
+				acc.copyConverted = func(src unsafe.Pointer, _ *codecScratch) (any, error) {
+					return copyConverted(src), nil
+				}
+			}
 		}
 
 		access = append(access, acc)
 	}
 
-	return access
+	return access, usesCodecScratch, nil
 }

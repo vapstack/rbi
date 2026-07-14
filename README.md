@@ -160,12 +160,16 @@ func main() {
 - named scalar types based on the kinds above
 - exact `time.Time` and `*time.Time`
 - pointers, slices, arrays, structs, and maps containing supported types
+- concrete field types with [custom field encoding](#custom-field-encoding)
 
 Map keys are stricter: string, bool, signed and unsigned integers, arrays of
 supported key values, and structs with only exported supported key fields.
 
-Named wrappers around `time.Time` are not supported. Recursive type graphs are
-rejected during schema construction. Unexported fields are ignored.
+Named wrappers around `time.Time` require a custom field codec.
+Recursive type graphs are rejected unless recursion is contained within
+a custom-encoded field.
+
+Unexported fields are ignored.
 
 ## API
 
@@ -568,6 +572,9 @@ Float equality is canonical across scalar and nested values: `-0` equals `+0`,
 and all NaN values compare equal. `time.Time` values compare with `Time.Equal`.
 Maps are compared by key presence and recursively by value.
 
+Custom-encoded values are compared by their encoded bytes and copied
+by an encode/decode round trip.
+
 ## Index persistence and recovery
 
 Indexes are persisted only on `Close`.
@@ -729,6 +736,40 @@ Most schema changes are handled gracefully:
 
 Indexes for affected tagged fields are automatically rebuilt when schema
 changes are detected.
+
+### Custom field encoding
+
+A concrete field type can override encoding/decoding by implementing `Codec`:
+
+```go
+type Codec interface {
+    // EncodeRBI appends the binary representation of the value to the end of b
+    // (allocating a larger slice if necessary) and returns the updated slice.
+    //
+    // Implementations must not retain b, nor mutate any bytes within b[:len(b)].
+    EncodeRBI(b []byte) ([]byte, error)
+
+    // DecodeRBI decodes the binary representation of value.
+    //
+    // Implementations must copy the data if it is retained after returning and
+    // must not retain or mutate the input []byte.
+    //
+    // Payload versioning and backward compatibility is the responsibility
+    // of the implementation.
+    DecodeRBI(b []byte) error
+}
+```
+
+The encoded value is opaque to RBI. The same representation is used for
+persistence, cloning, and `MakePatch` equality. Codec values are supported
+directly, behind pointers, and in arrays, slices, and map values.
+The root record and map keys do not use this override.
+
+Adding or removing a codec from a populated field may require migration.
+Compatibility between payload versions is the responsibility of the implementation.
+
+Custom encoding does not make a field indexable,
+unsupported types still require `ValueIndexer`.
 
 ## Storage notes
 

@@ -77,7 +77,7 @@ func (patch *PatchRuntime) ApplyCopied(ptr unsafe.Pointer, items []PatchItem, ig
 	return nil
 }
 
-func (patch *PatchRuntime) CopyItemValue(name string, value any, ignoreUnknown bool) (any, bool, error) {
+func (patch *PatchRuntime) CopyItemValue(name string, value any, ignoreUnknown bool, operation *PatchOperation) (any, bool, error) {
 	acc, ok := patch.AccessByName[name]
 	if !ok {
 		if ignoreUnknown {
@@ -94,6 +94,12 @@ func (patch *PatchRuntime) CopyItemValue(name string, value any, ignoreUnknown b
 	}
 
 	if sv := reflect.ValueOf(value); sv.Type().AssignableTo(acc.Type) {
+		if acc.codec {
+			fv := reflect.New(acc.Type).Elem()
+			fv.Set(sv)
+			copied, err := acc.copyField(unsafe.Pointer(fv.UnsafeAddr()), operation.scratch)
+			return copied, true, err
+		}
 		switch acc.Type.Kind() {
 		case reflect.Bool,
 			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -109,14 +115,16 @@ func (patch *PatchRuntime) CopyItemValue(name string, value any, ignoreUnknown b
 		}
 		fv := reflect.New(acc.Type).Elem()
 		fv.Set(sv)
-		return acc.CopyFieldValue(unsafe.Pointer(fv.UnsafeAddr())), true, nil
+		copied, err := acc.copyField(unsafe.Pointer(fv.UnsafeAddr()), operation.scratch)
+		return copied, true, err
 	}
 
 	fv := reflect.New(acc.Type).Elem()
 	if err := setReflectValue(fv, value); err != nil {
 		return nil, true, fmt.Errorf("field %v: %w", name, err)
 	}
-	return acc.CopyConvertedValue(unsafe.Pointer(fv.UnsafeAddr())), true, nil
+	copied, err := acc.copyConverted(unsafe.Pointer(fv.UnsafeAddr()), operation.scratch)
+	return copied, true, err
 }
 
 func (patch *PatchRuntime) ValidateNames(items []PatchItem) error {

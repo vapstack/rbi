@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -93,8 +92,10 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 		if err := m.Delete(keycodec.U64BytesWithBuf(oldIdx, &mapKey)); err != nil {
 			return err
 		}
-		buf := new(bytes.Buffer)
-		c.encode(&noIndexRec{Name: "k-03", Age: 4}, buf)
+		buf, err := c.encode(&noIndexRec{Name: "k-03", Age: 4}, nil)
+		if err != nil {
+			return err
+		}
 		idx, err := m.NextSequence()
 		if err != nil {
 			return err
@@ -103,7 +104,7 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 			return err
 		}
 		payload := keycodec.AppendU64Bytes(nil, idx)
-		payload = append(payload, buf.Bytes()...)
+		payload = append(payload, buf...)
 		return bucket.Put([]byte("k-03"), payload)
 	}); err != nil {
 		t.Fatalf("out-of-band mutate: %v", err)

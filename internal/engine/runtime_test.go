@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -170,9 +169,11 @@ func decodeRuntimeTestRec(data []byte) (unsafe.Pointer, error) {
 }
 
 func encodeRuntimeTestRec(rec *runtimeTestRec) []byte {
-	var buf bytes.Buffer
-	runtimeTestCodec.Codec.Encode(unsafe.Pointer(rec), &buf)
-	return slices.Clone(buf.Bytes())
+	payload, err := runtimeTestCodec.Codec.Encode(unsafe.Pointer(rec), nil)
+	if err != nil {
+		panic(err)
+	}
+	return slices.Clone(payload)
 }
 
 func releaseRuntimeTestRec(ptr unsafe.Pointer) {

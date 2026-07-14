@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -40,14 +39,13 @@ const (
 // representation used as an index key.
 //
 // IndexingValue method must return a stable, deterministic string.
-// Equal field values must produce equal indexing strings.
 // The returned string must not exceed 65535 bytes.
 //
 // Indexed fields that use ValueIndexer must be declared with concrete types,
-// not with ValueIndexer interface or any other interface type.
+// not with ValueIndexer or any other interface type.
 //
 // For a type T that implements ValueIndexer with a value receiver, nil *T
-// scalar values are indexed as null. In slice indexes, nil *T elements for
+// values are indexed as null. In slice indexes, nil *T elements for
 // value-receiver T do not emit index keys.
 //
 // Nil pointer-receiver values are passed to IndexingValue;
@@ -56,7 +54,28 @@ const (
 // The returned string is compared lexicographically when evaluating
 // range queries (>, >=, <, <=). Implementation must ensure that the
 // produced ordering matches the intent.
-type ValueIndexer = schema.ValueIndexer
+type ValueIndexer interface {
+	// IndexingValue returns a canonical string used as an index key.
+	IndexingValue() string
+}
+
+// Codec defines a custom field value encoding contract.
+type Codec interface {
+	// EncodeRBI appends the binary representation of the value to the end of b
+	// (allocating a larger slice if necessary) and returns the updated slice.
+	//
+	// Implementations must not retain b, nor mutate any bytes within b[:len(b)].
+	EncodeRBI(b []byte) ([]byte, error)
+
+	// DecodeRBI decodes the binary representation of value.
+	//
+	// Implementations must copy the data if it is retained after returning and
+	// must not retain or mutate the input []byte.
+	//
+	// Payload versioning and backward compatibility is the responsibility
+	// of the implementation.
+	DecodeRBI(b []byte) error
+}
 
 // Key is the reserved synthetic query field name for record primary keys.
 const Key = "$key"
@@ -682,8 +701,8 @@ func (c *Collection[K, V]) initWriteExecutor() {
 	c.root.scheduler.configure(c.options.BatchSoftLimit)
 
 	ops := wexec.RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) {
-			c.encode((*V)(ptr), buf)
+		Encode: func(ptr unsafe.Pointer, buf []byte) ([]byte, error) {
+			return c.encode((*V)(ptr), buf)
 		},
 		Decode: func(data []byte) (unsafe.Pointer, error) {
 			val, err := c.decode(data)
@@ -695,8 +714,8 @@ func (c *Collection[K, V]) initWriteExecutor() {
 		Acquire: func() unsafe.Pointer {
 			return unsafe.Pointer(c.recPool.Get())
 		},
-		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
-			c.schema.Clone.CloneInto(src, dst)
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) error {
+			return c.schema.Clone.CloneInto(src, dst)
 		},
 		Release: func(ptr unsafe.Pointer) {
 			c.ReleaseRecords((*V)(ptr))
@@ -1099,8 +1118,8 @@ func (c *Collection[K, V]) decode(b []byte) (*V, error) {
 	return v, nil
 }
 
-func (c *Collection[K, V]) encode(v *V, b *bytes.Buffer) {
-	c.schema.Codec.Encode(unsafe.Pointer(v), b)
+func (c *Collection[K, V]) encode(v *V, b []byte) ([]byte, error) {
+	return c.schema.Codec.Encode(unsafe.Pointer(v), b)
 }
 
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }

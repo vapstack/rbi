@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"bytes"
 	"path/filepath"
 	"testing"
 	"time"
@@ -226,9 +225,11 @@ func codecBenchMapValueRecord() *codecBenchMapRecord {
 
 func codecBenchCollectionPayload[V any](b *testing.B, c *Collection[uint64, V], rec *V) []byte {
 	b.Helper()
-	var buf bytes.Buffer
-	c.encode(rec, &buf)
-	payload := append([]byte(nil), buf.Bytes()...)
+	payload, err := c.encode(rec, nil)
+	if err != nil {
+		b.Fatalf("encode warmup: %v", err)
+	}
+	payload = append([]byte(nil), payload...)
 	decoded, err := c.decode(payload)
 	if err != nil {
 		b.Fatalf("decode warmup: %v", err)
@@ -239,17 +240,16 @@ func codecBenchCollectionPayload[V any](b *testing.B, c *Collection[uint64, V], 
 
 func benchmarkCodecCollectionEncode[V any](b *testing.B, c *Collection[uint64, V], rec *V) {
 	payload := codecBenchCollectionPayload(b, c, rec)
-	var buf bytes.Buffer
-	buf.Grow(len(payload))
+	buf := make([]byte, 0, len(payload))
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	var written uint64
 	for b.Loop() {
-		buf.Reset()
-		c.encode(rec, &buf)
-		written += uint64(buf.Len())
+		buf = buf[:0]
+		buf, _ = c.encode(rec, buf)
+		written += uint64(len(buf))
 	}
 	b.ReportMetric(float64(len(payload)), "payload_B/op")
 	codecBenchByteSink = written
@@ -359,9 +359,11 @@ func Benchmark_Codec_Collection_Decode(b *testing.B) {
 
 func codecBenchDirectPayload[V any](b *testing.B, c *Collection[uint64, V], rec *V) []byte {
 	b.Helper()
-	var buf bytes.Buffer
-	c.schema.Codec.Encode(unsafe.Pointer(rec), &buf)
-	payload := append([]byte(nil), buf.Bytes()...)
+	payload, err := c.schema.Codec.Encode(unsafe.Pointer(rec), nil)
+	if err != nil {
+		b.Fatalf("direct encode warmup: %v", err)
+	}
+	payload = append([]byte(nil), payload...)
 	var dst V
 	if err := c.schema.Codec.Decode(payload, unsafe.Pointer(&dst)); err != nil {
 		b.Fatalf("direct decode warmup: %v", err)
@@ -371,17 +373,16 @@ func codecBenchDirectPayload[V any](b *testing.B, c *Collection[uint64, V], rec 
 
 func benchmarkCodecDirectEncode[V any](b *testing.B, c *Collection[uint64, V], rec *V) {
 	payload := codecBenchDirectPayload(b, c, rec)
-	var buf bytes.Buffer
-	buf.Grow(len(payload))
+	buf := make([]byte, 0, len(payload))
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	var written uint64
 	for b.Loop() {
-		buf.Reset()
-		c.schema.Codec.Encode(unsafe.Pointer(rec), &buf)
-		written += uint64(buf.Len())
+		buf = buf[:0]
+		buf, _ = c.schema.Codec.Encode(unsafe.Pointer(rec), buf)
+		written += uint64(len(buf))
 	}
 	b.ReportMetric(float64(len(payload)), "payload_B/op")
 	codecBenchByteSink = written

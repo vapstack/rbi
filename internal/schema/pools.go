@@ -11,7 +11,28 @@ const (
 	stringSetPoolMaxLen = 4 << 10
 	u64SetPoolMaxCap    = 16 << 10
 	patchItemPoolMaxCap = 1024
+	codecScratchMaxCap  = 512 << 10
 )
+
+type codecScratch struct {
+	first  []byte
+	second []byte
+}
+
+var codecScratchPool = pooled.Pointers[codecScratch]{
+	Cleanup: func(s *codecScratch) {
+		if cap(s.first) > codecScratchMaxCap {
+			s.first = nil
+		} else {
+			s.first = s.first[:0]
+		}
+		if cap(s.second) > codecScratchMaxCap {
+			s.second = nil
+		} else {
+			s.second = s.second[:0]
+		}
+	},
+}
 
 var stringSetPool = pooled.Maps[string, struct{}]{
 	NewCap: 64,

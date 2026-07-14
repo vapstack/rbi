@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -80,7 +79,7 @@ func executeBatchForTest(ex *Executor, batch []*request) {
 		reqs := requestScratchPool.Get(1)
 		reqs = append(reqs, *batch[i])
 		batch[i].setValue = nil
-		batch[i].setPayload = nil
+		batch[i].setBuffer = nil
 		batch[i].patch = nil
 		ops := Batch{ex: ex, reqs: reqs}
 		if _, err = attempt.Prepare(&ops, nil, nil); err != nil {
@@ -224,23 +223,23 @@ func assignRequestErr(reqs []*request, err error) {
 }
 
 func setAttemptReq(id uint64, v byte) *request {
-	payload := encodePool.Get()
-	_ = payload.WriteByte(v)
+	buf := encodeBufferPool.Get()
+	buf = append(buf, v)
 	rec := &attemptRec{V: v}
 	return &request{
-		op:         opSet,
-		id:         keycodec.DataKeyFromUserKey(id, false),
-		setValue:   unsafe.Pointer(rec),
-		setPayload: payload,
+		op:        opSet,
+		id:        keycodec.DataKeyFromUserKey(id, false),
+		setValue:  unsafe.Pointer(rec),
+		setBuffer: buf,
 	}
 }
 
 func stringSetAttemptReq(id string, v byte) *request {
 	req := setAttemptReq(0, v)
 	req.id = keycodec.DataKeyFromUserKey(id, true)
-	req.setPayload.Reset()
-	req.payloadOff = reserveStringValuePrefix(req.setPayload, true)
-	_ = req.setPayload.WriteByte(v)
+	req.setBuffer = req.setBuffer[:0]
+	req.setBuffer, req.payloadOff = reserveStringValuePrefix(req.setBuffer, true)
+	req.setBuffer = append(req.setBuffer, v)
 	return req
 }
 
@@ -375,8 +374,8 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 	}
 
 	ops := RecordOps{
-		Encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) {
-			_ = buf.WriteByte((*attemptRec)(ptr).V)
+		Encode: func(ptr unsafe.Pointer, buf []byte) ([]byte, error) {
+			return append(buf, (*attemptRec)(ptr).V), nil
 		},
 		Decode: func(data []byte) (unsafe.Pointer, error) {
 			return unsafe.Pointer(&attemptRec{V: data[0]}), nil
@@ -384,8 +383,9 @@ func newAttemptTestExecutor(t *testing.T, events *[]string, commit func(*bbolt.T
 		Acquire: func() unsafe.Pointer {
 			return unsafe.Pointer(&attemptRec{})
 		},
-		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) {
+		CloneInto: func(src unsafe.Pointer, dst unsafe.Pointer) error {
 			*(*attemptRec)(dst) = *(*attemptRec)(src)
+			return nil
 		},
 		Release:       func(unsafe.Pointer) {},
 		ValidateIndex: func(unsafe.Pointer) error { return nil },

@@ -1,7 +1,6 @@
 package schema
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,6 +26,7 @@ const (
 	codecWireStruct
 	codecWireMap
 	codecWireBytes
+	codecWireCustom
 )
 
 const (
@@ -37,8 +37,9 @@ const (
 var errUnsupportedCodecField = errors.New("unsupported field")
 
 type CodecRuntime struct {
-	fields []codecField
-	byName map[string]int
+	fields    []codecField
+	byName    map[string]int
+	encodeErr []codecEncodeErrStep
 }
 
 type codecField struct {
@@ -50,34 +51,79 @@ type codecField struct {
 }
 
 type (
-	codecEncodeStep func(src unsafe.Pointer, dst *bytes.Buffer)
-	codecDecodeStep func(payload []byte, wire byte, dst unsafe.Pointer) error
-	codecReadStep   func(src []byte, pos int, dst unsafe.Pointer) (int, error)
-	codecStep       func(ptr unsafe.Pointer)
+	codecEncodeStep    func(src unsafe.Pointer, dst []byte) []byte
+	codecEncodeErrStep func(src unsafe.Pointer, dst []byte) ([]byte, error)
+	codecDecodeStep    func(payload []byte, wire byte, dst unsafe.Pointer) error
+	codecReadStep      func(src []byte, pos int, dst unsafe.Pointer) (int, error)
+	codecStep          func(ptr unsafe.Pointer)
 )
 
 type codecValue struct {
-	wire    byte
-	minSize int // lower bound for one value; it may be smaller than current encoder output.
-	encode  codecEncodeStep
-	read    codecReadStep
-	zero    codecStep
+	wire      byte
+	minSize   int // lower bound for one value; it may be smaller than current encoder output.
+	encode    codecEncodeStep
+	encodeErr codecEncodeErrStep
+	read      codecReadStep
+	zero      codecStep
 }
 
 type codecCompiler struct {
 	stack map[reflect.Type]bool
 }
 
-func (c CodecRuntime) Encode(src unsafe.Pointer, dst *bytes.Buffer) {
-	dst.WriteByte(codecVersion)
-	codecWriteUvarint(dst, uint64(len(c.fields)))
-	for i := range c.fields {
-		f := &c.fields[i]
-		f.encode(src, dst)
+type codecStruct struct {
+	fields    []codecField
+	encodeErr []codecEncodeErrStep
+}
+
+func (s *codecStruct) add(field codecField, encodeErr codecEncodeErrStep) {
+	s.fields = append(s.fields, field)
+	if encodeErr != nil {
+		if s.encodeErr == nil {
+			s.encodeErr = make([]codecEncodeErrStep, len(s.fields)-1, len(s.fields))
+		}
+		s.encodeErr = append(s.encodeErr, encodeErr)
+	} else if s.encodeErr != nil {
+		s.encodeErr = append(s.encodeErr, nil)
 	}
 }
 
-func (c CodecRuntime) Decode(src []byte, dst unsafe.Pointer) error {
+func (s *codecStruct) append(other codecStruct) {
+	for i := range other.fields {
+		var encodeErr codecEncodeErrStep
+		if other.encodeErr != nil {
+			encodeErr = other.encodeErr[i]
+		}
+		s.add(other.fields[i], encodeErr)
+	}
+}
+
+func (c CodecRuntime) Encode(src unsafe.Pointer, dst []byte) ([]byte, error) {
+	dst = append(dst, codecVersion)
+	dst = codecWriteUvarint(dst, uint64(len(c.fields)))
+	if c.encodeErr == nil {
+		for i := range c.fields {
+			dst = c.fields[i].encode(src, dst)
+		}
+		return dst, nil
+	}
+	for i := range c.fields {
+		f := &c.fields[i]
+		encodeErr := c.encodeErr[i]
+		if encodeErr != nil {
+			var err error
+			dst, err = encodeErr(src, dst)
+			if err != nil {
+				return dst, fmt.Errorf("encoding field %q: %w", f.name, err)
+			}
+		} else {
+			dst = f.encode(src, dst)
+		}
+	}
+	return dst, nil
+}
+
+func (c *CodecRuntime) Decode(src []byte, dst unsafe.Pointer) error {
 	if len(src) == 0 {
 		return fmt.Errorf("decode: missing version")
 	}
@@ -130,7 +176,16 @@ func codecReadFields(src []byte, pos int, fields []codecField, byName map[string
 		payload := src[pos : pos+int(payloadLen)]
 		pos += int(payloadLen)
 
-		if idx, ok := byName[string(name)]; ok {
+		nameKey := unsafe.String(unsafe.SliceData(name), len(name))
+		idx := -1
+		// Records written by this schema keep compiled order; schema-evolved
+		// payloads fall through to the name map without weakening name framing.
+		if i < uint64(len(fields)) && nameKey == fields[i].name {
+			idx = int(i)
+		} else if fieldIndex, exists := byName[nameKey]; exists {
+			idx = fieldIndex
+		}
+		if idx >= 0 {
 			if err := fields[idx].decode(payload, wire, dst); err != nil {
 				return 0, fmt.Errorf("decoding field %q: %w", name, err)
 			}
@@ -141,10 +196,11 @@ func codecReadFields(src []byte, pos int, fields []codecField, byName map[string
 
 func compileCodec(t reflect.Type) (CodecRuntime, error) {
 	c := codecCompiler{stack: make(map[reflect.Type]bool, 8)}
-	fields, err := c.compileStruct(t, nil, 0, t.Name())
+	compiled, err := c.compileStruct(t, nil, 0, t.Name())
 	if err != nil {
 		return CodecRuntime{}, err
 	}
+	fields := compiled.fields
 	byName := make(map[string]int, len(fields))
 	for i := range fields {
 		if _, exists := byName[fields[i].name]; exists {
@@ -153,21 +209,22 @@ func compileCodec(t reflect.Type) (CodecRuntime, error) {
 		byName[fields[i].name] = i
 	}
 	return CodecRuntime{
-		fields: fields,
-		byName: byName,
+		fields:    fields,
+		byName:    byName,
+		encodeErr: compiled.encodeErr,
 	}, nil
 }
 
-func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintptr, path string) ([]codecField, error) {
+func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintptr, path string) (codecStruct, error) {
 	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("%w %s type %s", errUnsupportedCodecField, path, t)
+		return codecStruct{}, fmt.Errorf("%w %s type %s", errUnsupportedCodecField, path, t)
 	}
 	if c.stack[t] {
-		return nil, fmt.Errorf("%w %s recursive type %s", errUnsupportedCodecField, path, t)
+		return codecStruct{}, fmt.Errorf("%w %s recursive type %s", errUnsupportedCodecField, path, t)
 	}
 	c.stack[t] = true
-	var fields []codecField
-	var promoted []codecField
+	var fields codecStruct
+	var promoted codecStruct
 	direct := make(map[string]struct{}, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
@@ -178,13 +235,29 @@ func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintpt
 			continue
 		}
 		name := fieldDBName(sf)
+		leaf, err := resolveCodecLeaf(sf.Type, path+"."+sf.Name)
+		if err != nil {
+			delete(c.stack, t)
+			return codecStruct{}, err
+		}
+		if leaf != nil {
+			fieldPrefix := codecAppendPath(prefix, name)
+			field, encodeErr := makeCustomCodecField(string(fieldPrefix), base+sf.Offset, leaf)
+			if _, exists := direct[field.name]; exists {
+				delete(c.stack, t)
+				return codecStruct{}, fmt.Errorf("duplicate field name %q", field.name)
+			}
+			direct[field.name] = struct{}{}
+			fields.add(field, encodeErr)
+			continue
+		}
 		if sf.Anonymous && sf.Type.Kind() == reflect.Struct && sf.Type != nativeTimeType {
 			nested, err := c.compileStruct(sf.Type, prefix, base+sf.Offset, path+"."+sf.Name)
 			if err != nil {
 				delete(c.stack, t)
-				return nil, err
+				return codecStruct{}, err
 			}
-			promoted = append(promoted, nested...)
+			promoted.append(nested)
 			continue
 		}
 		fieldPrefix := codecAppendPath(prefix, name)
@@ -192,45 +265,49 @@ func (c *codecCompiler) compileStruct(t reflect.Type, prefix []byte, base uintpt
 			nested, err := c.compileStruct(sf.Type, fieldPrefix, base+sf.Offset, path+"."+sf.Name)
 			if err != nil {
 				delete(c.stack, t)
-				return nil, err
+				return codecStruct{}, err
 			}
-			for i := range nested {
-				if _, exists := direct[nested[i].name]; exists {
+			for i := range nested.fields {
+				if _, exists := direct[nested.fields[i].name]; exists {
 					delete(c.stack, t)
-					return nil, fmt.Errorf("duplicate field name %q", nested[i].name)
+					return codecStruct{}, fmt.Errorf("duplicate field name %q", nested.fields[i].name)
 				}
-				direct[nested[i].name] = struct{}{}
+				direct[nested.fields[i].name] = struct{}{}
 			}
-			fields = append(fields, nested...)
+			fields.append(nested)
 			continue
 		}
-		field, err := c.makeCodecField(sf.Type, string(fieldPrefix), base+sf.Offset, path+"."+sf.Name)
+		field, encodeErr, err := c.makeCodecField(sf.Type, string(fieldPrefix), base+sf.Offset, path+"."+sf.Name)
 		if err != nil {
 			delete(c.stack, t)
-			return nil, err
+			return codecStruct{}, err
 		}
 		if _, exists := direct[field.name]; exists {
 			delete(c.stack, t)
-			return nil, fmt.Errorf("duplicate field name %q", field.name)
+			return codecStruct{}, fmt.Errorf("duplicate field name %q", field.name)
 		}
 		direct[field.name] = struct{}{}
-		fields = append(fields, field)
+		fields.add(field, encodeErr)
 	}
 	delete(c.stack, t)
 
-	if len(promoted) != 0 {
-		count := make(map[string]int, len(promoted))
-		for i := range promoted {
-			count[promoted[i].name]++
+	if len(promoted.fields) != 0 {
+		count := make(map[string]int, len(promoted.fields))
+		for i := range promoted.fields {
+			count[promoted.fields[i].name]++
 		}
-		for i := range promoted {
-			if _, shadowed := direct[promoted[i].name]; shadowed {
-				return nil, fmt.Errorf("promoted field %q is shadowed by direct field", promoted[i].name)
+		for i := range promoted.fields {
+			if _, shadowed := direct[promoted.fields[i].name]; shadowed {
+				return codecStruct{}, fmt.Errorf("promoted field %q is shadowed by direct field", promoted.fields[i].name)
 			}
-			if count[promoted[i].name] != 1 {
-				return nil, fmt.Errorf("ambiguous promoted field %q", promoted[i].name)
+			if count[promoted.fields[i].name] != 1 {
+				return codecStruct{}, fmt.Errorf("ambiguous promoted field %q", promoted.fields[i].name)
 			}
-			fields = append(fields, promoted[i])
+			var encodeErr codecEncodeErrStep
+			if promoted.encodeErr != nil {
+				encodeErr = promoted.encodeErr[i]
+			}
+			fields.add(promoted.fields[i], encodeErr)
 		}
 	}
 	return fields, nil
@@ -249,7 +326,7 @@ func codecAppendPath(prefix []byte, name string) []byte {
 	return out
 }
 
-func (c *codecCompiler) makeCodecField(t reflect.Type, name string, offset uintptr, path string) (codecField, error) {
+func (c *codecCompiler) makeCodecField(t reflect.Type, name string, offset uintptr, path string) (codecField, codecEncodeErrStep, error) {
 	if t == nativeTimeType {
 		return codecField{
 			name:   name,
@@ -257,7 +334,15 @@ func (c *codecCompiler) makeCodecField(t reflect.Type, name string, offset uintp
 			encode: codecEncodeTimeField(name, offset),
 			decode: codecDecodeTimeField(offset),
 			zero:   codecZeroField[time.Time](offset),
-		}, nil
+		}, nil, nil
+	}
+	leaf, err := resolveCodecLeaf(t, path)
+	if err != nil {
+		return codecField{}, nil, err
+	}
+	if leaf != nil {
+		field, encodeErr := makeCustomCodecField(name, offset, leaf)
+		return field, encodeErr, nil
 	}
 
 	switch t.Kind() {
@@ -269,32 +354,32 @@ func (c *codecCompiler) makeCodecField(t reflect.Type, name string, offset uintp
 			encode: codecEncodeBoolField(name, offset),
 			decode: codecDecodeBoolField(offset),
 			zero:   codecZeroField[bool](offset),
-		}, nil
+		}, nil, nil
 
 	case reflect.Int:
-		return codecSignedField[int](name, offset), nil
+		return codecSignedField[int](name, offset), nil, nil
 	case reflect.Int8:
-		return codecSignedField[int8](name, offset), nil
+		return codecSignedField[int8](name, offset), nil, nil
 	case reflect.Int16:
-		return codecSignedField[int16](name, offset), nil
+		return codecSignedField[int16](name, offset), nil, nil
 	case reflect.Int32:
-		return codecSignedField[int32](name, offset), nil
+		return codecSignedField[int32](name, offset), nil, nil
 	case reflect.Int64:
-		return codecSignedField[int64](name, offset), nil
+		return codecSignedField[int64](name, offset), nil, nil
 	case reflect.Uint:
-		return codecUnsignedField[uint](name, offset), nil
+		return codecUnsignedField[uint](name, offset), nil, nil
 	case reflect.Uint8:
-		return codecUnsignedField[uint8](name, offset), nil
+		return codecUnsignedField[uint8](name, offset), nil, nil
 	case reflect.Uint16:
-		return codecUnsignedField[uint16](name, offset), nil
+		return codecUnsignedField[uint16](name, offset), nil, nil
 	case reflect.Uint32:
-		return codecUnsignedField[uint32](name, offset), nil
+		return codecUnsignedField[uint32](name, offset), nil, nil
 	case reflect.Uint64:
-		return codecUnsignedField[uint64](name, offset), nil
+		return codecUnsignedField[uint64](name, offset), nil, nil
 	case reflect.Float32:
-		return codecFloatField[float32](name, offset), nil
+		return codecFloatField[float32](name, offset), nil, nil
 	case reflect.Float64:
-		return codecFloatField[float64](name, offset), nil
+		return codecFloatField[float64](name, offset), nil, nil
 
 	case reflect.String:
 		return codecField{
@@ -303,23 +388,27 @@ func (c *codecCompiler) makeCodecField(t reflect.Type, name string, offset uintp
 			encode: codecEncodeStringField(name, offset),
 			decode: codecDecodeStringField(offset),
 			zero:   codecZeroField[string](offset),
-		}, nil
+		}, nil, nil
 
 	case reflect.Pointer, reflect.Array, reflect.Slice, reflect.Map:
 		value, err := c.makeCodecValue(t, path)
 		if err != nil {
-			return codecField{}, err
+			return codecField{}, nil, err
 		}
-		return codecField{
+		field := codecField{
 			name:   name,
 			wire:   value.wire,
-			encode: codecEncodeVariableField(name, offset, value),
 			decode: codecDecodeVariableField(offset, value),
 			zero:   codecZeroVariableField(offset, value),
-		}, nil
+		}
+		if value.encodeErr != nil {
+			return field, codecEncodeVariableFieldErr(name, offset, value), nil
+		}
+		field.encode = codecEncodeVariableField(name, offset, value)
+		return field, nil, nil
 
 	default:
-		return codecField{}, fmt.Errorf("%w %s type %s", errUnsupportedCodecField, path, t)
+		return codecField{}, nil, fmt.Errorf("%w %s type %s", errUnsupportedCodecField, path, t)
 	}
 }
 
@@ -331,6 +420,19 @@ func (c *codecCompiler) makeCodecValue(t reflect.Type, path string) (codecValue,
 			encode:  codecEncodeTimeValue(),
 			read:    codecReadTimeValue(),
 			zero:    codecZeroValue[time.Time](),
+		}, nil
+	}
+	leaf, err := resolveCodecLeaf(t, path)
+	if err != nil {
+		return codecValue{}, err
+	}
+	if leaf != nil {
+		return codecValue{
+			wire:      codecWireCustom,
+			minSize:   4,
+			encodeErr: codecEncodeCustomValue(leaf),
+			read:      codecReadCustomValue(leaf),
+			zero:      codecZeroCustomValue(t),
 		}, nil
 	}
 
@@ -387,29 +489,43 @@ func (c *codecCompiler) makeCodecValue(t reflect.Type, path string) (codecValue,
 		if err != nil {
 			return codecValue{}, err
 		}
-		return codecValue{
+		value := codecValue{
 			wire:    codecWirePointer,
 			minSize: 1,
-			encode:  codecEncodePointerValue(elem),
 			read:    codecReadPointerValue(t.Elem(), elem),
 			zero:    codecZeroValue[unsafe.Pointer](),
-		}, nil
+		}
+		if elem.encodeErr != nil {
+			value.encodeErr = codecEncodePointerValueErr(elem)
+		} else {
+			value.encode = codecEncodePointerValue(elem)
+		}
+		return value, nil
 
 	case reflect.Array:
 		elem, err := c.makeCodecValue(t.Elem(), path+"[]")
 		if err != nil {
 			return codecValue{}, err
 		}
-		return codecValue{
+		value := codecValue{
 			wire:    codecWireArray,
 			minSize: t.Len() * elem.minSize,
-			encode:  codecEncodeArrayValue(t.Elem().Size(), t.Len(), elem),
 			read:    codecReadArrayValue(t.Elem().Size(), t.Len(), elem),
 			zero:    codecZeroArrayValue(t.Elem().Size(), t.Len(), elem),
-		}, nil
+		}
+		if elem.encodeErr != nil {
+			value.encodeErr = codecEncodeArrayValueErr(t.Elem().Size(), t.Len(), elem)
+		} else {
+			value.encode = codecEncodeArrayValue(t.Elem().Size(), t.Len(), elem)
+		}
+		return value, nil
 
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
+		elem, err := c.makeCodecValue(t.Elem(), path+"[]")
+		if err != nil {
+			return codecValue{}, err
+		}
+		if t.Elem().Kind() == reflect.Uint8 && elem.wire == codecWireUint {
 			return codecValue{
 				wire:    codecWireBytes,
 				minSize: 1,
@@ -418,17 +534,18 @@ func (c *codecCompiler) makeCodecValue(t reflect.Type, path string) (codecValue,
 				zero:    codecZeroValue[sliceHeader](),
 			}, nil
 		}
-		elem, err := c.makeCodecValue(t.Elem(), path+"[]")
-		if err != nil {
-			return codecValue{}, err
-		}
-		return codecValue{
+		value := codecValue{
 			wire:    codecWireSlice,
 			minSize: 1,
-			encode:  codecEncodeSliceValue(t.Elem().Size(), elem),
 			read:    codecReadSliceValue(t, t.Elem().Size(), elem),
 			zero:    codecZeroValue[sliceHeader](),
-		}, nil
+		}
+		if elem.encodeErr != nil {
+			value.encodeErr = codecEncodeSliceValueErr(t.Elem().Size(), elem)
+		} else {
+			value.encode = codecEncodeSliceValue(t.Elem().Size(), elem)
+		}
+		return value, nil
 
 	case reflect.Map:
 		if c.stack[t] {
@@ -446,13 +563,18 @@ func (c *codecCompiler) makeCodecValue(t reflect.Type, path string) (codecValue,
 			return codecValue{}, err
 		}
 		delete(c.stack, t)
-		return codecValue{
+		value := codecValue{
 			wire:    codecWireMap,
 			minSize: 1,
-			encode:  codecEncodeMapValue(t, key, elem),
 			read:    codecReadMapValue(t, key, elem),
 			zero:    codecZeroValue[unsafe.Pointer](),
-		}, nil
+		}
+		if elem.encodeErr != nil {
+			value.encodeErr = codecEncodeMapValueErr(t, key, elem)
+		} else {
+			value.encode = codecEncodeMapValue(t, key, elem)
+		}
+		return value, nil
 
 	default:
 		return codecValue{}, fmt.Errorf("%w %s type %s", errUnsupportedCodecField, path, t)
@@ -460,6 +582,13 @@ func (c *codecCompiler) makeCodecValue(t reflect.Type, path string) (codecValue,
 }
 
 func (c *codecCompiler) makeCodecMapKey(t reflect.Type, path string) (codecValue, error) {
+	leaf, err := resolveCodecLeaf(t, path)
+	if err != nil {
+		return codecValue{}, err
+	}
+	if leaf != nil {
+		return codecValue{}, fmt.Errorf("%w %s map key type %s uses RBI codec methods", errUnsupportedCodecField, path, t)
+	}
 	switch t.Kind() {
 
 	case reflect.Bool, reflect.String,
@@ -528,20 +657,22 @@ func (c *codecCompiler) makeCodecMapKeyStruct(t reflect.Type, path string) (code
 		byName[fields[i].name] = i
 	}
 
-	return codecValue{
+	value := codecValue{
 		wire:    codecWireStruct,
 		minSize: 1,
-		encode:  codecEncodeStructValue(fields),
 		read:    codecReadStructValue(fields, byName),
 		zero:    codecZeroStructValue(fields),
-	}, nil
+	}
+	value.encode = codecEncodeStructValue(fields)
+	return value, nil
 }
 
 func (c *codecCompiler) makeCodecStructValue(t reflect.Type, path string) (codecValue, error) {
-	fields, err := c.compileStruct(t, nil, 0, path)
+	compiled, err := c.compileStruct(t, nil, 0, path)
 	if err != nil {
 		return codecValue{}, err
 	}
+	fields := compiled.fields
 	byName := make(map[string]int, len(fields))
 	for i := range fields {
 		if _, exists := byName[fields[i].name]; exists {
@@ -549,13 +680,18 @@ func (c *codecCompiler) makeCodecStructValue(t reflect.Type, path string) (codec
 		}
 		byName[fields[i].name] = i
 	}
-	return codecValue{
+	value := codecValue{
 		wire:    codecWireStruct,
 		minSize: 1,
-		encode:  codecEncodeStructValue(fields),
 		read:    codecReadStructValue(fields, byName),
 		zero:    codecZeroStructValue(fields),
-	}, nil
+	}
+	if compiled.encodeErr != nil {
+		value.encodeErr = codecEncodeStructValueErr(fields, compiled.encodeErr)
+		return value, nil
+	}
+	value.encode = codecEncodeStructValue(fields)
+	return value, nil
 }
 
 func codecSignedField[T codecSigned](name string, offset uintptr) codecField {
@@ -644,23 +780,115 @@ func codecZeroValue[T any]() codecStep {
 	}
 }
 
-func codecEncodeVariableField(name string, offset uintptr, value codecValue) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		lenPos, payloadStart := codecWriteFieldHeaderReserve(dst, name, value.wire)
-		value.encode(unsafe.Add(src, offset), dst)
-		payloadLen := dst.Len() - payloadStart
+func makeCustomCodecField(name string, offset uintptr, leaf *codecLeaf) (codecField, codecEncodeErrStep) {
+	return codecField{
+		name:   name,
+		wire:   codecWireCustom,
+		decode: codecDecodeCustomField(offset, leaf),
+		zero:   codecZeroCustomField(offset, leaf.typ),
+	}, codecEncodeCustomField(name, offset, leaf)
+}
 
-		var scratch [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(scratch[:], uint64(payloadLen))
-		buf := dst.Bytes()
-		copy(buf[lenPos:], scratch[:n])
-
-		if n != binary.MaxVarintLen64 {
-			end := dst.Len()
-			copy(buf[lenPos+n:], buf[payloadStart:end])
-			dst.Truncate(end - (binary.MaxVarintLen64 - n))
+func codecEncodeCustomField(name string, offset uintptr, leaf *codecLeaf) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		dst, lenPos, payloadStart := codecWriteFieldHeaderReserve(dst, name, codecWireCustom)
+		payload, err := leaf.encode(unsafe.Add(src, offset), dst)
+		dst = payload
+		if err != nil {
+			return dst, err
 		}
+		return codecBackfillFieldLength(dst, lenPos, payloadStart), nil
 	}
+}
+
+func codecDecodeCustomField(offset uintptr, leaf *codecLeaf) codecDecodeStep {
+	return func(payload []byte, wire byte, dst unsafe.Pointer) error {
+		if wire != codecWireCustom {
+			return fmt.Errorf("expected custom payload")
+		}
+		return leaf.decode(payload, unsafe.Add(dst, offset))
+	}
+}
+
+func codecZeroCustomField(offset uintptr, t reflect.Type) codecStep {
+	return func(ptr unsafe.Pointer) {
+		reflect.NewAt(t, unsafe.Add(ptr, offset)).Elem().SetZero()
+	}
+}
+
+func codecEncodeCustomValue(leaf *codecLeaf) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		start := len(dst)
+		dst = append(dst, 0, 0, 0, 0)
+		payload, err := leaf.encode(src, dst)
+		dst = payload
+		if err != nil {
+			return dst, err
+		}
+		length := len(dst) - start - 4
+		if uint64(length) > math.MaxUint32 {
+			return dst, fmt.Errorf("custom payload length %d overflows uint32", length)
+		}
+		binary.LittleEndian.PutUint32(dst[start:start+4], uint32(length))
+		return dst, nil
+	}
+}
+
+func codecReadCustomValue(leaf *codecLeaf) codecReadStep {
+	return func(src []byte, pos int, dst unsafe.Pointer) (int, error) {
+		if len(src)-pos < 4 {
+			return 0, fmt.Errorf("malformed custom payload length")
+		}
+		length := uint64(binary.LittleEndian.Uint32(src[pos : pos+4]))
+		pos += 4
+		if length > uint64(len(src)-pos) {
+			return 0, fmt.Errorf("malformed custom payload length")
+		}
+		end := pos + int(length)
+		if err := leaf.decode(src[pos:end], dst); err != nil {
+			return 0, err
+		}
+		return end, nil
+	}
+}
+
+func codecZeroCustomValue(t reflect.Type) codecStep {
+	return func(ptr unsafe.Pointer) {
+		reflect.NewAt(t, ptr).Elem().SetZero()
+	}
+}
+
+func codecEncodeVariableField(name string, offset uintptr, value codecValue) codecEncodeStep {
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst, lenPos, payloadStart := codecWriteFieldHeaderReserve(dst, name, value.wire)
+		dst = value.encode(unsafe.Add(src, offset), dst)
+		return codecBackfillFieldLength(dst, lenPos, payloadStart)
+	}
+}
+
+func codecEncodeVariableFieldErr(name string, offset uintptr, value codecValue) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		dst, lenPos, payloadStart := codecWriteFieldHeaderReserve(dst, name, value.wire)
+		var err error
+		dst, err = value.encodeErr(unsafe.Add(src, offset), dst)
+		if err != nil {
+			return dst, err
+		}
+		return codecBackfillFieldLength(dst, lenPos, payloadStart), nil
+	}
+}
+
+func codecBackfillFieldLength(dst []byte, lenPos, payloadStart int) []byte {
+	payloadLen := len(dst) - payloadStart
+	var scratch [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(scratch[:], uint64(payloadLen))
+	copy(dst[lenPos:], scratch[:n])
+	if n != binary.MaxVarintLen64 {
+		end := len(dst)
+		copy(dst[lenPos+n:], dst[payloadStart:end])
+		dst = dst[:end-(binary.MaxVarintLen64-n)]
+	}
+	return dst
 }
 
 func codecDecodeVariableField(offset uintptr, value codecValue) codecDecodeStep {
@@ -686,23 +914,21 @@ func codecZeroVariableField(offset uintptr, value codecValue) codecStep {
 }
 
 func codecEncodeBoolField(name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		codecWriteFieldHeader(dst, name, codecWireBool, 1)
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst = codecWriteFieldHeader(dst, name, codecWireBool, 1)
 		if *(*bool)(unsafe.Add(src, offset)) {
-			dst.WriteByte(1)
-		} else {
-			dst.WriteByte(0)
+			return append(dst, 1)
 		}
+		return append(dst, 0)
 	}
 }
 
 func codecEncodeBoolValue() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		if *(*bool)(src) {
-			dst.WriteByte(1)
-		} else {
-			dst.WriteByte(0)
+			return append(dst, 1)
 		}
+		return append(dst, 0)
 	}
 }
 
@@ -741,20 +967,20 @@ func codecReadBoolValue() codecReadStep {
 }
 
 func codecEncodeSignedField[T codecSigned](name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		codecWriteFieldHeader(dst, name, codecWireInt, 8)
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst = codecWriteFieldHeader(dst, name, codecWireInt, 8)
 		var scratch [8]byte
 		binary.LittleEndian.PutUint64(scratch[:], uint64(int64(*(*T)(unsafe.Add(src, offset)))))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
 func codecEncodeSignedValue[T codecSigned]() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		var scratch [8]byte
-		dst.WriteByte(codecWireInt)
+		dst = append(dst, codecWireInt)
 		binary.LittleEndian.PutUint64(scratch[:], uint64(int64(*(*T)(src))))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
@@ -787,20 +1013,20 @@ func codecReadSignedValue[T codecSigned]() codecReadStep {
 }
 
 func codecEncodeUnsignedField[T codecUnsigned](name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		codecWriteFieldHeader(dst, name, codecWireUint, 8)
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst = codecWriteFieldHeader(dst, name, codecWireUint, 8)
 		var scratch [8]byte
 		binary.LittleEndian.PutUint64(scratch[:], uint64(*(*T)(unsafe.Add(src, offset))))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
 func codecEncodeUnsignedValue[T codecUnsigned]() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		var scratch [8]byte
-		dst.WriteByte(codecWireUint)
+		dst = append(dst, codecWireUint)
 		binary.LittleEndian.PutUint64(scratch[:], uint64(*(*T)(src)))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
@@ -833,20 +1059,20 @@ func codecReadUnsignedValue[T codecUnsigned]() codecReadStep {
 }
 
 func codecEncodeFloatField[T codecFloat](name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		codecWriteFieldHeader(dst, name, codecWireFloat, 8)
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst = codecWriteFieldHeader(dst, name, codecWireFloat, 8)
 		var scratch [8]byte
 		binary.LittleEndian.PutUint64(scratch[:], math.Float64bits(float64(*(*T)(unsafe.Add(src, offset)))))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
 func codecEncodeFloatValue[T codecFloat]() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		var scratch [8]byte
-		dst.WriteByte(codecWireFloat)
+		dst = append(dst, codecWireFloat)
 		binary.LittleEndian.PutUint64(scratch[:], math.Float64bits(float64(*(*T)(src))))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
@@ -879,18 +1105,18 @@ func codecReadFloatValue[T codecFloat]() codecReadStep {
 }
 
 func codecEncodeStringField(name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		value := *(*string)(unsafe.Add(src, offset))
-		codecWriteFieldHeader(dst, name, codecWireString, uint64(len(value)))
-		dst.WriteString(value)
+		dst = codecWriteFieldHeader(dst, name, codecWireString, uint64(len(value)))
+		return append(dst, value...)
 	}
 }
 
 func codecEncodeStringValue() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		value := *(*string)(src)
-		codecWriteUvarint(dst, uint64(len(value)))
-		dst.WriteString(value)
+		dst = codecWriteUvarint(dst, uint64(len(value)))
+		return append(dst, value...)
 	}
 }
 
@@ -916,23 +1142,23 @@ func codecReadStringValue() codecReadStep {
 }
 
 func codecEncodeTimeField(name string, offset uintptr) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		value := *(*time.Time)(unsafe.Add(src, offset))
-		codecWriteFieldHeader(dst, name, codecWireTime, 12)
+		dst = codecWriteFieldHeader(dst, name, codecWireTime, 12)
 		var scratch [12]byte
 		binary.LittleEndian.PutUint64(scratch[:8], uint64(value.Unix()))
 		binary.LittleEndian.PutUint32(scratch[8:], uint32(value.Nanosecond()))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
 func codecEncodeTimeValue() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		value := *(*time.Time)(src)
 		var scratch [12]byte
 		binary.LittleEndian.PutUint64(scratch[:8], uint64(value.Unix()))
 		binary.LittleEndian.PutUint32(scratch[8:], uint32(value.Nanosecond()))
-		dst.Write(scratch[:])
+		return append(dst, scratch[:]...)
 	}
 }
 
@@ -968,14 +1194,24 @@ func codecReadTimeValue() codecReadStep {
 }
 
 func codecEncodePointerValue(elem codecValue) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		ptr := *(*unsafe.Pointer)(src)
 		if ptr == nil {
-			dst.WriteByte(0)
-			return
+			return append(dst, 0)
 		}
-		dst.WriteByte(1)
-		elem.encode(ptr, dst)
+		dst = append(dst, 1)
+		return elem.encode(ptr, dst)
+	}
+}
+
+func codecEncodePointerValueErr(elem codecValue) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		ptr := *(*unsafe.Pointer)(src)
+		if ptr == nil {
+			return append(dst, 0), nil
+		}
+		dst = append(dst, 1)
+		return elem.encodeErr(ptr, dst)
 	}
 }
 
@@ -1007,10 +1243,24 @@ func codecReadPointerValue(elemType reflect.Type, elem codecValue) codecReadStep
 }
 
 func codecEncodeArrayValue(elemSize uintptr, length int, elem codecValue) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		for i := 0; i < length; i++ {
-			elem.encode(unsafe.Add(src, uintptr(i)*elemSize), dst)
+			dst = elem.encode(unsafe.Add(src, uintptr(i)*elemSize), dst)
 		}
+		return dst
+	}
+}
+
+func codecEncodeArrayValueErr(elemSize uintptr, length int, elem codecValue) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		for i := 0; i < length; i++ {
+			var err error
+			dst, err = elem.encodeErr(unsafe.Add(src, uintptr(i)*elemSize), dst)
+			if err != nil {
+				return dst, err
+			}
+		}
+		return dst, nil
 	}
 }
 
@@ -1043,17 +1293,17 @@ type sliceHeader struct {
 }
 
 func codecEncodeBytesValue() codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		h := (*sliceHeader)(src)
 		if h.data == nil && h.len == 0 && h.cap == 0 {
-			dst.WriteByte(0)
-			return
+			return append(dst, 0)
 		}
-		dst.WriteByte(1)
-		codecWriteUvarint(dst, uint64(h.len))
+		dst = append(dst, 1)
+		dst = codecWriteUvarint(dst, uint64(h.len))
 		if h.len != 0 {
-			dst.Write(unsafe.Slice((*byte)(h.data), h.len))
+			dst = append(dst, unsafe.Slice((*byte)(h.data), h.len)...)
 		}
+		return dst
 	}
 }
 
@@ -1088,17 +1338,36 @@ func codecReadBytesValue(sliceType reflect.Type) codecReadStep {
 }
 
 func codecEncodeSliceValue(elemSize uintptr, elem codecValue) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		h := (*sliceHeader)(src)
 		if h.data == nil && h.len == 0 && h.cap == 0 {
-			dst.WriteByte(0)
-			return
+			return append(dst, 0)
 		}
-		dst.WriteByte(1)
-		codecWriteUvarint(dst, uint64(h.len))
+		dst = append(dst, 1)
+		dst = codecWriteUvarint(dst, uint64(h.len))
 		for i := 0; i < h.len; i++ {
-			elem.encode(unsafe.Add(h.data, uintptr(i)*elemSize), dst)
+			dst = elem.encode(unsafe.Add(h.data, uintptr(i)*elemSize), dst)
 		}
+		return dst
+	}
+}
+
+func codecEncodeSliceValueErr(elemSize uintptr, elem codecValue) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		h := (*sliceHeader)(src)
+		if h.data == nil && h.len == 0 && h.cap == 0 {
+			return append(dst, 0), nil
+		}
+		dst = append(dst, 1)
+		dst = codecWriteUvarint(dst, uint64(h.len))
+		for i := 0; i < h.len; i++ {
+			var err error
+			dst, err = elem.encodeErr(unsafe.Add(h.data, uintptr(i)*elemSize), dst)
+			if err != nil {
+				return dst, err
+			}
+		}
+		return dst, nil
 	}
 }
 
@@ -1144,15 +1413,14 @@ func codecReadSliceValue(sliceType reflect.Type, elemSize uintptr, elem codecVal
 func codecEncodeMapValue(mapType reflect.Type, key codecValue, elem codecValue) codecEncodeStep {
 	keyType := mapType.Key()
 	elemType := mapType.Elem()
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
+	return func(src unsafe.Pointer, dst []byte) []byte {
 		if *(*unsafe.Pointer)(src) == nil {
-			dst.WriteByte(0)
-			return
+			return append(dst, 0)
 		}
-		dst.WriteByte(1)
+		dst = append(dst, 1)
 
 		value := reflect.NewAt(mapType, src).Elem()
-		codecWriteUvarint(dst, uint64(value.Len()))
+		dst = codecWriteUvarint(dst, uint64(value.Len()))
 
 		keyTmp := reflect.New(keyType).Elem()
 		elemTmp := reflect.New(elemType).Elem()
@@ -1162,10 +1430,41 @@ func codecEncodeMapValue(mapType reflect.Type, key codecValue, elem codecValue) 
 		iter := value.MapRange()
 		for iter.Next() {
 			keyTmp.SetIterKey(iter)
-			key.encode(keyPtr, dst)
+			dst = key.encode(keyPtr, dst)
 			elemTmp.SetIterValue(iter)
-			elem.encode(elemPtr, dst)
+			dst = elem.encode(elemPtr, dst)
 		}
+		return dst
+	}
+}
+
+func codecEncodeMapValueErr(mapType reflect.Type, key codecValue, elem codecValue) codecEncodeErrStep {
+	keyType := mapType.Key()
+	elemType := mapType.Elem()
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		if *(*unsafe.Pointer)(src) == nil {
+			return append(dst, 0), nil
+		}
+		dst = append(dst, 1)
+		value := reflect.NewAt(mapType, src).Elem()
+		dst = codecWriteUvarint(dst, uint64(value.Len()))
+
+		keyTmp := reflect.New(keyType).Elem()
+		elemTmp := reflect.New(elemType).Elem()
+		keyPtr := unsafe.Pointer(keyTmp.UnsafeAddr())
+		elemPtr := unsafe.Pointer(elemTmp.UnsafeAddr())
+		iter := value.MapRange()
+		for iter.Next() {
+			keyTmp.SetIterKey(iter)
+			dst = key.encode(keyPtr, dst)
+			elemTmp.SetIterValue(iter)
+			var err error
+			dst, err = elem.encodeErr(elemPtr, dst)
+			if err != nil {
+				return dst, err
+			}
+		}
+		return dst, nil
 	}
 }
 
@@ -1227,11 +1526,31 @@ func codecReadMapValue(mapType reflect.Type, key codecValue, elem codecValue) co
 }
 
 func codecEncodeStructValue(fields []codecField) codecEncodeStep {
-	return func(src unsafe.Pointer, dst *bytes.Buffer) {
-		codecWriteUvarint(dst, uint64(len(fields)))
+	return func(src unsafe.Pointer, dst []byte) []byte {
+		dst = codecWriteUvarint(dst, uint64(len(fields)))
 		for i := range fields {
-			fields[i].encode(src, dst)
+			dst = fields[i].encode(src, dst)
 		}
+		return dst
+	}
+}
+
+func codecEncodeStructValueErr(fields []codecField, encodeErr []codecEncodeErrStep) codecEncodeErrStep {
+	return func(src unsafe.Pointer, dst []byte) ([]byte, error) {
+		dst = codecWriteUvarint(dst, uint64(len(fields)))
+		for i := range fields {
+			field := &fields[i]
+			if encodeErr[i] != nil {
+				var err error
+				dst, err = encodeErr[i](src, dst)
+				if err != nil {
+					return dst, fmt.Errorf("encoding field %q: %w", field.name, err)
+				}
+			} else {
+				dst = field.encode(src, dst)
+			}
+		}
+		return dst, nil
 	}
 }
 
@@ -1427,28 +1746,26 @@ func codecFloatFits[T codecFloat](value float64) bool {
 	}
 }
 
-func codecWriteFieldHeader(dst *bytes.Buffer, name string, wire byte, payloadLen uint64) {
-	codecWriteUvarint(dst, uint64(len(name)))
-	dst.WriteString(name)
-	dst.WriteByte(wire)
-	codecWriteUvarint(dst, payloadLen)
+func codecWriteFieldHeader(dst []byte, name string, wire byte, payloadLen uint64) []byte {
+	dst = codecWriteUvarint(dst, uint64(len(name)))
+	dst = append(dst, name...)
+	dst = append(dst, wire)
+	return codecWriteUvarint(dst, payloadLen)
 }
 
-func codecWriteFieldHeaderReserve(dst *bytes.Buffer, name string, wire byte) (int, int) {
-	codecWriteUvarint(dst, uint64(len(name)))
-	dst.WriteString(name)
-	dst.WriteByte(wire)
-	lenPos := dst.Len()
-	for i := 0; i < binary.MaxVarintLen64; i++ {
-		dst.WriteByte(0)
-	}
-	return lenPos, dst.Len()
+func codecWriteFieldHeaderReserve(dst []byte, name string, wire byte) ([]byte, int, int) {
+	dst = codecWriteUvarint(dst, uint64(len(name)))
+	dst = append(dst, name...)
+	dst = append(dst, wire)
+	lenPos := len(dst)
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	return dst, lenPos, len(dst)
 }
 
-func codecWriteUvarint(dst *bytes.Buffer, value uint64) {
+func codecWriteUvarint(dst []byte, value uint64) []byte {
 	var scratch [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(scratch[:], value)
-	dst.Write(scratch[:n])
+	return append(dst, scratch[:n]...)
 }
 
 func codecReadUvarintAt(src []byte, pos int) (uint64, int, bool) {

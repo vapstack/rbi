@@ -143,6 +143,15 @@ type schemaTestNamedTimePtrRec struct {
 	When *schemaTestNamedTime `db:"when" rbi:"index"`
 }
 
+type schemaTestCodecNamedTime time.Time
+
+func (schemaTestCodecNamedTime) EncodeRBI(dst []byte) ([]byte, error) { return dst, nil }
+func (*schemaTestCodecNamedTime) DecodeRBI([]byte) error              { return nil }
+
+type schemaTestCodecNamedTimePtrRec struct {
+	When *schemaTestCodecNamedTime `db:"when" rbi:"index"`
+}
+
 type schemaTestNamedTimeSliceVI []schemaTestNamedTime
 
 func (v schemaTestNamedTimeSliceVI) IndexingValue() string {
@@ -589,6 +598,13 @@ func TestCompileAnonymousTaggedIndexFields(t *testing.T) {
 	}
 	if _, err = Compile(reflect.TypeFor[schemaTestUintptrSliceIndexRec](), Config{}); err == nil || !strings.Contains(err.Error(), "unsupported record field") || !strings.Contains(err.Error(), "uintptr") {
 		t.Fatalf("uintptr slice index err=%v", err)
+	}
+}
+
+func TestCompileRejectsCodecNamedTimePointerWithoutValueIndexer(t *testing.T) {
+	_, err := Compile(reflect.TypeFor[schemaTestCodecNamedTimePtrRec](), Config{})
+	if err == nil || !strings.Contains(err.Error(), "ValueIndexer") {
+		t.Fatalf("Compile codec named time pointer err=%v want ValueIndexer rejection", err)
 	}
 }
 

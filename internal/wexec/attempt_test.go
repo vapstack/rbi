@@ -43,8 +43,8 @@ func TestStringSetPrepareUsesRequestPhysicalPayloadBuffer(t *testing.T) {
 	if req.Err != nil {
 		t.Fatalf("prepareSet req error: %v", req.Err)
 	}
-	if len(att.ownedPayloads) != 0 {
-		t.Fatalf("prepareSet created attempt-owned payloads: %d", len(att.ownedPayloads))
+	if len(att.ownedBuffers) != 0 {
+		t.Fatalf("prepareSet created attempt-owned buffers: %d", len(att.ownedBuffers))
 	}
 	if len(att.prepared) != 1 {
 		t.Fatalf("prepared len=%d want 1", len(att.prepared))
@@ -69,9 +69,9 @@ func TestSetOnChangePrepareTransfersRequestValue(t *testing.T) {
 
 	clones := 0
 	cloneInto := ex.ops.CloneInto
-	ex.ops.CloneInto = func(src unsafe.Pointer, dst unsafe.Pointer) {
+	ex.ops.CloneInto = func(src unsafe.Pointer, dst unsafe.Pointer) error {
 		clones++
-		cloneInto(src, dst)
+		return cloneInto(src, dst)
 	}
 
 	rec := attemptRec{V: 7}
@@ -323,7 +323,7 @@ func TestSharedSetEmptyPayloadCommitsRest(t *testing.T) {
 	ex.snapshotOps = SnapshotOps{}
 
 	badReq := setAttemptReq(1, 1)
-	badReq.setPayload.Reset()
+	badReq.setBuffer = badReq.setBuffer[:0]
 	goodReq := setAttemptReq(2, 2)
 
 	executeBatchForTest(ex, []*request{badReq, goodReq})
@@ -350,7 +350,7 @@ func TestSharedTransparentSetFailureDoesNotHideExistingPatchTarget(t *testing.T)
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
 
 	badReq := setAttemptReq(1, 1)
-	badReq.setPayload.Reset()
+	badReq.setBuffer = badReq.setBuffer[:0]
 	patchReq := patchAttemptReq(1, []schema.PatchItem{{Name: "v", Value: byte(77)}}, true)
 
 	executeBatchForTest(ex, []*request{badReq, patchReq})
@@ -374,7 +374,7 @@ func TestSharedTransparentSetFailureDoesNotClearOldValueForLaterOnChange(t *test
 	putAttemptPayload(t, raw, bucket, 1, []byte{10})
 
 	badReq := setAttemptReq(1, 1)
-	badReq.setPayload.Reset()
+	badReq.setBuffer = badReq.setBuffer[:0]
 	setReq := setAttemptReq(1, 20)
 	var oldNil bool
 	var oldSeen byte
@@ -659,10 +659,10 @@ func TestLoadStateDecodeErrorClearsDiscardedStateSlot(t *testing.T) {
 			return fmt.Errorf("states len = %d, want 0", len(st.states))
 		}
 		state := st.states[:cap(st.states)][0]
-		if state.key != nil || state.value != nil || state.ownedPayload != nil || state.borrowedPayload != nil {
+		if state.key != nil || state.value != nil || state.payload != nil {
 			return fmt.Errorf("discarded state kept references: %+v", state)
 		}
-		if state.idx != 0 || state.idxKnown || state.idxNew || state.exists || state.payloadOff != 0 || state.payloadKnown {
+		if state.idx != 0 || state.idxKnown || state.idxNew || state.exists || state.payloadKnown {
 			return fmt.Errorf("discarded state kept scalar state: %+v", state)
 		}
 		return nil

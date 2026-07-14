@@ -4,7 +4,8 @@ import "github.com/vapstack/pooled"
 
 const requestScratchPoolCap = 4 << 10
 
-var encodePool = pooled.Buffers{
+var encodeBufferPool = pooled.FlatSlices[byte]{
+	NewCap: 64,
 	MaxCap: 512 << 10,
 }
 

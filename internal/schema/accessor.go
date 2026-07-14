@@ -2104,8 +2104,8 @@ func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) Pat
 	}
 
 	c := cloneCompiler{stack: make(map[reflect.Type]bool, 8)}
-	step, err := c.buildValueStep(fieldType, fieldType.String())
-	if err != nil {
+	step, errStep, err := c.buildValueSteps(fieldType, fieldType.String())
+	if err != nil || errStep != nil {
 		return nil
 	}
 	return func(root unsafe.Pointer) any {

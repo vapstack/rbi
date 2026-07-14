@@ -1,7 +1,6 @@
 package wexec
 
 import (
-	"bytes"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
@@ -75,10 +74,10 @@ type (
 )
 
 type RecordOps struct {
-	Encode        func(unsafe.Pointer, *bytes.Buffer)
+	Encode        func(unsafe.Pointer, []byte) ([]byte, error)
 	Decode        func([]byte) (unsafe.Pointer, error)
 	Acquire       func() unsafe.Pointer
-	CloneInto     func(unsafe.Pointer, unsafe.Pointer)
+	CloneInto     func(unsafe.Pointer, unsafe.Pointer) error
 	Release       func(unsafe.Pointer)
 	ValidateIndex func(unsafe.Pointer) error
 }

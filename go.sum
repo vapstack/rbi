@@ -8,6 +8,10 @@ github.com/vapstack/monotime v0.4.0 h1:s2QFo111AJvU4JW8VRm1vSotVmIirGRucmhL93ra7
 github.com/vapstack/monotime v0.4.0/go.mod h1:Iv2DJcJxHHOx73KK97ARVWbk3HdcyGp0GLsCsoKPHRw=
 github.com/vapstack/pooled v0.1.1 h1:8boazSqrcx/FRbYJp3tYNfH8SLUGIOlRZqU2yK0xUck=
 github.com/vapstack/pooled v0.1.1/go.mod h1:G7pwbAJBtWqC0ttLzcBekN1zku/ssk4kgGYNBYp37jI=
+github.com/vapstack/pooled v0.2.0 h1:sCiW1k+g+TQ0JdxbhswL1qTRhCgB5GfFsZzOBBrPlP8=
+github.com/vapstack/pooled v0.2.0/go.mod h1:G7pwbAJBtWqC0ttLzcBekN1zku/ssk4kgGYNBYp37jI=
+github.com/vapstack/pooled v0.3.0 h1:lkK5MyAp1OUWrc60QFFx0iCvz4IWu12KfEIiuXn+oJI=
+github.com/vapstack/pooled v0.3.0/go.mod h1:G7pwbAJBtWqC0ttLzcBekN1zku/ssk4kgGYNBYp37jI=
 github.com/vapstack/qx v0.4.0 h1:6yi0NOexi/cvi9c6/5mfwTIWdkcBJowZ8wQRYaQvTsI=
 github.com/vapstack/qx v0.4.0/go.mod h1:GdIItKR2RMt+ej9uCHHREqkAXcO5zkPny2GVw5izc3s=
 go.etcd.io/bbolt v1.4.3 h1:dEadXpI6G79deX5prL3QRNP6JB8UxVkqo4UPnHaNXJo=

@@ -65,7 +65,7 @@ const (
 	writeBenchHighChurnOps  = 2048
 )
 
-var writeBenchEncodePool pooled.Buffers
+var writeBenchBufferPool = pooled.Slices[byte]{MaxCap: 64 << 10}
 var writeBenchHookSink uint64
 
 func buildWriteBenchCollection(b *testing.B) (*Collection[uint64, UserBench], *bbolt.DB, uint64) {
@@ -204,10 +204,14 @@ func buildWriteBenchBatchUpdateInput(batchSize int) ([]uint64, []*UserBench, []*
 }
 
 func rawSetBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
-	b := writeBenchEncodePool.Get()
-	defer writeBenchEncodePool.Put(b)
-
-	c.encode(rec, b)
+	buf := writeBenchBufferPool.Get(8 << 10)
+	var err error
+	buf, err = c.encode(rec, buf)
+	if err != nil {
+		writeBenchBufferPool.Put(buf)
+		return err
+	}
+	defer writeBenchBufferPool.Put(buf)
 
 	return raw.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(c.dataBucket)
@@ -216,7 +220,7 @@ func rawSetBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, rec
 		}
 		bucket.FillPercent = c.options.BucketFillPercent
 		var keyBuf [8]byte
-		if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf), b.Bytes()); err != nil {
+		if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, c.strKey, &keyBuf), buf); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
 		return nil
@@ -252,12 +256,16 @@ func rawPatchBench(c *Collection[uint64, UserBench], raw *bbolt.DB, id uint64, p
 			return fmt.Errorf("apply patch: %w", err)
 		}
 
-		b := writeBenchEncodePool.Get()
-		defer writeBenchEncodePool.Put(b)
-		c.encode(newVal, b)
+		buf := writeBenchBufferPool.Get(8 << 10)
+		buf, err = c.encode(newVal, buf)
+		if err != nil {
+			writeBenchBufferPool.Put(buf)
+			return err
+		}
+		defer writeBenchBufferPool.Put(buf)
 
 		bucket.FillPercent = c.options.BucketFillPercent
-		if err = bucket.Put(key, b.Bytes()); err != nil {
+		if err = bucket.Put(key, buf); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
 		return nil

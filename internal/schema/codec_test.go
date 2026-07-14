@@ -292,7 +292,7 @@ func TestCodecRuntimeScalarStringTimeRoundTrip(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecSupportedRec
 	if err = rt.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -328,7 +328,7 @@ func TestCodecRuntimeRejectsInvalidTimeNanoseconds(t *testing.T) {
 	}
 	var slicePayload bytes.Buffer
 	slicePayload.WriteByte(1)
-	codecWriteUvarint(&slicePayload, 1)
+	codecTestWriteUvarint(&slicePayload, 1)
 	slicePayload.Write(schemaCodecTestTimePayload(10, 1_000_000_000))
 
 	payload = schemaCodecTestPayload(
@@ -437,7 +437,7 @@ func TestCodecRuntimeTaggedPromotedFieldsRoundTrip(t *testing.T) {
 		SchemaCodecTaggedPromotedRight: SchemaCodecTaggedPromotedRight{X: "right"},
 	}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecTaggedPromotedRec
 	if err = rt.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -460,7 +460,7 @@ func TestCodecRuntimeEmbeddedTopLevelSchemaMovement(t *testing.T) {
 
 	embeddedSrc := schemaCodecEmbeddedMoveRec{SchemaCodecMovedEmbedded: SchemaCodecMovedEmbedded{Value: "embedded", Count: 7}}
 	var buf bytes.Buffer
-	embeddedRT.Codec.Encode(unsafe.Pointer(&embeddedSrc), &buf)
+	codecTestEncode(embeddedRT.Codec, unsafe.Pointer(&embeddedSrc), &buf)
 	var flatDst schemaCodecFlatMoveRec
 	if err = flatRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&flatDst)); err != nil {
 		t.Fatalf("Decode embedded as flat: %v", err)
@@ -471,7 +471,7 @@ func TestCodecRuntimeEmbeddedTopLevelSchemaMovement(t *testing.T) {
 
 	flatSrc := schemaCodecFlatMoveRec{Value: "flat", Count: 9}
 	buf.Reset()
-	flatRT.Codec.Encode(unsafe.Pointer(&flatSrc), &buf)
+	codecTestEncode(flatRT.Codec, unsafe.Pointer(&flatSrc), &buf)
 	var embeddedDst schemaCodecEmbeddedMoveRec
 	if err = embeddedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&embeddedDst)); err != nil {
 		t.Fatalf("Decode flat as embedded: %v", err)
@@ -493,7 +493,7 @@ func TestCodecRuntimeIntegerWiresDecodeAsRepresentableFloats(t *testing.T) {
 
 	src := schemaCodecIntegerRec{Value: -123, U: 1 << 60}
 	var buf bytes.Buffer
-	intRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(intRT.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecFloat64Rec
 	if err = floatRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -516,7 +516,7 @@ func TestCodecRuntimeFloatWiresDecodeAsRepresentableIntegers(t *testing.T) {
 
 	src := schemaCodecFloat64Rec{Value: -123, U: 1 << 40}
 	var buf bytes.Buffer
-	floatRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(floatRT.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecIntegerRec
 	if err = intRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -539,7 +539,7 @@ func TestCodecRuntimeRejectsLossyFloatIntegerEvolution(t *testing.T) {
 
 	src := schemaCodecFloat64Rec{Value: 1.5}
 	var buf bytes.Buffer
-	floatRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(floatRT.Codec, unsafe.Pointer(&src), &buf)
 	var dst schemaCodecIntegerRec
 	if err = intRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
 		t.Fatalf("Decode fractional float as integer err=%v want exactness error", err)
@@ -547,14 +547,14 @@ func TestCodecRuntimeRejectsLossyFloatIntegerEvolution(t *testing.T) {
 
 	src = schemaCodecFloat64Rec{U: -1}
 	buf.Reset()
-	floatRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(floatRT.Codec, unsafe.Pointer(&src), &buf)
 	if err = intRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("Decode negative float as unsigned err=%v want negative overflow", err)
 	}
 
 	src = schemaCodecFloat64Rec{Value: math.Ldexp(1, 63)}
 	buf.Reset()
-	floatRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(floatRT.Codec, unsafe.Pointer(&src), &buf)
 	if err = intRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "overflows") {
 		t.Fatalf("Decode overflowing float as integer err=%v want overflow", err)
 	}
@@ -577,7 +577,7 @@ func TestCodecRuntimeCompositeFloatWiresDecodeAsRepresentableIntegers(t *testing
 		Labels: map[string]float64{"a": 1, "b": 1 << 40},
 	}
 	var buf bytes.Buffer
-	floatRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(floatRT.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecIntegerCompositeNumericRec
 	if err = intRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -605,7 +605,7 @@ func TestCodecRuntimeRejectsInexactIntegerFloatEvolution(t *testing.T) {
 
 	src := schemaCodecIntegerRec{Value: 1<<24 + 1}
 	var buf bytes.Buffer
-	intRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(intRT.Codec, unsafe.Pointer(&src), &buf)
 	var f32 schemaCodecFloat32Rec
 	if err = float32RT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&f32)); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
 		t.Fatalf("Decode inexact int64 as float32 err=%v want exactness error", err)
@@ -613,7 +613,7 @@ func TestCodecRuntimeRejectsInexactIntegerFloatEvolution(t *testing.T) {
 
 	src = schemaCodecIntegerRec{U: 1<<53 + 1}
 	buf.Reset()
-	intRT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(intRT.Codec, unsafe.Pointer(&src), &buf)
 	var f64 schemaCodecFloat64Rec
 	if err = float64RT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&f64)); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
 		t.Fatalf("Decode inexact uint64 as float64 err=%v want exactness error", err)
@@ -636,7 +636,7 @@ func TestCodecRuntimeAllowsExactFloat32Evolution(t *testing.T) {
 
 	intSrc := schemaCodecIntegerRec{Value: 1 << 24}
 	var buf bytes.Buffer
-	intRT.Codec.Encode(unsafe.Pointer(&intSrc), &buf)
+	codecTestEncode(intRT.Codec, unsafe.Pointer(&intSrc), &buf)
 	var f32 schemaCodecFloat32Rec
 	if err = float32RT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&f32)); err != nil {
 		t.Fatalf("Decode exact int64 as float32: %v", err)
@@ -647,7 +647,7 @@ func TestCodecRuntimeAllowsExactFloat32Evolution(t *testing.T) {
 
 	floatSrc := schemaCodecFloat64Rec{Value: 1.5}
 	buf.Reset()
-	float64RT.Codec.Encode(unsafe.Pointer(&floatSrc), &buf)
+	codecTestEncode(float64RT.Codec, unsafe.Pointer(&floatSrc), &buf)
 	if err = float32RT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&f32)); err != nil {
 		t.Fatalf("Decode exact float64 as float32: %v", err)
 	}
@@ -668,7 +668,7 @@ func TestCodecRuntimeRejectsLossyFloat64ToFloat32(t *testing.T) {
 
 	src := schemaCodecFloat64Rec{Value: 0.1}
 	var buf bytes.Buffer
-	float64RT.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(float64RT.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecFloat32Rec
 	if err = float32RT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "cannot be represented exactly") {
@@ -688,7 +688,7 @@ func TestCodecRuntimeCompositeArrayMapNumericSignednessEvolution(t *testing.T) {
 
 	unsignedSrc := schemaCodecUnsignedArrayMapRec{Fixed: [1]uint64{^uint64(0)}, Labels: map[string]uint64{"ok": 1}}
 	var buf bytes.Buffer
-	unsignedRT.Codec.Encode(unsafe.Pointer(&unsignedSrc), &buf)
+	codecTestEncode(unsignedRT.Codec, unsafe.Pointer(&unsignedSrc), &buf)
 	var signedDst schemaCodecSignedArrayMapRec
 	if err = signedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&signedDst)); err == nil || !strings.Contains(err.Error(), "overflows int64") {
 		t.Fatalf("Decode unsigned array as signed err=%v want overflow", err)
@@ -696,14 +696,14 @@ func TestCodecRuntimeCompositeArrayMapNumericSignednessEvolution(t *testing.T) {
 
 	unsignedSrc = schemaCodecUnsignedArrayMapRec{Fixed: [1]uint64{1}, Labels: map[string]uint64{"bad": ^uint64(0)}}
 	buf.Reset()
-	unsignedRT.Codec.Encode(unsafe.Pointer(&unsignedSrc), &buf)
+	codecTestEncode(unsignedRT.Codec, unsafe.Pointer(&unsignedSrc), &buf)
 	if err = signedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&signedDst)); err == nil || !strings.Contains(err.Error(), "overflows int64") {
 		t.Fatalf("Decode unsigned map as signed err=%v want overflow", err)
 	}
 
 	signedSrc := schemaCodecSignedArrayMapRec{Fixed: [1]int64{-1}, Labels: map[string]int64{"ok": 1}}
 	buf.Reset()
-	signedRT.Codec.Encode(unsafe.Pointer(&signedSrc), &buf)
+	codecTestEncode(signedRT.Codec, unsafe.Pointer(&signedSrc), &buf)
 	var unsignedDst schemaCodecUnsignedArrayMapRec
 	if err = unsignedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&unsignedDst)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("Decode negative signed array as unsigned err=%v want negative overflow", err)
@@ -711,7 +711,7 @@ func TestCodecRuntimeCompositeArrayMapNumericSignednessEvolution(t *testing.T) {
 
 	signedSrc = schemaCodecSignedArrayMapRec{Fixed: [1]int64{1}, Labels: map[string]int64{"bad": -1}}
 	buf.Reset()
-	signedRT.Codec.Encode(unsafe.Pointer(&signedSrc), &buf)
+	codecTestEncode(signedRT.Codec, unsafe.Pointer(&signedSrc), &buf)
 	if err = unsignedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&unsignedDst)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("Decode negative signed map as unsigned err=%v want negative overflow", err)
 	}
@@ -767,7 +767,7 @@ func TestCodecRuntimePointersArraysSlicesRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 	var dst schemaCodecCompositeRec
 	if err = rt.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
 		t.Fatalf("Decode: %v", err)
@@ -810,7 +810,7 @@ func TestCodecRuntimeByteSlicesUseCompactPayload(t *testing.T) {
 		Alias: schemaCodecNamedBytes{9, 8, 7},
 	}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 
 	wire, payload := schemaCodecEncodedField(t, buf.Bytes(), "blob")
 	if wire != codecWireBytes {
@@ -842,7 +842,7 @@ func TestCodecRuntimeCompositeFieldLengthUsesCompactVarint(t *testing.T) {
 
 	src := schemaCodecUnsignedCompositeRec{Values: []uint64{1}}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 
 	payload := buf.Bytes()
 	count, pos, ok := codecReadUvarintAt(payload, 1)
@@ -876,7 +876,7 @@ func TestCodecRuntimeFloat32InfinitiesRoundTrip(t *testing.T) {
 		Values: []float32{float32(math.Inf(1)), float32(math.Inf(-1)), float32(math.NaN())},
 	}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 
 	var dst schemaCodecFloatSpecialRec
 	if err = rt.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
@@ -901,7 +901,7 @@ func TestCodecRuntimeCompositeNumericSignednessEvolution(t *testing.T) {
 
 	unsignedSrc := schemaCodecUnsignedCompositeRec{Values: []uint64{^uint64(0)}}
 	var buf bytes.Buffer
-	unsignedRT.Codec.Encode(unsafe.Pointer(&unsignedSrc), &buf)
+	codecTestEncode(unsignedRT.Codec, unsafe.Pointer(&unsignedSrc), &buf)
 	var signedDst schemaCodecSignedCompositeRec
 	if err = signedRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&signedDst)); err == nil || !strings.Contains(err.Error(), "overflows int64") {
 		t.Fatalf("Decode unsigned composite as signed err=%v want overflow", err)
@@ -918,7 +918,7 @@ func TestCodecRuntimeCompositeNumericSignednessEvolution(t *testing.T) {
 	negative := int64(-1)
 	signedPtrSrc := schemaCodecSignedPtrRec{Value: &negative}
 	buf.Reset()
-	signedPtrRT.Codec.Encode(unsafe.Pointer(&signedPtrSrc), &buf)
+	codecTestEncode(signedPtrRT.Codec, unsafe.Pointer(&signedPtrSrc), &buf)
 	var unsignedPtrDst schemaCodecUnsignedPtrRec
 	if err = unsignedPtrRT.Codec.Decode(buf.Bytes(), unsafe.Pointer(&unsignedPtrDst)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("Decode negative signed pointer as unsigned err=%v want negative overflow", err)
@@ -933,7 +933,7 @@ func TestCodecRuntimeRejectsMalformedCompositeLengthsBeforeAllocation(t *testing
 
 	var slicePayload bytes.Buffer
 	slicePayload.WriteByte(1)
-	codecWriteUvarint(&slicePayload, 1<<30)
+	codecTestWriteUvarint(&slicePayload, 1<<30)
 	payload := schemaCodecTestPayload(schemaCodecTestField{name: "tags", wire: codecWireSlice, payload: slicePayload.Bytes()})
 	var dst schemaCodecMalformedCompositeLengthRec
 	if err = rt.Codec.Decode(payload, unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "malformed slice length") {
@@ -946,7 +946,7 @@ func TestCodecRuntimeRejectsMalformedCompositeLengthsBeforeAllocation(t *testing
 	}
 	slicePayload.Reset()
 	slicePayload.WriteByte(1)
-	codecWriteUvarint(&slicePayload, 2)
+	codecTestWriteUvarint(&slicePayload, 2)
 	slicePayload.WriteByte(0)
 	slicePayload.WriteByte(0)
 	payload = schemaCodecTestPayload(schemaCodecTestField{name: "values", wire: codecWireSlice, payload: slicePayload.Bytes()})
@@ -957,7 +957,7 @@ func TestCodecRuntimeRejectsMalformedCompositeLengthsBeforeAllocation(t *testing
 
 	var mapPayload bytes.Buffer
 	mapPayload.WriteByte(1)
-	codecWriteUvarint(&mapPayload, 1<<30)
+	codecTestWriteUvarint(&mapPayload, 1<<30)
 	payload = schemaCodecTestPayload(schemaCodecTestField{name: "labels", wire: codecWireMap, payload: mapPayload.Bytes()})
 	if err = rt.Codec.Decode(payload, unsafe.Pointer(&dst)); err == nil || !strings.Contains(err.Error(), "malformed map length") {
 		t.Fatalf("Decode malformed map length err=%v want length error", err)
@@ -983,7 +983,7 @@ func TestCodecRuntimeIgnoresTaggedFields(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 	data := buf.Bytes()
 	for _, name := range []string{"DBSkip", "skip", "Disabled"} {
 		if bytes.Contains(data, []byte(name)) {
@@ -1104,7 +1104,7 @@ func TestCodecRuntimeMapsRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	rt.Codec.Encode(unsafe.Pointer(&src), &buf)
+	codecTestEncode(rt.Codec, unsafe.Pointer(&src), &buf)
 	var dst schemaCodecMapRec
 	if err = rt.Codec.Decode(buf.Bytes(), unsafe.Pointer(&dst)); err != nil {
 		t.Fatalf("Decode: %v", err)
@@ -1236,12 +1236,33 @@ type schemaCodecTestField struct {
 func schemaCodecTestPayload(fields ...schemaCodecTestField) []byte {
 	var buf bytes.Buffer
 	buf.WriteByte(codecVersion)
-	codecWriteUvarint(&buf, uint64(len(fields)))
+	codecTestWriteUvarint(&buf, uint64(len(fields)))
 	for i := range fields {
-		codecWriteFieldHeader(&buf, fields[i].name, fields[i].wire, uint64(len(fields[i].payload)))
+		codecTestWriteFieldHeader(&buf, fields[i].name, fields[i].wire, uint64(len(fields[i].payload)))
 		buf.Write(fields[i].payload)
 	}
 	return buf.Bytes()
+}
+
+func codecTestEncode(codec CodecRuntime, src unsafe.Pointer, dst *bytes.Buffer) {
+	payload, err := codec.Encode(src, dst.Bytes())
+	if err != nil {
+		panic(err)
+	}
+	dst.Reset()
+	_, _ = dst.Write(payload)
+}
+
+func codecTestWriteUvarint(dst *bytes.Buffer, value uint64) {
+	payload := codecWriteUvarint(dst.Bytes(), value)
+	dst.Reset()
+	_, _ = dst.Write(payload)
+}
+
+func codecTestWriteFieldHeader(dst *bytes.Buffer, name string, wire byte, payloadLen uint64) {
+	payload := codecWriteFieldHeader(dst.Bytes(), name, wire, payloadLen)
+	dst.Reset()
+	_, _ = dst.Write(payload)
 }
 
 func schemaCodecTestTimePayload(sec int64, nsec int64) []byte {
@@ -1286,4 +1307,76 @@ func schemaCodecEncodedField(t testing.TB, payload []byte, field string) (byte, 
 	}
 	t.Fatalf("field %q not found", field)
 	return 0, nil
+}
+
+type schemaCustomValue struct {
+	text string
+}
+
+func (v schemaCustomValue) EncodeRBI(dst []byte) ([]byte, error) {
+	return append(dst, v.text...), nil
+}
+
+func (v *schemaCustomValue) DecodeRBI(src []byte) error {
+	v.text = string(src)
+	return nil
+}
+
+type schemaCustomRecord struct {
+	Value  schemaCustomValue
+	Ptr    *schemaCustomValue
+	Array  [2]schemaCustomValue
+	Slice  []schemaCustomValue
+	Values map[string]schemaCustomValue
+}
+
+func TestCustomCodecRoundTripCloneAndPatchValue(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaCustomRecord](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	src := schemaCustomRecord{
+		Value: schemaCustomValue{text: "value"},
+		Ptr:   &schemaCustomValue{text: "pointer"},
+		Array: [2]schemaCustomValue{{text: "array-first"}, {text: "array-second"}},
+		Slice: []schemaCustomValue{{text: "first"}, {text: "second"}},
+		Values: map[string]schemaCustomValue{
+			"key": {text: "mapped"},
+		},
+	}
+	payload, err := rt.Codec.Encode(unsafe.Pointer(&src), nil)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var decoded schemaCustomRecord
+	if err = rt.Codec.Decode(payload, unsafe.Pointer(&decoded)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if decoded.Value.text != "value" || decoded.Ptr == nil || decoded.Ptr.text != "pointer" || decoded.Array[1].text != "array-second" ||
+		len(decoded.Slice) != 2 || decoded.Slice[1].text != "second" || decoded.Values["key"].text != "mapped" {
+		t.Fatalf("decoded=%#v", decoded)
+	}
+
+	var cloned schemaCustomRecord
+	if err = rt.Clone.CloneInto(unsafe.Pointer(&src), unsafe.Pointer(&cloned)); err != nil {
+		t.Fatalf("CloneInto: %v", err)
+	}
+	src.Ptr.text = "changed"
+	src.Slice[0].text = "changed"
+	mapped := src.Values["key"]
+	mapped.text = "changed"
+	src.Values["key"] = mapped
+	if cloned.Ptr.text != "pointer" || cloned.Slice[0].text != "first" || cloned.Values["key"].text != "mapped" {
+		t.Fatalf("clone aliases source: %#v", cloned)
+	}
+
+	access := rt.Patch.AccessByName["Value"]
+	oldValue := schemaCustomRecord{Value: schemaCustomValue{text: "old"}}
+	newValue := schemaCustomRecord{Value: schemaCustomValue{text: "new"}}
+	operation := rt.Patch.BeginOperation()
+	value, changed, err := rt.Patch.Value(&access, unsafe.Pointer(&oldValue), unsafe.Pointer(&newValue), true, &operation)
+	rt.Patch.EndOperation(&operation)
+	if err != nil || !changed || value.(schemaCustomValue).text != "new" {
+		t.Fatalf("patch value=%#v changed=%v err=%v", value, changed, err)
+	}
 }

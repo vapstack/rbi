@@ -1,7 +1,6 @@
 package rebuild
 
 import (
-	"bytes"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -155,9 +154,11 @@ func decodeRebuildTestRec(data []byte) (unsafe.Pointer, error) {
 }
 
 func encodeRebuildTestRec(rec *rebuildTestRec) []byte {
-	var buf bytes.Buffer
-	rebuildTestCodec.Codec.Encode(unsafe.Pointer(rec), &buf)
-	return slices.Clone(buf.Bytes())
+	payload, err := rebuildTestCodec.Codec.Encode(unsafe.Pointer(rec), nil)
+	if err != nil {
+		panic(err)
+	}
+	return slices.Clone(payload)
 }
 
 func releaseRebuildTestRec(ptr unsafe.Pointer) {

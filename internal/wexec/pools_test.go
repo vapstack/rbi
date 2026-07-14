@@ -10,10 +10,35 @@ import (
 	"github.com/vapstack/rbi/internal/snapshot"
 )
 
+func TestEncodeBufferPoolReusesGrownStorage(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{name: "64KiB", size: 64 << 10},
+		{name: "128KiB", size: 128 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, tc.size)
+			allocs := testing.AllocsPerRun(100, func() {
+				buf := encodeBufferPool.Get()
+				buf = append(buf, payload...)
+				encodeBufferPool.Put(buf)
+			})
+			if allocs != 0 {
+				t.Fatalf("grown encode buffer reuse allocations=%v want 0", allocs)
+			}
+		})
+	}
+}
+
 func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	ex := NewExecutor(Config{})
-	payload := encodePool.Get()
-	_, _ = payload.Write([]byte{1, 2, 3})
+	buf := encodeBufferPool.Get()
+	buf = append(buf, 1, 2, 3)
 
 	v := attemptRec{V: 7}
 	released := false
@@ -28,7 +53,7 @@ func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	req.op = opSet
 	req.id = keycodec.DataKeyFromUserKey(uint64(42), false)
 	req.setValue = unsafe.Pointer(&v)
-	req.setPayload = payload
+	req.setBuffer = buf
 	req.payloadOff = 8
 	req.patch = append(req.patch, schema.PatchItem{Name: "x"})
 	req.patchIgnoreUnknown = true
@@ -40,8 +65,8 @@ func TestReleaseRequestReleasesPayloadAndClearsState(t *testing.T) {
 	if req.op != 0 || req.id != (keycodec.DataKey{}) || req.Err != nil {
 		t.Fatalf("request identity was not cleared: op=%v id=%v err=%v", req.op, req.id, req.Err)
 	}
-	if req.setPayload != nil || req.setValue != nil {
-		t.Fatalf("set state was not cleared: payload=%v value=%v", req.setPayload, req.setValue)
+	if req.setBuffer != nil || req.setValue != nil {
+		t.Fatalf("set state was not cleared: buffer=%v value=%v", req.setBuffer, req.setValue)
 	}
 	if req.payloadOff != 0 {
 		t.Fatalf("payload offset was not cleared: %d", req.payloadOff)
@@ -68,9 +93,9 @@ func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 	}
 	st.releaseValues = append(st.releaseValues, unsafe.Pointer(valueA), unsafe.Pointer(valueB))
 
-	payload := encodePool.Get()
-	_, _ = payload.Write([]byte{1, 2, 3})
-	st.ownedPayloads = append(st.ownedPayloads, payload)
+	buf := encodeBufferPool.Get()
+	buf = append(buf, 1, 2, 3)
+	st.ownedBuffers = append(st.ownedBuffers, buf)
 
 	req := &request{op: opPatch}
 	st.prepared = append(st.prepared, prepared{req: req, payload: []byte{2}, idx: 7})
@@ -80,8 +105,8 @@ func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 		Patch: []schema.PatchItem{{Name: "v", Value: []byte{1}}},
 	})
 	st.acceptedSnapshots = append(st.acceptedSnapshots, snapshot.BatchEntry{ID: 8})
-	st.states = append(st.states, recordState{idx: 7, value: unsafe.Pointer(valueA), borrowedPayload: []byte{9}})
-	st.state = recordState{idx: 9, value: unsafe.Pointer(valueB), borrowedPayload: []byte{10}}
+	st.states = append(st.states, recordState{idx: 7, value: unsafe.Pointer(valueA), payload: []byte{9}})
+	st.state = recordState{idx: 9, value: unsafe.Pointer(valueB), payload: []byte{10}}
 	st.stateByUintID = map[uint64]int{7: 1}
 	st.stateByStringID = map[string]int{"k": 1}
 
@@ -90,11 +115,8 @@ func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 	if released != 2 || valueA.V != 0 || valueB.V != 0 {
 		t.Fatalf("release count=%d values=(%d,%d), want released zeroed values", released, valueA.V, valueB.V)
 	}
-	if payload.Len() != 0 {
-		t.Fatalf("owned payload buffer was not reset: len=%d", payload.Len())
-	}
-	if len(st.releaseValues) != 0 || len(st.ownedPayloads) != 0 {
-		t.Fatalf("attempt cleanup kept value/payload slices: values=%d payloads=%d", len(st.releaseValues), len(st.ownedPayloads))
+	if len(st.releaseValues) != 0 || len(st.ownedBuffers) != 0 {
+		t.Fatalf("attempt cleanup kept values/buffers: values=%d buffers=%d", len(st.releaseValues), len(st.ownedBuffers))
 	}
 	if len(st.prepared) != 0 || len(st.accepted) != 0 || len(st.states) != 0 {
 		t.Fatalf("attempt cleanup kept prepared/accepted/states: %d/%d/%d", len(st.prepared), len(st.accepted), len(st.states))
@@ -105,7 +127,7 @@ func TestAttemptStatePoolCleanupReleasesValuesAndClearsScratch(t *testing.T) {
 	if len(st.stateByUintID) != 0 || len(st.stateByStringID) != 0 {
 		t.Fatalf("attempt cleanup kept state maps: uint=%d string=%d", len(st.stateByUintID), len(st.stateByStringID))
 	}
-	if st.release != nil || st.state.value != nil || st.state.payloadKnown || st.state.borrowedPayload != nil {
+	if st.release != nil || st.state.value != nil || st.state.payloadKnown || st.state.payload != nil {
 		t.Fatalf("attempt cleanup kept current state: release=%p state=%+v", st.release, st.state)
 	}
 }

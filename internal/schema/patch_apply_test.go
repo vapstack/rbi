@@ -84,62 +84,71 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	newPtr := unsafe.Pointer(&newRec)
 
 	scalar := schemaTestPatchAccess(t, rt, "Scalar")
-	if scalar.ValueEqual == nil || scalar.ValueEqual(oldPtr, newPtr) {
+	scalarValue, scalarChanged, scalarErr := scalar.value(oldPtr, newPtr, true, nil)
+	if scalarErr != nil || !scalarChanged {
 		t.Fatal("scalar patch equality failed")
 	}
-	if scalar.CopyValue == nil || scalar.CopyValue(newPtr).(int64) != 2 {
+	if scalarValue.(int64) != 2 {
 		t.Fatal("scalar patch copy failed")
 	}
 
 	typed := schemaTestPatchAccess(t, rt, "Typed")
-	copiedTyped := typed.CopyValue(newPtr).([]string)
+	copiedTypedValue, _, _ := typed.value(oldPtr, newPtr, false, nil)
+	copiedTyped := copiedTypedValue.([]string)
 	copiedTyped[0] = "mutated"
 	if newRec.Typed[0] != "b" {
 		t.Fatal("typed slice copy aliases source")
 	}
 
 	named := schemaTestPatchAccess(t, rt, "Named")
-	copiedNamed := named.CopyValue(newPtr).(schemaTestNamedStrings)
+	copiedNamedValue, _, _ := named.value(oldPtr, newPtr, false, nil)
+	copiedNamed := copiedNamedValue.(schemaTestNamedStrings)
 	copiedNamed[0] = "mutated"
 	if newRec.Named[0] != "n2" {
 		t.Fatal("named immutable slice copy aliases source")
 	}
 
 	nested := schemaTestPatchAccess(t, rt, "Nested")
-	if nested.ValueEqual == nil || nested.ValueEqual(oldPtr, newPtr) || nested.CopyValue == nil {
+	copiedNestedValue, nestedChanged, nestedErr := nested.value(oldPtr, newPtr, true, nil)
+	if nestedErr != nil || !nestedChanged {
 		t.Fatal("nested patch equality/copy failed")
 	}
-	copiedNested := nested.CopyValue(newPtr).(schemaTestPatchNested)
+	copiedNested := copiedNestedValue.(schemaTestPatchNested)
 	copiedNested.Values[0] = 9
 	if newRec.Nested.Values[0] != 2 {
 		t.Fatal("nested patch copy aliases source")
 	}
 	vi := schemaTestPatchAccess(t, rt, "VI")
-	if vi.ValueEqual == nil || vi.ValueEqual(oldPtr, newPtr) {
+	viValue, viChanged, viErr := vi.value(oldPtr, newPtr, true, nil)
+	if viErr != nil || !viChanged {
 		t.Fatal("ValueIndexer scalar patch equality failed")
 	}
-	if vi.CopyValue == nil || vi.CopyValue(newPtr).(schemaTestVI) != "BB" {
+	if viValue.(schemaTestVI) != "BB" {
 		t.Fatal("ValueIndexer scalar patch copy failed")
 	}
 	viPtr := schemaTestPatchAccess(t, rt, "VIPtr")
-	if viPtr.ValueEqual == nil || viPtr.ValueEqual(oldPtr, newPtr) {
+	viPtrValue, viPtrChanged, viPtrErr := viPtr.value(oldPtr, newPtr, true, nil)
+	if viPtrErr != nil || !viPtrChanged {
 		t.Fatal("ValueIndexer pointer patch equality failed")
 	}
-	copiedVIPtr := viPtr.CopyValue(newPtr).(*schemaTestVI)
+	copiedVIPtr := viPtrValue.(*schemaTestVI)
 	if copiedVIPtr == newRec.VIPtr || *copiedVIPtr != "BB" {
 		t.Fatal("ValueIndexer pointer patch copy failed")
 	}
 	newRec.VIPtr = &oldVI
-	if !viPtr.ValueEqual(oldPtr, newPtr) {
+	_, viPtrChanged, _ = viPtr.value(oldPtr, newPtr, true, nil)
+	if viPtrChanged {
 		t.Fatal("ValueIndexer pointer patch equality should compare pointed value")
 	}
 	oldRec.VIPtr = nil
 	newRec.VIPtr = nil
-	if !viPtr.ValueEqual(oldPtr, newPtr) {
+	_, viPtrChanged, _ = viPtr.value(oldPtr, newPtr, true, nil)
+	if viPtrChanged {
 		t.Fatal("ValueIndexer pointer patch equality should treat nil pointers as equal")
 	}
 	newRec.VIPtr = &newVI
-	if viPtr.ValueEqual(oldPtr, newPtr) {
+	_, viPtrChanged, _ = viPtr.value(oldPtr, newPtr, true, nil)
+	if !viPtrChanged {
 		t.Fatal("ValueIndexer pointer patch equality should detect nil/non-nil change")
 	}
 
@@ -241,14 +250,16 @@ func TestPatchRuntimeApplyCopiedUsesCopiedStorage(t *testing.T) {
 	}
 
 	inputTags := []int16{3, 4}
-	tags, ok, err := rt.Patch.CopyItemValue("Tags", inputTags, false)
+	operation := rt.Patch.BeginOperation()
+	defer rt.Patch.EndOperation(&operation)
+	tags, ok, err := rt.Patch.CopyItemValue("Tags", inputTags, false, &operation)
 	if err != nil || !ok {
 		t.Fatalf("CopyItemValue(Tags) ok=%v err=%v", ok, err)
 	}
 	inputTags[0] = 9
 
 	inputPtr := 42
-	ptr, ok, err := rt.Patch.CopyItemValue("Ptr", &inputPtr, false)
+	ptr, ok, err := rt.Patch.CopyItemValue("Ptr", &inputPtr, false, &operation)
 	if err != nil || !ok {
 		t.Fatalf("CopyItemValue(Ptr) ok=%v err=%v", ok, err)
 	}

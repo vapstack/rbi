@@ -306,6 +306,25 @@ func TestCloneRuntimeRawSpansExcludePointerBearingFields(t *testing.T) {
 	}
 }
 
+func TestCompileCloneScalarArrayPlanDoesNotScaleWithLength(t *testing.T) {
+	small := reflect.TypeFor[struct{ Value [1]byte }]()
+	large := reflect.TypeFor[struct{ Value [4096]byte }]()
+
+	smallAllocs := testing.AllocsPerRun(10, func() {
+		if _, err := compileClone(small); err != nil {
+			t.Fatal(err)
+		}
+	})
+	largeAllocs := testing.AllocsPerRun(10, func() {
+		if _, err := compileClone(large); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if largeAllocs > smallAllocs+8 {
+		t.Fatalf("compileClone allocations scale with scalar array length: [1]byte=%v [4096]byte=%v", smallAllocs, largeAllocs)
+	}
+}
+
 func byteSpansOverlap(aOff uintptr, aSize uintptr, bOff uintptr, bSize uintptr) bool {
 	return aOff < bOff+bSize && bOff < aOff+aSize
 }

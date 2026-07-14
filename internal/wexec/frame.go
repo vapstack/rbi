@@ -168,14 +168,14 @@ func (attempt *CollectionWriteAttempt) AcceptValidatedCurrent() {
 	// clear cur's slices before pooling it so cleanup does not release twice.
 	att.prepared = append(att.prepared, cur.prepared...)
 	att.preparedSnapshots = append(att.preparedSnapshots, cur.preparedSnapshots...)
-	att.ownedPayloads = append(att.ownedPayloads, cur.ownedPayloads...)
+	att.ownedBuffers = append(att.ownedBuffers, cur.ownedBuffers...)
 	att.releaseValues = append(att.releaseValues, cur.releaseValues...)
 	attempt.mergeCurrentStates()
 	attempt.batches = append(attempt.batches, attempt.curB...)
 	batchSlicePool.Put(attempt.curB)
 
-	clear(cur.ownedPayloads)
-	cur.ownedPayloads = cur.ownedPayloads[:0]
+	clear(cur.ownedBuffers)
+	cur.ownedBuffers = cur.ownedBuffers[:0]
 	clear(cur.releaseValues)
 	cur.releaseValues = cur.releaseValues[:0]
 	attempt.curB = nil

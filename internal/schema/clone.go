@@ -10,8 +10,9 @@ import (
 )
 
 type CloneRuntime struct {
-	spans []byteSpan
-	steps []cloneStep
+	spans    []byteSpan
+	steps    []cloneStep
+	errSteps []cloneErrStep
 }
 
 type byteSpan struct {
@@ -19,33 +20,42 @@ type byteSpan struct {
 	size uintptr
 }
 
-type cloneStep func(src unsafe.Pointer, dst unsafe.Pointer)
+type (
+	cloneStep    func(src unsafe.Pointer, dst unsafe.Pointer)
+	cloneErrStep func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error
+)
 
 var errInvalidRecordType = errors.New("invalid record type")
 
-func (c *CloneRuntime) CloneInto(src unsafe.Pointer, dst unsafe.Pointer) {
+func (c *CloneRuntime) CloneInto(src unsafe.Pointer, dst unsafe.Pointer) error {
+	if len(c.errSteps) == 0 {
+		for i := range c.spans {
+			cloneSpan(c.spans[i], src, dst)
+		}
+		for i := range c.steps {
+			c.steps[i](src, dst)
+		}
+		return nil
+	}
+	scratch := codecScratchPool.Get()
+	err := c.cloneInto(src, dst, scratch)
+	codecScratchPool.Put(scratch)
+	return err
+}
+
+func (c *CloneRuntime) cloneInto(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
 	for i := range c.spans {
 		cloneSpan(c.spans[i], src, dst)
 	}
 	for i := range c.steps {
 		c.steps[i](src, dst)
 	}
-}
-
-func (c CloneRuntime) step() cloneStep {
-	if len(c.spans) == 0 && len(c.steps) == 0 {
-		return nil
-	}
-	spans := c.spans
-	steps := c.steps
-	return func(src unsafe.Pointer, dst unsafe.Pointer) {
-		for i := range spans {
-			cloneSpan(spans[i], src, dst)
-		}
-		for i := range steps {
-			steps[i](src, dst)
+	for i := range c.errSteps {
+		if err := c.errSteps[i](src, dst, scratch); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func cloneSpan(span byteSpan, src unsafe.Pointer, dst unsafe.Pointer) {
@@ -56,8 +66,15 @@ func cloneSpan(span byteSpan, src unsafe.Pointer, dst unsafe.Pointer) {
 }
 
 type clonePlan struct {
-	spans []byteSpan
-	steps []cloneStep
+	spans    []byteSpan
+	steps    []cloneStep
+	errSteps []cloneErrStep
+}
+
+func (p *clonePlan) addErrStep(offset uintptr, step cloneErrStep) {
+	p.errSteps = append(p.errSteps, func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+		return step(unsafe.Add(src, offset), unsafe.Add(dst, offset), scratch)
+	})
 }
 
 func (p *clonePlan) addSpan(off uintptr, size uintptr) {
@@ -93,10 +110,14 @@ func compileClone(t reflect.Type) (CloneRuntime, error) {
 		return CloneRuntime{}, err
 	}
 	var plan clonePlan
-	if err := c.buildPlan(t, 0, t.Name(), &plan); err != nil {
+	if err := c.buildStructPlan(t, 0, t.Name(), &plan); err != nil {
 		return CloneRuntime{}, err
 	}
-	return CloneRuntime(plan), nil
+	return CloneRuntime{
+		spans:    plan.spans,
+		steps:    plan.steps,
+		errSteps: plan.errSteps,
+	}, nil
 }
 
 func (c *cloneCompiler) validateRecord(t reflect.Type, path string) error {
@@ -122,10 +143,6 @@ func (c *cloneCompiler) validateRecord(t reflect.Type, path string) error {
 }
 
 func (c *cloneCompiler) validateType(t reflect.Type, path string, key bool) error {
-	if isNativeTimeWrapperType(t) {
-		return fmt.Errorf("%w: named time field %s type %s is not supported", errInvalidRecordType, path, t)
-	}
-
 	if key {
 		switch t.Kind() {
 
@@ -165,6 +182,16 @@ func (c *cloneCompiler) validateType(t reflect.Type, path string, key bool) erro
 	}
 	if t == nativeTimeType {
 		return nil
+	}
+	leaf, err := resolveCodecLeaf(t, path)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errInvalidRecordType, err)
+	}
+	if leaf != nil {
+		return nil
+	}
+	if isNativeTimeWrapperType(t) && (t.Kind() != reflect.Pointer || t.Name() != "") {
+		return fmt.Errorf("%w: named time field %s type %s is not supported", errInvalidRecordType, path, t)
 	}
 
 	switch t.Kind() {
@@ -240,6 +267,14 @@ func (c *cloneCompiler) buildPlan(t reflect.Type, offset uintptr, path string, p
 		plan.addStep(offset, valueCloneStep[time.Time]())
 		return nil
 	}
+	leaf, err := resolveCodecLeaf(t, path)
+	if err != nil {
+		return err
+	}
+	if leaf != nil {
+		plan.addErrStep(offset, codecLeafCloneStep(leaf))
+		return nil
+	}
 	switch t.Kind() {
 
 	case reflect.Bool,
@@ -265,52 +300,104 @@ func (c *cloneCompiler) buildPlan(t reflect.Type, offset uintptr, path string, p
 			return nil
 		}
 		elem := t.Elem()
-		if cloneTypePointerFree(t) {
-			plan.addSpan(offset, t.Size())
-			return nil
+		elemPath := path + "[]"
+		spanType := elem
+		spanPath := elemPath
+	LOOP:
+		for {
+			leaf, err = resolveCodecLeaf(spanType, spanPath)
+			if err != nil {
+				return err
+			}
+			if leaf != nil {
+				break
+			}
+			switch spanType.Kind() {
+			case reflect.Bool,
+				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+				reflect.Float32, reflect.Float64:
+				plan.addSpan(offset, t.Size())
+				return nil
+			case reflect.Array:
+				spanType = spanType.Elem()
+				spanPath += "[]"
+			default:
+				break LOOP
+			}
 		}
 		size := elem.Size()
 		for i := 0; i < t.Len(); i++ {
-			if err := c.buildPlan(elem, offset+uintptr(i)*size, path+"[]", plan); err != nil {
+			if err := c.buildPlan(elem, offset+uintptr(i)*size, elemPath, plan); err != nil {
 				return err
 			}
 		}
 		return nil
 
 	case reflect.Slice:
-		if step := makeScalarSliceCloneStep(t); step != nil {
-			plan.addStep(offset, step)
-			return nil
-		}
-		elemStep, err := c.buildValueStep(t.Elem(), path+"[]")
+		elemLeaf, err := resolveCodecLeaf(t.Elem(), path+"[]")
 		if err != nil {
 			return err
 		}
-		plan.addStep(offset, sliceCloneStep(t, elemStep))
+		if elemLeaf == nil {
+			if step := makeScalarSliceCloneStep(t); step != nil {
+				plan.addStep(offset, step)
+				return nil
+			}
+		}
+		elemStep, elemErrStep, err := c.buildValueSteps(t.Elem(), path+"[]")
+		if err != nil {
+			return err
+		}
+		if elemErrStep != nil {
+			plan.addErrStep(offset, sliceCloneErrStep(t, elemErrStep))
+		} else {
+			plan.addStep(offset, sliceCloneStep(t, elemStep))
+		}
 		return nil
 
 	case reflect.Pointer:
-		if step := makeScalarPointerCloneStep(t); step != nil {
-			plan.addStep(offset, step)
-			return nil
-		}
-		elemStep, err := c.buildValueStep(t.Elem(), path)
+		elemLeaf, err := resolveCodecLeaf(t.Elem(), path)
 		if err != nil {
 			return err
 		}
-		plan.addStep(offset, pointerCloneStep(t.Elem(), elemStep))
+		if elemLeaf == nil {
+			if step := makeScalarPointerCloneStep(t); step != nil {
+				plan.addStep(offset, step)
+				return nil
+			}
+		}
+		elemStep, elemErrStep, err := c.buildValueSteps(t.Elem(), path)
+		if err != nil {
+			return err
+		}
+		if elemErrStep != nil {
+			plan.addErrStep(offset, pointerCloneErrStep(t.Elem(), elemErrStep))
+		} else {
+			plan.addStep(offset, pointerCloneStep(t.Elem(), elemStep))
+		}
 		return nil
 
 	case reflect.Map:
-		if step := makeScalarMapCloneStep(t); step != nil {
-			plan.addStep(offset, step)
-			return nil
-		}
-		valueStep, err := c.buildValueStep(t.Elem(), path+" value")
+		valueLeaf, err := resolveCodecLeaf(t.Elem(), path+" value")
 		if err != nil {
 			return err
 		}
-		plan.addStep(offset, mapCloneStep(t, valueStep))
+		if valueLeaf == nil {
+			if step := makeScalarMapCloneStep(t); step != nil {
+				plan.addStep(offset, step)
+				return nil
+			}
+		}
+		valueStep, valueErrStep, err := c.buildValueSteps(t.Elem(), path+" value")
+		if err != nil {
+			return err
+		}
+		if valueErrStep != nil {
+			plan.addErrStep(offset, mapCloneErrStep(t, valueErrStep))
+		} else {
+			plan.addStep(offset, mapCloneStep(t, valueStep))
+		}
 		return nil
 
 	default:
@@ -340,31 +427,63 @@ func (c *cloneCompiler) buildStructPlan(t reflect.Type, offset uintptr, path str
 	return nil
 }
 
-func (c *cloneCompiler) buildValueStep(t reflect.Type, path string) (cloneStep, error) {
+func (c *cloneCompiler) buildValueSteps(t reflect.Type, path string) (cloneStep, cloneErrStep, error) {
 	var plan clonePlan
 	if err := c.buildPlan(t, 0, path, &plan); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return (CloneRuntime(plan)).step(), nil
-}
-
-func cloneTypePointerFree(t reflect.Type) bool {
-	switch t.Kind() {
-	case reflect.Bool,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
-		return true
-	case reflect.Array:
-		return cloneTypePointerFree(t.Elem())
-	default:
-		return false
+	if len(plan.errSteps) != 0 {
+		spans := plan.spans
+		steps := plan.steps
+		errSteps := plan.errSteps
+		return nil, func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+			for i := range spans {
+				cloneSpan(spans[i], src, dst)
+			}
+			for i := range steps {
+				steps[i](src, dst)
+			}
+			for i := range errSteps {
+				if err := errSteps[i](src, dst, scratch); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, nil
 	}
+	if len(plan.spans) == 0 && len(plan.steps) == 0 {
+		return nil, nil, nil
+	}
+	spans := plan.spans
+	steps := plan.steps
+	return func(src unsafe.Pointer, dst unsafe.Pointer) {
+		for i := range spans {
+			cloneSpan(spans[i], src, dst)
+		}
+		for i := range steps {
+			steps[i](src, dst)
+		}
+	}, nil, nil
 }
 
 func valueCloneStep[T any]() cloneStep {
 	return func(src unsafe.Pointer, dst unsafe.Pointer) {
 		*(*T)(dst) = *(*T)(src)
+	}
+}
+
+func codecLeafCloneStep(leaf *codecLeaf) cloneErrStep {
+	return func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+		payload, err := leaf.encode(src, scratch.first[:0])
+		scratch.first = payload
+		if err != nil {
+			return fmt.Errorf("cloning field %s: %w", leaf.path, err)
+		}
+		reflect.NewAt(leaf.typ, dst).Elem().SetZero()
+		if err = leaf.decode(payload, dst); err != nil {
+			return fmt.Errorf("cloning field %s: %w", leaf.path, err)
+		}
+		return nil
 	}
 }
 
@@ -578,6 +697,23 @@ func pointerCloneStep(elem reflect.Type, elemStep cloneStep) cloneStep {
 	}
 }
 
+func pointerCloneErrStep(elem reflect.Type, elemStep cloneErrStep) cloneErrStep {
+	return func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+		s := *(*unsafe.Pointer)(src)
+		if s == nil {
+			*(*unsafe.Pointer)(dst) = nil
+			return nil
+		}
+		out := reflect.New(elem)
+		ptr := unsafe.Pointer(out.Pointer())
+		if err := elemStep(s, ptr, scratch); err != nil {
+			return err
+		}
+		*(*unsafe.Pointer)(dst) = ptr
+		return nil
+	}
+}
+
 func sliceCloneStep(t reflect.Type, elemStep cloneStep) cloneStep {
 	return func(src unsafe.Pointer, dst unsafe.Pointer) {
 		sv := reflect.NewAt(t, src).Elem()
@@ -593,6 +729,25 @@ func sliceCloneStep(t reflect.Type, elemStep cloneStep) cloneStep {
 			}
 		}
 		dv.Set(out)
+	}
+}
+
+func sliceCloneErrStep(t reflect.Type, elemStep cloneErrStep) cloneErrStep {
+	return func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+		sv := reflect.NewAt(t, src).Elem()
+		dv := reflect.NewAt(t, dst).Elem()
+		if sv.IsNil() {
+			dv.SetZero()
+			return nil
+		}
+		out := reflect.MakeSlice(t, sv.Len(), sv.Len())
+		for i := 0; i < sv.Len(); i++ {
+			if err := elemStep(unsafe.Pointer(sv.Index(i).UnsafeAddr()), unsafe.Pointer(out.Index(i).UnsafeAddr()), scratch); err != nil {
+				return err
+			}
+		}
+		dv.Set(out)
+		return nil
 	}
 }
 
@@ -626,5 +781,33 @@ func mapCloneStep(t reflect.Type, valueStep cloneStep) cloneStep {
 			out.SetMapIndex(iter.Key(), dstTmp)
 		}
 		dv.Set(out)
+	}
+}
+
+func mapCloneErrStep(t reflect.Type, valueStep cloneErrStep) cloneErrStep {
+	return func(src unsafe.Pointer, dst unsafe.Pointer, scratch *codecScratch) error {
+		sv := reflect.NewAt(t, src).Elem()
+		dv := reflect.NewAt(t, dst).Elem()
+		if sv.IsNil() {
+			dv.SetZero()
+			return nil
+		}
+		out := reflect.MakeMapWithSize(t, sv.Len())
+		iter := sv.MapRange()
+		elem := t.Elem()
+		srcTmp := reflect.New(elem).Elem()
+		dstTmp := reflect.New(elem).Elem()
+		srcPtr := unsafe.Pointer(srcTmp.UnsafeAddr())
+		dstPtr := unsafe.Pointer(dstTmp.UnsafeAddr())
+		for iter.Next() {
+			srcTmp.SetIterValue(iter)
+			dstTmp.SetZero()
+			if err := valueStep(srcPtr, dstPtr, scratch); err != nil {
+				return err
+			}
+			out.SetMapIndex(iter.Key(), dstTmp)
+		}
+		dv.Set(out)
+		return nil
 	}
 }

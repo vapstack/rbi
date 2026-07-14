@@ -102,7 +102,7 @@ func TestRunAtomicUniqueDeleteThenSetReusesFreedValue(t *testing.T) {
 
 	deleteReq := deleteAttemptReq(1)
 	setReq := setAttemptReq(2, 1)
-	defer encodePool.Put(setReq.setPayload)
+	defer encodeBufferPool.Put(setReq.setBuffer)
 
 	executeAtomicRequestsForTest(ex, []*request{deleteReq, setReq})
 
@@ -376,9 +376,9 @@ func TestRunAtomicUniqueDuplicateIDUsesFinalValue(t *testing.T) {
 	putAttemptPayload(t, raw, bucket, 2, []byte{2})
 
 	transientReq := setAttemptReq(1, 2)
-	defer encodePool.Put(transientReq.setPayload)
+	defer encodeBufferPool.Put(transientReq.setBuffer)
 	finalReq := setAttemptReq(1, 3)
-	defer encodePool.Put(finalReq.setPayload)
+	defer encodeBufferPool.Put(finalReq.setBuffer)
 
 	executeAtomicRequestsForTest(ex, []*request{transientReq, finalReq})
 
